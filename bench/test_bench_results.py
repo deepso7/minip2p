@@ -76,8 +76,6 @@ class BenchResultsTest(unittest.TestCase):
             ("rust-wall", "yamux/64KiB/session_send_and_drain", "median_ns", 106): "noise",
             ("rust-wall", "yamux/64KiB/session_send_and_drain", "median_ns", 110): "changed",
             ("node-ffi", "sdk_drain_flood", "median_ns", 104.9): "noise",
-            ("rust-wall", "endpoint_ping_load/idle/tcp", "rtt_us_p50", 114): "noise",
-            ("rust-wall", "endpoint_ping_load/idle/tcp", "rtt_us_p50", 130): "notable",
         }
         for (tier, name, metric, current), expected in cases.items():
             with self.subTest(name=name, metric=metric, current=current):
@@ -89,10 +87,27 @@ class BenchResultsTest(unittest.TestCase):
         self.assertEqual(self.compare_one("bytes_allocated_per_msg", 1000, 985).classification, "changed")
 
     def test_informational_metrics_are_never_classified(self):
-        for metric in ("cpu_ms_per_s", "rtt_us_p99"):
+        for metric in ("cpu_ms_per_s", "rtt_us_p50", "rtt_us_p99"):
             with self.subTest(metric=metric):
                 row = self.compare_one(metric, 100, 200)
                 self.assertEqual((row.classification, row.direction), ("informational", ""))
+
+    def test_wall_row_with_flat_ir_row_is_informational(self):
+        def document(wall, ir):
+            rows = [{"tier": "rust-wall", "name": "bench", "metric": "median_ns", "value": wall}]
+            rows += [] if ir is None else [{"tier": "rust-micro", "name": "bench", "metric": "Ir", "value": ir}]
+            return {"schema_version": 1, "git_sha": "sha", "rows": rows}
+
+        def wall(current, baseline, ir_reason=None):
+            rows = bench_results.compare_rows(current, baseline, ir_reason)
+            return next(row for row in rows if row.metric == "median_ns")
+
+        self.assertEqual(wall(document(145, 100), document(100, 100)).classification, "informational")
+        # A moved, missing or incomparable Ir row leaves the wall row its band.
+        self.assertEqual(wall(document(145, 110), document(100, 100)).classification, "notable")
+        self.assertEqual(wall(document(145, None), document(100, None)).classification, "notable")
+        self.assertEqual(wall(document(145, 100), document(100, None)).classification, "notable")
+        self.assertEqual(wall(document(145, 100), document(100, 100), "incompatible Ir pins").classification, "notable")
 
     def test_ir_pin_mismatch_only_unclassifies_ir_rows(self):
         reason = "incompatible Ir pins: Cargo.lock differs"

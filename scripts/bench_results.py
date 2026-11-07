@@ -9,7 +9,7 @@ import math
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
 
@@ -56,8 +56,6 @@ BANDS = (
     ("median_ns", "rust-wall", "", (10.0, 20.0)),
     # Throughput (p90 5.4%, max 5.8%).
     ("mb_per_s", None, "", (5.0, 10.0)),
-    # Application ping latency under load (p90 3%, swings ~22-37 µs).
-    ("rtt_us_p50", None, "", (15.0, 30.0)),
     # Idle wakeups are near-deterministic; a change means a new timer.
     ("wakeups_per_s", None, "", (10.0, 20.0)),
     # Allocations and datagrams over real transports depend on scheduling, read
@@ -66,8 +64,9 @@ BANDS = (
         "allocs_per_mb", "bytes_allocated_per_mb", "datagrams_per_mb",
         "avg_datagram_bytes", "datagrams_per_receive_call",
     )),
-    # rtt_us_p99 (p90 49%) and idle cpu_ms_per_s (~0.005 ms/s of timer noise)
-    # stay informational.
+    # Ping latency under load is one 200-sample run per release, so rtt_us_p50
+    # (moved 17-40% between releases) and rtt_us_p99 (p90 49%) stay
+    # informational, as does idle cpu_ms_per_s (~0.005 ms/s of timer noise).
 )
 EXPECTED_CRITERION = {
     "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
@@ -496,6 +495,16 @@ def compare_rows(
         magnitude = abs(delta)
         classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "noise"
         compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
+    # A Criterion row is informational when its benchmark's Ir row is noise:
+    # memory-bound wall rows swing 28-45% on the bench instance while their Ir
+    # stays flat, so with unchanged instructions the swing is not a code change.
+    flat = {row.name for row in compared if row.metric == "Ir" and row.classification == "noise"}
+    compared = [
+        replace(row, classification="informational", direction="")
+        if row.reason is None and row.tier == "rust-wall" and row.metric == "median_ns" and row.name in flat
+        else row
+        for row in compared
+    ]
     current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
     for key, baseline_value in old.items():
         if key not in current_keys:
