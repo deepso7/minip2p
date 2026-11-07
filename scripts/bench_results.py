@@ -121,6 +121,10 @@ GUNGRAUN_NAMES = {
         )
     },
 }
+# Criterion benchmarks that do work their `Ir` twin does not, so a flat Ir row
+# says nothing about them: the sparse Yamux bench also handles each stream's
+# window refill and reuses one session across iterations.
+WALL_ONLY_WORK = {"yamux/1024_streams/sparse_send_8_streams"}
 # Benchmarks renamed since the last release, old name suffix -> new, so a
 # release baseline still lines up with the current rows. Drop entries once a
 # release carries the new names.
@@ -498,7 +502,12 @@ def compare_rows(
     # A Criterion row is informational when its benchmark's Ir row is noise:
     # memory-bound wall rows swing 28-45% on the bench instance while their Ir
     # stays flat, so with unchanged instructions the swing is not a code change.
-    flat = {row.name for row in compared if row.metric == "Ir" and row.classification == "noise"}
+    # `WALL_ONLY_WORK` rows keep their band.
+    flat = {
+        row.name
+        for row in compared
+        if row.tier == "rust-micro" and row.metric == "Ir" and row.classification == "noise"
+    } - WALL_ONLY_WORK
     compared = [
         replace(row, classification="informational", direction="")
         if row.reason is None and row.tier == "rust-wall" and row.metric == "median_ns" and row.name in flat

@@ -93,9 +93,9 @@ class BenchResultsTest(unittest.TestCase):
                 self.assertEqual((row.classification, row.direction), ("informational", ""))
 
     def test_wall_row_with_flat_ir_row_is_informational(self):
-        def document(wall, ir):
-            rows = [{"tier": "rust-wall", "name": "bench", "metric": "median_ns", "value": wall}]
-            rows += [] if ir is None else [{"tier": "rust-micro", "name": "bench", "metric": "Ir", "value": ir}]
+        def document(wall, ir, name="bench"):
+            rows = [{"tier": "rust-wall", "name": name, "metric": "median_ns", "value": wall}]
+            rows += [] if ir is None else [{"tier": "rust-micro", "name": name, "metric": "Ir", "value": ir}]
             return {"schema_version": 1, "git_sha": "sha", "rows": rows}
 
         def wall(current, baseline, ir_reason=None):
@@ -103,6 +103,9 @@ class BenchResultsTest(unittest.TestCase):
             return next(row for row in rows if row.metric == "median_ns")
 
         self.assertEqual(wall(document(145, 100), document(100, 100)).classification, "informational")
+        self.assertEqual(wall(document(145, 1009), document(100, 1000)).classification, "informational")
+        sparse = "yamux/1024_streams/sparse_send_8_streams"
+        self.assertEqual(wall(document(145, 100, sparse), document(100, 100, sparse)).classification, "notable")
         # A moved, missing or incomparable Ir row leaves the wall row its band.
         self.assertEqual(wall(document(145, 110), document(100, 100)).classification, "notable")
         self.assertEqual(wall(document(145, None), document(100, None)).classification, "notable")
