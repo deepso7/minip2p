@@ -199,7 +199,8 @@ impl NoiseSession {
         }
     }
 
-    /// Returns whether the authenticated handshake has completed.
+    /// Returns whether the authenticated handshake has completed and the
+    /// session is still live: `false` once it has failed.
     pub fn is_handshake_complete(&self) -> bool {
         matches!(self.state, State::Transport { .. })
     }
@@ -207,7 +208,8 @@ impl NoiseSession {
     /// Returns the final Noise handshake hash once the handshake completes.
     ///
     /// Both ends compute the same value, so it names this session on either
-    /// side (channel binding, in Noise terms).
+    /// side (channel binding, in Noise terms). `None` once the session has
+    /// failed.
     pub fn handshake_hash(&self) -> Option<[u8; 32]> {
         match self.state {
             State::Transport { handshake_hash, .. } => Some(handshake_hash),
