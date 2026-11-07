@@ -152,26 +152,54 @@ struct Connect {
     frames: FrameDecoder,
     /// Reassembles capsules from the stream's DATA frames.
     capsules: CapsuleDecoder,
-    /// The status the request earns, before the client's SETTINGS weigh in.
-    request_status: &'static str,
-    /// The response went out: 200 accepts the session.
-    replied: bool,
-    /// Our side is finished (or queued to finish).
-    finished: bool,
-    /// The peer finished or reset its side.
-    peer_ended: bool,
-    /// The peer sent its trailer section: nothing may follow.
-    trailers: bool,
+    /// Our answer to the request.
+    reply: Reply,
+    /// What the peer's side of the stream said so far.
+    peer: PeerSide,
+    /// Our side of the stream.
+    send: SendSide,
+}
+
+/// Our answer to the CONNECT request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    /// Not sent yet: it waits for the client's SETTINGS. Holds the status
+    /// the request earns on its own.
+    Pending(&'static str),
+    /// Answered with 200: the session is accepted.
+    Accepted,
+    /// Answered with an error status: the stream and the session end.
+    Refused,
+}
+
+/// The peer's side of the CONNECT stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerSide {
+    /// Capsules may still come.
+    Open,
+    /// The peer sent its trailer section: no frame may follow.
+    Trailers,
     /// The peer sent `CLOSE_WEBTRANSPORT_SESSION`: only its FIN may follow.
-    close_received: bool,
-    /// The peer acknowledged our FIN, or stopped our side: nothing we
-    /// sent on it is still in flight.
-    delivered: bool,
-    /// We reset our side of it: after the peer's STOP_SENDING, or with
+    CloseReceived,
+    /// The peer finished or reset its side, or we stopped it for data
+    /// after its close capsule: nothing more is read.
+    Ended,
+}
+
+/// Our side of the CONNECT stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendSide {
+    Open,
+    /// Finished, or queued to finish.
+    Finished,
+    /// The peer acknowledged our FIN: nothing we sent on it is still in
+    /// flight.
+    Delivered,
+    /// We reset it: after the peer's STOP_SENDING, or with
     /// `H3_MESSAGE_ERROR` (also stopping it) for data after the close
     /// capsule. Nothing acknowledges a reset, so only the Closing deadline
     /// may close QUIC, which lets the session's resets out first.
-    refused: bool,
+    Reset,
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
@@ -264,25 +292,34 @@ pub(crate) struct WtSession {
     /// Bytes read before authentication, against [`MAX_EARLY_BYTES`].
     early_bytes: usize,
     noise: Option<NoiseStream>,
-    established: bool,
+    phase: Phase,
     /// The session was accepted under draft-13/14, not draft-02.
     draft14: bool,
     /// Session flow control, when the chosen draft and the client enable it.
     credit: Option<Credit>,
-    /// The session is ending: only the CONNECT stream is read.
-    closing: bool,
     /// Bytes per stream the engine has not accepted yet, with whether a FIN
     /// follows them.
     out: HashMap<u64, (Vec<u8>, bool)>,
     events: Vec<WtEvent>,
-    /// When the connection fails for not authenticating: until Noise
-    /// completes, the Closing phase starts, or the session is disarmed.
-    handshake_deadline: Option<Instant>,
-    /// In the Closing phase: when QUIC closes with `H3_NO_ERROR` at the
-    /// latest.
-    close_at: Option<Instant>,
-    /// We closed the session, so the Closing phase waits out `close_at`.
-    we_closed: bool,
+}
+
+/// Where the session is in its life.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Until Noise completes. The connection fails for not authenticating
+    /// at `deadline`; `None` once it fired or the session was disarmed.
+    Handshaking { deadline: Option<Instant> },
+    /// Noise completed: the connection is authenticated.
+    Established,
+    /// The session is ending: only the CONNECT stream is read. `at` is when
+    /// QUIC closes with `H3_NO_ERROR` at the latest, once
+    /// [`WtSession::start_closing`] armed it (`None` before that, once
+    /// reported, or once disarmed). `we_closed` says we closed the session,
+    /// so the phase waits `at` out.
+    Closing {
+        at: Option<Instant>,
+        we_closed: bool,
+    },
 }
 
 /// How a read of a stream ended.
@@ -315,15 +352,31 @@ impl WtSession {
             held: VecDeque::new(),
             early_bytes: 0,
             noise: None,
-            established: false,
+            phase: Phase::Handshaking {
+                deadline: Some(armed_at + handshake_timeout),
+            },
             draft14: false,
             credit: None,
-            closing: false,
             out: HashMap::new(),
             events: Vec::new(),
-            handshake_deadline: Some(armed_at + handshake_timeout),
-            close_at: None,
-            we_closed: false,
+        }
+    }
+
+    fn is_established(&self) -> bool {
+        matches!(self.phase, Phase::Established)
+    }
+
+    fn is_closing(&self) -> bool {
+        matches!(self.phase, Phase::Closing { .. })
+    }
+
+    /// Enters the Closing phase, its deadline not armed yet; once.
+    fn enter_closing(&mut self) {
+        if !self.is_closing() {
+            self.phase = Phase::Closing {
+                at: None,
+                we_closed: false,
+            };
         }
     }
 
@@ -332,8 +385,15 @@ impl WtSession {
     pub(crate) fn session_id(&self) -> Option<u64> {
         self.connect
             .as_ref()
-            .filter(|_| self.established)
+            .filter(|_| self.is_established())
             .map(|connect| connect.id)
+    }
+
+    /// Whether the CONNECT was answered with 200, accepting the session.
+    pub(crate) fn accepted(&self) -> bool {
+        self.connect
+            .as_ref()
+            .is_some_and(|connect| connect.reply == Reply::Accepted)
     }
 
     /// The code the session's streams end with as it closes, when its draft
@@ -385,18 +445,18 @@ impl WtSession {
     /// there was such a session to close; without one the connection has
     /// nothing to wait for.
     pub(crate) fn close(&mut self, conn: &mut Connection, code: u32) -> bool {
-        self.closing = true;
+        self.enter_closing();
         let Some(connect) = self
             .connect
             .as_mut()
-            .filter(|connect| connect.replied && connect.request_status == "200")
+            .filter(|connect| connect.reply == Reply::Accepted)
         else {
             return false;
         };
-        if connect.finished {
+        if connect.send != SendSide::Open {
             return true;
         }
-        connect.finished = true;
+        connect.send = SendSide::Finished;
         let id = connect.id;
         let mut capsule = Vec::new();
         let mut bytes = Vec::new();
@@ -415,9 +475,13 @@ impl WtSession {
 
     /// Finishes our side of the CONNECT stream, once.
     pub(crate) fn finish_connect(&mut self, conn: &mut Connection) {
-        self.closing = true;
-        if let Some(connect) = self.connect.as_mut().filter(|connect| !connect.finished) {
-            connect.finished = true;
+        self.enter_closing();
+        if let Some(connect) = self
+            .connect
+            .as_mut()
+            .filter(|connect| connect.send == SendSide::Open)
+        {
+            connect.send = SendSide::Finished;
             let id = connect.id;
             self.send(conn, id, Vec::new(), true);
         }
@@ -438,7 +502,6 @@ impl WtSession {
         code: VarInt,
         we_closed: bool,
     ) {
-        self.closing = true;
         let streams: Vec<u64> = self
             .heads
             .drain()
@@ -450,15 +513,20 @@ impl WtSession {
             self.out.remove(&raw);
             refuse(conn, raw, code.into_inner());
         }
-        self.handshake_deadline = None;
-        self.we_closed = we_closed;
-        self.close_at = Some(now + (conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX));
+        self.phase = Phase::Closing {
+            at: Some(now + (conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX)),
+            we_closed,
+        };
     }
 
     /// The session's next deadline: the handshake's, or the Closing
-    /// phase's. Never both: closing drops the handshake deadline.
+    /// phase's.
     pub(crate) fn poll_timeout(&self) -> Option<Instant> {
-        self.close_at.or(self.handshake_deadline)
+        match self.phase {
+            Phase::Handshaking { deadline } => deadline,
+            Phase::Established => None,
+            Phase::Closing { at, .. } => at,
+        }
     }
 
     /// What the connection must do now about a session deadline, reported
@@ -467,29 +535,36 @@ impl WtSession {
     /// does the close itself, since the engine drops queued resets and FINs
     /// with it.
     pub(crate) fn poll_close(&mut self, now: Instant) -> Option<WtClose> {
-        if let Some(at) = self.close_at {
-            if now < at && !self.may_close_early() {
-                return None;
+        match self.phase {
+            Phase::Handshaking {
+                deadline: Some(deadline),
+            } if deadline <= now => {
+                self.phase = Phase::Handshaking { deadline: None };
+                Some(WtClose::HandshakeTimedOut)
             }
-            self.close_at = None;
-            return Some(WtClose::CloseQuic);
+            Phase::Closing {
+                at: Some(at),
+                we_closed,
+            } => {
+                if now < at && !self.may_close_early() {
+                    return None;
+                }
+                self.phase = Phase::Closing {
+                    at: None,
+                    we_closed,
+                };
+                Some(WtClose::CloseQuic)
+            }
+            _ => None,
         }
-        if self
-            .handshake_deadline
-            .is_some_and(|deadline| deadline <= now)
-        {
-            self.handshake_deadline = None;
-            return Some(WtClose::HandshakeTimedOut);
-        }
-        None
     }
 
     /// Ends the Closing phase now, for a transport that will not be polled
     /// again: the next [`Self::poll_close`] reports it over. Outside the
     /// phase, nothing changes.
     pub(crate) fn cut_closing(&mut self, now: Instant) {
-        if self.close_at.is_some() {
-            self.close_at = Some(now);
+        if let Phase::Closing { at: Some(at), .. } = &mut self.phase {
+            *at = now;
         }
     }
 
@@ -497,8 +572,11 @@ impl WtSession {
     /// failed close, or transport loss): no session timeout fires and no
     /// further QUIC close is asked for.
     pub(crate) fn disarm(&mut self) {
-        self.handshake_deadline = None;
-        self.close_at = None;
+        match &mut self.phase {
+            Phase::Handshaking { deadline } => *deadline = None,
+            Phase::Established => {}
+            Phase::Closing { at, .. } => *at = None,
+        }
     }
 
     /// Whether the Closing phase may end before its deadline, closing QUIC
@@ -516,18 +594,26 @@ impl WtSession {
     /// qualifies: nothing acknowledges a reset, so only the deadline lets
     /// the resets out first.
     fn may_close_early(&self) -> bool {
-        !self.we_closed
-            && self
-                .connect
-                .as_ref()
-                .is_none_or(|connect| connect.peer_ended && connect.delivered && !connect.refused)
+        matches!(
+            self.phase,
+            Phase::Closing {
+                we_closed: false,
+                ..
+            }
+        ) && self.connect.as_ref().is_none_or(|connect| {
+            connect.peer == PeerSide::Ended && connect.send == SendSide::Delivered
+        })
     }
 
     /// The engine is done sending on `raw`: everything was acknowledged, or
     /// the peer stopped it.
     pub(crate) fn on_send_done(&mut self, raw: u64) {
-        if let Some(connect) = self.connect.as_mut().filter(|connect| connect.id == raw) {
-            connect.delivered = true;
+        if let Some(connect) = self
+            .connect
+            .as_mut()
+            .filter(|connect| connect.id == raw && connect.send == SendSide::Finished)
+        {
+            connect.send = SendSide::Delivered;
         }
     }
 
@@ -564,8 +650,7 @@ impl WtSession {
         self.out.remove(&raw);
         if let Some(connect) = self.connect.as_mut().filter(|c| c.id == raw) {
             // Nothing acknowledges our reset: wait out the Closing deadline.
-            connect.delivered = true;
-            connect.refused = true;
+            connect.send = SendSide::Reset;
             // A close capsule already received keeps its code.
             self.read_connect(conn);
             self.peer_closed(0);
@@ -646,7 +731,7 @@ impl WtSession {
     pub(crate) fn on_readable(&mut self, conn: &mut Connection, raw: u64) {
         if self.connect.as_ref().is_some_and(|c| c.id == raw) {
             self.read_connect(conn);
-        } else if !self.closing {
+        } else if !self.is_closing() {
             if self.peer_uni.contains_key(&raw) {
                 self.read_uni(conn, raw);
             } else if self.heads.contains_key(&raw) {
@@ -697,7 +782,7 @@ impl WtSession {
 
     /// Counts bytes read before authentication against the cap.
     fn count_early(&mut self, bytes: usize) {
-        if self.established {
+        if !matches!(self.phase, Phase::Handshaking { .. }) {
             return;
         }
         self.early_bytes += bytes;
@@ -712,7 +797,7 @@ impl WtSession {
     /// Checks the early streams against [`MAX_EARLY_STREAMS`], failing the
     /// connection past it; returns whether it failed.
     fn too_many_early_streams(&mut self) -> bool {
-        if self.established {
+        if !matches!(self.phase, Phase::Handshaking { .. }) {
             return false;
         }
         let early = self.heads.len() + self.held.len() + usize::from(self.noise.is_some());
@@ -732,7 +817,8 @@ impl WtSession {
 
     /// The peer ended the session; reported once.
     fn peer_closed(&mut self, code: u32) {
-        if !std::mem::replace(&mut self.closing, true) {
+        if !self.is_closing() {
+            self.enter_closing();
             self.events.push(WtEvent::PeerClosed { code });
         }
     }
@@ -1002,21 +1088,14 @@ impl WtSession {
             id: raw,
             frames,
             capsules: CapsuleDecoder::new(),
-            request_status,
-            replied: false,
-            finished: false,
-            peer_ended: false,
-            trailers: false,
-            close_received: false,
-            delivered: false,
-            refused: false,
+            reply: Reply::Pending(request_status),
+            peer: PeerSide::Open,
+            send: SendSide::Open,
         });
         if stopped.is_some() {
             // Our side is reset: nothing to answer or finish.
             if let Some(connect) = self.connect.as_mut() {
-                connect.finished = true;
-                connect.delivered = true;
-                connect.refused = true;
+                connect.send = SendSide::Reset;
             }
             self.peer_closed(0);
             return;
@@ -1030,10 +1109,12 @@ impl WtSession {
         else {
             return;
         };
-        if connect.replied || self.closing {
+        let Reply::Pending(request_status) = connect.reply else {
+            return;
+        };
+        if matches!(self.phase, Phase::Closing { .. }) {
             return;
         }
-        connect.replied = true;
         // The highest draft both sides speak: 13/14 (Safari), else 02
         // (Chrome, Firefox). Both need HTTP/3 datagrams, in SETTINGS and as
         // the QUIC transport parameter (draft-14 §3.1, draft-02 §3.1);
@@ -1046,9 +1127,14 @@ impl WtSession {
                 .is_some_and(|sessions| sessions >= 1);
         let draft02 = datagrams && settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
         let status = if draft14 || draft02 {
-            connect.request_status
+            request_status
         } else {
             "400"
+        };
+        connect.reply = if status == "200" {
+            Reply::Accepted
+        } else {
+            Reply::Refused
         };
         self.draft14 = draft14 && status == "200";
         // Draft-13/14 flow control is on once both sides ask for it, with
@@ -1084,8 +1170,8 @@ impl WtSession {
         if status != "200" {
             // The refusal ends the stream and the session; the connection
             // closes once the status is through.
-            connect.finished = true;
-            self.closing = true;
+            connect.send = SendSide::Finished;
+            self.enter_closing();
             self.send(conn, id, bytes, true);
             self.events.push(WtEvent::Refused {
                 reason: format!("refused the WebTransport request with {status}"),
@@ -1108,13 +1194,17 @@ impl WtSession {
     /// `H3_MESSAGE_ERROR` (draft-14 §6); the session still ends with the
     /// capsule's code.
     fn read_connect(&mut self, conn: &mut Connection) {
-        let Some(connect) = self.connect.as_mut().filter(|c| c.replied && !c.peer_ended) else {
+        let Some(connect) = self
+            .connect
+            .as_mut()
+            .filter(|c| !matches!(c.reply, Reply::Pending(_)) && c.peer != PeerSide::Ended)
+        else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
         let mut closed_with = None;
-        let mut trailing = connect.close_received && !input.is_empty();
+        let mut trailing = connect.peer == PeerSide::CloseReceived && !input.is_empty();
         let unexpected =
             |what: &str| Some((code::H3_FRAME_UNEXPECTED, format!("CONNECT stream: {what}")));
         let mut failure = 'frames: loop {
@@ -1123,13 +1213,15 @@ impl WtSession {
             }
             match connect.frames.decode(&mut input) {
                 // Trailers end the message (RFC 9114 §4.1).
-                Ok(Some(Frame::Data(_) | Frame::Headers(_))) if connect.trailers => {
+                Ok(Some(Frame::Data(_) | Frame::Headers(_)))
+                    if connect.peer == PeerSide::Trailers =>
+                {
                     break unexpected("a frame after the trailer section");
                 }
                 Ok(Some(Frame::Data(mut chunk))) => loop {
                     match connect.capsules.decode(&mut chunk) {
                         Ok(Some(Capsule::CloseSession { code, .. })) => {
-                            connect.close_received = true;
+                            connect.peer = PeerSide::CloseReceived;
                             closed_with.get_or_insert(code);
                             trailing = !chunk.is_empty() || !input.is_empty();
                             if trailing {
@@ -1157,7 +1249,7 @@ impl WtSession {
                     }
                 },
                 Ok(Some(Frame::Headers(block))) => {
-                    connect.trailers = true;
+                    connect.peer = PeerSide::Trailers;
                     let mut decoder = QpackDecoder::new();
                     match decoder.decode(&block) {
                         Ok(section) if section.iter().all(|field| valid_regular_field(&field)) => {}
@@ -1182,9 +1274,8 @@ impl WtSession {
             // The reset is in flight, with no acknowledgement to wait
             // for: the Closing phase's deadline lets it out, whatever an
             // acknowledgement of our FIN read in the same poll says.
-            connect.peer_ended = true;
-            connect.finished = true;
-            connect.refused = true;
+            connect.peer = PeerSide::Ended;
+            connect.send = SendSide::Reset;
             let id = connect.id;
             self.out.remove(&id);
             refuse(conn, id, code::H3_MESSAGE_ERROR);
@@ -1192,7 +1283,7 @@ impl WtSession {
             return;
         }
         if !matches!(end, ReadEnd::Open) {
-            connect.peer_ended = true;
+            connect.peer = PeerSide::Ended;
             closed_with.get_or_insert(0);
         }
         // A FIN must fall between frames and between capsules; a reset may
@@ -1239,7 +1330,7 @@ impl WtSession {
             );
             return;
         }
-        if self.established {
+        if self.is_established() {
             if Some(session_id) == self.session_id() {
                 self.events.push(WtEvent::Admit {
                     raw,
@@ -1288,7 +1379,7 @@ impl WtSession {
         let Some(session) = self
             .connect
             .as_ref()
-            .filter(|connect| connect.replied && connect.request_status == "200")
+            .filter(|_| self.accepted())
             .map(|connect| connect.id)
         else {
             return;
@@ -1302,7 +1393,7 @@ impl WtSession {
                 if let Some(held) = self.held.pop_front() {
                     self.start_noise(conn, held);
                 }
-            } else if self.established {
+            } else if self.is_established() {
                 if let Some(held) = self.held.pop_front() {
                     self.events.push(WtEvent::Admit {
                         raw: held.id,
@@ -1434,8 +1525,9 @@ impl WtSession {
             if let Some(noise) = self.noise.as_mut() {
                 noise.session = None;
             }
-            self.established = true;
-            self.handshake_deadline = None;
+            if !self.is_closing() {
+                self.phase = Phase::Established;
+            }
             self.events.push(WtEvent::Established { peer, token });
             self.promote_held(conn);
         } else if !matches!(end, ReadEnd::Open) {

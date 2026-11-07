@@ -1466,6 +1466,23 @@ fn settings_without_a_supported_draft_answer_400_and_close() {
 }
 
 #[test]
+fn a_session_refused_for_its_settings_is_not_accepted() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // A request that earns 200 on its own, refused for the SETTINGS.
+    peer.control(&[(setting::H3_DATAGRAM, 1)]);
+    peer.libp2p_connect();
+    peer.drive(&mut server, &mut events, "the response", |peer, _| {
+        peer.status().is_some()
+    });
+    assert_eq!(peer.status().as_deref(), Some("400"));
+    // Still in its Closing phase.
+    let conn = server.connections.values().next().expect("the connection");
+    assert!(!conn.wt_accepted());
+}
+
+#[test]
 fn an_unknown_uni_stream_is_stopped_and_the_session_goes_on() {
     let mut server = server();
     let mut events = Vec::new();
