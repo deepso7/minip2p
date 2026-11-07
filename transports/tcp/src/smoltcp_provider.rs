@@ -111,8 +111,12 @@ impl Default for SmoltcpConfig {
 /// Which side opened the stream, and so which event announces it.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Role {
+    /// Accepted. A listener's port is shared by every connection it accepts,
+    /// so these hold none of their own.
     Inbound,
-    Outbound,
+    /// Dialed, from an ephemeral `port` returned to the pool once the socket
+    /// is reclaimed.
+    Outbound { port: u16 },
 }
 
 /// Where a stream is between being asked for and carrying bytes.
@@ -147,10 +151,6 @@ enum Phase {
 struct Entry {
     inner: SmoltcpHandle,
     role: Role,
-    /// Held only by a dial, and returned to the pool once the socket is
-    /// reclaimed. A listener's port is shared by every connection it accepts,
-    /// so those carry none.
-    ephemeral_port: Option<u16>,
     /// The remote's end-of-stream has already been reported.
     read_closed: bool,
     /// A send was refused in part, so a [`TcpEvent::Writable`] is owed once
@@ -452,7 +452,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         };
         self.reclaiming.push(Reclaim {
             socket: entry.inner,
-            port: entry.ephemeral_port,
+            port: match entry.role {
+                Role::Inbound => None,
+                Role::Outbound { port } => Some(port),
+            },
         });
     }
 
@@ -507,7 +510,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                             Entry {
                                 inner,
                                 role: Role::Inbound,
-                                ephemeral_port: None,
                                 read_closed: false,
                                 send_blocked: false,
                                 phase: Phase::Opening,
@@ -735,7 +737,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 .sockets
                 .get_mut::<tcp::Socket>(inner)
                 .abort();
-            if role == Role::Outbound {
+            if let Role::Outbound { .. } = role {
                 // The handle is already the caller's, so it has to be retired
                 // in the open. An inbound attempt was never handed over, so it
                 // leaves without a word.
@@ -764,7 +766,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 socket: handle,
                 remote,
             },
-            Role::Outbound => TcpEvent::Connected {
+            Role::Outbound { .. } => TcpEvent::Connected {
                 socket: handle,
                 remote,
             },
@@ -905,8 +907,7 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             handle,
             Entry {
                 inner,
-                role: Role::Outbound,
-                ephemeral_port: Some(local),
+                role: Role::Outbound { port: local },
                 read_closed: false,
                 send_blocked: false,
                 phase: Phase::Opening,
