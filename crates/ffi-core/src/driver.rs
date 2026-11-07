@@ -3,17 +3,16 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use minip2p::{EndpointWaitOutcome, Error, PeerId, WaitDeadline};
 
 use crate::carry::PUMP_DRAIN_LIMIT;
-use crate::endpoint::{Lifecycle, Shared};
+use crate::endpoint::{Lifecycle, Live, Shared};
 use crate::events::{CloseOutcome, UnfinishedConnection, convert_endpoint_event};
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent, driver_failure_kind};
 
-struct ExitGuard {
+pub(crate) struct ExitGuard {
     shared: Arc<Shared>,
     doorbell: Option<Arc<dyn EventDoorbell>>,
 }
@@ -21,12 +20,7 @@ struct ExitGuard {
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         drop(self.doorbell.take());
-        let mut state = self.shared.lock_state();
-        state.release_endpoint();
-        self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
-        self.shared.driver_running.store(false, Ordering::Release);
-        drop(state);
-        self.shared.latch_stopped();
+        self.shared.finish_stop(self.shared.lock_state());
     }
 }
 
@@ -36,6 +30,15 @@ impl Drop for ExitGuard {
 /// ahead of the last event, `EndpointClosed`; the guard then latches
 /// stopped. Only a panic leaves the endpoint to the guard's plain drop.
 pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
+    run_with(shared, doorbell, pump);
+}
+
+/// [`run`] around `pump`, which tests replace to inject a driver failure.
+pub(crate) fn run_with(
+    shared: Arc<Shared>,
+    doorbell: Arc<dyn EventDoorbell>,
+    pump: impl FnOnce(&mut ExitGuard) -> Result<(), Error>,
+) {
     shared.lock_state().driver_thread_id = Some(std::thread::current().id());
     let mut guard = ExitGuard {
         shared,
@@ -46,9 +49,9 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
         let mut state = guard.shared.lock_state();
         let failed = matches!(&result, Err(_) | Ok(Err(_)));
         let panicked = result.is_err();
-        let report_failure = state.lifecycle == Lifecycle::Running && failed;
+        let report_failure = matches!(state.lifecycle, Lifecycle::Running(_)) && failed;
         if report_failure {
-            guard.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
+            guard.shared.begin_stop(&mut state, Duration::ZERO);
         }
         let failure = match result {
             Ok(Err(error)) if report_failure => Some(P2pEvent::DriverFailed {
@@ -61,16 +64,21 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
             }),
             _ => None,
         };
-        // A panic may have left the endpoint mid-update: the guard drops it.
-        let endpoint = if panicked {
-            None
-        } else {
-            state.release_endpoint()
-        };
-        let timeout = if failed {
-            Duration::ZERO
-        } else {
-            state.close_timeout
+        // The pump only returns once shutdown has begun. A panic may have
+        // left the endpoint mid-update: the guard drops it.
+        let (endpoint, timeout) = match &mut state.lifecycle {
+            Lifecycle::Stopping {
+                live,
+                close_timeout,
+            } if !panicked => (
+                live.take().map(|live| live.endpoint),
+                if failed {
+                    Duration::ZERO
+                } else {
+                    *close_timeout
+                },
+            ),
+            _ => (None, Duration::ZERO),
         };
         (failure, endpoint, timeout)
     };
@@ -112,16 +120,14 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
 fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
     loop {
         let mut state = guard.shared.lock_state();
-        if state.lifecycle != Lifecycle::Running {
-            return Ok(());
-        }
         let crate::endpoint::EndpointState {
-            endpoint,
-            writes,
+            lifecycle: Lifecycle::Running(Live { endpoint, writes }),
             published_peers,
             ..
-        } = &mut *state;
-        let endpoint = endpoint.as_mut().expect("running endpoint exists");
+        } = &mut *state
+        else {
+            return Ok(());
+        };
         // Only `Endpoint::wait`, so the carry stays in Endpoint emission
         // order. A follow-up `poll()` would open a second batch and finish
         // that batch on its own.

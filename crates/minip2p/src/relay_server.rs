@@ -26,6 +26,9 @@ pub enum RelayServerControlError {
 pub(crate) struct RelayServerDriver {
     pub(crate) agent: RelayServerAgent,
     pub(crate) events: VecDeque<RelayServerEvent>,
+    /// The transport address revision the listener addresses were last
+    /// taken at.
+    pub(crate) listeners_revision: Option<u64>,
 }
 
 impl RelayServerDriver {
@@ -33,6 +36,7 @@ impl RelayServerDriver {
         Self {
             agent,
             events: VecDeque::new(),
+            listeners_revision: None,
         }
     }
 
