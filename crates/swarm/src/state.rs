@@ -1428,31 +1428,22 @@ impl SwarmState {
         );
     }
 
+    /// Whether `conn_id` is one of our dials that has not established.
+    pub fn is_pending_dial(&self, conn_id: ConnectionId) -> bool {
+        self.conn_phases
+            .get(&conn_id)
+            .is_some_and(|phase| phase.dial().is_some())
+    }
+
     /// Takes a pending dial to abort it and returns `(addr, last_error)`, if
     /// any. The connection closes silently from here on, and never
     /// establishes.
-    ///
-    /// [`crate::SwarmCore::abort_dial`] uses this so a failed `close` can
-    /// reinstate the full dial via [`Self::restore_pending_dial`].
     pub fn take_pending_dial(
         &mut self,
         conn_id: ConnectionId,
     ) -> Option<(PeerAddr, Option<String>)> {
         let pending = self.take_dial(conn_id)?;
         Some((pending.addr, pending.last_error))
-    }
-
-    /// Puts a previously taken pending dial back, preserving `last_error`.
-    pub fn restore_pending_dial(
-        &mut self,
-        conn_id: ConnectionId,
-        addr: PeerAddr,
-        last_error: Option<String>,
-    ) {
-        self.conn_phases.insert(
-            conn_id,
-            ConnPhase::Dialing(PendingDial { addr, last_error }),
-        );
     }
 
     /// Marks pending dial `conn_id` so establish-stage events cannot
