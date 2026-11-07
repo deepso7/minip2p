@@ -2267,6 +2267,41 @@ mod tests {
     }
 
     #[test]
+    fn an_aborted_dial_that_connects_anyway_never_establishes() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = PeerAddr::new(
+            "/ip4/198.51.100.11/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let mut swarm = swarm_with(ScriptedTransport::default(), SeqEntropy(1));
+        let conn_id = swarm.dial(&addr).expect("dial");
+        assert!(swarm.abort_dial(conn_id).expect("abort"));
+        // The transport had already queued the handshake's completion.
+        swarm
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
+            });
+        let events = swarm.poll(Now::from_millis(1)).expect("late connected");
+        assert!(
+            events.is_empty(),
+            "an aborted dial stays silent; got {events:?}"
+        );
+        assert_eq!(swarm.connection_id(&peer), None);
+
+        swarm.transport_mut().initial.push(TransportEvent::Closed {
+            id: conn_id,
+            reason: ConnectionCloseReason::Local,
+        });
+        let events = swarm.poll(Now::from_millis(2)).expect("closed");
+        assert!(events.is_empty(), "got {events:?}");
+        assert!(!swarm.state.has_tracked_connections());
+    }
+
+    #[test]
     fn veto_establish_closes_dial_without_replacing_existing_peer() {
         let peer = Ed25519Keypair::generate().peer_id();
         let existing_addr = PeerAddr::new(

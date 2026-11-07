@@ -200,7 +200,8 @@ struct PendingOutbound {
     target: ProtocolKind,
     /// When the negotiation is given up; see
     /// [`SwarmTimeouts::negotiation_ms`]. `None` until the transport
-    /// reports the stream opened.
+    /// reports the stream opened, and for good when the stream's protocol
+    /// bounds it with its own deadline (`SwarmState::has_own_deadline`).
     deadline_ms: Option<u64>,
     /// The peer's stop-sending code, when it arrived after our proposal
     /// went out: handled as the negotiated protocol would once it is.
@@ -451,17 +452,11 @@ pub(crate) struct SwarmState {
     outbound_protocols: Vec<String>,
 
     // --- Bookkeeping ---
-    /// Peers with a pending `.ping(peer)` call: once the ping stream
-    /// negotiates, the queued 32-byte payload is sent automatically.
-    pending_pings: BTreeMap<PeerId, [u8; PING_PAYLOAD_LEN]>,
-    /// Each peer's running ping attempt, by its absolute deadline
-    /// ([`SwarmTimeouts::ping_ms`] from the `ping` call). It covers the
-    /// whole attempt: the open, the negotiation and the echo. An entry is
-    /// removed exactly when the attempt ends: by `PingRttMeasured`, by
-    /// `PingFailed` (mostly [`Self::fail_ping`]), or silently with its
-    /// connection.
-    ping_deadlines: BTreeMap<PeerId, u64>,
-    /// The protocol deadlines; `ping_ms` computes `ping_deadlines` entries.
+    /// Each peer's running ping attempt. An entry is removed exactly when
+    /// the attempt ends: by `PingRttMeasured`, by `PingFailed` (mostly
+    /// [`Self::fail_ping`]), or silently with its connection.
+    pings: BTreeMap<PeerId, PingAttempt>,
+    /// The protocol deadlines; `ping_ms` computes `pings` deadlines.
     timeouts: SwarmTimeouts,
     /// Snapshot of the transport's local listening addresses, refreshed
     /// by the core at the top of each `poll()` tick. Used to
@@ -478,22 +473,11 @@ pub(crate) struct SwarmState {
     /// Connections whose first Identify has not succeeded yet. Dropped when
     /// it succeeds or the connection leaves.
     first_identify: BTreeMap<ConnectionId, FirstIdentify>,
-    /// Outbound dials that have not yet established. Closed before
-    /// [`SwarmEvent::ConnectionEstablished`] becomes [`SwarmEvent::DialFailed`].
-    pending_dials: BTreeMap<ConnectionId, PendingDial>,
-    /// Pending dials that must not establish. Checked before
-    /// [`Self::register_connection`] / identity upgrade so a late handshake
-    /// cannot replace an already-valid peer connection (e.g. after a failed
-    /// `abort_dial`). Cleared on close, not on the first establish-stage event.
-    vetoed_establishes: BTreeSet<ConnectionId>,
-    /// Dials taken off `pending_dials` to be aborted: their close is silent
-    /// whatever its reason. Cleared on close.
-    aborted_dials: BTreeSet<ConnectionId>,
-    /// Connections handed over by a Connection replacement, awaiting the
-    /// transport's `Closed`. Every other transport event on them is ignored,
-    /// so a late identity, stream, or establish event can never re-register
-    /// a retired connection or displace its replacement.
-    retired_connections: BTreeSet<ConnectionId>,
+    /// Connections in a lifecycle phase other than an inbound handshake or
+    /// an established connection: our dials that have not established, and
+    /// connections closing unannounced. An entry leaves when the dial
+    /// establishes or the transport reports the connection closed.
+    conn_phases: BTreeMap<ConnectionId, ConnPhase>,
     /// This node's peer id, derived from the Identify public key. Breaks
     /// simultaneous-dial ties; see [`SIMULTANEOUS_DIAL_WINDOW_MS`].
     local_peer_id: PeerId,
@@ -541,10 +525,48 @@ enum FirstIdentify {
     Failed(IdentifyFailure),
 }
 
+/// A running ping attempt to one peer.
+struct PingAttempt {
+    /// Absolute deadline ([`SwarmTimeouts::ping_ms`] from the `ping` call),
+    /// covering the whole attempt: the open, the negotiation and the echo.
+    deadline_ms: u64,
+    /// The payload waiting for the ping stream to negotiate; `None` once it
+    /// was sent and Ping holds the echo in flight.
+    queued: Option<[u8; PING_PAYLOAD_LEN]>,
+}
+
 /// An outbound dial waiting to establish, keyed by the transport connection id.
 struct PendingDial {
     addr: PeerAddr,
     last_error: Option<String>,
+}
+
+/// Where a connection without an ordinary lifecycle stands; see
+/// `SwarmState::conn_phases`.
+enum ConnPhase {
+    /// Our dial, not yet established. A close before it establishes is
+    /// reported as [`SwarmEvent::DialFailed`].
+    Dialing(PendingDial),
+    /// Our dial that must not establish (after a failed
+    /// [`crate::SwarmCore::abort_dial`]): its establish is rejected as
+    /// `DialFailed` so it cannot displace the peer's current connection.
+    Vetoed(PendingDial),
+    /// Closing without being announced, or no longer announced: an aborted
+    /// dial, a rejected establish, a race loser, or a connection handed
+    /// over by a Connection replacement. Every transport event on it but
+    /// `Closed` is ignored, so nothing late can register it, and its close
+    /// is silent.
+    Closing,
+}
+
+impl ConnPhase {
+    /// The dial this phase still waits on, if any.
+    fn dial(&self) -> Option<&PendingDial> {
+        match self {
+            Self::Dialing(dial) | Self::Vetoed(dial) => Some(dial),
+            Self::Closing => None,
+        }
+    }
 }
 
 /// How and when a peer's current connection took its slot.
@@ -583,18 +605,14 @@ impl SwarmState {
             abandoned_streams: BTreeSet::new(),
             inbound_protocols,
             outbound_protocols: Vec::new(),
-            pending_pings: BTreeMap::new(),
-            ping_deadlines: BTreeMap::new(),
+            pings: BTreeMap::new(),
             timeouts,
             local_addresses: Vec::new(),
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
             first_identify: BTreeMap::new(),
-            pending_dials: BTreeMap::new(),
-            vetoed_establishes: BTreeSet::new(),
-            aborted_dials: BTreeSet::new(),
-            retired_connections: BTreeSet::new(),
+            conn_phases: BTreeMap::new(),
             local_peer_id,
             registrations: BTreeMap::new(),
             simultaneous_dial_window_ms: SIMULTANEOUS_DIAL_WINDOW_MS,
@@ -875,9 +893,9 @@ impl SwarmState {
             .outbound_negotiators
             .values()
             .filter_map(|pending| pending.deadline_ms);
-        self.ping_deadlines
+        self.pings
             .values()
-            .copied()
+            .map(|attempt| attempt.deadline_ms)
             .chain(
                 self.first_identify
                     .values()
@@ -929,22 +947,20 @@ impl SwarmState {
                 .map_err(|e| SwarmError::PingError {
                     reason: format!("{e}"),
                 })?;
-            self.start_ping_attempt(peer_id, now_ms);
+            self.start_ping_attempt(peer_id, None, now_ms);
             self.drain_ping_outputs();
             return Ok(());
         }
 
         // Case 2: a ping stream is negotiating -- update the queued payload.
         if self.has_pending_ping_stream(peer_id) {
-            self.pending_pings.insert(peer_id.clone(), payload);
-            self.start_ping_attempt(peer_id, now_ms);
+            self.start_ping_attempt(peer_id, Some(payload), now_ms);
             return Ok(());
         }
 
         // Case 3: no stream yet -- open one and queue the payload.
         self.queue_open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)?;
-        self.pending_pings.insert(peer_id.clone(), payload);
-        self.start_ping_attempt(peer_id, now_ms);
+        self.start_ping_attempt(peer_id, Some(payload), now_ms);
         Ok(())
     }
 
@@ -1294,7 +1310,7 @@ impl SwarmState {
     /// outbound dials and inbound handshakes that have not yet emitted
     /// [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {
-        !self.conn_to_remote_addr.is_empty() || !self.pending_dials.is_empty()
+        !self.conn_to_remote_addr.is_empty() || self.pending_dials().next().is_some()
     }
 
     /// Every tracked transport connection, pending dials included, with its
@@ -1302,19 +1318,37 @@ impl SwarmState {
     /// handshake that has not yet identified one has `None`.
     pub fn tracked_connections(&self) -> impl Iterator<Item = (ConnectionId, Option<&PeerId>)> {
         let dials_only = self
-            .pending_dials
-            .keys()
+            .pending_dials()
+            .map(|(conn_id, _)| conn_id)
             .filter(|conn_id| !self.conn_to_remote_addr.contains_key(conn_id));
         self.conn_to_remote_addr
             .keys()
+            .copied()
             .chain(dials_only)
-            .map(|conn_id| (*conn_id, self.tracked_peer(*conn_id)))
+            .map(|conn_id| (conn_id, self.tracked_peer(conn_id)))
+    }
+
+    /// Our dials that have not established.
+    fn pending_dials(&self) -> impl Iterator<Item = (ConnectionId, &PendingDial)> {
+        self.conn_phases
+            .iter()
+            .filter_map(|(conn_id, phase)| Some((*conn_id, phase.dial()?)))
+    }
+
+    /// Takes `conn_id`'s pending dial, if it has one, leaving it
+    /// [`ConnPhase::Closing`].
+    fn take_dial(&mut self, conn_id: ConnectionId) -> Option<PendingDial> {
+        let phase = self.conn_phases.get_mut(&conn_id)?;
+        match core::mem::replace(phase, ConnPhase::Closing) {
+            ConnPhase::Dialing(dial) | ConnPhase::Vetoed(dial) => Some(dial),
+            ConnPhase::Closing => None,
+        }
     }
 
     /// The peer behind tracked `conn_id`: a pending dial's target, else its
     /// established peer. A handshake's placeholder peer is not one.
     fn tracked_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
-        if let Some(dial) = self.pending_dials.get(&conn_id) {
+        if let Some(dial) = self.conn_phases.get(&conn_id).and_then(ConnPhase::dial) {
             return Some(dial.addr.peer_id());
         }
         self.conn_to_peer
@@ -1385,16 +1419,18 @@ impl SwarmState {
     /// Records an outbound dial so a later close before establishment emits
     /// [`SwarmEvent::DialFailed`] with `addr`.
     pub fn note_dial(&mut self, conn_id: ConnectionId, addr: PeerAddr) {
-        self.pending_dials.insert(
+        self.conn_phases.insert(
             conn_id,
-            PendingDial {
+            ConnPhase::Dialing(PendingDial {
                 addr,
                 last_error: None,
-            },
+            }),
         );
     }
 
-    /// Removes a pending dial and returns `(addr, last_error)`, if any.
+    /// Takes a pending dial to abort it and returns `(addr, last_error)`, if
+    /// any. The connection closes silently from here on, and never
+    /// establishes.
     ///
     /// [`crate::SwarmCore::abort_dial`] uses this so a failed `close` can
     /// reinstate the full dial via [`Self::restore_pending_dial`].
@@ -1402,8 +1438,7 @@ impl SwarmState {
         &mut self,
         conn_id: ConnectionId,
     ) -> Option<(PeerAddr, Option<String>)> {
-        let pending = self.pending_dials.remove(&conn_id)?;
-        self.aborted_dials.insert(conn_id);
+        let pending = self.take_dial(conn_id)?;
         Some((pending.addr, pending.last_error))
     }
 
@@ -1414,20 +1449,27 @@ impl SwarmState {
         addr: PeerAddr,
         last_error: Option<String>,
     ) {
-        self.aborted_dials.remove(&conn_id);
-        self.pending_dials
-            .insert(conn_id, PendingDial { addr, last_error });
+        self.conn_phases.insert(
+            conn_id,
+            ConnPhase::Dialing(PendingDial { addr, last_error }),
+        );
     }
 
-    /// Marks `conn_id` so establish-stage events cannot register or replace.
+    /// Marks pending dial `conn_id` so establish-stage events cannot
+    /// register or replace; a no-op for any other connection.
     ///
     /// Used after a failed [`crate::SwarmCore::abort_dial`]: the dial is
     /// restored as pending, but must not displace an existing peer connection
-    /// if the transport still completes. The veto stays until the connection
-    /// closes, covering both [`TransportEvent::Connected`] and a later
-    /// [`TransportEvent::PeerIdentityVerified`].
+    /// if the transport still completes. The first establish-stage event,
+    /// [`TransportEvent::Connected`] or
+    /// [`TransportEvent::PeerIdentityVerified`], reports the dial as
+    /// `DialFailed` and closes it; the connection ignores everything after.
     pub fn veto_establish(&mut self, conn_id: ConnectionId) {
-        self.vetoed_establishes.insert(conn_id);
+        if matches!(self.conn_phases.get(&conn_id), Some(ConnPhase::Dialing(_)))
+            && let Some(dial) = self.take_dial(conn_id)
+        {
+            self.conn_phases.insert(conn_id, ConnPhase::Vetoed(dial));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1442,17 +1484,12 @@ impl SwarmState {
     /// Feeds one transport event at `now_ms`.
     pub fn handle_transport_event(&mut self, event: TransportEvent, now_ms: u64) {
         if let Some(id) = transport_event_connection(&event)
-            && self.retired_connections.contains(&id)
+            && matches!(self.conn_phases.get(&id), Some(ConnPhase::Closing))
         {
-            // A replaced connection was already reported through
-            // `ConnectionReplaced`; only its final close is bookkeeping.
+            // Whatever announced or reported the connection already did;
+            // only its final close is bookkeeping.
             match event {
-                TransportEvent::Closed { .. } => {
-                    self.retired_connections.remove(&id);
-                    self.vetoed_establishes.remove(&id);
-                    self.conn_to_remote_addr.remove(&id);
-                    self.forget_connection_streams(id);
-                }
+                TransportEvent::Closed { reason, .. } => self.handle_connection_closed(id, reason),
                 // Nobody will read it, so the state consumes it.
                 TransportEvent::StreamData {
                     stream_id, data, ..
@@ -1469,9 +1506,7 @@ impl SwarmState {
             TransportEvent::Connected { id, endpoint } => {
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
-                // Keep the veto until Closed so a later PeerIdentityVerified
-                // cannot upgrade after Connected already rejected.
-                if self.vetoed_establishes.contains(&id) {
+                if matches!(self.conn_phases.get(&id), Some(ConnPhase::Vetoed(_))) {
                     self.reject_pending_establish(id);
                     return;
                 }
@@ -1494,7 +1529,7 @@ impl SwarmState {
                 // migration).
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
-                if self.vetoed_establishes.contains(&id) {
+                if matches!(self.conn_phases.get(&id), Some(ConnPhase::Vetoed(_))) {
                     self.reject_pending_establish(id);
                     return;
                 }
@@ -1551,17 +1586,13 @@ impl SwarmState {
             }
             TransportEvent::Listening { .. } => {}
             TransportEvent::Error { id, message } => {
-                if let Some(pending) = self.pending_dials.get_mut(&id) {
-                    pending.last_error = Some(message.clone());
+                if let Some(ConnPhase::Dialing(pending) | ConnPhase::Vetoed(pending)) =
+                    self.conn_phases.get_mut(&id)
+                {
+                    pending.last_error = Some(message);
                     // Attempt-owned and raw outbound dials report through
                     // DialFailed on close. Emitting Error here would leak a
                     // second diagnostic the connect engine cannot consume.
-                    return;
-                }
-                // reject_pending_establish already removed pending_dials and
-                // emitted DialFailed; ignore trailing transport errors until
-                // Closed clears the veto.
-                if self.vetoed_establishes.contains(&id) {
                     return;
                 }
                 self.emit_error(
@@ -1579,9 +1610,9 @@ impl SwarmState {
         self.ping.on_tick(now_ms);
         self.collect_protocol_events();
         let overdue: Vec<PeerId> = self
-            .ping_deadlines
+            .pings
             .iter()
-            .filter(|(_, due)| **due <= now_ms)
+            .filter(|(_, attempt)| attempt.deadline_ms <= now_ms)
             .map(|(peer_id, _)| peer_id.clone())
             .collect();
         for peer_id in overdue {
@@ -1933,10 +1964,21 @@ impl SwarmState {
     }
 
     /// Starts a ping attempt to `peer_id` at `now_ms`, unless one is
-    /// already running: that one keeps its deadline.
-    fn start_ping_attempt(&mut self, peer_id: &PeerId, now_ms: u64) {
-        let due = now_ms.saturating_add(self.timeouts.ping_ms);
-        self.ping_deadlines.entry(peer_id.clone()).or_insert(due);
+    /// already running: that one keeps its deadline. `queued` is the payload
+    /// waiting for the ping stream to negotiate, replacing any queued
+    /// before; `None` when the ping was sent already.
+    fn start_ping_attempt(
+        &mut self,
+        peer_id: &PeerId,
+        queued: Option<[u8; PING_PAYLOAD_LEN]>,
+        now_ms: u64,
+    ) {
+        let deadline_ms = now_ms.saturating_add(self.timeouts.ping_ms);
+        let attempt = self.pings.entry(peer_id.clone()).or_insert(PingAttempt {
+            deadline_ms,
+            queued: None,
+        });
+        attempt.queued = queued;
     }
 
     /// Whether the outbound stream for `target` on `conn_id` is bounded by
@@ -1960,10 +2002,9 @@ impl SwarmState {
     /// negotiating stream, or the echo in flight), resetting its stream.
     /// Returns whether an attempt was running.
     fn fail_ping(&mut self, peer_id: &PeerId, cause: PingFailure) -> bool {
-        if self.ping_deadlines.remove(peer_id).is_none() {
+        if self.pings.remove(peer_id).is_none() {
             return false;
         }
-        self.pending_pings.remove(peer_id);
         let Some(conn_id) = self.connection_id(peer_id) else {
             return true;
         };
@@ -2081,7 +2122,7 @@ impl SwarmState {
     /// a transport close for `conn_id` only, and leaves any other connection
     /// for the same peer untouched.
     fn reject_pending_establish(&mut self, conn_id: ConnectionId) {
-        if let Some(pending) = self.pending_dials.remove(&conn_id) {
+        if let Some(pending) = self.take_dial(conn_id) {
             let reason = pending
                 .last_error
                 .unwrap_or_else(|| String::from("connection closed before establishment"));
@@ -2116,7 +2157,7 @@ impl SwarmState {
         if now_ms.saturating_sub(current.at_ms) >= self.simultaneous_dial_window_ms {
             return false;
         }
-        let new_outbound = self.pending_dials.contains_key(&new);
+        let new_outbound = matches!(self.conn_phases.get(&new), Some(ConnPhase::Dialing(_)));
         if current.outbound == new_outbound {
             return matches!(
                 (current.token, new_token),
@@ -2133,7 +2174,7 @@ impl SwarmState {
     /// the winner already settled consumes it. Like a replaced connection,
     /// it stays retired until the transport reports it closed.
     fn reject_race_loser(&mut self, conn_id: ConnectionId) {
-        if let Some(pending) = self.pending_dials.remove(&conn_id) {
+        if let Some(pending) = self.take_dial(conn_id) {
             self.events.push_back(SwarmEvent::DialFailed {
                 conn_id,
                 addr: pending.addr,
@@ -2143,12 +2184,13 @@ impl SwarmState {
             });
         }
         self.close_unannounced(conn_id);
-        self.retired_connections.insert(conn_id);
     }
 
     /// Drops what an unannounced connection gathered, including a placeholder
-    /// peer, and queues its transport close.
+    /// peer, and queues its transport close. It is [`ConnPhase::Closing`]
+    /// until the transport reports it closed.
     fn close_unannounced(&mut self, conn_id: ConnectionId) {
+        self.conn_phases.insert(conn_id, ConnPhase::Closing);
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
             if self.peer_to_conn.get(&peer_id) == Some(&conn_id) {
                 self.peer_to_conn.remove(&peer_id);
@@ -2166,8 +2208,7 @@ impl SwarmState {
     /// attempt, which ends without a ping event: the connection's own event
     /// ends it.
     fn reset_peer_protocols(&mut self, peer_id: &PeerId) {
-        self.pending_pings.remove(peer_id);
-        self.ping_deadlines.remove(peer_id);
+        self.pings.remove(peer_id);
         self.ping.remove_peer(peer_id);
         self.identify.remove_peer(peer_id);
         self.drain_ping_outputs();
@@ -2230,7 +2271,10 @@ impl SwarmState {
             ),
         }
 
-        if self.pending_pings.contains_key(peer_id)
+        if self
+            .pings
+            .get(peer_id)
+            .is_some_and(|attempt| attempt.queued.is_some())
             && self.find_negotiated_ping_stream(peer_id).is_none()
             && !self.has_pending_ping_stream(peer_id)
             && let Err(e) =
@@ -2267,13 +2311,13 @@ impl SwarmState {
         // timeout. Only this peer's ping is timed out: another peer's reply
         // may still be later in the batch.
         let overdue = self
-            .ping_deadlines
+            .pings
             .get(peer_id)
-            .is_some_and(|due| *due <= now_ms);
+            .is_some_and(|attempt| attempt.deadline_ms <= now_ms);
         // The in-flight payload lives in Ping's per-peer state; read it
         // before that state is reset.
         let ping_intent = if overdue {
-            self.ping_deadlines.remove(peer_id);
+            self.pings.remove(peer_id);
             self.events.push_back(SwarmEvent::PingFailed {
                 peer_id: peer_id.clone(),
                 conn_id: old,
@@ -2283,7 +2327,7 @@ impl SwarmState {
         } else {
             self.ping
                 .in_flight_payload(peer_id)
-                .or_else(|| self.pending_pings.get(peer_id).copied())
+                .or_else(|| self.pings.get(peer_id).and_then(|attempt| attempt.queued))
         };
         self.reset_peer_protocols(peer_id);
         self.peer_info.remove(peer_id);
@@ -2295,7 +2339,7 @@ impl SwarmState {
         self.forget_connection_streams(old);
         self.actions
             .retain(|action| !dropped_on_replacement(action, old));
-        self.retired_connections.insert(old);
+        self.conn_phases.insert(old, ConnPhase::Closing);
         self.deferred_closes.retain(|conn_id| *conn_id != old);
         self.deferred_closes.push_back(old);
         ping_intent
@@ -2315,7 +2359,10 @@ impl SwarmState {
     ) {
         self.set_conn_peer(conn_id, peer_id.clone());
         self.peer_to_conn.insert(peer_id.clone(), conn_id);
-        let outbound = self.pending_dials.remove(&conn_id).is_some();
+        let outbound = matches!(
+            self.conn_phases.remove(&conn_id),
+            Some(ConnPhase::Dialing(_))
+        );
         self.registrations.insert(
             conn_id,
             Registration {
@@ -2325,8 +2372,7 @@ impl SwarmState {
             },
         );
         if let Some(payload) = ping_intent {
-            self.pending_pings.insert(peer_id.clone(), payload);
-            self.start_ping_attempt(peer_id, now_ms);
+            self.start_ping_attempt(peer_id, Some(payload), now_ms);
         }
         match old {
             Some(old) if self.established_peers.contains(peer_id) => {
@@ -2409,11 +2455,8 @@ impl SwarmState {
             self.identify.migrate_peer(&stale, &new_peer_id);
             // The ping attempt moves with the protocol state, before the
             // drain looks for attempts that lost their stream.
-            if let Some(payload) = self.pending_pings.remove(&stale) {
-                self.pending_pings.insert(new_peer_id.clone(), payload);
-            }
-            if let Some(due) = self.ping_deadlines.remove(&stale) {
-                self.ping_deadlines.insert(new_peer_id.clone(), due);
+            if let Some(attempt) = self.pings.remove(&stale) {
+                self.pings.insert(new_peer_id.clone(), attempt);
             }
             self.drain_ping_outputs();
             self.drain_identify_outputs();
@@ -2703,21 +2746,23 @@ impl SwarmState {
         };
         self.conn_to_remote_addr.remove(&conn_id);
         self.registrations.remove(&conn_id);
-        // A vetoed establish already reported its dial as `DialFailed`.
-        let mut reported = self.vetoed_establishes.remove(&conn_id);
-        reported |= self.aborted_dials.remove(&conn_id);
-
-        if let Some(pending) = self.pending_dials.remove(&conn_id) {
-            let reason = pending
-                .last_error
-                .unwrap_or_else(|| format!("connection closed before establishment: {reason}"));
-            self.events.push_back(SwarmEvent::DialFailed {
-                conn_id,
-                addr: pending.addr,
-                reason,
-            });
-            reported = true;
-        }
+        let mut reported = match self.conn_phases.remove(&conn_id) {
+            Some(ConnPhase::Dialing(pending) | ConnPhase::Vetoed(pending)) => {
+                let reason = pending
+                    .last_error
+                    .unwrap_or_else(|| format!("connection closed before establishment: {reason}"));
+                self.events.push_back(SwarmEvent::DialFailed {
+                    conn_id,
+                    addr: pending.addr,
+                    reason,
+                });
+                true
+            }
+            // Whatever closed it unannounced already reported it, or needed
+            // no report.
+            Some(ConnPhase::Closing) => true,
+            None => false,
+        };
 
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id)
             && self.peer_to_conn.get(&peer_id) == Some(&conn_id)
@@ -3062,7 +3107,11 @@ impl SwarmState {
                 }
                 self.drain_ping_outputs();
 
-                if let Some(payload) = self.pending_pings.remove(&peer_id) {
+                if let Some(payload) = self
+                    .pings
+                    .get_mut(&peer_id)
+                    .and_then(|attempt| attempt.queued.take())
+                {
                     match self.ping.send_ping(&peer_id, &payload, now_ms) {
                         Ok(()) => self.drain_ping_outputs(),
                         Err(e) => self.emit_error(
@@ -3189,13 +3238,12 @@ impl SwarmState {
             }
         }
         let lost: Vec<PeerId> = self
-            .ping_deadlines
-            .keys()
-            .filter(|peer_id| {
-                !self.pending_pings.contains_key(*peer_id)
-                    && self.ping.in_flight_payload(peer_id).is_none()
+            .pings
+            .iter()
+            .filter(|(peer_id, attempt)| {
+                attempt.queued.is_none() && self.ping.in_flight_payload(peer_id).is_none()
             })
-            .cloned()
+            .map(|(peer_id, _)| peer_id.clone())
             .collect();
         for peer_id in lost {
             self.fail_ping(&peer_id, PingFailure::StreamClosed);
@@ -3225,7 +3273,7 @@ impl SwarmState {
             PingEvent::RttMeasured {
                 peer_id, rtt_ms, ..
             } => {
-                self.ping_deadlines.remove(&peer_id);
+                self.pings.remove(&peer_id);
                 if let Some(conn_id) = self.connection_id(&peer_id) {
                     self.events.push_back(SwarmEvent::PingRttMeasured {
                         peer_id,
@@ -3651,7 +3699,7 @@ mod tests {
         core.ping(&peer, [7; PING_PAYLOAD_LEN], start)
             .expect("ping in flight");
         assert_eq!(
-            core.ping_deadlines.get(&peer).copied(),
+            core.pings.get(&peer).map(|attempt| attempt.deadline_ms),
             Some(u64::MAX),
             "a saturated ping deadline must not wrap to the past"
         );
@@ -6599,7 +6647,7 @@ mod tests {
             "reject should DialFailed; got {after_reject:?}"
         );
 
-        // reject_pending_establish already dropped pending_dials; a trailing
+        // reject_pending_establish already reported the dial; a trailing
         // Error before Closed must not leak a second SwarmEvent::Error.
         feed(
             &mut core,
@@ -7560,7 +7608,7 @@ mod tests {
                 all,
                 "{how:?}: one reset per stream: {outputs:?}"
             );
-            assert!(core.pending_pings.is_empty(), "{how:?}: payload cleared");
+            assert!(core.pings.is_empty(), "{how:?}: attempt cleared");
             assert!(
                 !core
                     .outbound_negotiators
