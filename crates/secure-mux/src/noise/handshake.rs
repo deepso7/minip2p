@@ -40,7 +40,6 @@ pub(crate) struct HandshakeState {
     identity: Ed25519Keypair,
     local_static: [u8; 32],
     local_ephemeral: [u8; 32],
-    remote_ephemeral: Option<[u8; 32]>,
     expected_peer: Option<PeerId>,
     local_extensions: Option<NoiseExtensions>,
     symmetric: SymmetricState,
@@ -73,7 +72,6 @@ impl HandshakeState {
             identity,
             local_static,
             local_ephemeral,
-            remote_ephemeral: None,
             expected_peer,
             local_extensions,
             symmetric: SymmetricState::with_prologue(b""),
@@ -104,18 +102,17 @@ impl HandshakeState {
         match self.step {
             Step::ResponderReadMessage1 => {
                 let remote = exact_array::<32>(message, "invalid Noise message 1 length")?;
-                self.remote_ephemeral = Some(remote);
                 self.symmetric.mix_hash(&remote);
                 let plaintext = self.symmetric.decrypt_and_hash(b"")?;
                 debug_assert!(plaintext.is_empty());
                 self.step = Step::ResponderWriteMessage2;
-                let response = self.write_message2()?;
+                let response = self.write_message2(remote)?;
                 Ok((Some(response), None))
             }
             Step::InitiatorReadMessage2 => {
-                let remote = self.read_message2(message)?;
+                let (remote_e, remote) = self.read_message2(message)?;
                 self.step = Step::InitiatorWriteMessage3;
-                let response = self.write_message3()?;
+                let response = self.write_message3(remote_e)?;
                 let result = self.finish_with_peer(remote);
                 Ok((Some(response), Some(result)))
             }
@@ -128,10 +125,9 @@ impl HandshakeState {
         }
     }
 
-    fn write_message2(&mut self) -> Result<Vec<u8>, NoiseError> {
+    fn write_message2(&mut self, remote_e: [u8; 32]) -> Result<Vec<u8>, NoiseError> {
         debug_assert_eq!(self.role, NoiseRole::Responder);
         debug_assert_eq!(self.step, Step::ResponderWriteMessage2);
-        let remote_e = required(self.remote_ephemeral)?;
         let local_e_public = public_key(self.local_ephemeral);
         let mut out = local_e_public.to_vec();
         self.symmetric.mix_hash(&local_e_public);
@@ -147,7 +143,9 @@ impl HandshakeState {
         Ok(out)
     }
 
-    fn read_message2(&mut self, message: &[u8]) -> Result<VerifiedRemote, NoiseError> {
+    /// Reads XX message 2, returning the remote ephemeral key that message 3
+    /// needs alongside the verified identity.
+    fn read_message2(&mut self, message: &[u8]) -> Result<([u8; 32], VerifiedRemote), NoiseError> {
         if message.len() < 32 + 48 + 16 {
             return Err(NoiseError::InvalidHandshakeMessage(
                 "Noise message 2 is too short",
@@ -161,7 +159,6 @@ impl HandshakeState {
                 ))?,
             "invalid remote ephemeral key",
         )?;
-        self.remote_ephemeral = Some(remote_e);
         self.symmetric.mix_hash(&remote_e);
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_e)?)?;
@@ -175,13 +172,12 @@ impl HandshakeState {
         let payload = self.symmetric.decrypt_and_hash(message.get(80..).ok_or(
             NoiseError::InvalidHandshakeMessage("Noise message 2 is too short"),
         )?)?;
-        self.verify_payload(&payload, remote_s)
+        Ok((remote_e, self.verify_payload(&payload, remote_s)?))
     }
 
-    fn write_message3(&mut self) -> Result<Vec<u8>, NoiseError> {
+    fn write_message3(&mut self, remote_e: [u8; 32]) -> Result<Vec<u8>, NoiseError> {
         debug_assert_eq!(self.role, NoiseRole::Initiator);
         debug_assert_eq!(self.step, Step::InitiatorWriteMessage3);
-        let remote_e = required(self.remote_ephemeral)?;
         let local_s_public = public_key(self.local_static);
         let mut out = Vec::new();
         self.symmetric.encrypt_and_hash(&mut out, &local_s_public)?;
@@ -375,10 +371,6 @@ fn exact_array<const N: usize>(input: &[u8], reason: &'static str) -> Result<[u8
     input
         .try_into()
         .map_err(|_| NoiseError::InvalidHandshakeMessage(reason))
-}
-
-fn required<T>(value: Option<T>) -> Result<T, NoiseError> {
-    value.ok_or(NoiseError::InvalidState("missing handshake key"))
 }
 
 #[cfg(test)]

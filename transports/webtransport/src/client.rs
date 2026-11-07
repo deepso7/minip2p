@@ -10,6 +10,7 @@
 //! then the Noise stream is finished and the connection is up. Every later
 //! stream is a plain libp2p stream, mapped 1:1 onto a WebTransport stream.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -139,21 +140,95 @@ struct Session {
     /// The dialed certhashes: the server's Noise extensions must list each
     /// (none for a CA-certificate dial, which any list satisfies).
     certhashes: Vec<Multihash>,
-    /// The Noise stream and its session, until the handshake completes.
-    noise_stream: Option<StreamHandle>,
-    noise: Option<NoiseSession>,
-    /// The server's Noise handshake checked out: the connection is
-    /// established once message three and the FIN are with the platform.
-    verified: bool,
-    connected: bool,
-    /// When an unconnected session times out, in monotonic ms, stamped at
-    /// the first poll that sees it.
-    handshake_deadline: Option<u64>,
+    state: State,
     streams: BTreeMap<StreamHandle, Stream>,
     /// Pending write bytes across every stream (see [`Stream::pending`]).
     pending: usize,
     /// Streams that returned `Full` and wait for a `StreamWritable`.
     writable_armed: BTreeSet<StreamHandle>,
+}
+
+/// Whether a session is still coming up, or carries the caller's streams.
+///
+/// One state rather than flags plus a deadline, so the handshake countdown
+/// cannot outlive the handshake it bounds.
+enum State {
+    Handshaking {
+        /// When the handshake times out, in monotonic ms. `None` until the
+        /// first poll to see the session stamps it: the client has no clock
+        /// between polls.
+        deadline: Option<u64>,
+        step: Step,
+    },
+    /// Established. The finished Noise stream is kept so its late platform
+    /// events are recognised and ignored.
+    Connected { noise_stream: StreamHandle },
+}
+
+/// How far a [`State::Handshaking`] session has got.
+enum Step {
+    /// The CONNECT is in flight.
+    Connecting,
+    /// The Noise stream is asked for and not yet writable.
+    Opening { stream: StreamHandle },
+    /// Noise XX runs over `stream`. Boxed: far larger than the other steps,
+    /// and needed only for the handshake.
+    Noise {
+        stream: StreamHandle,
+        noise: Box<NoiseSession>,
+    },
+    /// The server checked out; message three and the Noise stream's FIN are
+    /// still going to the platform. Connected once they are with it.
+    Flushing { stream: StreamHandle },
+}
+
+impl State {
+    fn noise_stream(&self) -> Option<StreamHandle> {
+        match self {
+            Self::Handshaking {
+                step: Step::Connecting,
+                ..
+            } => None,
+            Self::Handshaking {
+                step:
+                    Step::Opening { stream } | Step::Noise { stream, .. } | Step::Flushing { stream },
+                ..
+            } => Some(*stream),
+            Self::Connected { noise_stream } => Some(*noise_stream),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    /// The server's Noise handshake checked out, whether or not message
+    /// three has gone yet.
+    fn is_verified(&self) -> bool {
+        matches!(
+            self,
+            Self::Connected { .. }
+                | Self::Handshaking {
+                    step: Step::Flushing { .. },
+                    ..
+                }
+        )
+    }
+}
+
+/// A stream's local write side.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum Write {
+    #[default]
+    Open,
+    /// Closed by the caller (or the Noise handshake); the FIN goes out once
+    /// the queued writes drain.
+    FinQueued,
+    /// The FIN is with the platform.
+    Finished,
+    /// Ended without a FIN: stopped by the peer, refused by the platform, or
+    /// reset. Its writes were dropped.
+    Stopped,
 }
 
 /// One stream's half-close state, write queue and read accounting.
@@ -172,12 +247,8 @@ struct Stream {
     pending: usize,
     /// Bytes the platform accepted whose `WriteCompleted` has not arrived.
     in_flight: usize,
-    /// A FIN goes out once `writes` drains.
-    fin_queued: bool,
-    /// Our write side is done: finished, stopped by the peer, or reset.
-    local_closed: bool,
+    write: Write,
     remote_closed: bool,
-    write_stopped: bool,
     closed_notified: bool,
     /// Delivered bytes the reader has not acknowledged.
     unacked: usize,
@@ -259,14 +330,13 @@ impl Session {
                 }
                 // The platform refused the stream: nothing more goes out.
                 Err(_) => {
-                    state.local_closed = true;
-                    state.write_stopped = true;
                     self.drop_writes(handle);
                     return true;
                 }
             }
         }
-        if mem::take(&mut state.fin_queued) {
+        if state.write == Write::FinQueued {
+            state.write = Write::Finished;
             io.close_write(handle);
         }
         false
@@ -285,13 +355,14 @@ impl Session {
         }
     }
 
-    /// The write side ended for good: queued and in-flight writes are gone
-    /// (the platform drops its own), and so is any pending `StreamWritable`.
+    /// The write side ended for good, [stopped](Write::Stopped): queued and
+    /// in-flight writes are gone (the platform drops its own), and so is any
+    /// pending `StreamWritable`.
     fn drop_writes(&mut self, handle: StreamHandle) {
         self.writable_armed.remove(&handle);
         if let Some(state) = self.streams.get_mut(&handle) {
+            state.write = Write::Stopped;
             state.writes.clear();
-            state.fin_queued = false;
             state.in_flight = 0;
             self.pending -= mem::take(&mut state.pending);
         }
@@ -306,7 +377,7 @@ impl Session {
 
     /// Every stream but the Noise stream.
     fn app_streams(&self) -> impl Iterator<Item = (&StreamHandle, &Stream)> {
-        let noise = self.noise_stream;
+        let noise = self.state.noise_stream();
         self.streams
             .iter()
             .filter(move |(handle, _)| Some(**handle) != noise)
@@ -412,7 +483,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             let Some(state) = conn
                 .streams
                 .get(&handle)
-                .filter(|state| !state.local_closed)
+                .filter(|state| state.write == Write::Open)
             else {
                 continue;
             };
@@ -488,7 +559,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         let reason = match code {
-            Some(code) if session.connected => ConnectionCloseReason::Remote {
+            Some(code) if session.state.is_connected() => ConnectionCloseReason::Remote {
                 code: u64::from(code),
             },
             _ => ConnectionCloseReason::Error(format!("WebTransport session failed: {reason}")),
@@ -507,7 +578,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
     /// stream.
     fn owner(&self, handle: StreamHandle) -> Option<(ConnectionId, bool)> {
         let id = *self.by_stream.get(&handle)?;
-        let noise = self.connections.get(&id)?.noise_stream == Some(handle);
+        let noise = self.connections.get(&id)?.state.noise_stream() == Some(handle);
         Some((id, noise))
     }
 
@@ -519,7 +590,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         match self.io.open_stream(session) {
             Ok(stream) => {
                 if let Some(conn) = self.connections.get_mut(&id) {
-                    conn.noise_stream = Some(stream);
+                    if let State::Handshaking { step, .. } = &mut conn.state {
+                        *step = Step::Opening { stream };
+                    }
                     conn.streams.insert(stream, Stream::default());
                     self.by_stream.insert(stream, id);
                 }
@@ -534,7 +607,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let max = self.limits.max_streams_per_connection;
         let admitted = self.by_session.get(&session).and_then(|&id| {
             let conn = self.connections.get_mut(&id)?;
-            (conn.connected && conn.stream_count(false) < max).then_some((id, conn))
+            (conn.state.is_connected() && conn.stream_count(false) < max).then_some((id, conn))
         });
         let Some((id, conn)) = admitted else {
             self.io.reset(stream, 0);
@@ -581,6 +654,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
+        let State::Handshaking { step, .. } = &mut conn.state else {
+            return;
+        };
         let [static_secret, ephemeral_secret] = secrets;
         let mut noise = NoiseSession::new(NoiseConfig {
             role: NoiseRole::Initiator,
@@ -594,7 +670,10 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             self.fail(id, format!("Noise start failed: {error}"));
             return;
         }
-        conn.noise = Some(noise);
+        *step = Step::Noise {
+            stream: handle,
+            noise: Box::new(noise),
+        };
         if let Some(state) = conn.streams.get_mut(&handle) {
             state.opened = true;
             state.granted = NOISE_READ_GRANT;
@@ -611,7 +690,11 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             let Some(conn) = self.connections.get_mut(&id) else {
                 return;
             };
-            let Some(session) = conn.noise.as_mut() else {
+            let State::Handshaking {
+                step: Step::Noise { noise: session, .. },
+                ..
+            } = &mut conn.state
+            else {
                 // Anything after the handshake is ignored.
                 return;
             };
@@ -648,7 +731,11 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
-        let Some(noise) = conn.noise.as_mut() else {
+        let State::Handshaking {
+            step: Step::Noise { noise, .. },
+            ..
+        } = &mut conn.state
+        else {
             return;
         };
         let mut frames = Vec::new();
@@ -694,14 +781,14 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         }
         // Message three goes out, then the Noise stream is finished.
         if let Some(state) = conn.streams.get_mut(&handle) {
-            state.fin_queued = true;
-            state.local_closed = true;
+            state.write = Write::FinQueued;
         }
         if let Some(hash) = hash {
             conn.endpoint.set_token(ConnectionToken::new(hash));
         }
-        conn.noise = None;
-        conn.verified = true;
+        if let State::Handshaking { step, .. } = &mut conn.state {
+            *step = Step::Flushing { stream: handle };
+        }
         if conn.flush(&mut self.io, handle) {
             self.fail(id, NOISE_REFUSED.into());
             return;
@@ -716,18 +803,23 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
-        if !conn.verified || conn.connected {
+        let State::Handshaking {
+            step: Step::Flushing { stream },
+            ..
+        } = conn.state
+        else {
             return;
-        }
+        };
         let sent = conn
-            .noise_stream
-            .and_then(|handle| conn.streams.get(&handle))
-            .is_some_and(|state| state.writes.is_empty() && !state.fin_queued);
+            .streams
+            .get(&stream)
+            .is_some_and(|state| state.write == Write::Finished);
         if !sent {
             return;
         }
-        conn.connected = true;
-        conn.handshake_deadline = None;
+        conn.state = State::Connected {
+            noise_stream: stream,
+        };
         self.events.push(TransportEvent::Connected {
             id,
             endpoint: conn.endpoint.clone(),
@@ -741,7 +833,11 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         if noise {
             // Once the server's messages are verified it has nothing more
             // to send, so its FIN is no failure.
-            if self.connections.get(&id).is_some_and(|conn| !conn.verified) {
+            if self
+                .connections
+                .get(&id)
+                .is_some_and(|conn| !conn.state.is_verified())
+            {
                 self.fail(
                     id,
                     "the server finished the Noise stream mid-handshake".into(),
@@ -783,7 +879,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             if self
                 .connections
                 .get(&id)
-                .is_some_and(|conn| !conn.connected)
+                .is_some_and(|conn| !conn.state.is_connected())
             {
                 self.fail(id, "the server reset the Noise stream".into());
             }
@@ -798,7 +894,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         conn.drop_writes(handle);
         if let Some(state) = conn.streams.get_mut(&handle) {
             state.granted = 0;
-            state.local_closed = true;
             state.remote_closed = true;
         }
         self.drop_writable(id, handle);
@@ -815,7 +910,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             if self
                 .connections
                 .get(&id)
-                .is_some_and(|conn| !conn.connected)
+                .is_some_and(|conn| !conn.state.is_connected())
             {
                 self.fail(id, "the server stopped the Noise stream".into());
             }
@@ -827,14 +922,12 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(state) = conn.streams.get_mut(&handle) else {
             return;
         };
-        if state.write_stopped {
+        if state.write == Write::Stopped {
             return;
         }
         // After StreamClosed nothing more is reported, but writes still in
         // the platform are released: a stopped stream never completes them.
         let notify = !state.closed_notified;
-        state.write_stopped = true;
-        state.local_closed = true;
         conn.drop_writes(handle);
         self.drop_writable(id, handle);
         if notify {
@@ -865,13 +958,13 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
-        if conn.noise_stream == Some(handle) {
+        if conn.state.noise_stream() == Some(handle) {
             return;
         }
         let Some(state) = conn.streams.get_mut(&handle) else {
             return;
         };
-        let finished = state.local_closed && state.writes.is_empty() && !state.fin_queued;
+        let finished = matches!(state.write, Write::Finished | Write::Stopped);
         if finished && state.remote_closed && !state.closed_notified {
             state.closed_notified = true;
             self.events.push(TransportEvent::StreamClosed {
@@ -897,7 +990,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
         let handle = StreamHandle(stream_id.as_u64());
-        if conn.noise_stream == Some(handle) || !conn.streams.contains_key(&handle) {
+        if conn.state.noise_stream() == Some(handle) || !conn.streams.contains_key(&handle) {
             return Err(TransportError::StreamNotFound { id, stream_id });
         }
         Ok((conn, &mut self.io, handle))
@@ -910,11 +1003,11 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let expired: Vec<ConnectionId> = self
             .connections
             .iter_mut()
-            .filter(|(_, conn)| !conn.connected)
             .filter_map(|(id, conn)| {
-                let at = *conn
-                    .handshake_deadline
-                    .get_or_insert(now.monotonic_ms.saturating_add(timeout));
+                let State::Handshaking { deadline, .. } = &mut conn.state else {
+                    return None;
+                };
+                let at = *deadline.get_or_insert(now.monotonic_ms.saturating_add(timeout));
                 (now.monotonic_ms >= at).then_some(*id)
             })
             .collect();
@@ -974,11 +1067,10 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
                 handle,
                 endpoint: ConnectionEndpoint::from_peer_addr(addr),
                 certhashes,
-                noise_stream: None,
-                noise: None,
-                verified: false,
-                connected: false,
-                handshake_deadline: None,
+                state: State::Handshaking {
+                    deadline: None,
+                    step: Step::Connecting,
+                },
                 streams: BTreeMap::new(),
                 pending: 0,
                 writable_armed: BTreeSet::new(),
@@ -998,7 +1090,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
             .connections
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
-        if !conn.connected {
+        if !conn.state.is_connected() {
             return Err(TransportError::InvalidState {
                 id,
                 state: ConnectionState::Connecting,
@@ -1045,7 +1137,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         let Some(state) = conn
             .streams
             .get(&handle)
-            .filter(|state| !state.local_closed)
+            .filter(|state| state.write == Write::Open)
         else {
             return Err(TransportError::StreamSendFailed {
                 id,
@@ -1088,7 +1180,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         let Some(state) = conn
             .streams
             .get_mut(&handle)
-            .filter(|state| !state.local_closed)
+            .filter(|state| state.write == Write::Open)
         else {
             return Err(TransportError::StreamCloseWriteFailed {
                 id,
@@ -1096,8 +1188,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
                 reason: "local stream write side is already closed".into(),
             });
         };
-        state.local_closed = true;
-        state.fin_queued = true;
+        state.write = Write::FinQueued;
         conn.writable_armed.remove(&handle);
         let refused = conn.flush(io, handle);
         self.drop_writable(id, handle);
@@ -1214,7 +1305,10 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         }
         self.connections
             .values()
-            .filter_map(|conn| conn.handshake_deadline)
+            .filter_map(|conn| match conn.state {
+                State::Handshaking { deadline, .. } => deadline,
+                State::Connected { .. } => None,
+            })
             .chain(self.held_resets.iter().map(|&(_, at)| at))
             .min()
             .map(Deadline::from_millis)

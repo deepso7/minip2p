@@ -157,7 +157,7 @@ impl SessionError {
 enum Phase {
     SelectNoise {
         select: MultistreamSelect,
-        noise: Option<NoiseSession>,
+        noise: NoiseSession,
     },
     Noise {
         noise: NoiseSession,
@@ -174,6 +174,19 @@ enum Phase {
         yamux: Box<YamuxSession>,
         peer: PeerId,
     },
+    /// A fatal error ended the session. Keeps Yamux's unsettled counts from
+    /// when it was dropped, for [`SecureMuxSession::unsettled_streams`].
+    Failed {
+        unsettled: Vec<(StreamId, usize)>,
+    },
+}
+
+impl Phase {
+    /// The placeholder left while a phase is taken out to be advanced: an
+    /// error that returns early leaves the session failed.
+    const FAILED: Self = Self::Failed {
+        unsettled: Vec::new(),
+    };
 }
 
 /// multistream-select + Noise XX + Yamux over one ordered byte stream.
@@ -183,13 +196,11 @@ enum Phase {
 pub struct SecureMuxSession {
     role: SessionRole,
     yamux_config: YamuxConfig,
-    phase: Option<Phase>,
+    phase: Phase,
     outputs: VecDeque<SessionOutput>,
     /// Bytes ready for the underlying stream: negotiation and handshake
     /// messages, and encrypted Yamux frames already pulled.
     writes: WriteQueue,
-    /// Yamux's unsettled counts, kept when a fatal error dropped it.
-    unsettled_at_failure: Vec<(StreamId, usize)>,
 }
 
 /// The most input [`SecureMuxSession::handle_input`] feeds the decoders at
@@ -255,13 +266,9 @@ impl SecureMuxSession {
         Self {
             role: config.role,
             yamux_config: config.yamux,
-            phase: Some(Phase::SelectNoise {
-                select,
-                noise: Some(noise),
-            }),
+            phase: Phase::SelectNoise { select, noise },
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         }
     }
 
@@ -276,7 +283,7 @@ impl SecureMuxSession {
             }
             other => other,
         };
-        self.phase = Some(phase);
+        self.phase = phase;
         Ok(())
     }
 
@@ -298,7 +305,7 @@ impl SecureMuxSession {
         }
         let phase = self.take_phase()?;
         let phase = self.feed_phase(phase, data)?;
-        self.phase = Some(phase);
+        self.phase = phase;
         Ok(())
     }
 
@@ -320,7 +327,7 @@ impl SecureMuxSession {
         if let Some(bytes) = self.writes.pop() {
             return Ok(Some(bytes));
         }
-        let Some(Phase::Ready { noise, yamux, .. }) = self.phase.as_mut() else {
+        let Phase::Ready { noise, yamux, .. } = &mut self.phase else {
             return Ok(None);
         };
         let Some(frame) = yamux.poll_frame() else {
@@ -329,8 +336,9 @@ impl SecureMuxSession {
         let encrypted = encrypt_into(noise, frame, &mut self.writes);
         push_yamux_events(yamux, &mut self.outputs);
         if let Err(error) = encrypted {
-            self.unsettled_at_failure = unsettled_of(yamux);
-            self.phase = None;
+            self.phase = Phase::Failed {
+                unsettled: unsettled_of(yamux),
+            };
             return Err(error);
         }
         Ok(self.writes.pop())
@@ -339,7 +347,7 @@ impl SecureMuxSession {
     /// Whether [`poll_write`](Self::poll_write) has bytes to hand out now.
     pub fn has_pending_write(&self) -> bool {
         !self.writes.is_empty()
-            || matches!(&self.phase, Some(Phase::Ready { yamux, .. }) if yamux.has_frames())
+            || matches!(&self.phase, Phase::Ready { yamux, .. } if yamux.has_frames())
     }
 
     /// Every substream holding delivered bytes not yet acknowledged, open or
@@ -351,14 +359,15 @@ impl SecureMuxSession {
     /// failure, or a fatal Noise or output error.
     pub fn unsettled_streams(&self) -> Vec<(StreamId, usize)> {
         match &self.phase {
-            Some(Phase::Ready { yamux, .. }) => unsettled_of(yamux),
-            _ => self.unsettled_at_failure.clone(),
+            Phase::Ready { yamux, .. } => unsettled_of(yamux),
+            Phase::Failed { unsettled } => unsettled.clone(),
+            _ => Vec::new(),
         }
     }
 
     /// Returns whether the upgrade has completed.
     pub fn is_established(&self) -> bool {
-        matches!(self.phase, Some(Phase::Ready { .. }))
+        matches!(self.phase, Phase::Ready { .. })
     }
 
     /// Advances Yamux keepalive using the host's time sample.
@@ -385,7 +394,7 @@ impl SecureMuxSession {
     /// see [`YamuxSession::note_peer_acked`] for what counts as evidence.
     /// A no-op until the upgrade has finished.
     pub fn note_peer_acked(&mut self) {
-        if let Some(Phase::Ready { yamux, .. }) = self.phase.as_mut() {
+        if let Phase::Ready { yamux, .. } = &mut self.phase {
             yamux.note_peer_acked();
         }
     }
@@ -394,7 +403,7 @@ impl SecureMuxSession {
     ///
     /// `None` until Yamux is up, and once the session has failed or gone away.
     pub fn next_deadline(&self) -> Option<Deadline> {
-        match self.phase.as_ref()? {
+        match &self.phase {
             Phase::Ready { yamux, .. } => yamux.next_deadline(),
             _ => None,
         }
@@ -402,7 +411,7 @@ impl SecureMuxSession {
 
     /// Returns the authenticated peer, once Noise has verified it.
     pub fn peer(&self) -> Option<&PeerId> {
-        match self.phase.as_ref()? {
+        match &self.phase {
             Phase::SelectYamux { peer, .. } | Phase::Ready { peer, .. } => Some(peer),
             _ => None,
         }
@@ -514,8 +523,9 @@ impl SecureMuxSession {
         // Only `Ready` runs stream operations, but every other phase is still
         // a live session mid-upgrade: put it back, or a stray early call would
         // strand the connection.
-        let (mut noise, mut yamux, peer) = match self.phase.take() {
-            Some(Phase::Ready { noise, yamux, peer }) => (noise, yamux, peer),
+        let (mut noise, mut yamux, peer) = match core::mem::replace(&mut self.phase, Phase::FAILED)
+        {
+            Phase::Ready { noise, yamux, peer } => (noise, yamux, peer),
             other => {
                 self.phase = other;
                 return Err(SessionError::NotEstablished);
@@ -528,7 +538,9 @@ impl SecureMuxSession {
         // its GoAway and leave the phase taken.
         if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
             let drained = self.drain_yamux(&mut noise, &mut yamux, true);
-            self.unsettled_at_failure = unsettled_of(&yamux);
+            self.phase = Phase::Failed {
+                unsettled: unsettled_of(&yamux),
+            };
             drained?;
             return Err(SessionError::protocol(format!(
                 "Yamux protocol failed: {error}"
@@ -537,10 +549,12 @@ impl SecureMuxSession {
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
         if let Err(error) = self.drain_yamux(&mut noise, &mut yamux, false) {
-            self.unsettled_at_failure = unsettled_of(&yamux);
+            self.phase = Phase::Failed {
+                unsettled: unsettled_of(&yamux),
+            };
             return Err(error);
         }
-        self.phase = Some(Phase::Ready { noise, yamux, peer });
+        self.phase = Phase::Ready { noise, yamux, peer };
         result.map_err(SessionError::Yamux)
     }
 
@@ -558,9 +572,13 @@ impl SecureMuxSession {
     }
 
     fn take_phase(&mut self) -> Result<Phase, SessionError> {
-        self.phase
-            .take()
-            .ok_or_else(|| SessionError::protocol("session already failed"))
+        match core::mem::replace(&mut self.phase, Phase::FAILED) {
+            phase @ Phase::Failed { .. } => {
+                self.phase = phase;
+                Err(SessionError::protocol("session already failed"))
+            }
+            phase => Ok(phase),
+        }
     }
 
     fn feed_phase(&mut self, phase: Phase, data: Vec<u8>) -> Result<Phase, SessionError> {
@@ -594,9 +612,6 @@ impl SecureMuxSession {
                     return Ok(Phase::SelectNoise { select, noise });
                 }
                 let remaining = select.take_remaining_buffer();
-                let mut noise = noise
-                    .take()
-                    .ok_or_else(|| SessionError::protocol("Noise session unavailable"))?;
                 noise.start().map_err(|error| {
                     SessionError::protocol(format!("Noise start failed: {error}"))
                 })?;
@@ -673,6 +688,8 @@ impl SecureMuxSession {
                 let fed = self.feed_ready(&mut noise, &mut yamux, data);
                 self.keep_ready(fed, noise, yamux, peer)
             }
+            // `take_phase` refuses a failed session before it gets here.
+            failed @ Phase::Failed { .. } => Ok(failed),
         }
     }
 
@@ -745,7 +762,9 @@ impl SecureMuxSession {
         match fed {
             Ok(()) => Ok(Phase::Ready { noise, yamux, peer }),
             Err(error) => {
-                self.unsettled_at_failure = unsettled_of(&yamux);
+                self.phase = Phase::Failed {
+                    unsettled: unsettled_of(&yamux),
+                };
                 Err(error)
             }
         }
@@ -1079,7 +1098,7 @@ mod tests {
             .handle_input(core::mem::take(&mut proposals))
             .expect("reject TLS and accept Noise on the same negotiation");
 
-        assert!(matches!(responder.phase, Some(Phase::Noise { .. })));
+        assert!(matches!(responder.phase, Phase::Noise { .. }));
         let writes = core::iter::from_fn(|| responder.poll_write().expect("write"))
             .flatten()
             .collect::<Vec<_>>();
@@ -1194,14 +1213,13 @@ mod tests {
         let mut responder = SecureMuxSession {
             role: SessionRole::Responder,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::SelectYamux {
+            phase: Phase::SelectYamux {
                 noise: responder_noise,
                 select,
                 peer: initiator_peer,
-            }),
+            },
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1219,7 +1237,7 @@ mod tests {
             .handle_input(ciphertext)
             .expect("reject mplex and accept Yamux on the same negotiation");
 
-        assert!(matches!(responder.phase, Some(Phase::Ready { .. })));
+        assert!(matches!(responder.phase, Phase::Ready { .. }));
         assert!(responder.poll_write().expect("write").is_some());
         assert!(matches!(
             responder.poll_output(),
@@ -1289,14 +1307,13 @@ mod tests {
         let mut dialer = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::SelectYamux {
+            phase: Phase::SelectYamux {
                 noise: dialer_noise,
                 select,
                 peer: listener_peer,
-            }),
+            },
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
 
         let mut packed = echo;
@@ -1395,14 +1412,13 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready {
+            phase: Phase::Ready {
                 noise,
                 yamux: Box::new(yamux),
                 peer,
-            }),
+            },
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
 
         session
@@ -1431,15 +1447,14 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready {
+            phase: Phase::Ready {
                 noise,
                 yamux: Box::new(yamux),
                 peer,
-            }),
+            },
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
 
         session.go_away(0).expect("go away");
@@ -1468,15 +1483,14 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready {
+            phase: Phase::Ready {
                 noise,
                 yamux: Box::new(yamux),
                 peer,
-            }),
+            },
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
 
         // The ping is never pulled, so the hand-off bound runs out.
@@ -1513,14 +1527,13 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready {
+            phase: Phase::Ready {
                 noise,
                 yamux: Box::new(YamuxSession::new(YamuxRole::Client)),
                 peer,
-            }),
+            },
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
         };
         let stream = StreamId::new(77);
 

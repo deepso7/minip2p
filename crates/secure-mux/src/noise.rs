@@ -161,21 +161,32 @@ impl NoiseError {
 /// queued output. Caller-misuse errors ([`NoiseError::AlreadyStarted`] and
 /// [`NoiseError::InvalidInput`]) leave both the session and its output intact.
 pub struct NoiseSession {
-    handshake: Option<HandshakeState>,
-    send_cipher: Option<CipherState>,
-    receive_cipher: Option<CipherState>,
+    state: State,
     decoder: FrameDecoder,
     pending: VecDeque<NoiseOutput>,
-    handshake_hash: Option<[u8; 32]>,
-    started: bool,
-    failed: bool,
+}
+
+/// Where a [`NoiseSession`] is in its life.
+enum State {
+    /// Created; `start` has not run.
+    Idle(HandshakeState),
+    /// Exchanging the XX handshake messages.
+    Handshaking(HandshakeState),
+    /// Handshake complete: frames are encrypted and decrypted.
+    Transport {
+        send: CipherState,
+        receive: CipherState,
+        handshake_hash: [u8; 32],
+    },
+    /// A terminal error ended the session.
+    Failed,
 }
 
 impl NoiseSession {
     /// Creates a session from caller-supplied identity and fresh X25519 secrets.
     pub fn new(config: NoiseConfig) -> Self {
         Self {
-            handshake: Some(HandshakeState::new(
+            state: State::Idle(HandshakeState::new(
                 config.role,
                 config.identity,
                 config.static_secret,
@@ -183,27 +194,27 @@ impl NoiseSession {
                 config.expected_peer,
                 config.local_extensions,
             )),
-            send_cipher: None,
-            receive_cipher: None,
             decoder: FrameDecoder::new(),
             pending: VecDeque::new(),
-            handshake_hash: None,
-            started: false,
-            failed: false,
         }
     }
 
-    /// Returns whether the authenticated handshake has completed.
+    /// Returns whether the authenticated handshake has completed and the
+    /// session is still live: `false` once it has failed.
     pub fn is_handshake_complete(&self) -> bool {
-        self.send_cipher.is_some() && self.receive_cipher.is_some()
+        matches!(self.state, State::Transport { .. })
     }
 
     /// Returns the final Noise handshake hash once the handshake completes.
     ///
     /// Both ends compute the same value, so it names this session on either
-    /// side (channel binding, in Noise terms).
+    /// side (channel binding, in Noise terms). `None` once the session has
+    /// failed.
     pub fn handshake_hash(&self) -> Option<[u8; 32]> {
-        self.handshake_hash
+        match self.state {
+            State::Transport { handshake_hash, .. } => Some(handshake_hash),
+            _ => None,
+        }
     }
 
     /// Starts the handshake. The initiator queues message one; the responder
@@ -239,7 +250,7 @@ impl NoiseSession {
 
     /// Refuses input once a terminal error has failed the session.
     fn check_live(&self) -> Result<(), NoiseError> {
-        if self.failed {
+        if matches!(self.state, State::Failed) {
             return Err(NoiseError::Failed);
         }
         Ok(())
@@ -248,65 +259,65 @@ impl NoiseSession {
     /// Fails the session, dropping queued output, on a terminal error.
     fn settle(&mut self, result: Result<(), NoiseError>) -> Result<(), NoiseError> {
         if result.as_ref().is_err_and(NoiseError::is_terminal) {
-            self.failed = true;
+            self.state = State::Failed;
             self.pending.clear();
         }
         result
     }
 
     fn begin_handshake(&mut self) -> Result<(), NoiseError> {
-        if self.started {
-            return Err(NoiseError::AlreadyStarted);
+        match core::mem::replace(&mut self.state, State::Failed) {
+            State::Idle(mut handshake) => {
+                // A start error is terminal, so the session stays `Failed`.
+                let outbound = handshake.start()?;
+                self.state = State::Handshaking(handshake);
+                if let Some(message) = outbound {
+                    self.pending
+                        .push_back(NoiseOutput::Outbound(encode_frame(&message)?));
+                }
+                Ok(())
+            }
+            other => {
+                self.state = other;
+                Err(NoiseError::AlreadyStarted)
+            }
         }
-        self.started = true;
-        let outbound = self
-            .handshake
-            .as_mut()
-            .ok_or(NoiseError::InvalidState("handshake is unavailable"))?
-            .start()?;
-        if let Some(message) = outbound {
-            self.pending
-                .push_back(NoiseOutput::Outbound(encode_frame(&message)?));
-        }
-        Ok(())
     }
 
     fn receive(&mut self, bytes: Vec<u8>) -> Result<(), NoiseError> {
-        if !self.started {
+        if matches!(self.state, State::Idle(_)) {
             return Err(NoiseError::InvalidInput("session has not been started"));
         }
         self.decoder.push(bytes);
         while let Some(mut message) = self.decoder.next_frame() {
-            if self.is_handshake_complete() {
-                self.receive_cipher
-                    .as_mut()
-                    .ok_or(NoiseError::InvalidState("receive cipher is unavailable"))?
-                    .decrypt_with_ad(b"", &mut message)?;
-                self.pending.push_back(NoiseOutput::Decrypted(message));
-                continue;
-            }
-
-            let (outbound, complete) = self
-                .handshake
-                .as_mut()
-                .ok_or(NoiseError::InvalidState("handshake is unavailable"))?
-                .read_message(&message)?;
-            if let Some(outbound) = outbound {
-                self.pending
-                    .push_back(NoiseOutput::Outbound(encode_frame(&outbound)?));
-            }
-            if let Some(result) = complete {
-                self.complete_handshake(result);
+            match &mut self.state {
+                State::Transport { receive, .. } => {
+                    receive.decrypt_with_ad(b"", &mut message)?;
+                    self.pending.push_back(NoiseOutput::Decrypted(message));
+                }
+                State::Handshaking(handshake) => {
+                    let (outbound, complete) = handshake.read_message(&message)?;
+                    if let Some(outbound) = outbound {
+                        self.pending
+                            .push_back(NoiseOutput::Outbound(encode_frame(&outbound)?));
+                    }
+                    if let Some(result) = complete {
+                        self.complete_handshake(result);
+                    }
+                }
+                // Both are refused before any frame is decoded.
+                State::Idle(_) | State::Failed => return Err(NoiseError::Failed),
             }
         }
         Ok(())
     }
 
     fn complete_handshake(&mut self, result: HandshakeResult) {
-        self.send_cipher = Some(result.send);
-        self.receive_cipher = Some(result.receive);
-        self.handshake_hash = Some(result.handshake_hash);
-        self.handshake = None;
+        self.state = State::Transport {
+            send: result.send,
+            receive: result.receive,
+            handshake_hash: result.handshake_hash,
+        };
         self.pending.push_back(NoiseOutput::HandshakeComplete {
             peer: result.peer,
             identity_key: result.identity_key,
@@ -317,10 +328,9 @@ impl NoiseSession {
     /// Frames and encrypts `plaintext` in `MAX_TRANSPORT_PLAINTEXT` segments.
     /// Each segment is copied once into its outbound frame and encrypted there.
     fn encrypt_frames(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
-        let cipher = self
-            .send_cipher
-            .as_mut()
-            .ok_or(NoiseError::InvalidInput("handshake is not complete"))?;
+        let State::Transport { send: cipher, .. } = &mut self.state else {
+            return Err(NoiseError::InvalidInput("handshake is not complete"));
+        };
         // An empty write still emits one tag-only frame.
         let empty = plaintext.is_empty().then_some(&[][..]);
         for segment in plaintext.chunks(MAX_TRANSPORT_PLAINTEXT).chain(empty) {
@@ -563,14 +573,14 @@ mod tests {
     #[test]
     fn rejects_expected_identity_mismatch() {
         let mut pair = Pair::new();
-        pair.initiator.handshake = Some(HandshakeState::new(
-            NoiseRole::Initiator,
-            Ed25519Keypair::from_secret_key_bytes([1; 32]),
-            [3; 32],
-            [4; 32],
-            Some(Ed25519Keypair::from_secret_key_bytes([99; 32]).peer_id()),
-            None,
-        ));
+        pair.initiator = NoiseSession::new(NoiseConfig {
+            role: NoiseRole::Initiator,
+            identity: Ed25519Keypair::from_secret_key_bytes([1; 32]),
+            static_secret: [3; 32],
+            ephemeral_secret: [4; 32],
+            expected_peer: Some(Ed25519Keypair::from_secret_key_bytes([99; 32]).peer_id()),
+            local_extensions: None,
+        });
         pair.initiator.start().unwrap();
         pair.responder.start().unwrap();
         let message1 = outbound(&mut pair.initiator);
