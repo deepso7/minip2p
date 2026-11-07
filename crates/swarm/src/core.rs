@@ -498,27 +498,27 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// already failed, or unknown) — a [`SwarmEvent::DialFailed`] may already
     /// be queued for that id. Never disconnects an established peer.
     ///
-    /// If `close` fails after the dial was taken off the pending map, the
-    /// pending entry is restored (including any recorded `last_error`) so a
-    /// later close still surfaces as [`SwarmEvent::DialFailed`] rather than a
-    /// silent half-aborted dial.
+    /// If `close` fails, the dial is left exactly as it was (still pending,
+    /// with any recorded `last_error` and any veto), so a later close still
+    /// surfaces as [`SwarmEvent::DialFailed`] rather than a silent
+    /// half-aborted dial.
     pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
-        let Some((addr, last_error)) = self.state.take_pending_dial(conn_id) else {
+        if !self.state.is_pending_dial(conn_id) {
             return Ok(false);
-        };
+        }
         match self.transport.close(conn_id) {
-            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(true),
-            Err(error) => {
-                self.state.restore_pending_dial(conn_id, addr, last_error);
-                Err(error.into())
+            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => {
+                self.state.take_pending_dial(conn_id);
+                Ok(true)
             }
+            Err(error) => Err(error.into()),
         }
     }
 
     /// Marks `conn_id` so establish-stage events cannot register or replace.
     ///
-    /// Used after a failed [`abort_dial`](Self::abort_dial): the dial is
-    /// restored as pending, but must not displace an existing peer connection
+    /// Used after a failed [`abort_dial`](Self::abort_dial): the dial stays
+    /// pending, but must not displace an existing peer connection
     /// if the transport still completes. The veto stays until the connection
     /// closes, covering both `TransportEvent::Connected` and a later
     /// `TransportEvent::PeerIdentityVerified`.
@@ -2264,6 +2264,84 @@ mod tests {
             ),
             "got {events:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_abort_retry_keeps_the_veto() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = PeerAddr::new(
+            "/ip4/198.51.100.12/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let mut swarm = swarm_with(
+            ScriptedTransport {
+                refuse_close: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        let conn_id = swarm.dial(&addr).expect("dial");
+        swarm.abort_dial(conn_id).expect_err("close refused");
+        swarm.veto_establish(conn_id);
+        // The host retries the abort, and closing fails again.
+        swarm.abort_dial(conn_id).expect_err("close refused");
+        swarm
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
+            });
+        // The rejection's own close is refused too, which surfaces as a
+        // runtime error beside the DialFailed.
+        let events = swarm.poll(Now::from_millis(1)).expect("late connected");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::DialFailed { conn_id: failed, .. } if *failed == conn_id
+            )) && !events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::ConnectionEstablished { .. })),
+            "the veto survives the retried abort; got {events:?}"
+        );
+        assert_eq!(swarm.connection_id(&peer), None);
+    }
+
+    #[test]
+    fn an_aborted_dial_that_connects_anyway_never_establishes() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = PeerAddr::new(
+            "/ip4/198.51.100.11/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let mut swarm = swarm_with(ScriptedTransport::default(), SeqEntropy(1));
+        let conn_id = swarm.dial(&addr).expect("dial");
+        // The transport has already queued the handshake's completion when
+        // the host aborts; `close` does not drop it.
+        swarm
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
+            });
+        assert!(swarm.abort_dial(conn_id).expect("abort"));
+        let events = swarm.poll(Now::from_millis(1)).expect("late connected");
+        assert!(
+            events.is_empty(),
+            "an aborted dial stays silent; got {events:?}"
+        );
+        assert_eq!(swarm.connection_id(&peer), None);
+
+        swarm.transport_mut().initial.push(TransportEvent::Closed {
+            id: conn_id,
+            reason: ConnectionCloseReason::Local,
+        });
+        let events = swarm.poll(Now::from_millis(2)).expect("closed");
+        assert!(events.is_empty(), "got {events:?}");
+        assert!(!swarm.state.has_tracked_connections());
     }
 
     #[test]
