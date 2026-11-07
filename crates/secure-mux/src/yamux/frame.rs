@@ -15,7 +15,37 @@ pub const FLAG_FIN: u16 = 4;
 pub const FLAG_RST: u16 = 8;
 
 const STREAM_FLAGS: u16 = FLAG_SYN | FLAG_ACK | FLAG_FIN | FLAG_RST;
+
 const PING_FLAGS: u16 = FLAG_SYN | FLAG_ACK;
+
+/// Spare bytes around an encoded frame, so an outer layer can prefix and seal
+/// it in place instead of copying it into a buffer of its own: `head` bytes
+/// (zeroed) before the header and `tail` bytes of spare capacity after it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FrameRoom {
+    pub(crate) head: usize,
+    pub(crate) tail: usize,
+}
+
+impl FrameRoom {
+    /// Moves an already encoded frame into a buffer with this room. Without
+    /// room the frame is returned as is.
+    pub(crate) fn wrap(self, frame: Vec<u8>) -> Vec<u8> {
+        if self == Self::default() {
+            return frame;
+        }
+        let mut output = self.buffer(frame.len());
+        output.extend_from_slice(&frame);
+        output
+    }
+
+    /// An empty buffer for a `len`-byte frame, holding the zeroed head.
+    fn buffer(self, len: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.head + len + self.tail);
+        output.resize(self.head, 0);
+        output
+    }
+}
 
 /// Yamux wire-frame type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,25 +169,37 @@ impl Frame {
 
     /// Encodes this frame to its 12-byte header plus optional data payload.
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_with_payload(&self.payload)
+        self.encode_with_payload(&self.payload, FrameRoom::default())
     }
 
-    /// Encodes a data frame straight from borrowed bytes, so the payload is
-    /// copied once, into the wire buffer, instead of into an owned `Frame` first.
+    /// [`encode_data_with_room`](Self::encode_data_with_room) without room.
+    #[cfg(test)]
     pub(crate) fn encode_data(
         stream_id: u32,
         flags: u16,
         payload: &[u8],
     ) -> Result<Vec<u8>, YamuxError> {
+        Self::encode_data_with_room(stream_id, flags, payload, FrameRoom::default())
+    }
+
+    /// Encodes a data frame straight from borrowed bytes, so the payload is
+    /// copied once, into the wire buffer, instead of into an owned `Frame`
+    /// first. The buffer carries `room` around the frame.
+    pub(crate) fn encode_data_with_room(
+        stream_id: u32,
+        flags: u16,
+        payload: &[u8],
+        room: FrameRoom,
+    ) -> Result<Vec<u8>, YamuxError> {
         let header = Self::data(stream_id, flags, Vec::new())?;
         let Ok(value) = u32::try_from(payload.len()) else {
             return Err(YamuxError::FrameLengthOverflow);
         };
-        Ok(Self { value, ..header }.encode_with_payload(payload))
+        Ok(Self { value, ..header }.encode_with_payload(payload, room))
     }
 
-    fn encode_with_payload(&self, payload: &[u8]) -> Vec<u8> {
-        let mut output = Vec::with_capacity(HEADER_LEN + payload.len());
+    fn encode_with_payload(&self, payload: &[u8], room: FrameRoom) -> Vec<u8> {
+        let mut output = room.buffer(HEADER_LEN + payload.len());
         output.push(0);
         output.push(self.frame_type as u8);
         output.extend_from_slice(&self.flags.to_be_bytes());
