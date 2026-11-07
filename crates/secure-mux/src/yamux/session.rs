@@ -44,10 +44,40 @@ enum ProbePhase {
     AwaitingAck { since: u64 },
 }
 
+/// How far a stream's opening handshake has got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OpenFlag {
-    Syn,
-    Ack,
+enum Open {
+    /// Opened locally; the next frame for it carries `SYN`.
+    SynPending,
+    /// Opened locally; `SYN` sent, the peer's `ACK` not yet seen.
+    SynSent,
+    /// Opened by the peer; the next frame for it carries `ACK`.
+    AckPending,
+    /// Both sides know the stream.
+    Acknowledged,
+}
+
+/// The local write side of a stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteSide {
+    Open,
+    /// Closed by [`YamuxSession::close_write`]; `FIN` goes out once the send
+    /// buffer has been framed.
+    FinPending,
+    /// `FIN` sent.
+    Closed,
+}
+
+/// Whether the session still carries streams, and if not, why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lifecycle {
+    Active,
+    /// This side sent GoAway (possibly in answer to the peer's).
+    LocalGoAway,
+    /// The peer sent GoAway.
+    RemoteGoAway,
+    /// A protocol error or keepalive timeout ended the session.
+    Failed,
 }
 
 /// Bytes accepted by [`YamuxSession::send`] but not yet framed.
@@ -85,9 +115,7 @@ impl QueuedChunk {
 
 #[derive(Debug)]
 struct StreamState {
-    locally_opened: bool,
-    pending_open: Option<OpenFlag>,
-    acknowledged: bool,
+    open: Open,
     send_window: u32,
     /// Credit the peer still has: the window less what it has sent us and
     /// we have not returned.
@@ -102,10 +130,7 @@ struct StreamState {
     /// frame carrying them is pulled by [`YamuxSession::poll_frame`].
     send_buffer: VecDeque<QueuedChunk>,
     buffered_send: usize,
-    /// The local write side was closed; `FIN` goes out once `send_buffer`
-    /// has been framed.
-    close_pending: bool,
-    local_write_closed: bool,
+    write: WriteSide,
     remote_write_closed: bool,
     /// May queue into [`YamuxConfig::control_stream_reserve`].
     control: bool,
@@ -113,23 +138,16 @@ struct StreamState {
 
 impl StreamState {
     fn outbound(config: &YamuxConfig) -> Self {
-        Self::new(config, true, Some(OpenFlag::Syn), DEFAULT_RECEIVE_WINDOW)
+        Self::new(config, Open::SynPending, DEFAULT_RECEIVE_WINDOW)
     }
 
     fn inbound(config: &YamuxConfig, send_window: u32) -> Self {
-        Self::new(config, false, Some(OpenFlag::Ack), send_window)
+        Self::new(config, Open::AckPending, send_window)
     }
 
-    fn new(
-        config: &YamuxConfig,
-        locally_opened: bool,
-        pending_open: Option<OpenFlag>,
-        send_window: u32,
-    ) -> Self {
+    fn new(config: &YamuxConfig, open: Open, send_window: u32) -> Self {
         Self {
-            locally_opened,
-            pending_open,
-            acknowledged: false,
+            open,
             send_window,
             receive_window: DEFAULT_RECEIVE_WINDOW,
             unacked: 0,
@@ -137,34 +155,48 @@ impl StreamState {
             pending_credit: u64::from(config.receive_window - DEFAULT_RECEIVE_WINDOW),
             send_buffer: VecDeque::new(),
             buffered_send: 0,
-            close_pending: false,
-            local_write_closed: false,
+            write: WriteSide::Open,
             remote_write_closed: false,
             control: false,
         }
     }
 
+    /// The open flag the next frame for this stream carries, marking it sent.
     fn take_open_flag(&mut self) -> u16 {
-        match self.pending_open.take() {
-            Some(OpenFlag::Syn) => FLAG_SYN,
-            Some(OpenFlag::Ack) => {
-                self.acknowledged = true;
+        match self.open {
+            Open::SynPending => {
+                self.open = Open::SynSent;
+                FLAG_SYN
+            }
+            Open::AckPending => {
+                self.open = Open::Acknowledged;
                 FLAG_ACK
             }
-            None => 0,
+            Open::SynSent | Open::Acknowledged => 0,
+        }
+    }
+
+    fn open_flag_pending(&self) -> bool {
+        matches!(self.open, Open::SynPending | Open::AckPending)
+    }
+
+    /// Notes the flags of a frame received for this stream.
+    fn on_peer_flags(&mut self, flags: u16) {
+        if flags & FLAG_ACK != 0 && self.open == Open::SynSent {
+            self.open = Open::Acknowledged;
         }
     }
 
     /// Whether this stream needs a standalone window update: returned credit,
     /// or an open flag that no data frame is about to carry.
     fn needs_control_frame(&self) -> bool {
-        self.pending_credit != 0 || (self.pending_open.is_some() && !self.has_sendable_data())
+        self.pending_credit != 0 || (self.open_flag_pending() && !self.has_sendable_data())
     }
 
     /// Whether a data or `FIN` frame can be pulled for this stream now.
     fn has_sendable_data(&self) -> bool {
         (self.send_window != 0 && !self.send_buffer.is_empty())
-            || (self.close_pending && self.send_buffer.is_empty())
+            || (self.write == WriteSide::FinPending && self.send_buffer.is_empty())
     }
 }
 
@@ -261,9 +293,7 @@ pub struct YamuxSession {
     /// Round-robin position for data frames: the last stream framed.
     send_cursor: u32,
     total_buffered_send: usize,
-    failed: bool,
-    local_go_away: bool,
-    remote_go_away: bool,
+    lifecycle: Lifecycle,
     /// Monotonic milliseconds of the first poll after the peer last showed
     /// it was alive (a received frame, or [`Self::note_peer_acked`]), or of
     /// the first poll if it has not yet. `None` until the host supplies a
@@ -312,9 +342,7 @@ impl YamuxSession {
             sendable: BTreeSet::new(),
             send_cursor: 0,
             total_buffered_send: 0,
-            failed: false,
-            local_go_away: false,
-            remote_go_away: false,
+            lifecycle: Lifecycle::Active,
             last_alive_ms: None,
             alive: false,
             probe: None,
@@ -340,12 +368,15 @@ impl YamuxSession {
     pub fn poll(&mut self, now: Now) -> Result<(), YamuxError> {
         self.ensure_active()?;
         let now = now.monotonic_ms;
-        if self.alive || self.last_alive_ms.is_none() {
-            self.last_alive_ms = Some(now);
-            self.alive = false;
-        }
+        let quiet_since = match self.last_alive_ms {
+            Some(since) if !self.alive => since,
+            _ => {
+                self.last_alive_ms = Some(now);
+                self.alive = false;
+                now
+            }
+        };
         let Some(probe) = &mut self.probe else {
-            let quiet_since = self.last_alive_ms.expect("stamped above");
             if now.saturating_sub(quiet_since) >= KEEPALIVE_INTERVAL_MS {
                 let nonce = self.next_ping_nonce;
                 self.next_ping_nonce = nonce.wrapping_add(1).max(1);
@@ -385,7 +416,7 @@ impl YamuxSession {
     /// `None` until the first poll supplies a timeline, and once the session
     /// has failed or gone away.
     pub fn next_deadline(&self) -> Option<Deadline> {
-        if self.failed || self.local_go_away || self.remote_go_away {
+        if self.lifecycle != Lifecycle::Active {
             return None;
         }
         let at = match self.probe.map(|probe| probe.phase) {
@@ -448,7 +479,7 @@ impl YamuxSession {
             .get_mut(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
         let total_room = total_cap_for(config, state.control).saturating_sub(total_buffered_send);
-        if state.local_write_closed || state.close_pending {
+        if state.write != WriteSide::Open {
             return Err(YamuxError::StreamWriteClosed(stream));
         }
         if data.is_empty() {
@@ -500,8 +531,8 @@ impl YamuxSession {
             .streams
             .get_mut(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
-        if !state.local_write_closed {
-            state.close_pending = true;
+        if state.write == WriteSide::Open {
+            state.write = WriteSide::FinPending;
         }
         self.index_work(stream);
         self.disarm_writable(stream);
@@ -525,7 +556,7 @@ impl YamuxSession {
         }
         self.ensure_active()?;
         let unannounced = match self.streams.get(&stream) {
-            Some(state) => state.pending_open == Some(OpenFlag::Syn),
+            Some(state) => state.open == Open::SynPending,
             None => return Err(YamuxError::UnknownStream(stream)),
         };
         let peer_opened = self.valid_remote_stream_id(stream);
@@ -588,10 +619,10 @@ impl YamuxSession {
 
     /// Gracefully terminates the whole Yamux session with `code`.
     pub fn go_away(&mut self, code: u32) {
-        if self.local_go_away || self.failed {
+        if matches!(self.lifecycle, Lifecycle::LocalGoAway | Lifecycle::Failed) {
             return;
         }
-        self.local_go_away = true;
+        self.lifecycle = Lifecycle::LocalGoAway;
         self.close_all_streams();
         self.decoder.clear();
         self.push_control(Frame::go_away(code));
@@ -603,12 +634,7 @@ impl YamuxSession {
     /// by a protocol GoAway and queued events are dropped. No per-stream
     /// terminal events follow; every stream ends with the session.
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
-        if self.failed {
-            return Err(YamuxError::Failed);
-        }
-        if self.local_go_away || self.remote_go_away {
-            return Err(YamuxError::SessionClosed);
-        }
+        self.ensure_active()?;
         self.decoder.push(bytes);
         loop {
             let frame = match self.decoder.next_frame() {
@@ -620,7 +646,7 @@ impl YamuxSession {
                 return self.fail_protocol(error);
             }
             self.alive = true;
-            if self.remote_go_away {
+            if self.lifecycle == Lifecycle::RemoteGoAway {
                 self.decoder.clear();
                 return Ok(());
             }
@@ -651,7 +677,7 @@ impl YamuxSession {
             }
             return Some(frame);
         }
-        if self.failed || self.local_go_away || self.remote_go_away {
+        if self.lifecycle != Lifecycle::Active {
             return None;
         }
         debug_assert!(self.work_indexed(), "stream work index out of sync");
@@ -678,7 +704,7 @@ impl YamuxSession {
         if !self.control.is_empty() {
             return true;
         }
-        if self.failed || self.local_go_away || self.remote_go_away {
+        if self.lifecycle != Lifecycle::Active {
             return false;
         }
         !self.control_due.is_empty() || !self.sendable.is_empty()
@@ -728,17 +754,15 @@ impl YamuxSession {
     pub fn is_acknowledged(&self, stream: u32) -> Result<bool, YamuxError> {
         self.streams
             .get(&stream)
-            .map(|state| state.acknowledged)
+            .map(|state| state.open == Open::Acknowledged)
             .ok_or(YamuxError::UnknownStream(stream))
     }
 
     fn ensure_active(&self) -> Result<(), YamuxError> {
-        if self.failed {
-            Err(YamuxError::Failed)
-        } else if self.local_go_away || self.remote_go_away {
-            Err(YamuxError::SessionClosed)
-        } else {
-            Ok(())
+        match self.lifecycle {
+            Lifecycle::Active => Ok(()),
+            Lifecycle::Failed => Err(YamuxError::Failed),
+            Lifecycle::LocalGoAway | Lifecycle::RemoteGoAway => Err(YamuxError::SessionClosed),
         }
     }
 
@@ -748,7 +772,7 @@ impl YamuxSession {
             FrameType::WindowUpdate => self.on_window_update(frame),
             FrameType::Ping => self.on_ping(frame),
             FrameType::GoAway => {
-                self.remote_go_away = true;
+                self.lifecycle = Lifecycle::RemoteGoAway;
                 self.events.push_back(YamuxOutput::GoAwayReceived {
                     code: frame.value(),
                 });
@@ -797,9 +821,7 @@ impl YamuxSession {
                 .streams
                 .get_mut(&stream)
                 .expect("stream was inserted or checked above");
-            if flags & FLAG_ACK != 0 && state.locally_opened {
-                state.acknowledged = true;
-            }
+            state.on_peer_flags(flags);
             if state.remote_write_closed && !frame.payload().is_empty() {
                 return Err(YamuxError::Protocol("data after FIN"));
             }
@@ -820,7 +842,7 @@ impl YamuxSession {
                 state.remote_write_closed = true;
                 remote_closed = true;
             }
-            fully_closed = state.remote_write_closed && state.local_write_closed;
+            fully_closed = state.remote_write_closed && state.write == WriteSide::Closed;
         }
         if let Some(data) = data_output {
             self.events.push_back(YamuxOutput::Data { stream, data });
@@ -883,14 +905,12 @@ impl YamuxSession {
                 .streams
                 .get_mut(&stream)
                 .expect("stream was inserted or checked above");
-            if flags & FLAG_ACK != 0 && state.locally_opened {
-                state.acknowledged = true;
-            }
+            state.on_peer_flags(flags);
             if flags & FLAG_FIN != 0 && !state.remote_write_closed {
                 state.remote_write_closed = true;
                 remote_closed = true;
             }
-            fully_closed = state.remote_write_closed && state.local_write_closed;
+            fully_closed = state.remote_write_closed && state.write == WriteSide::Closed;
         }
         if remote_closed {
             self.events
@@ -950,7 +970,7 @@ impl YamuxSession {
                     .min(state.send_window as usize)
                     .min(max_frame_len);
                 let drained = sent == chunk.bytes.len();
-                if drained && last_chunk && state.close_pending {
+                if drained && last_chunk && state.write == WriteSide::FinPending {
                     flags |= FLAG_FIN;
                 }
                 let payload = chunk.bytes.get(..sent).unwrap_or_default();
@@ -973,8 +993,7 @@ impl YamuxSession {
             }
         };
         if flags & FLAG_FIN != 0 {
-            state.close_pending = false;
-            state.local_write_closed = true;
+            state.write = WriteSide::Closed;
             if state.remote_write_closed {
                 self.remove_stream(stream, true);
             }
@@ -1142,13 +1161,13 @@ impl YamuxSession {
     /// Whether the session failed: a protocol error or keepalive timeout
     /// ended it, and every stream with it.
     pub(crate) fn has_failed(&self) -> bool {
-        self.failed
+        self.lifecycle == Lifecycle::Failed
     }
 
     /// Fails the session for good: queued frames and events are dropped,
     /// and no stream gets a terminal event of its own; the failure ends them.
     fn fail(&mut self) {
-        self.failed = true;
+        self.lifecycle = Lifecycle::Failed;
         // Data still queued is dropped below and never delivered, so it is
         // nobody's to acknowledge.
         for event in &self.events {
@@ -1858,7 +1877,7 @@ mod tests {
         session.streams.get_mut(&stream).unwrap().send_window = 0;
         session.send(stream, Bytes::from_static(b"queued")).unwrap();
         session.close_write(stream).unwrap();
-        assert!(session.streams[&stream].close_pending);
+        assert_eq!(session.streams[&stream].write, WriteSide::FinPending);
         // Only the standalone SYN can go before credit arrives.
         assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
         assert_eq!(session.poll_frame(), None);
