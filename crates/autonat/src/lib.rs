@@ -313,6 +313,10 @@ impl AutoNatClient {
     }
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
+        // At most one response: anything pipelined behind it is ignored.
+        if self.state == FlowState::Done {
+            return Ok(());
+        }
         let Some(msg) = self.frames.next_frame(Message::decode)? else {
             return Ok(());
         };
@@ -1005,6 +1009,30 @@ mod tests {
         assert!(
             matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "all dialbacks failed")
         );
+    }
+
+    /// A second DIAL_RESPONSE pipelined behind the first is never decoded,
+    /// even when the remote's half-close arrives after the first was polled.
+    #[test]
+    fn client_emits_one_outcome_despite_a_pipelined_second_response() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let _ = client.take_outbound();
+
+        let mut chunk = Vec::new();
+        for reason in ["first", "second"] {
+            let mut server = AutoNatServer::new();
+            server.respond_error(ResponseStatus::DialError, reason);
+            chunk.extend(server.take_outbound());
+        }
+        client.on_data(&chunk).unwrap();
+        assert!(matches!(
+            client.poll_output(),
+            Some(AutoNatClientOutput::Outcome(Reachability::Private { reason, .. })) if reason == "first"
+        ));
+
+        client.on_remote_write_closed().unwrap();
+        assert_eq!(client.poll_output(), None);
     }
 
     #[test]

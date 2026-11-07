@@ -775,7 +775,7 @@ fn a_relay_without_hop_moves_to_the_next() {
 
     relay_ready(&mut w, &a, a_conn, &[]);
     let actions = drain_actions(&mut w.agent);
-    assert_eq!(send_stream_count(&actions), 0, "no HOP stream is opened");
+    assert!(!has_hop_open(&actions), "no HOP stream is opened");
     assert_eq!(dial_count_for(&actions, &b), 1, "B is tried next");
     let events = drain_all_events(&mut w.agent);
     assert!(
