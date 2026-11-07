@@ -359,14 +359,26 @@ enum SendState {
         stream_id: StreamId,
         since_ms: u64,
     },
+    /// Negotiated: everything here belongs to this stream and goes with it.
     Ready {
         stream_id: StreamId,
-        in_flight: Option<(GossipsubToken, FrameCommit)>,
-        /// The unsent tail of the in-flight frame after a Full write. It is
-        /// resent on `stream_writable`; the frame commits only once all of it
-        /// has been accepted.
-        blocked: Option<Bytes>,
+        version: MeshsubVersion,
+        /// Subscription announcements owed on this stream: the full resync
+        /// queued at negotiation, then each live diff.
+        subscriptions: VecDeque<SubOpts>,
+        in_flight: Option<InFlight>,
     },
+}
+
+/// The one frame awaiting its write result on a ready stream.
+#[derive(Clone, Debug)]
+struct InFlight {
+    token: GossipsubToken,
+    commit: FrameCommit,
+    /// The unsent tail after a Full write. It is resent on
+    /// `stream_writable`; the frame commits only once all of it has been
+    /// accepted.
+    blocked: Option<Bytes>,
 }
 
 impl SendState {
@@ -374,6 +386,14 @@ impl SendState {
         match self {
             Self::Opening { since_ms, .. } | Self::Negotiating { since_ms, .. } => Some(*since_ms),
             Self::Idle | Self::Ready { .. } => None,
+        }
+    }
+
+    /// The outbound stream this state is bound to, once one is open.
+    fn stream_id(&self) -> Option<StreamId> {
+        match self {
+            Self::Negotiating { stream_id, .. } | Self::Ready { stream_id, .. } => Some(*stream_id),
+            Self::Idle | Self::Opening { .. } => None,
         }
     }
 }
@@ -387,11 +407,9 @@ struct PeerState {
     /// Bounded by `max_topics_per_peer`; active subscriptions are derived
     /// from the agent's current topic set and need no history here.
     unsubscribe_tombstones: BTreeSet<String>,
-    subscription_queue: VecDeque<SubOpts>,
     inbound: BTreeMap<StreamId, Vec<u8>>,
     remote_topics: BTreeSet<String>,
     advertised_version: Option<MeshsubVersion>,
-    outbound_version: Option<MeshsubVersion>,
     pending_control: ControlBuffer,
 }
 
@@ -402,7 +420,11 @@ impl PeerState {
         // front while in flight; only control moves into the commit record.
         let in_flight_control = match &self.sender {
             SendState::Ready {
-                in_flight: Some((_, FrameCommit::Control(items))),
+                in_flight:
+                    Some(InFlight {
+                        commit: FrameCommit::Control(items),
+                        ..
+                    }),
                 ..
             } => items.len(),
             _ => 0,
@@ -679,25 +701,19 @@ impl GossipsubAgent {
         result: Result<(), String>,
         now_ms: u64,
     ) {
-        let current = self.peers.get(peer).is_some_and(|state| {
-            matches!(
-                &state.sender,
-                SendState::Ready {
-                    stream_id: expected,
-                    in_flight: Some((expected_token, _)),
-                    ..
-                } if *expected == stream_id && *expected_token == token
-            )
-        });
-        if !current {
+        let Some(SendState::Ready {
+            stream_id: expected,
+            in_flight,
+            ..
+        }) = self.peers.get_mut(peer).map(|state| &mut state.sender)
+        else {
+            return;
+        };
+        if *expected != stream_id {
             return;
         }
-        let commit = {
-            let state = self.peers.get_mut(peer).expect("checked above");
-            let SendState::Ready { in_flight, .. } = &mut state.sender else {
-                return;
-            };
-            in_flight.take().expect("checked above").1
+        let Some(InFlight { commit, .. }) = in_flight.take_if(|frame| frame.token == token) else {
+            return;
         };
         match result {
             Ok(()) => {
@@ -712,8 +728,6 @@ impl GossipsubAgent {
                 });
                 if let Some(state) = self.peers.get_mut(peer) {
                     state.sender = SendState::Idle;
-                    state.outbound_version = None;
-                    state.subscription_queue.clear();
                 }
                 self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: peer.clone(),
@@ -738,13 +752,13 @@ impl GossipsubAgent {
         if let Some(state) = self.peers.get_mut(peer)
             && let SendState::Ready {
                 stream_id: expected,
-                in_flight: Some((expected_token, _)),
-                blocked,
+                in_flight: Some(frame),
+                ..
             } = &mut state.sender
             && *expected == stream_id
-            && *expected_token == token
+            && frame.token == token
         {
-            *blocked = Some(unsent);
+            frame.blocked = Some(unsent);
         }
     }
 
@@ -758,7 +772,7 @@ impl GossipsubAgent {
         let SendState::Ready {
             stream_id: expected,
             in_flight,
-            blocked,
+            ..
         } = &mut state.sender
         else {
             return false;
@@ -766,10 +780,13 @@ impl GossipsubAgent {
         if *expected != stream_id {
             return false;
         }
-        let (Some((in_flight_token, _)), Some(data)) = (in_flight.as_mut(), blocked.take()) else {
+        let Some(frame) = in_flight else {
             return true;
         };
-        *in_flight_token = token;
+        let Some(data) = frame.blocked.take() else {
+            return true;
+        };
+        frame.token = token;
         self.actions.push_back(GossipsubAction::SendStream {
             token,
             peer: peer.clone(),
@@ -836,13 +853,8 @@ impl GossipsubAgent {
             .iter()
             .filter_map(|(peer, state)| {
                 let since = state.sender.establishment_since()?;
-                (now_ms.saturating_sub(since) >= self.config.send_timeout_ms).then(|| {
-                    let stream = match state.sender {
-                        SendState::Negotiating { stream_id, .. } => Some(stream_id),
-                        _ => None,
-                    };
-                    (peer.clone(), stream)
-                })
+                (now_ms.saturating_sub(since) >= self.config.send_timeout_ms)
+                    .then(|| (peer.clone(), state.sender.stream_id()))
             })
             .collect();
         for (peer, stream) in timed_out {
@@ -851,8 +863,6 @@ impl GossipsubAgent {
             }
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.sender = SendState::Idle;
-                state.outbound_version = None;
-                state.subscription_queue.clear();
             }
             self.events.push_back(GossipsubEvent::OutboundFailure {
                 peer,
@@ -976,31 +986,24 @@ impl GossipsubAgent {
             if !ours {
                 return self.owns_stream(peer, stream_id);
             }
-            let current_topics: Vec<String> = self.topics.iter().cloned().collect();
             if let Some(state) = self.peers.get_mut(peer) {
-                state.outbound_version = Some(version);
-                state.subscription_queue.clear();
-                for topic in current_topics {
-                    state.subscription_queue.push_back(SubOpts {
-                        subscribe: Some(true),
-                        topic_id: Some(topic),
-                    });
-                }
-                let withdrawals: Vec<String> = state
+                let announce = self.topics.iter().map(|topic| (true, topic));
+                let withdraw = state
                     .unsubscribe_tombstones
                     .difference(&self.topics)
-                    .cloned()
+                    .map(|topic| (false, topic));
+                let subscriptions = announce
+                    .chain(withdraw)
+                    .map(|(subscribe, topic)| SubOpts {
+                        subscribe: Some(subscribe),
+                        topic_id: Some(topic.clone()),
+                    })
                     .collect();
-                for topic in withdrawals {
-                    state.subscription_queue.push_back(SubOpts {
-                        subscribe: Some(false),
-                        topic_id: Some(topic),
-                    });
-                }
                 state.sender = SendState::Ready {
                     stream_id,
+                    version,
+                    subscriptions,
                     in_flight: None,
-                    blocked: None,
                 };
             }
             self.drive_sender(peer, now_ms);
@@ -1200,40 +1203,25 @@ impl GossipsubAgent {
         }
         match role {
             StreamRole::Outbound => {
-                let (commit, failed_establishment) = self
+                // A stale stream (one the sender already moved past) closes
+                // without touching the current sender.
+                let closed = self
                     .peers
                     .get_mut(peer)
-                    .map(|state| {
-                        let sender = core::mem::take(&mut state.sender);
-                        state.outbound_version = None;
-                        state.subscription_queue.clear();
-                        match sender {
-                            SendState::Ready {
-                                stream_id: expected,
-                                in_flight,
-                                ..
-                            } if expected == stream_id => {
-                                (in_flight.map(|(_, commit)| commit), false)
-                            }
-                            SendState::Negotiating {
-                                stream_id: expected,
-                                ..
-                            } if expected == stream_id => (None, true),
-                            other => {
-                                state.sender = other;
-                                (None, false)
-                            }
-                        }
-                    })
-                    .unwrap_or((None, false));
-                if let Some(commit) = commit {
-                    self.restore_commit(peer, commit);
-                }
-                if failed_establishment {
-                    self.events.push_back(GossipsubEvent::OutboundFailure {
-                        peer: peer.clone(),
-                        reason: "stream closed during negotiation".to_string(),
-                    });
+                    .filter(|state| state.sender.stream_id() == Some(stream_id))
+                    .map(|state| core::mem::take(&mut state.sender));
+                match closed {
+                    Some(SendState::Ready {
+                        in_flight: Some(frame),
+                        ..
+                    }) => self.restore_commit(peer, frame.commit),
+                    Some(SendState::Negotiating { .. }) => {
+                        self.events.push_back(GossipsubEvent::OutboundFailure {
+                            peer: peer.clone(),
+                            reason: "stream closed during negotiation".to_string(),
+                        });
+                    }
+                    _ => {}
                 }
             }
             StreamRole::Inbound => {
@@ -1690,22 +1678,11 @@ impl GossipsubAgent {
     }
 
     fn drive_sender(&mut self, peer: &PeerId, now_ms: u64) {
-        let state_kind = self.peers.get(peer).map(|state| match state.sender {
-            SendState::Idle => 0,
-            SendState::Ready {
-                in_flight: None, ..
-            } => 1,
-            _ => 2,
-        });
-        match state_kind {
-            Some(0) => {
-                let Some(version) = self
-                    .peers
-                    .get(peer)
-                    .and_then(|state| state.advertised_version)
-                else {
-                    return;
-                };
+        let Some(state) = self.peers.get(peer) else {
+            return;
+        };
+        match (&state.sender, state.advertised_version) {
+            (SendState::Idle, Some(version)) => {
                 let token = self.allocate_token();
                 if let Some(state) = self.peers.get_mut(peer) {
                     state.sender = SendState::Opening {
@@ -1719,94 +1696,90 @@ impl GossipsubAgent {
                     protocol_id: String::from(version.protocol_id()),
                 });
             }
-            Some(1) => self.emit_next_frame(peer),
+            (
+                SendState::Ready {
+                    in_flight: None, ..
+                },
+                _,
+            ) => self.emit_next_frame(peer),
             _ => {}
         }
     }
 
+    /// Puts the next frame in flight on an idle ready stream: owed
+    /// subscriptions first (the live diff is queued once the resync drains),
+    /// then control, then the oldest message.
     fn emit_next_frame(&mut self, peer: &PeerId) {
-        let (stream_id, version) = match self.peers.get(peer) {
-            Some(PeerState {
-                sender:
-                    SendState::Ready {
-                        stream_id,
-                        in_flight: None,
-                        ..
-                    },
-                outbound_version: Some(version),
-                ..
-            }) => (*stream_id, *version),
-            _ => return,
+        let Some(state) = self.peers.get_mut(peer) else {
+            return;
         };
+        let SendState::Ready {
+            stream_id,
+            version,
+            subscriptions,
+            in_flight: None,
+        } = &mut state.sender
+        else {
+            return;
+        };
+        let (stream_id, version) = (*stream_id, *version);
+        if subscriptions.is_empty() {
+            let announce = self
+                .topics
+                .difference(&state.acknowledged_topics)
+                .map(|topic| (true, topic));
+            let withdraw = state
+                .acknowledged_topics
+                .difference(&self.topics)
+                .map(|topic| (false, topic));
+            subscriptions.extend(announce.chain(withdraw).map(|(subscribe, topic)| SubOpts {
+                subscribe: Some(subscribe),
+                topic_id: Some(topic.clone()),
+            }));
+        }
 
-        let work = if self
-            .peers
-            .get(peer)
-            .is_some_and(|state| !state.subscription_queue.is_empty())
-        {
-            let mut subscriptions = Vec::new();
+        let (frame, commit) = if !subscriptions.is_empty() {
+            let mut batch = Vec::new();
             let mut body_len = 0;
             // Subscription and control commits intentionally occupy separate
             // RPCs. This keeps each acknowledgement atomic at the cost of one
             // extra write after a reopen; each category is still packed
             // greedily to the exact wire limit.
-            while let Some(next) = self
-                .peers
-                .get(peer)
-                .and_then(|state| state.subscription_queue.front().cloned())
-            {
+            while let Some(next) = subscriptions.front() {
                 let next_len = nested_field_len(next.encode().len());
                 if body_len + next_len > MAX_RPC_SIZE {
                     break;
                 }
                 body_len += next_len;
-                subscriptions.push(next);
-                self.peers
-                    .get_mut(peer)
-                    .expect("peer exists")
-                    .subscription_queue
-                    .pop_front();
+                batch.extend(subscriptions.pop_front());
             }
             let body = Rpc {
-                subscriptions: subscriptions.clone(),
+                subscriptions: batch.clone(),
                 publish: Vec::new(),
                 control: None,
             }
             .encode();
             debug_assert_eq!(body.len(), body_len);
-            Some((
+            (
                 encode_frame(&body).into(),
-                FrameCommit::Subscriptions(subscriptions),
-            ))
+                FrameCommit::Subscriptions(batch),
+            )
+        } else if let Some((body, items)) = state.pending_control.take_frame(version) {
+            (encode_frame(&body).into(), FrameCommit::Control(items))
+        } else if let Some(frame) = state.pending_messages.front() {
+            (frame.clone(), FrameCommit::Message)
         } else {
-            self.enqueue_live_subscription_diff(peer);
-            if self
-                .peers
-                .get(peer)
-                .is_some_and(|state| !state.subscription_queue.is_empty())
-            {
-                self.emit_next_frame(peer);
-                return;
-            }
-            if let Some((body, items)) = self
-                .peers
-                .get_mut(peer)
-                .and_then(|state| state.pending_control.take_frame(version))
-            {
-                Some((encode_frame(&body).into(), FrameCommit::Control(items)))
-            } else {
-                self.peers
-                    .get(peer)
-                    .and_then(|state| state.pending_messages.front().cloned())
-                    .map(|frame| (frame, FrameCommit::Message))
-            }
+            return;
         };
-        let Some((frame, commit)) = work else { return };
         let token = self.allocate_token();
         if let Some(state) = self.peers.get_mut(peer)
             && let SendState::Ready { in_flight, .. } = &mut state.sender
         {
-            *in_flight = Some((token, commit));
+            *in_flight = Some(InFlight {
+                token,
+                commit,
+                blocked: None,
+            });
         }
         self.actions.push_back(GossipsubAction::SendStream {
             token,
@@ -1814,24 +1787,6 @@ impl GossipsubAgent {
             stream_id,
             data: frame,
         });
-    }
-
-    fn enqueue_live_subscription_diff(&mut self, peer: &PeerId) {
-        let Some(state) = self.peers.get_mut(peer) else {
-            return;
-        };
-        for topic in self.topics.difference(&state.acknowledged_topics) {
-            state.subscription_queue.push_back(SubOpts {
-                subscribe: Some(true),
-                topic_id: Some(topic.clone()),
-            });
-        }
-        for topic in state.acknowledged_topics.difference(&self.topics) {
-            state.subscription_queue.push_back(SubOpts {
-                subscribe: Some(false),
-                topic_id: Some(topic.clone()),
-            });
-        }
     }
 
     fn commit_frame(&mut self, peer: &PeerId, commit: FrameCommit) {

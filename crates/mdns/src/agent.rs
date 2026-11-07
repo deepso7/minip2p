@@ -77,6 +77,22 @@ impl DeterministicRng {
     }
 }
 
+/// How the next query is spaced after the current one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuerySchedule {
+    /// Startup probing: each delay doubles from one second up to the query
+    /// interval, until a peer answers.
+    Fast { next_delay_ms: u64 },
+    /// A peer answered: query once per interval.
+    Steady,
+}
+
+impl QuerySchedule {
+    const START: Self = Self::Fast {
+        next_delay_ms: 1_000,
+    };
+}
+
 /// Sans-I/O libp2p mDNS agent.
 pub struct MdnsAgent {
     peer_id: PeerId,
@@ -86,8 +102,7 @@ pub struct MdnsAgent {
     interfaces: Vec<InterfaceSnapshot>,
     local_addrs: Vec<Multiaddr>,
     next_query_at_ms: u64,
-    next_fast_delay_ms: u64,
-    fast_phase: bool,
+    schedule: QuerySchedule,
     scheduled: Vec<ScheduledResponse>,
     actions: VecDeque<MdnsAction>,
     events: VecDeque<MdnsEvent>,
@@ -114,8 +129,7 @@ impl MdnsAgent {
             interfaces: Vec::new(),
             local_addrs: Vec::new(),
             next_query_at_ms: 0,
-            next_fast_delay_ms: 1_000,
-            fast_phase: true,
+            schedule: QuerySchedule::START,
             scheduled: Vec::new(),
             actions: VecDeque::new(),
             events: VecDeque::new(),
@@ -235,16 +249,16 @@ impl MdnsAgent {
                     payload: payload.clone(),
                 });
             }
-            let delay = self.next_fast_delay_ms.min(self.config.query_interval_ms);
-            self.next_query_at_ms = now_ms.saturating_add(if self.fast_phase {
-                delay
-            } else {
-                self.config.query_interval_ms
-            });
-            if self.fast_phase {
-                self.next_fast_delay_ms =
-                    delay.saturating_mul(2).min(self.config.query_interval_ms);
-            }
+            let interval = self.config.query_interval_ms;
+            let delay = match &mut self.schedule {
+                QuerySchedule::Fast { next_delay_ms } => {
+                    let delay = (*next_delay_ms).min(interval);
+                    *next_delay_ms = delay.saturating_mul(2).min(interval);
+                    delay
+                }
+                QuerySchedule::Steady => interval,
+            };
+            self.next_query_at_ms = now_ms.saturating_add(delay);
         }
     }
 
@@ -298,8 +312,7 @@ impl MdnsAgent {
     }
 
     fn restart_fast_phase(&mut self, now_ms: u64) {
-        self.fast_phase = true;
-        self.next_fast_delay_ms = 1_000;
+        self.schedule = QuerySchedule::START;
         self.next_query_at_ms = now_ms;
     }
 
@@ -448,9 +461,8 @@ impl MdnsAgent {
             return;
         }
         if observed.iter().any(|(_, ttl_ms)| *ttl_ms > 0) {
-            self.fast_phase = false;
+            self.schedule = QuerySchedule::Steady;
             self.next_query_at_ms = now_ms.saturating_add(self.config.query_interval_ms);
-            self.next_fast_delay_ms = self.config.query_interval_ms;
         }
         self.events.push_back(MdnsEvent::PeerObserved {
             peer,
@@ -724,7 +736,7 @@ mod tests {
             Some(MdnsEvent::PeerObserved { peer, addrs })
                 if peer == remote && addrs[0].1 == 120_000
         ));
-        assert!(!agent.fast_phase);
+        assert_eq!(agent.schedule, QuerySchedule::Steady);
     }
 
     #[test]
@@ -735,13 +747,13 @@ mod tests {
         let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
         agent.handle_packet(InterfaceId::new(1), from, &response_from(&local, 120), 1);
         assert!(agent.poll_event().is_none());
-        assert!(agent.fast_phase);
+        assert!(matches!(agent.schedule, QuerySchedule::Fast { .. }));
         agent.handle_packet(InterfaceId::new(1), from, &response_from(&peer(2), 0), 2);
         assert!(matches!(
             agent.poll_event(),
             Some(MdnsEvent::PeerObserved { .. })
         ));
-        assert!(agent.fast_phase);
+        assert!(matches!(agent.schedule, QuerySchedule::Fast { .. }));
     }
 
     #[test]

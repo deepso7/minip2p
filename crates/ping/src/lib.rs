@@ -128,6 +128,11 @@ pub enum PingError {
         peer_id: PeerId,
         stream_id: StreamId,
     },
+    #[error("peer {peer_id} outbound ping stream {stream_id} is closed for writing")]
+    OutboundWriteClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
     #[error("invalid ping payload length {actual}; expected {PING_PAYLOAD_LEN}")]
     InvalidPayloadLength { actual: usize },
 }
@@ -141,15 +146,34 @@ struct PendingPing {
     sent_at_ms: u64,
 }
 
+/// The single outbound stream used for sending pings to a peer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum Outbound {
+    #[default]
+    None,
+    /// Registered and idle: the next ping may be sent.
+    Open(StreamId),
+    /// A ping was sent and awaits its echo.
+    InFlight(StreamId, PendingPing),
+    /// Our write side is closed; waiting for the remote to close its side.
+    WriteClosed(StreamId),
+}
+
+impl Outbound {
+    fn stream_id(&self) -> Option<StreamId> {
+        match self {
+            Self::None => None,
+            Self::Open(id) | Self::InFlight(id, _) | Self::WriteClosed(id) => Some(*id),
+        }
+    }
+}
+
 /// Per-peer state tracking for the ping protocol.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct PeerPingState {
-    /// The single outbound stream used for sending pings to this peer.
-    outbound_stream: Option<StreamId>,
+    outbound: Outbound,
     /// Inbound streams on which this peer sends pings to us.
     inbound_streams: BTreeSet<StreamId>,
-    /// The in-flight outbound ping, if any.
-    pending_ping: Option<PendingPing>,
     /// Per-stream receive buffers to handle fragmented data delivery.
     recv_bufs: BTreeMap<StreamId, Vec<u8>>,
 }
@@ -191,7 +215,7 @@ impl PingProtocol {
     ) -> Result<(), PingError> {
         let peer = self.peers.entry(peer_id.clone()).or_default();
 
-        if let Some(existing) = peer.outbound_stream {
+        if let Some(existing) = peer.outbound.stream_id() {
             if existing != stream_id {
                 return Err(PingError::OutboundStreamExists {
                     peer_id,
@@ -203,17 +227,18 @@ impl PingProtocol {
             return Ok(());
         }
 
-        peer.outbound_stream = Some(stream_id);
+        peer.outbound = Outbound::Open(stream_id);
         self.pending_events
             .push_back(PingEvent::OutboundStreamRegistered { peer_id, stream_id });
         Ok(())
     }
 
-    /// Returns the negotiated outbound ping stream for `peer_id`, if any.
+    /// Returns the negotiated outbound ping stream for `peer_id`, if any,
+    /// including one whose write side this side already closed.
     pub fn outbound_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
         self.peers
             .get(peer_id)
-            .and_then(|peer| peer.outbound_stream)
+            .and_then(|peer| peer.outbound.stream_id())
     }
 
     /// Returns the payload of the ping in flight to `peer_id`, if any.
@@ -223,8 +248,10 @@ impl PingProtocol {
     pub fn in_flight_payload(&self, peer_id: &PeerId) -> Option<[u8; PING_PAYLOAD_LEN]> {
         self.peers
             .get(peer_id)
-            .and_then(|peer| peer.pending_ping.as_ref())
-            .map(|pending| pending.payload)
+            .and_then(|peer| match &peer.outbound {
+                Outbound::InFlight(_, pending) => Some(pending.payload),
+                _ => None,
+            })
     }
 
     /// Registers a negotiated inbound stream from a peer.
@@ -271,25 +298,17 @@ impl PingProtocol {
             .ok_or_else(|| PingError::OutboundStreamMissing {
                 peer_id: peer_id.clone(),
             })?;
-        let stream_id = peer
-            .outbound_stream
-            .ok_or_else(|| PingError::OutboundStreamMissing {
-                peer_id: peer_id.clone(),
-            })?;
-
-        if peer.pending_ping.is_some() {
-            return Err(PingError::PingAlreadyInFlight {
-                peer_id: peer_id.clone(),
-                stream_id,
-            });
-        }
+        let stream_id = Self::writable_outbound(peer_id, &peer.outbound)?;
 
         let mut frame = [0u8; PING_PAYLOAD_LEN];
         frame.copy_from_slice(payload);
-        peer.pending_ping = Some(PendingPing {
-            payload: frame,
-            sent_at_ms: now_ms,
-        });
+        peer.outbound = Outbound::InFlight(
+            stream_id,
+            PendingPing {
+                payload: frame,
+                sent_at_ms: now_ms,
+            },
+        );
 
         self.pending_actions.push_back(PingAction::Send {
             peer_id: peer_id.clone(),
@@ -299,7 +318,10 @@ impl PingProtocol {
         Ok(())
     }
 
-    /// Half-closes the outbound stream. Fails if a ping is in flight.
+    /// Half-closes the outbound stream. Fails if a ping is in flight or the
+    /// write side is already closed; after it, [`send_ping`](Self::send_ping)
+    /// fails until the remote closes its side too and a new stream is
+    /// registered.
     pub fn close_outbound_stream_write(&mut self, peer_id: &PeerId) -> Result<(), PingError> {
         let peer = self
             .peers
@@ -307,18 +329,8 @@ impl PingProtocol {
             .ok_or_else(|| PingError::OutboundStreamMissing {
                 peer_id: peer_id.clone(),
             })?;
-        let stream_id = peer
-            .outbound_stream
-            .ok_or_else(|| PingError::OutboundStreamMissing {
-                peer_id: peer_id.clone(),
-            })?;
-
-        if peer.pending_ping.is_some() {
-            return Err(PingError::PingAlreadyInFlight {
-                peer_id: peer_id.clone(),
-                stream_id,
-            });
-        }
+        let stream_id = Self::writable_outbound(peer_id, &peer.outbound)?;
+        peer.outbound = Outbound::WriteClosed(stream_id);
 
         self.pending_actions
             .push_back(PingAction::CloseStreamWrite {
@@ -326,6 +338,24 @@ impl PingProtocol {
                 stream_id,
             });
         Ok(())
+    }
+
+    /// The idle outbound stream a ping or write-close may go on.
+    fn writable_outbound(peer_id: &PeerId, outbound: &Outbound) -> Result<StreamId, PingError> {
+        match *outbound {
+            Outbound::Open(stream_id) => Ok(stream_id),
+            Outbound::None => Err(PingError::OutboundStreamMissing {
+                peer_id: peer_id.clone(),
+            }),
+            Outbound::InFlight(stream_id, _) => Err(PingError::PingAlreadyInFlight {
+                peer_id: peer_id.clone(),
+                stream_id,
+            }),
+            Outbound::WriteClosed(stream_id) => Err(PingError::OutboundWriteClosed {
+                peer_id: peer_id.clone(),
+                stream_id,
+            }),
+        }
     }
 
     /// Feeds received stream data into the protocol, queuing any actions.
@@ -338,7 +368,7 @@ impl PingProtocol {
     ) {
         // Check stream is known, collecting info before mutating.
         let is_known = self.peers.get(peer_id).is_some_and(|p| {
-            p.outbound_stream == Some(stream_id) || p.inbound_streams.contains(&stream_id)
+            p.outbound.stream_id() == Some(stream_id) || p.inbound_streams.contains(&stream_id)
         });
 
         if !is_known {
@@ -425,8 +455,10 @@ impl PingProtocol {
     ) {
         let peer = self.peers.get_mut(peer_id).expect("peer exists");
 
-        if peer.outbound_stream == Some(stream_id) {
-            let Some(pending) = peer.pending_ping.take() else {
+        if peer.outbound.stream_id() == Some(stream_id) {
+            let Outbound::InFlight(_, pending) =
+                core::mem::replace(&mut peer.outbound, Outbound::Open(stream_id))
+            else {
                 return self.protocol_violation(
                     peer_id,
                     stream_id,
@@ -471,8 +503,8 @@ impl PingProtocol {
             return;
         }
 
-        if peer.outbound_stream == Some(stream_id) {
-            if peer.pending_ping.is_some() {
+        if peer.outbound.stream_id() == Some(stream_id) {
+            if matches!(peer.outbound, Outbound::InFlight(..)) {
                 return self.protocol_violation(
                     peer_id,
                     stream_id,
@@ -480,7 +512,7 @@ impl PingProtocol {
                 );
             }
 
-            peer.outbound_stream = None;
+            peer.outbound = Outbound::None;
             peer.recv_bufs.remove(&stream_id);
             self.pending_events
                 .push_back(PingEvent::OutboundStreamClosed {
@@ -498,9 +530,8 @@ impl PingProtocol {
 
         peer.inbound_streams.remove(&stream_id);
         peer.recv_bufs.remove(&stream_id);
-        if peer.outbound_stream == Some(stream_id) {
-            peer.outbound_stream = None;
-            peer.pending_ping = None;
+        if peer.outbound.stream_id() == Some(stream_id) {
+            peer.outbound = Outbound::None;
         }
     }
 
@@ -549,17 +580,14 @@ impl PingProtocol {
     /// Checks for timed-out ping requests. Call periodically.
     pub fn on_tick(&mut self, now_ms: u64) {
         for (peer_id, peer) in self.peers.iter_mut() {
-            let Some(stream_id) = peer.outbound_stream else {
+            let Outbound::InFlight(stream_id, pending) = &peer.outbound else {
                 continue;
             };
-            let Some(pending) = peer.pending_ping.as_ref() else {
-                continue;
-            };
+            let stream_id = *stream_id;
 
             let elapsed = now_ms.saturating_sub(pending.sent_at_ms);
             if elapsed > self.config.request_timeout_ms {
-                peer.pending_ping = None;
-                peer.outbound_stream = None;
+                peer.outbound = Outbound::None;
                 peer.recv_bufs.remove(&stream_id);
                 self.pending_events.push_back(PingEvent::Timeout {
                     peer_id: peer_id.clone(),
@@ -584,10 +612,9 @@ impl PingProtocol {
     /// needs a fresh one.
     fn protocol_violation(&mut self, peer_id: &PeerId, stream_id: StreamId, reason: String) {
         if let Some(peer) = self.peers.get_mut(peer_id)
-            && peer.outbound_stream == Some(stream_id)
+            && peer.outbound.stream_id() == Some(stream_id)
         {
-            peer.outbound_stream = None;
-            peer.pending_ping = None;
+            peer.outbound = Outbound::None;
             peer.recv_bufs.remove(&stream_id);
         }
         self.pending_events.push_back(PingEvent::ProtocolViolation {
@@ -945,6 +972,35 @@ mod tests {
 
         let result = ping.close_outbound_stream_write(&peer);
         assert!(matches!(result, Err(PingError::PingAlreadyInFlight { .. })));
+    }
+
+    #[test]
+    fn write_closed_outbound_stream_refuses_further_writes() {
+        let mut ping = PingProtocol::default();
+        let peer = test_peer();
+        let stream = StreamId::new(0);
+
+        ping.register_outbound_stream(peer.clone(), stream)
+            .expect("register stream");
+        ping.close_outbound_stream_write(&peer)
+            .expect("close write");
+        let _ = ping.poll_actions();
+
+        let payload = [1u8; PING_PAYLOAD_LEN];
+        assert_eq!(
+            ping.send_ping(&peer, &payload, 100),
+            Err(PingError::OutboundWriteClosed {
+                peer_id: peer.clone(),
+                stream_id: stream,
+            })
+        );
+        assert!(ping.close_outbound_stream_write(&peer).is_err());
+        assert!(ping.poll_actions().is_empty(), "nothing more is written");
+
+        // The remote's close retires the stream; a new one can be registered.
+        ping.on_stream_remote_write_closed(&peer, stream);
+        ping.register_outbound_stream(peer.clone(), StreamId::new(4))
+            .expect("register replacement");
     }
 
     #[test]
