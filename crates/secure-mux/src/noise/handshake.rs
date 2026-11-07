@@ -145,10 +145,7 @@ impl HandshakeState {
 
     /// Reads XX message 2, returning the remote ephemeral key that message 3
     /// needs alongside the verified identity.
-    fn read_message2(
-        &mut self,
-        message: &[u8],
-    ) -> Result<([u8; 32], VerifiedRemote), NoiseError> {
+    fn read_message2(&mut self, message: &[u8]) -> Result<([u8; 32], VerifiedRemote), NoiseError> {
         if message.len() < 32 + 48 + 16 {
             return Err(NoiseError::InvalidHandshakeMessage(
                 "Noise message 2 is too short",
