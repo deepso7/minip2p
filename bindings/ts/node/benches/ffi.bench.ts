@@ -19,6 +19,8 @@ let sdkA: Minip2p;
 let sdkB: Minip2p;
 let rawA: NativeEndpoint;
 let rawB: NativeEndpoint;
+/** Resolves on `rawA`'s next doorbell, or at once if it rang since the last wait. */
+let rawADoorbell: () => Promise<void>;
 let transfer: Stream;
 /** Resolves once `bytes` more transfer bytes reached `sdkB`. */
 let awaitTransferred: (bytes: number) => Promise<void>;
@@ -42,9 +44,11 @@ beforeAll(async () => {
   transfer = await sdkA.openStream(sdkB.peerId(), TRANSFER_PROTOCOL, {
     timeoutMs: TIMEOUT_MS,
   });
-  rawA = createRaw();
+  const bell = latch();
+  rawADoorbell = bell.wait;
+  rawA = createRaw(bell.ring);
   cleanup.push(() => rawA.close(0));
-  rawB = createRaw(true);
+  rawB = createRaw(() => drainAllEvents(rawB));
   cleanup.push(() => rawB.close(0));
   rawA.connect([firstAddr(rawB.listenAddrs())]);
   await Promise.all([
@@ -87,26 +91,32 @@ describe("node-ffi", () => {
     }).run();
   });
 
+  // Waits on the doorbell between drains, as an embedder would; a timer
+  // poll would round each wait up to the event loop's ~1 ms timer.
   test("raw_drain_events", async ({ bench }) => {
     await bench("raw_drain_events", async () => {
       const streams = Array.from({ length: BURST }, () =>
         rawA.openStream(rawB.peerId(), PROTOCOL)
       );
       let seen = 0;
-      const deadline = Date.now() + TIMEOUT_MS;
-      while (seen < BURST && Date.now() < deadline) {
-        for (const event of rawA.drainEvents(256)) {
-          if (isNativeEvent(event) && event.tag === "StreamReady") {
-            seen += 1;
+      const drain = async () => {
+        for (;;) {
+          const events = rawA.drainEvents(256);
+          for (const event of events) {
+            if (isNativeEvent(event) && event.tag === "StreamReady") {
+              seen += 1;
+            }
+          }
+          if (seen === BURST) {
+            return;
+          }
+          // The doorbell rings only when the queue turns non-empty.
+          if (events.length < 256) {
+            await rawADoorbell();
           }
         }
-        if (seen < BURST) {
-          await delay(0);
-        }
-      }
-      if (seen !== BURST) {
-        throw new Error(`Timed out draining raw events: ${seen}/${BURST}`);
-      }
+      };
+      await withTimeout(drain(), "raw StreamReady events");
       for (const stream of streams) {
         rawA.abandonStream(BigInt(stream.connId), BigInt(stream.streamId));
       }
@@ -130,7 +140,8 @@ function createSdk(): Minip2p {
   });
 }
 
-function createRaw(drainOnDoorbell = false): NativeEndpoint {
+/** Starts a raw endpoint whose doorbell calls `onDoorbell`. */
+function createRaw(onDoorbell: () => void): NativeEndpoint {
   const endpoint = new nativeBinding.NodeEndpoint(
     nativeBinding.generateSecretKey(),
     {
@@ -142,11 +153,7 @@ function createRaw(drainOnDoorbell = false): NativeEndpoint {
       relays: [],
     }
   );
-  endpoint.start(() => {
-    if (drainOnDoorbell) {
-      drainAllEvents(endpoint);
-    }
-  });
+  endpoint.start(onDoorbell);
   return endpoint;
 }
 
@@ -202,6 +209,35 @@ function firstAddr(addrs: readonly string[]): string {
     throw new Error("Endpoint has no listen address");
   }
   return addr;
+}
+
+/**
+ * An edge-triggered doorbell latch: `ring` wakes the pending `wait`, or
+ * makes the next one resolve at once, so a ring between a drain and its
+ * wait is not lost.
+ */
+function latch(): { ring: () => void; wait: () => Promise<void> } {
+  let rung = false;
+  let wake: (() => void) | undefined;
+  return {
+    ring() {
+      rung = true;
+      wake?.();
+    },
+    wait() {
+      if (rung) {
+        rung = false;
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => {
+        wake = () => {
+          rung = false;
+          wake = undefined;
+          resolve();
+        };
+      });
+    },
+  };
 }
 
 function drainAllEvents(endpoint: NativeEndpoint): void {
