@@ -9,7 +9,7 @@ This crate implements the [multistream-select](https://github.com/multiformats/m
 - Varint-length-prefixed wire format (spec-compliant framing).
 - Dialer and listener roles.
 - One round trip per negotiation: the dialer sends its header and proposal in one write, as go-libp2p and rust-libp2p do, and still requires the listener's header before its answer.
-- Incremental `on_data` handling for chunked/partial input.
+- Incremental `on_data` handling for chunked/partial input. Bytes received before `start` are buffered and answered once it runs, so nothing goes out ahead of this side's header.
 - `MultistreamOutput` events for outbound data, negotiation result, and errors.
 - Typed `MultistreamError` with actionable context.
 - Zero-copy decoding where possible.

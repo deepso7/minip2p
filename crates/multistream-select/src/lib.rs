@@ -58,23 +58,26 @@ pub enum MultistreamError {
     UnexpectedProtocolResponse { actual: String },
 }
 
-/// Whether this side initiated (Dialer) or accepted (Listener) the negotiation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Which side of the negotiation this is, with the data only that side needs.
 enum Role {
-    Dialer,
-    Listener,
+    /// Initiated the stream and proposes one protocol.
+    Dialer { desired: String },
+    /// Accepted the stream and answers proposals from this set.
+    Listener { supported: BTreeSet<String> },
 }
 
 /// Internal state machine states for the multistream-select handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
+    /// `start` has not run. Received bytes are buffered, not answered, so
+    /// nothing goes out before this side's header.
+    Unstarted,
     /// Expecting the remote's multistream protocol header. A started dialer
     /// has already sent its proposal too.
     WaitingForRemoteHeader,
-    /// Listener waiting for the dialer's protocol proposal.
-    WaitingForProtocolRequest,
-    /// Dialer waiting for the listener's protocol confirmation or rejection.
-    WaitingForProtocolResponse,
+    /// Header received: a listener waits for a proposal, a dialer for the
+    /// answer to its own.
+    Negotiating,
     /// Negotiation finished (success or error).
     Done,
 }
@@ -83,54 +86,50 @@ enum State {
 pub struct MultistreamSelect {
     role: Role,
     state: State,
-    desired_protocol: Option<String>,
-    supported_protocols: BTreeSet<String>,
     recv_buf: Vec<u8>,
-    started: bool,
     pending_outputs: VecDeque<MultistreamOutput>,
 }
 
 impl MultistreamSelect {
     /// Creates a dialer that will propose `desired_protocol`.
     pub fn dialer(desired_protocol: impl Into<String>) -> Self {
-        Self {
-            role: Role::Dialer,
-            state: State::WaitingForRemoteHeader,
-            desired_protocol: Some(desired_protocol.into()),
-            supported_protocols: BTreeSet::new(),
-            recv_buf: Vec::new(),
-            started: false,
-            pending_outputs: VecDeque::new(),
-        }
+        Self::new(Role::Dialer {
+            desired: desired_protocol.into(),
+        })
     }
 
     /// Creates a listener that accepts connections for the given protocols.
     pub fn listener(protocols: impl IntoIterator<Item = String>) -> Self {
+        Self::new(Role::Listener {
+            supported: protocols.into_iter().collect(),
+        })
+    }
+
+    fn new(role: Role) -> Self {
         Self {
-            role: Role::Listener,
-            state: State::WaitingForRemoteHeader,
-            desired_protocol: None,
-            supported_protocols: protocols.into_iter().collect(),
+            role,
+            state: State::Unstarted,
             recv_buf: Vec::new(),
-            started: false,
             pending_outputs: VecDeque::new(),
         }
     }
 
     /// Queues the initial write: the multistream header, and for a dialer its
-    /// protocol proposal right after it in the same `OutboundData`. Idempotent.
+    /// protocol proposal right after it in the same `OutboundData`. Then
+    /// answers any bytes received before the start. Idempotent.
     pub fn start(&mut self) {
-        if self.started {
+        if self.state != State::Unstarted {
             return;
         }
 
-        self.started = true;
+        self.state = State::WaitingForRemoteHeader;
         let mut first_write = encode_message(MULTISTREAM_PROTOCOL_ID);
-        if let Some(desired) = &self.desired_protocol {
+        if let Role::Dialer { desired } = &self.role {
             first_write.extend_from_slice(&encode_message(desired));
         }
         self.pending_outputs
             .push_back(MultistreamOutput::OutboundData(first_write));
+        self.process_buffer();
     }
 
     /// Returns `true` if negotiation has completed (successfully or with an error).
@@ -143,9 +142,11 @@ impl MultistreamSelect {
     /// the reply: it has nothing left to write. That holds from the moment
     /// `start`'s write is polled, before the remote header arrives.
     pub fn awaits_response(&self) -> bool {
-        self.role == Role::Dialer
-            && self.started
-            && self.state != State::Done
+        matches!(self.role, Role::Dialer { .. })
+            && matches!(
+                self.state,
+                State::WaitingForRemoteHeader | State::Negotiating
+            )
             && self.pending_outputs.is_empty()
     }
 
@@ -161,42 +162,40 @@ impl MultistreamSelect {
     }
 
     /// Feeds received bytes into the state machine, queuing any outputs.
+    /// Bytes received before [`start`](Self::start) wait for it.
     pub fn on_data(&mut self, bytes: &[u8]) {
         if self.state == State::Done {
             return;
         }
 
         self.recv_buf.extend_from_slice(bytes);
-        let outputs = &mut self.pending_outputs;
+        self.process_buffer();
+    }
 
-        loop {
-            if self.state == State::Done {
-                break;
-            }
-
+    /// Handles every complete message buffered so far.
+    fn process_buffer(&mut self) {
+        while matches!(
+            self.state,
+            State::WaitingForRemoteHeader | State::Negotiating
+        ) {
             let (next_state, produced, consumed) = match decode_message(&self.recv_buf) {
                 DecodeResult::Complete { payload, consumed } => {
-                    let (next_state, produced) = handle_message(
-                        self.role,
-                        self.state,
-                        self.desired_protocol.as_deref(),
-                        &self.supported_protocols,
-                        payload,
-                    );
+                    let (next_state, produced) = handle_message(&self.role, self.state, payload);
                     (next_state, produced, consumed)
                 }
                 DecodeResult::Incomplete => break,
                 DecodeResult::Error(err) => {
                     self.state = State::Done;
-                    outputs.push_back(MultistreamOutput::ProtocolError {
-                        reason: err.to_string(),
-                    });
+                    self.pending_outputs
+                        .push_back(MultistreamOutput::ProtocolError {
+                            reason: err.to_string(),
+                        });
                     break;
                 }
             };
             self.recv_buf.drain(..consumed);
             self.state = next_state;
-            outputs.extend(produced);
+            self.pending_outputs.extend(produced);
         }
     }
 
@@ -210,29 +209,19 @@ impl MultistreamSelect {
 }
 
 /// Processes a single decoded protocol line.
-fn handle_message(
-    role: Role,
-    state: State,
-    desired_protocol: Option<&str>,
-    supported_protocols: &BTreeSet<String>,
-    line: &str,
-) -> (State, Vec<MultistreamOutput>) {
-    match state {
-        State::WaitingForRemoteHeader => {
+fn handle_message(role: &Role, state: State, line: &str) -> (State, Vec<MultistreamOutput>) {
+    match (state, role) {
+        (State::WaitingForRemoteHeader, _) => {
             if line != MULTISTREAM_PROTOCOL_ID {
                 return protocol_error(MultistreamError::UnexpectedHeader {
                     actual: line.to_string(),
                 });
             }
-
             // The dialer's proposal went out with its header in `start`.
-            match role {
-                Role::Dialer => (State::WaitingForProtocolResponse, Vec::new()),
-                Role::Listener => (State::WaitingForProtocolRequest, Vec::new()),
-            }
+            (State::Negotiating, Vec::new())
         }
-        State::WaitingForProtocolRequest => {
-            if supported_protocols.contains(line) {
+        (State::Negotiating, Role::Listener { supported }) => {
+            if supported.contains(line) {
                 (
                     State::Done,
                     vec![
@@ -248,7 +237,7 @@ fn handle_message(
                     // stream after `na` (for example rust-libp2p tries
                     // meshsub 1.2 before falling back to 1.1). Keep the
                     // listener alive for that next proposal.
-                    State::WaitingForProtocolRequest,
+                    State::Negotiating,
                     vec![
                         MultistreamOutput::OutboundData(encode_message(NOT_AVAILABLE)),
                         MultistreamOutput::NotAvailable,
@@ -256,14 +245,12 @@ fn handle_message(
                 )
             }
         }
-        State::WaitingForProtocolResponse => {
-            let desired = desired_protocol.expect("dialer must have desired protocol");
-
+        (State::Negotiating, Role::Dialer { desired }) => {
             if line == desired {
                 (
                     State::Done,
                     vec![MultistreamOutput::Negotiated {
-                        protocol: desired.to_string(),
+                        protocol: desired.clone(),
                     }],
                 )
             } else if line == NOT_AVAILABLE {
@@ -274,7 +261,8 @@ fn handle_message(
                 })
             }
         }
-        State::Done => (State::Done, Vec::new()),
+        // `process_buffer` only runs in the two states above.
+        (State::Unstarted | State::Done, _) => (state, Vec::new()),
     }
 }
 
@@ -565,6 +553,24 @@ mod tests {
         let mut listener = MultistreamSelect::listener([PING.to_string()]);
         let _ = listener.start_drained();
         assert!(!listener.awaits_response());
+    }
+
+    #[test]
+    fn data_before_start_is_answered_after_the_header() {
+        let mut listener = MultistreamSelect::listener([PING.to_string()]);
+        // Nothing may go out before the listener's own header.
+        assert!(listener.receive(&header_and(PING)).is_empty());
+
+        assert_eq!(
+            listener.start_drained(),
+            vec![
+                MultistreamOutput::OutboundData(encode_message(MULTISTREAM_PROTOCOL_ID)),
+                MultistreamOutput::OutboundData(encode_message(PING)),
+                MultistreamOutput::Negotiated {
+                    protocol: PING.to_string()
+                }
+            ]
+        );
     }
 
     #[test]
