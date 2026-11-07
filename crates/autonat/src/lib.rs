@@ -228,14 +228,12 @@ pub struct AutoNatClient {
     frames: FrameExchange,
     state: FlowState,
     outcome: Option<Reachability>,
-    emitted_outcome: bool,
 }
 
 /// Server-side AutoNAT request handler.
 pub struct AutoNatServer {
     frames: FrameExchange,
     request: Option<AutoNatRequest>,
-    emitted_request: bool,
     state: ServerState,
 }
 
@@ -281,7 +279,6 @@ impl AutoNatClient {
             frames,
             state: FlowState::Pending,
             outcome: None,
-            emitted_outcome: false,
         }
     }
 
@@ -308,7 +305,8 @@ impl AutoNatClient {
         self.try_decode_response()
     }
 
-    /// Returns the reachability outcome, if available.
+    /// Returns the reachability outcome until
+    /// [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn outcome(&self) -> Option<&Reachability> {
         self.outcome.as_ref()
@@ -389,7 +387,6 @@ impl AutoNatServer {
         Self {
             frames: FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING),
             request: None,
-            emitted_request: false,
             state: ServerState::AwaitingRequest,
         }
     }
@@ -403,7 +400,8 @@ impl AutoNatServer {
         self.try_decode_request()
     }
 
-    /// Returns the parsed dial-back request, if ready.
+    /// Returns the parsed dial-back request until
+    /// [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn request(&self) -> Option<&AutoNatRequest> {
         self.request.as_ref()
@@ -472,7 +470,6 @@ impl AutoNatServer {
             addrs,
             raw_addrs: peer.addrs,
         });
-        self.emitted_request = false;
         self.state = ServerState::RequestReady;
         Ok(())
     }
@@ -488,10 +485,7 @@ impl AutoNatClient {
         if !outbound.is_empty() {
             return Some(AutoNatClientOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
+        if let Some(outcome) = self.outcome.take() {
             return Some(AutoNatClientOutput::Outcome(outcome));
         }
         None
@@ -504,10 +498,7 @@ impl AutoNatServer {
     /// Drain until `None` after every input, before waiting on the stream or
     /// the dial-back result again.
     pub fn poll_output(&mut self) -> Option<AutoNatServerOutput> {
-        if !self.emitted_request
-            && let Some(request) = self.request.clone()
-        {
-            self.emitted_request = true;
+        if let Some(request) = self.request.take() {
             return Some(AutoNatServerOutput::Request(request));
         }
         let outbound = self.take_outbound();

@@ -36,10 +36,18 @@ pub enum HopResponderOutput {
     BridgeData(Vec<u8>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingRequest {
-    Reserve,
-    Connect,
+/// Where a [`HopResponder`] is in its single request/response exchange.
+enum HopState {
+    /// Reading the request frame.
+    AwaitRequest,
+    /// A RESERVE was emitted and awaits the host's decision.
+    PendingReserve,
+    /// A CONNECT awaits its decision, holding payload coalesced with it.
+    PendingConnect { bridge: Vec<u8> },
+    /// CONNECT accepted: later stream bytes are bridge data.
+    Bridged,
+    /// Terminal; further inputs are ignored.
+    Done,
 }
 
 /// Relay-side wire machine for one inbound HOP stream.
@@ -59,11 +67,8 @@ enum PendingRequest {
 pub struct HopResponder {
     frames: FrameExchange,
     outputs: VecDeque<HopResponderOutput>,
-    pending_request: Option<PendingRequest>,
-    pending_bridge: Vec<u8>,
-    bridged: bool,
+    state: HopState,
     remote_write_closed: bool,
-    done: bool,
 }
 
 impl HopResponder {
@@ -72,11 +77,8 @@ impl HopResponder {
         Self {
             frames: handshake_frames(),
             outputs: VecDeque::new(),
-            pending_request: None,
-            pending_bridge: Vec::new(),
-            bridged: false,
+            state: HopState::AwaitRequest,
             remote_write_closed: false,
-            done: false,
         }
     }
 
@@ -88,18 +90,19 @@ impl HopResponder {
         if self.remote_write_closed {
             return Ok(());
         }
-        if self.bridged {
-            if !data.is_empty() {
-                self.outputs
-                    .push_back(HopResponderOutput::BridgeData(data.to_vec()));
+        match self.state {
+            HopState::AwaitRequest => {}
+            HopState::PendingReserve | HopState::PendingConnect { .. } => {
+                return Err(RelayError::DecisionPending);
             }
-            return Ok(());
-        }
-        if self.done {
-            return Ok(());
-        }
-        if self.pending_request.is_some() {
-            return Err(RelayError::DecisionPending);
+            HopState::Bridged => {
+                if !data.is_empty() {
+                    self.outputs
+                        .push_back(HopResponderOutput::BridgeData(data.to_vec()));
+                }
+                return Ok(());
+            }
+            HopState::Done => return Ok(()),
         }
         // Framing faults reset; a well-framed message that fails to decode
         // gets a status, so the decode result is carried out separately.
@@ -125,8 +128,8 @@ impl HopResponder {
                 return Ok(());
             }
         };
-        let (request, pending_request) = match message.kind {
-            HopMessageType::Reserve => (HopRequest::Reserve, PendingRequest::Reserve),
+        let request = match message.kind {
+            HopMessageType::Reserve => HopRequest::Reserve,
             HopMessageType::Connect => {
                 let Some(peer) = message.peer else {
                     self.queue_status_and_close(Status::MalformedMessage);
@@ -136,12 +139,9 @@ impl HopResponder {
                     self.queue_status_and_close(Status::MalformedMessage);
                     return Ok(());
                 };
-                (
-                    HopRequest::Connect {
-                        destination_peer_id,
-                    },
-                    PendingRequest::Connect,
-                )
+                HopRequest::Connect {
+                    destination_peer_id,
+                }
             }
             HopMessageType::Status => {
                 self.queue_status_and_close(Status::UnexpectedMessage);
@@ -149,10 +149,10 @@ impl HopResponder {
             }
         };
         let pipelined = self.frames.take_buffered();
-        if pending_request == PendingRequest::Connect {
-            self.pending_bridge = pipelined;
-        }
-        self.pending_request = Some(pending_request);
+        self.state = match request {
+            HopRequest::Reserve => HopState::PendingReserve,
+            HopRequest::Connect { .. } => HopState::PendingConnect { bridge: pipelined },
+        };
         self.outputs.push_back(HopResponderOutput::Request(request));
         Ok(())
     }
@@ -164,7 +164,7 @@ impl HopResponder {
         mut reservation: Reservation,
         limit: Option<Limit>,
     ) -> Result<(), RelayError> {
-        if self.pending_request != Some(PendingRequest::Reserve) {
+        if !matches!(self.state, HopState::PendingReserve) {
             return Err(RelayError::UnexpectedMessage(
                 "cannot accept HOP RESERVE without a pending RESERVE request".into(),
             ));
@@ -180,7 +180,7 @@ impl HopResponder {
     /// Accepts a pending CONNECT with the advertised circuit limit (none
     /// when unrestricted).
     pub fn accept_connect(&mut self, limit: Option<Limit>) -> Result<(), RelayError> {
-        if self.pending_request != Some(PendingRequest::Connect) {
+        if !matches!(self.state, HopState::PendingConnect { .. }) {
             return Err(RelayError::UnexpectedMessage(
                 "cannot accept HOP CONNECT without a pending CONNECT request".into(),
             ));
@@ -190,15 +190,17 @@ impl HopResponder {
             return Ok(());
         };
         self.outputs.push_back(HopResponderOutput::Outbound(frame));
-        if !self.pending_bridge.is_empty() {
+        let next = if self.remote_write_closed {
+            HopState::Done
+        } else {
+            HopState::Bridged
+        };
+        if let HopState::PendingConnect { bridge } = core::mem::replace(&mut self.state, next)
+            && !bridge.is_empty()
+        {
             self.outputs
-                .push_back(HopResponderOutput::BridgeData(core::mem::take(
-                    &mut self.pending_bridge,
-                )));
+                .push_back(HopResponderOutput::BridgeData(bridge));
         }
-        self.pending_request = None;
-        self.bridged = !self.remote_write_closed;
-        self.done = true;
         Ok(())
     }
 
@@ -206,7 +208,10 @@ impl HopResponder {
     ///
     /// `OK` and `UNUSED` are not valid denials and request a stream reset.
     pub fn reject(&mut self, status: Status) -> Result<(), RelayError> {
-        if self.pending_request.is_none() {
+        if !matches!(
+            self.state,
+            HopState::PendingReserve | HopState::PendingConnect { .. }
+        ) {
             return Err(RelayError::UnexpectedMessage(
                 "cannot reject without a pending HOP request".into(),
             ));
@@ -231,18 +236,14 @@ impl HopResponder {
             }
             Err(_) => self.outputs.push_back(HopResponderOutput::Reset),
         }
-        self.pending_request = None;
-        self.pending_bridge = Vec::new();
         self.frames.take_buffered();
-        self.done = true;
+        self.state = HopState::Done;
     }
 
     fn queue_reset(&mut self) {
         self.frames.take_buffered();
-        self.pending_request = None;
-        self.pending_bridge = Vec::new();
         self.outputs.push_back(HopResponderOutput::Reset);
-        self.done = true;
+        self.state = HopState::Done;
     }
 
     /// The remote closed its write side.
@@ -252,22 +253,17 @@ impl HopResponder {
     pub fn on_remote_write_closed(&mut self) {
         self.remote_write_closed = true;
         self.frames.take_buffered();
-        if self.pending_request.is_none() && !self.done {
-            self.pending_bridge = Vec::new();
-            self.done = true;
+        if matches!(self.state, HopState::AwaitRequest | HopState::Bridged) {
+            self.state = HopState::Done;
         }
-        self.bridged = false;
     }
 
     /// The remote reset the stream, discarding pending decisions and outputs.
     pub fn on_remote_reset(&mut self) {
         self.frames.take_buffered();
-        self.pending_request = None;
-        self.pending_bridge = Vec::new();
         self.outputs.clear();
-        self.bridged = false;
         self.remote_write_closed = true;
-        self.done = true;
+        self.state = HopState::Done;
     }
 
     /// Returns true once the handshake has reached a terminal state.
@@ -275,14 +271,17 @@ impl HopResponder {
     /// An accepted CONNECT may continue to produce bridge data after this
     /// becomes true.
     pub fn is_done(&self) -> bool {
-        self.done
+        matches!(self.state, HopState::Bridged | HopState::Done)
     }
     /// Payload coalesced with a pending CONNECT, held until the decision: it
     /// follows acceptance as [`HopResponderOutput::BridgeData`] and is
     /// dropped by a rejection, so a host tracking read credit can tell it
     /// from the request's own bytes.
     pub fn pending_bridge_len(&self) -> usize {
-        self.pending_bridge.len()
+        match &self.state {
+            HopState::PendingConnect { bridge } => bridge.len(),
+            _ => 0,
+        }
     }
 }
 
@@ -374,8 +373,18 @@ pub enum StopInitiatorOutput {
 pub struct StopInitiator {
     frames: FrameExchange,
     outputs: VecDeque<StopInitiatorOutput>,
-    bridged: bool,
-    done: bool,
+    state: StopState,
+}
+
+/// Where a [`StopInitiator`] is in its STOP exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopState {
+    /// Waiting for the destination's STATUS.
+    AwaitStatus,
+    /// Accepted: later stream bytes are bridge data.
+    Bridged,
+    /// Terminal; further inputs are ignored.
+    Done,
 }
 
 impl StopInitiator {
@@ -397,8 +406,7 @@ impl StopInitiator {
         Self {
             frames: handshake_frames(),
             outputs,
-            bridged: false,
-            done: false,
+            state: StopState::AwaitStatus,
         }
     }
 
@@ -406,15 +414,16 @@ impl StopInitiator {
     ///
     /// Wire failures are reported as outputs.
     pub fn on_data(&mut self, data: &[u8]) {
-        if self.bridged {
-            if !data.is_empty() {
-                self.outputs
-                    .push_back(StopInitiatorOutput::BridgeData(data.to_vec()));
+        match self.state {
+            StopState::AwaitStatus => {}
+            StopState::Bridged => {
+                if !data.is_empty() {
+                    self.outputs
+                        .push_back(StopInitiatorOutput::BridgeData(data.to_vec()));
+                }
+                return;
             }
-            return;
-        }
-        if self.done {
-            return;
+            StopState::Done => return,
         }
         // Framing faults reset; a well-framed message that fails to decode
         // gets a corrective status, so the decode result is carried out
@@ -445,20 +454,21 @@ impl StopInitiator {
             self.queue_protocol_error(Status::MalformedMessage);
             return;
         };
-        let outcome = if status == Status::Ok {
-            self.bridged = true;
-            StopInitiatorOutcome::Accepted
-        } else {
-            StopInitiatorOutcome::Refused { status }
-        };
-        self.outputs
-            .push_back(StopInitiatorOutput::Outcome(outcome));
         let pipelined = self.frames.take_buffered();
-        if self.bridged && !pipelined.is_empty() {
+        if status == Status::Ok {
             self.outputs
-                .push_back(StopInitiatorOutput::BridgeData(pipelined));
+                .push_back(StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted));
+            if !pipelined.is_empty() {
+                self.outputs
+                    .push_back(StopInitiatorOutput::BridgeData(pipelined));
+            }
+            self.state = StopState::Bridged;
+        } else {
+            self.outputs.push_back(StopInitiatorOutput::Outcome(
+                StopInitiatorOutcome::Refused { status },
+            ));
+            self.state = StopState::Done;
         }
-        self.done = true;
     }
 
     fn queue_protocol_error(&mut self, status: Status) {
@@ -473,7 +483,7 @@ impl StopInitiator {
             StopInitiatorOutcome::ProtocolError { status },
         ));
         self.frames.take_buffered();
-        self.done = true;
+        self.state = StopState::Done;
     }
 
     fn queue_reset(&mut self, status: Status) {
@@ -482,14 +492,14 @@ impl StopInitiator {
             StopInitiatorOutcome::ProtocolError { status },
         ));
         self.frames.take_buffered();
-        self.done = true;
+        self.state = StopState::Done;
     }
 
     /// The remote closed its write side.
     ///
     /// Outputs from a complete response remain drainable.
     pub fn on_remote_write_closed(&mut self) {
-        if !self.done {
+        if self.state == StopState::AwaitStatus {
             self.outputs.clear();
             self.outputs.push_back(StopInitiatorOutput::Outcome(
                 StopInitiatorOutcome::RemoteWriteClosed,
@@ -503,7 +513,7 @@ impl StopInitiator {
     /// Semantic outputs from a response decoded before the reset remain
     /// drainable; unsent transport actions are discarded.
     pub fn on_remote_reset(&mut self) {
-        if self.done {
+        if self.state != StopState::AwaitStatus {
             self.outputs.retain(|output| {
                 matches!(
                     output,
@@ -521,15 +531,14 @@ impl StopInitiator {
 
     fn finish_remote_terminal(&mut self) {
         self.frames.take_buffered();
-        self.bridged = false;
-        self.done = true;
+        self.state = StopState::Done;
     }
 
     /// Returns true once the STOP handshake has terminated.
     ///
     /// An accepted STOP stream may continue to produce bridge data afterward.
     pub fn is_done(&self) -> bool {
-        self.done
+        self.state != StopState::AwaitStatus
     }
 }
 

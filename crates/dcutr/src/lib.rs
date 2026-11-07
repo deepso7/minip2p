@@ -130,7 +130,6 @@ pub struct DcutrInitiator {
     frames: FrameExchange,
     state: InitiatorState,
     outcome: Option<InitiatorOutcome>,
-    emitted_outcome: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,8 +142,10 @@ enum InitiatorState {
     ReadyToSync,
     /// SYNC queued; awaiting caller to flush.
     SyncPending,
-    /// SYNC sent, or the exchange failed; flow complete.
-    Done,
+    /// SYNC sent; the flow completed successfully.
+    Synced,
+    /// The exchange failed; flow complete.
+    Failed,
 }
 
 impl DcutrInitiator {
@@ -168,7 +169,6 @@ impl DcutrInitiator {
             frames,
             state: InitiatorState::Pending,
             outcome: None,
-            emitted_outcome: false,
         })
     }
 
@@ -195,7 +195,7 @@ impl DcutrInitiator {
         if result.is_err() {
             // Terminate without retaining attacker-controlled protocol input
             // or its backing allocation.
-            self.state = InitiatorState::Done;
+            self.state = InitiatorState::Failed;
             self.frames.take_buffered();
         }
         result
@@ -229,21 +229,18 @@ impl DcutrInitiator {
         if self.frames.has_outbound() {
             self.state = match self.state {
                 InitiatorState::Pending => InitiatorState::AwaitingConnectReply,
-                InitiatorState::SyncPending => InitiatorState::Done,
+                InitiatorState::SyncPending => InitiatorState::Synced,
                 other => other,
             };
             return Some(DcutrInitiatorOutput::Outbound(self.frames.take_outbound()));
         }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
+        if let Some(outcome) = self.outcome.take() {
             return Some(DcutrInitiatorOutput::Outcome(outcome));
         }
         None
     }
 
-    /// Returns the current outcome, if available.
+    /// Returns the outcome until [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn outcome(&self) -> Option<&InitiatorOutcome> {
         self.outcome.as_ref()
@@ -251,7 +248,7 @@ impl DcutrInitiator {
 
     /// Returns `true` if the flow has completed (SYNC was sent) or failed.
     pub fn is_done(&self) -> bool {
-        self.state == InitiatorState::Done
+        matches!(self.state, InitiatorState::Synced | InitiatorState::Failed)
     }
 
     /// Returns bytes received after the CONNECT reply in the same stream
@@ -266,8 +263,7 @@ impl DcutrInitiator {
     /// exchanges never expose buffered control-plane bytes as application
     /// data.
     pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
-        (self.state == InitiatorState::Done && self.outcome.is_some())
-            .then(|| self.frames.take_buffered())
+        (self.state == InitiatorState::Synced).then(|| self.frames.take_buffered())
     }
 
     fn try_decode_reply(&mut self, rtt_ms: u64) -> Result<(), DcutrError> {
@@ -291,7 +287,6 @@ impl DcutrInitiator {
             remote_addr_bytes: reply.obs_addrs,
             rtt_ms,
         });
-        self.emitted_outcome = false;
         Ok(())
     }
 }
