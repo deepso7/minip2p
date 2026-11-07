@@ -1035,6 +1035,59 @@ fn two_publishes_share_stream_and_failed_second_send_retries_in_order() {
     );
 }
 
+/// A failed send's stream can close only after its replacement is ready
+/// (delayed forwarding, or a reset that itself failed). That stale close must
+/// not touch the replacement's state.
+#[test]
+fn stale_close_of_a_failed_stream_keeps_the_ready_replacement_sending() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 0);
+    drain_events(&mut agent);
+
+    agent.publish("room", b"one".to_vec(), 1).unwrap();
+    let (_, token, stream_id) = sent(&drain_actions(&mut agent)).unwrap();
+    agent.send_result(&remote, stream_id, token, Err("broken".to_string()), 1);
+    drain_actions(&mut agent);
+    agent.handle_tick(1_000);
+    let retry = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(8),
+        MESHSUB_PROTOCOL_ID_V11,
+        1_000,
+    );
+
+    // The old stream's close arrives late, after stream 8 is ready.
+    assert!(agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: StreamId::new(4),
+        },
+        1_000,
+    ));
+    ack(&mut agent, &remote, &retry, 1_000);
+    drain_actions(&mut agent);
+    agent.publish("room", b"two".to_vec(), 1_001).unwrap();
+    let next = drain_actions(&mut agent);
+    let (frame, _, stream_id) = sent(&next).expect("replacement stream keeps sending");
+    assert_eq!(stream_id, StreamId::new(8));
+    assert_eq!(
+        decode_rpc(&frame).publish[0].data.as_deref(),
+        Some(&b"two"[..])
+    );
+}
+
 #[test]
 fn stream_reopen_resyncs_an_acked_unsubscribe() {
     let mut agent = agent();

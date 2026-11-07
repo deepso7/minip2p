@@ -86,25 +86,37 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 pub struct MdnsDriver<I: MdnsIo> {
     agent: MdnsAgent,
     /// `None` once shut down.
-    io: Option<I>,
+    running: Option<Running<I>>,
     /// When the interfaces are next re-read. `None` until the first tick
     /// arms it: construction just read them, and has no reading to date that
     /// by.
     next_interface_refresh_ms: Option<u64>,
     interface_refresh_ms: u64,
-    backlog: bool,
     /// An action the previous tick could not send -- its budget ran out, the
     /// carrier was full, or the send failed. Held rather than dropped so a
     /// burst is delayed instead of lost.
     pending_action: Option<MdnsAction>,
-    /// The hard failure mDNS is backing off from, if any.
-    failure: Option<Failure>,
     /// The last reading a caller gave, so a drop can date its goodbye.
     last_now: Now,
     /// Reused across ticks: one datagram's worth of buffer is too much to put
     /// on an embedded stack frame every time it is needed.
     buffer: Vec<u8>,
     events: VecDeque<MdnsEvent>,
+}
+
+/// A driver that has not been shut down: its carrier, and how the last turn
+/// went.
+struct Running<I> {
+    io: I,
+    health: Health,
+}
+
+/// How the last turn ended.
+enum Health {
+    /// It completed; `backlog` says whether its budget left work over.
+    Clear { backlog: bool },
+    /// It hit a hard failure, which the driver is backing off from.
+    BackingOff(Failure),
 }
 
 /// The failure state: what failed last, and when to try again.
@@ -119,12 +131,13 @@ impl<I: MdnsIo> MdnsDriver<I> {
         agent.set_interfaces(io.interfaces(), 0);
         Self {
             agent,
-            io: Some(io),
+            running: Some(Running {
+                io,
+                health: Health::Clear { backlog: false },
+            }),
             next_interface_refresh_ms: None,
             interface_refresh_ms: config.interface_refresh_ms,
-            backlog: false,
             pending_action: None,
-            failure: None,
             last_now: Now::from_millis(0),
             // One byte past the limit, so a datagram that fills it is
             // recognisably too big rather than silently truncated.
@@ -138,14 +151,9 @@ impl<I: MdnsIo> MdnsDriver<I> {
         &self.agent
     }
 
-    /// The agent this driver runs, mutably.
-    pub fn agent_mut(&mut self) -> &mut MdnsAgent {
-        &mut self.agent
-    }
-
     /// The carrier this driver runs on, or `None` once shut down.
     pub fn io(&self) -> Option<&I> {
-        self.io.as_ref()
+        self.running.as_ref().map(|running| &running.io)
     }
 
     /// The carrier this driver runs on, mutably.
@@ -154,7 +162,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// interface whose addresses arrive by DHCP, say -- reaches it here, since
     /// handing it over is what put it out of reach.
     pub fn io_mut(&mut self) -> Option<&mut I> {
-        self.io.as_mut()
+        self.running.as_mut().map(|running| &mut running.io)
     }
 
     /// Takes the next observation, if any.
@@ -167,7 +175,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// True while backing off from a failure; false once shut down, after
     /// which [`tick`](Self::tick) does nothing.
     pub fn is_active(&self) -> bool {
-        self.io.is_some()
+        self.running.is_some()
     }
 
     /// Does one turn: refresh, receive, tick the agent, send.
@@ -178,43 +186,42 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// returned; see [Failure](Self#failure).
     pub fn tick(&mut self, now: Now, local_addrs: &[Multiaddr]) {
         self.last_now = now;
-        if self
-            .failure
-            .as_ref()
-            .is_some_and(|failure| !failure.retry_at.is_expired_at(now))
-        {
-            return;
-        }
         // Out for the turn, so it can be held across the agent's borrows.
-        let Some(mut io) = self.io.take() else {
+        let Some(mut running) = self.running.take() else {
             return;
         };
-        let result = self.turn(&mut io, now.monotonic_ms, local_addrs);
-        self.io = Some(io);
+        if let Health::BackingOff(failure) = &running.health
+            && !failure.retry_at.is_expired_at(now)
+        {
+            self.running = Some(running);
+            return;
+        }
+        let result = self.turn(&mut running.io, now.monotonic_ms, local_addrs);
         self.drain_events();
-        match result {
-            Ok(backlog) => {
-                self.backlog = backlog;
-                if self.failure.take().is_some() {
+        running.health = match (result, running.health) {
+            (Ok(backlog), previous) => {
+                if matches!(previous, Health::BackingOff(_)) {
                     self.events.push_back(MdnsEvent::Recovered);
                 }
+                Health::Clear { backlog }
             }
-            Err(error) => {
-                let repeated = self
-                    .failure
-                    .as_ref()
-                    .is_some_and(|failure| same_failure(&failure.error, &error));
+            (Err(error), previous) => {
+                let repeated = matches!(
+                    &previous,
+                    Health::BackingOff(failure) if same_failure(&failure.error, &error)
+                );
                 if !repeated {
                     self.events.push_back(MdnsEvent::Failed {
                         error: error.clone(),
                     });
                 }
-                self.failure = Some(Failure {
+                Health::BackingOff(Failure {
                     error,
                     retry_at: now.deadline_after(MDNS_FAILURE_RETRY),
-                });
+                })
             }
-        }
+        };
+        self.running = Some(running);
     }
 
     /// The body of a tick, stopping at the first hard failure. Reports
@@ -304,14 +311,13 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// shut down, so a host can drop it from its timeline rather than wake for
     /// something that will do nothing.
     pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
-        let io = self.io.as_ref()?;
-        if let Some(failure) = &self.failure {
-            return Some(failure.retry_at);
-        }
-        if self.backlog {
+        let Running { io, health } = self.running.as_ref()?;
+        match health {
+            Health::BackingOff(failure) => return Some(failure.retry_at),
             // Work was left on the floor by this tick's budget, so the next
             // one is due regardless of what any timer says.
-            return Some(now.as_deadline());
+            Health::Clear { backlog: true } => return Some(now.as_deadline()),
+            Health::Clear { backlog: false } => {}
         }
         let refresh = self.next_interface_refresh_ms.map(Deadline::from_millis);
         // The carrier's own timers count too: a stack running in this process
@@ -338,11 +344,10 @@ impl<I: MdnsIo> MdnsDriver<I> {
         // Taking the io is what makes this idempotent, and it is the same
         // thing that makes a stopped driver inert: there is one way to be
         // finished here, not two that have to agree.
-        let Some(mut io) = self.io.take() else {
+        let Some(Running { mut io, .. }) = self.running.take() else {
             return Ok(());
         };
         self.pending_action = None;
-        self.failure = None;
         self.agent.shutdown(now_ms);
 
         let mut first_error = None;
@@ -724,7 +729,7 @@ mod tests {
 
         // The same bytes from the link do reach it, so the drop above was
         // about where it came from and not about what it said.
-        driver.io.as_mut().expect("still running").queue(1, CLAIM);
+        driver.io_mut().expect("still running").queue(1, CLAIM);
         driver.tick(Now::from_millis(1), &[]);
         assert!(
             matches!(
@@ -769,7 +774,7 @@ mod tests {
         let now = Now::from_millis(7_000);
         driver.tick(now, &[]);
         assert_eq!(
-            driver.io.as_ref().expect("still running").inbound.len(),
+            driver.io().expect("still running").inbound.len(),
             5,
             "a link that keeps talking must not hold the caller inside one tick"
         );
@@ -791,7 +796,7 @@ mod tests {
         let mut driver = driver(io);
 
         driver.tick(Now::from_millis(0), &[]);
-        assert_eq!(driver.io.as_ref().expect("still running").inbound.len(), 5);
+        assert_eq!(driver.io().expect("still running").inbound.len(), 5);
     }
 
     #[test]
@@ -846,7 +851,7 @@ mod tests {
         // The carrier drains between turns, and the parked datagram is the
         // first thing said on the next one -- so a burst is delayed, never
         // lost.
-        driver.io.as_mut().expect("still running").room = None;
+        driver.io_mut().expect("still running").room = None;
         driver.tick(Now::from_millis(1), &[]);
         assert_eq!(sent.borrow().get(1), Some(&parked));
         assert_eq!(sent.borrow().len(), 3, "and the rest follow it");
@@ -1132,7 +1137,7 @@ mod tests {
 
         let announced = sent.borrow().len();
         let refresh_at = MdnsConfig::default().interface_refresh_ms;
-        let io = driver.io.as_mut().expect("still running");
+        let io = driver.io_mut().expect("still running");
         io.refresh_changes = true;
         io.interfaces.clear();
         driver.tick(Now::from_millis(refresh_at), &[]);
@@ -1145,7 +1150,7 @@ mod tests {
             "work encoded against the old snapshot is dropped, not held"
         );
         assert_eq!(sent.borrow().len(), announced, "and not sent either");
-        assert_eq!(driver.io.as_ref().expect("still running").refreshes, 1);
+        assert_eq!(driver.io().expect("still running").refreshes, 1);
     }
 
     #[test]
@@ -1236,9 +1241,9 @@ mod tests {
         // straight away, and is owed one exactly when the interval is up.
         let refresh_at = 50_000 + refresh_ms;
         driver.tick(Now::from_millis(refresh_at - 1), &[]);
-        assert_eq!(driver.io.as_ref().expect("running").refreshes, 0);
+        assert_eq!(driver.io().expect("running").refreshes, 0);
         driver.tick(Now::from_millis(refresh_at), &[]);
-        assert_eq!(driver.io.as_ref().expect("running").refreshes, 1);
+        assert_eq!(driver.io().expect("running").refreshes, 1);
     }
 
     #[test]
