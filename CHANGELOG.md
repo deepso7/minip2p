@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### The AutoNAT server validates dial-back requests
+
+`AutoNatServer::new()` is now `AutoNatServer::new(remote_peer, observed_addr)`: pass the connection's authenticated peer and remote address (`Endpoint::connection_remote_addr`). As AutoNAT v1 requires, the server refuses a DIAL over a relayed connection (`E_DIAL_REFUSED`) or naming another peer (`E_BAD_REQUEST`), and `AutoNatRequest::addrs` holds only the candidates on the IP the requester was observed on; with none left it answers `E_DIAL_REFUSED`. It answers these itself without emitting a `Request`, and ignores any `respond_*` after its one response. `Default` for `AutoNatServer` is removed.
+
 ### TCP holds one encrypted frame above the socket (#477)
 
 `TcpConfig::default().max_buffered_send` is now 0, down from 1 MiB: a TCP connection holds one encrypted Yamux frame for its socket at a time, so streams share a slow link in Yamux's round-robin order and pings and window updates are not queued behind up to 1 MiB of earlier writes. The kernel's send buffer still keeps the link busy. To restore the deep queue, set `max_buffered_send: 1024 * 1024` (`limits.tcp.maxBufferedSend` in the bindings).

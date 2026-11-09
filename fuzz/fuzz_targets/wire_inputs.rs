@@ -601,7 +601,10 @@ fn fuzz_autonat(data: &[u8]) {
     let _ = minip2p_autonat::decode_frame(data);
     let (head, tail) = data.split_at(data.len() / 2);
 
-    let mut server = AutoNatServer::new();
+    let observed: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1"
+        .parse()
+        .expect("valid observed address");
+    let mut server = AutoNatServer::new(fuzz_peer_id(), &observed);
     for chunk in [head, tail] {
         let _ = server.on_data(chunk);
     }

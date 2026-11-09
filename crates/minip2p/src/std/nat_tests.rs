@@ -1334,12 +1334,17 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
             .expect("drive server")
         {
             Some(EndpointEvent::StreamReady {
+                peer_id,
                 conn_id,
                 stream_id,
                 protocol_id,
                 ..
             }) if protocol_id == AUTONAT_PROTOCOL_ID => {
-                machines.insert((conn_id, stream_id), AutoNatServer::new());
+                let observed = server
+                    .connection_remote_addr(conn_id)
+                    .expect("the stream's connection is open");
+                let machine = AutoNatServer::new(peer_id, observed);
+                machines.insert((conn_id, stream_id), machine);
             }
             Some(EndpointEvent::StreamData {
                 conn_id,
