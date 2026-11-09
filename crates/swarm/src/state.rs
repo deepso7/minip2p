@@ -87,14 +87,15 @@ pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 /// (QUIC waiting for the peer's stream credit) does not count. A stream the
 /// peer has not agreed to by then is reset and reported as a
 /// [`SwarmErrorKind::OpenStreamFailed`] error naming it, timed by the `now`
-/// samples the host passes in. It does not apply to a ping stream or to a
-/// connection's first Identify stream: their own deadlines
+/// samples the host passes in. It does not apply to our own ping stream or to
+/// a connection's first outbound Identify stream: their own deadlines
 /// ([`SwarmTimeouts::ping_ms`], [`SwarmTimeouts::identify_ms`]) cover their
 /// negotiation.
 ///
 /// An inbound stream's clock starts when it arrives
-/// ([`TransportEvent::IncomingStream`]). One the peer has not finished
-/// negotiating by then is reset and reported as a
+/// ([`TransportEvent::IncomingStream`]), whatever protocol the peer goes on to
+/// propose (ping and Identify included). If the peer has not finished
+/// negotiating by then, the stream is reset and reported as a
 /// [`SwarmErrorKind::Multistream`] error, so a peer cannot hold stream slots
 /// by opening streams it never negotiates.
 pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 30_000;
@@ -201,7 +202,6 @@ impl OwnedStream {
     }
 }
 
-/// Tracks a pending outbound stream that is still negotiating multistream-select.
 /// An inbound stream in multistream-select negotiation.
 struct PendingInbound {
     negotiator: MultistreamSelect,
@@ -210,6 +210,7 @@ struct PendingInbound {
     deadline_ms: u64,
 }
 
+/// Tracks a pending outbound stream that is still negotiating multistream-select.
 struct PendingOutbound {
     negotiator: MultistreamSelect,
     target: ProtocolKind,
