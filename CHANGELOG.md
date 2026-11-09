@@ -6,7 +6,7 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ### Portable shutdown returns a report
 
-`PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every failure, and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` with `shutdown(now).events` and check `errors`. In `@minip2p/web`, `endpointClosed` now carries those close events after a failed shutdown and real `unfinished` connections.
+`PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every failure, and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` with `shutdown(now).events` and check `errors`. In `@minip2p/web`, `endpointClosed` now carries those close events after a failed shutdown and real `unfinished` connections, and its `outcome` is `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports.
 
 ### TCP holds one encrypted frame above the socket (#477)
 

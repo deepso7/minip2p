@@ -291,13 +291,22 @@ fn close_carries_endpoint_closed_last_and_stops_commands() {
     assert!(a.drain_events(LIMIT).is_empty());
 }
 
-/// An in-memory transport whose closes and polls fail once `broken` is
-/// set, as a browser transport that has gone away.
-struct Breakable(InMemoryTransport, Rc<Cell<bool>>);
+/// How a [`Breakable`] transport behaves from now on.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Up,
+    /// Closes and polls fail, as a browser transport that has gone away.
+    Gone,
+    /// Closes are accepted but never complete, as a peer that never answers.
+    Deaf,
+}
+
+/// An in-memory transport switched between [`Mode`]s by the test.
+struct Breakable(InMemoryTransport, Rc<Cell<Mode>>);
 
 impl Breakable {
     fn gone(&self) -> Result<(), TransportError> {
-        if self.1.get() {
+        if self.1.get() == Mode::Gone {
             return Err(TransportError::PollError {
                 reason: "transport gone".into(),
             });
@@ -348,6 +357,9 @@ impl Transport for Breakable {
     }
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         self.gone()?;
+        if self.1.get() == Mode::Deaf {
+            return Ok(());
+        }
         self.0.close(id)
     }
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -362,14 +374,14 @@ impl Transport for Breakable {
     }
 }
 
-/// A shutdown whose transport fails still carries its events (the close
-/// failure), ends `Failed`, and names the connection it abandoned.
-#[test]
-fn a_failed_close_carries_its_events_and_unfinished_connections() {
-    let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
-    let conn_id = a.connection_id();
-    let broken = Rc::new(Cell::new(false));
-    let mut a = Host::new(vec![1; 32], config(), |_| Breakable(a, broken.clone())).expect("a");
+/// Host `a` over a [`Breakable`] transport, connected to `b` and settled,
+/// with the switch for its mode. `b`'s host is pumped alongside, then dropped.
+fn connected_breakable(
+    a: InMemoryTransport,
+    b: InMemoryTransport,
+) -> (Host<Breakable>, Rc<Cell<Mode>>) {
+    let mode = Rc::new(Cell::new(Mode::Up));
+    let mut a = Host::new(vec![1; 32], config(), |_| Breakable(a, mode.clone())).expect("a");
     let mut b = Host::new(vec![2; 32], config(), |_| b).expect("b");
     a.start().expect("start a");
     b.start().expect("start b");
@@ -379,8 +391,41 @@ fn a_failed_close_carries_its_events_and_unfinished_connections() {
         a.drain_events(LIMIT);
         b.drain_events(LIMIT);
     }
+    (a, mode)
+}
 
-    broken.set(true);
+/// A clean shutdown that leaves a connection still tracked ends
+/// `DeadlineExpired`, as std `close_within(Duration::ZERO)` does, so apps
+/// checking `outcome !== "Drained"` see the abandoned connection.
+#[test]
+fn a_close_that_abandons_a_connection_ends_deadline_expired() {
+    let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
+    let conn_id = a.connection_id();
+    let (mut a, mode) = connected_breakable(a, b);
+    mode.set(Mode::Deaf);
+    a.close(Now::from_millis(32));
+    let events = a.drain_events(LIMIT);
+    assert_eq!(
+        events.last(),
+        Some(&P2pEvent::EndpointClosed {
+            outcome: CloseOutcome::DeadlineExpired,
+            unfinished: vec![UnfinishedConnection {
+                conn_id: conn_id.as_u64(),
+                peer_id: Some(peer(2).to_base58()),
+            }],
+        }),
+        "{events:?}"
+    );
+}
+
+/// A shutdown whose transport fails still carries its events (the close
+/// failure), ends `Failed`, and names the connection it abandoned.
+#[test]
+fn a_failed_close_carries_its_events_and_unfinished_connections() {
+    let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
+    let conn_id = a.connection_id();
+    let (mut a, mode) = connected_breakable(a, b);
+    mode.set(Mode::Gone);
     a.close(Now::from_millis(32));
     let events = a.drain_events(LIMIT);
     assert!(

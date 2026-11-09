@@ -544,9 +544,11 @@ impl<T: Transport> Host<T> {
     }
 }
 
-/// The `EndpointClosed` a finished shutdown ends with: `Failed` after a
-/// host failure or any shutdown error, `Drained` otherwise (portable
-/// shutdown has no deadline to expire), with the connections it abandoned.
+/// The `EndpointClosed` a finished shutdown ends with, listing the
+/// connections it abandoned: `Failed` after a host failure or any shutdown
+/// error, else `DeadlineExpired` if any connection was still tracked (the one
+/// pass portable shutdown makes is a zero deadline, as with std
+/// `close_within(Duration::ZERO)`), else `Drained`.
 fn closed_event(
     failed: bool,
     errors: &[DriverError],
@@ -555,6 +557,8 @@ fn closed_event(
     P2pEvent::EndpointClosed {
         outcome: if failed || !errors.is_empty() {
             CloseOutcome::Failed
+        } else if !unfinished.is_empty() {
+            CloseOutcome::DeadlineExpired
         } else {
             CloseOutcome::Drained
         },
