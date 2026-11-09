@@ -63,7 +63,7 @@ A minimal libp2p implementation in Rust that connects applications over QUIC and
 
 minip2p is a minimal libp2p implementation in Rust. It connects applications over authenticated QUIC and TCP, negotiates custom protocol streams, and adds pubsub, discovery, relays, and NAT traversal only when you ask for them.
 
-There is no async runtime: the protocols are deterministic sans-I/O state machines that move only when you call `wait`. Sockets, clocks, and timers live in adapters, and `unsafe` is forbidden across the workspace.
+There is no async runtime: the protocols are deterministic sans-I/O state machines that move only when you call `wait`. Sockets, clocks, and timers live in adapters, and `unsafe` is forbidden across the workspace, apart from one scoped call that enables Apple's fast UDP datapath and napi-rs's generated code in the Node binding.
 
 The core builds as `no_std + alloc` for microcontrollers. Node.js, React Native, and the browser drive the same endpoint through bindings, with Promises and typed events.
 
