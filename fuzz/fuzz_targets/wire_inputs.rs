@@ -19,7 +19,7 @@ use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
 use minip2p_multistream_select::MultistreamSelect;
-use minip2p_ping::{PING_PAYLOAD_LEN, PingAction, PingConfig, PingOutput, PingProtocol};
+use minip2p_ping::{PING_PAYLOAD_LEN, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
@@ -731,16 +731,22 @@ fn fuzz_ping(data: &[u8]) {
     ping.register_inbound_stream(peer.clone(), inbound);
     let _ = ping.register_outbound_stream(peer.clone(), outbound);
     let _ = ping.send_ping(&peer, &SENT, 0);
-    // Every payload sent back on the inbound stream.
+    // Every payload sent back on the inbound stream, and whether the
+    // outbound ping measured an RTT.
     let mut echoes = Vec::new();
+    let mut measured = false;
     let mut drain = |ping: &mut PingProtocol| {
         while let Some(output) = ping.poll_output() {
-            if let PingOutput::Action(PingAction::Send {
-                stream_id, data, ..
-            }) = output
-                && stream_id == inbound
-            {
-                echoes.push(data);
+            match output {
+                PingOutput::Action(PingAction::Send {
+                    stream_id, data, ..
+                }) if stream_id == inbound => echoes.push(data),
+                PingOutput::Event(PingEvent::RttMeasured { stream_id, .. })
+                    if stream_id == outbound =>
+                {
+                    measured = true;
+                }
+                _ => {}
             }
         }
     };
@@ -759,6 +765,12 @@ fn fuzz_ping(data: &[u8]) {
     ping.on_stream_closed(&peer, outbound);
     drain(&mut ping);
 
+    // The outbound stream's reply is the input's first payload: an RTT is
+    // measured only if it echoes what we sent; a short or wrong reply never is.
+    assert!(
+        !measured || data.get(..PING_PAYLOAD_LEN) == Some(&SENT[..]),
+        "an RTT was measured for a reply that does not echo the ping"
+    );
     // The responder only ever echoes a complete payload the peer sent.
     for echo in echoes {
         assert!(data.windows(PING_PAYLOAD_LEN).any(|window| window == echo));
@@ -1008,7 +1020,8 @@ fn fuzz_webtransport_client(data: &[u8]) {
     let mut now = 0_u64;
     // Delivered, unacknowledged bytes per caller stream, from the events.
     let mut unacked: BTreeMap<StreamId, usize> = BTreeMap::new();
-    for _ in 0..MAX_OPS {
+    // One poll more than ops, so the last op's effects are polled and checked.
+    for step in 0..=MAX_OPS {
         let Ok(events) = client.poll(Now::from_millis(now)) else {
             break;
         };
@@ -1027,6 +1040,9 @@ fn fuzz_webtransport_client(data: &[u8]) {
             }
         }
 
+        if step == MAX_OPS {
+            break;
+        }
         let Some(op) = script.byte() else {
             break;
         };
