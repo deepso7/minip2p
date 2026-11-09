@@ -1094,6 +1094,7 @@ fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
 mod tests {
     use super::*;
     use crate::yamux::{FLAG_SYN, Frame};
+    use minip2p_multistream_select::DEFAULT_MAX_REJECTED_PROPOSALS;
 
     #[test]
     fn session_errors_map_to_close_reasons() {
@@ -1151,14 +1152,16 @@ mod tests {
             .handle_input(b"\x13/multistream/1.0.0\n".to_vec())
             .expect("header");
 
-        // Each refused proposal queues an `na` that nobody pulls.
-        let failed = (0..MAX_HANDSHAKE_BACKLOG)
+        // Each refused proposal queues an `na` that nobody pulls, until the
+        // listener's rejection budget fails the negotiation, long before the
+        // handshake backlog bound.
+        let failed = (0..=DEFAULT_MAX_REJECTED_PROPOSALS)
             .find_map(|_| responder.handle_input(b"\x0b/tls/1.0.0\n".to_vec()).err());
         assert!(
-            matches!(failed, Some(SessionError::Protocol(ref reason)) if reason.contains("backlog")),
-            "the session fails once the backlog passes its bound: {failed:?}"
+            matches!(failed, Some(SessionError::Protocol(ref reason)) if reason.contains("unsupported protocol proposals")),
+            "the session fails once the peer passes the rejection budget: {failed:?}"
         );
-        assert!(responder.writes.bytes <= MAX_HANDSHAKE_BACKLOG + 64);
+        assert!(responder.writes.bytes <= MAX_HANDSHAKE_BACKLOG);
     }
 
     /// Runs two raw Noise sessions through their handshake, returning both in
