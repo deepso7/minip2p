@@ -1391,7 +1391,12 @@ impl GossipsubAgent {
             } else {
                 supplied.min(self.config.max_backoff_ms)
             };
-            self.record_backoff(&topic, peer, backoff, now_ms);
+            // Honour backoff for joined topics, and extend a live entry (e.g.
+            // the one `unsubscribe` recorded) so a resubscribe still waits.
+            // Anything else would let a peer grow `backoff` one topic at a time.
+            if self.topics.contains(&topic) || self.is_backed_off(&topic, peer, now_ms) {
+                self.record_backoff(&topic, peer, backoff, now_ms);
+            }
         }
         for ihave in control.ihave {
             let Some(topic) = ihave.topic_id.as_deref() else {
@@ -2139,5 +2144,98 @@ mod tests {
         }
         assert!(frames > 1);
         assert_eq!(ids, 3_000);
+    }
+
+    /// An agent plus one v1.1 peer that announced `topics`.
+    fn agent_with_peer(topics: &[&str]) -> (GossipsubAgent, PeerId) {
+        let mut agent = GossipsubAgent::new(
+            Ed25519Keypair::from_secret_key_bytes([1; 32]),
+            GossipsubConfig::default(),
+            0,
+            0,
+        )
+        .expect("default config");
+        let peer = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
+        let state = PeerState {
+            advertised_version: Some(MeshsubVersion::V11),
+            remote_topics: topics.iter().map(|topic| String::from(*topic)).collect(),
+            ..PeerState::default()
+        };
+        agent.peers.insert(peer.clone(), state);
+        (agent, peer)
+    }
+
+    fn prune(topic: &str, backoff_secs: u64) -> ControlMessage {
+        ControlMessage {
+            prune: alloc::vec![ControlPrune {
+                topic_id: Some(String::from(topic)),
+                peers: Vec::new(),
+                backoff: Some(backoff_secs),
+            }],
+            ..ControlMessage::default()
+        }
+    }
+
+    fn graft(topic: &str) -> ControlMessage {
+        ControlMessage {
+            graft: alloc::vec![ControlGraft {
+                topic_id: Some(String::from(topic)),
+            }],
+            ..ControlMessage::default()
+        }
+    }
+
+    #[test]
+    fn prune_for_unjoined_topics_records_no_backoff() {
+        let (mut agent, peer) = agent_with_peer(&["future"]);
+        let topics: Vec<String> = (0..64).map(|index| format!("topic-{index}")).collect();
+        let control = ControlMessage {
+            prune: topics
+                .iter()
+                .chain(core::iter::once(&String::from("future")))
+                .map(|topic| ControlPrune {
+                    topic_id: Some(topic.clone()),
+                    peers: Vec::new(),
+                    backoff: Some(3_600),
+                })
+                .collect(),
+            ..ControlMessage::default()
+        };
+        agent.process_control(&peer, control, 1);
+        assert!(agent.backoff.is_empty());
+
+        agent.subscribe("future", 2).unwrap();
+        assert_eq!(agent.mesh_peers("future"), alloc::vec![peer]);
+    }
+
+    #[test]
+    fn prune_for_joined_topic_blocks_regraft_until_backoff_expires() {
+        let (mut agent, peer) = agent_with_peer(&["room"]);
+        agent.subscribe("room", 0).unwrap();
+        assert_eq!(agent.mesh_peers("room"), alloc::vec![peer.clone()]);
+
+        agent.process_control(&peer, prune("room", 120), 1);
+        assert!(agent.mesh_peers("room").is_empty());
+
+        agent.process_control(&peer, graft("room"), 120_000);
+        assert!(agent.mesh_peers("room").is_empty(), "GRAFT inside backoff");
+        // Refusing that GRAFT re-armed our own backoff for the peer.
+        agent.process_control(&peer, graft("room"), 180_001);
+        assert_eq!(agent.mesh_peers("room"), alloc::vec![peer]);
+    }
+
+    #[test]
+    fn prune_after_unsubscribe_extends_existing_backoff() {
+        let (mut agent, peer) = agent_with_peer(&["room"]);
+        agent.subscribe("room", 0).unwrap();
+        assert!(agent.unsubscribe("room", 1));
+        let local = agent.config.unsubscribe_backoff_ms;
+
+        agent.process_control(&peer, prune("room", 120), 2);
+        agent.subscribe("room", 1 + local + 1).unwrap();
+        assert!(
+            agent.mesh_peers("room").is_empty(),
+            "resubscribe must honour the longer remote backoff"
+        );
     }
 }
