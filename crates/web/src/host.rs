@@ -11,17 +11,17 @@
 //! and is tested natively.
 
 use minip2p::{
-    CircuitTransport, ConnectId, ConnectionId, Deadline, Ed25519Keypair, EndpointEvent,
-    GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
+    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
+    EndpointEvent, GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
     PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
 };
 use minip2p_ffi_core::{
     CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, EndpointConfig, EventCarry,
     FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent, PUMP_DRAIN_LIMIT, PathKind,
-    Reachability, RelayReservationInfo, convert_endpoint_event, convert_identify, convert_path,
-    convert_reachability, driver_failure_kind, keypair_from_bytes, map_driver_error,
-    map_gossipsub_error, map_write_error, parse_connect_target, parse_direct_peer_addr,
-    parse_peer_id, stream_writer, write_accepted_event,
+    Reachability, RelayReservationInfo, UnfinishedConnection, convert_endpoint_event,
+    convert_identify, convert_path, convert_reachability, driver_failure_kind, keypair_from_bytes,
+    map_driver_error, map_gossipsub_error, map_write_error, parse_connect_target,
+    parse_direct_peer_addr, parse_peer_id, stream_writer, write_accepted_event,
 };
 
 use crate::WebEntropy;
@@ -526,22 +526,45 @@ impl<T: Transport> Host<T> {
             Lifecycle::Created(live) | Lifecycle::Running(live) => Some(live.endpoint),
             Lifecycle::Stopped => None,
         };
-        let outcome_if_ok = if failure.is_some() {
+        let failed = failure.is_some();
+        let report = endpoint.map(|endpoint| endpoint.shutdown(now));
+        let mut events: Vec<P2pEvent> = failure.into_iter().collect();
+        let closed = match report {
+            Some(report) => {
+                events.extend(report.events.into_iter().filter_map(convert_endpoint_event));
+                closed_event(failed, &report.errors, report.unfinished)
+            }
+            None => P2pEvent::EndpointClosed {
+                outcome: CloseOutcome::Failed,
+                unfinished: Vec::new(),
+            },
+        };
+        events.push(closed);
+        self.ingest(events)
+    }
+}
+
+/// The `EndpointClosed` a finished shutdown ends with: `Failed` after a
+/// host failure or any shutdown error, `Drained` otherwise (portable
+/// shutdown has no deadline to expire), with the connections it abandoned.
+fn closed_event(
+    failed: bool,
+    errors: &[DriverError],
+    unfinished: Vec<(ConnectionId, Option<PeerId>)>,
+) -> P2pEvent {
+    P2pEvent::EndpointClosed {
+        outcome: if failed || !errors.is_empty() {
             CloseOutcome::Failed
         } else {
             CloseOutcome::Drained
-        };
-        let (drained, outcome) = match endpoint.map(|endpoint| endpoint.shutdown(now)) {
-            Some(Ok(events)) => (events, outcome_if_ok),
-            Some(Err(_)) | None => (Vec::new(), CloseOutcome::Failed),
-        };
-        let mut events: Vec<P2pEvent> = failure.into_iter().collect();
-        events.extend(drained.into_iter().filter_map(convert_endpoint_event));
-        events.push(P2pEvent::EndpointClosed {
-            outcome,
-            unfinished: Vec::new(),
-        });
-        self.ingest(events)
+        },
+        unfinished: unfinished
+            .into_iter()
+            .map(|(conn_id, peer)| UnfinishedConnection {
+                conn_id: conn_id.as_u64(),
+                peer_id: peer.as_ref().map(PeerId::to_base58),
+            })
+            .collect(),
     }
 }
 

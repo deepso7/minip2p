@@ -131,6 +131,29 @@ fn portable_platform(has_circuits: bool) -> Platform {
     }
 }
 
+/// What [`PortableEndpoint::shutdown`] collected from its one final drive:
+/// every event, every error, and what dropping the transport abandoned.
+///
+/// A failure the swarm reports as it happens (a transport refusing to close
+/// a connection, say) arrives as [`EndpointEvent::Error`] in `events`, as it
+/// would from [`PortableEndpoint::poll`].
+#[derive(Debug)]
+#[must_use = "a shutdown report carries the shutdown's events and errors"]
+#[non_exhaustive]
+pub struct ShutdownReport {
+    /// Events queued before the shutdown and those its final drive
+    /// produced, in order, also when that drive failed.
+    pub events: Vec<EndpointEvent>,
+    /// Every failure: each disconnect, then a failed final drive.
+    pub errors: Vec<DriverError>,
+    /// Connections still tracked after the final drive, pending dials
+    /// included, with their peer when known (an inbound handshake may not
+    /// have identified one yet). The endpoint drops them without waiting
+    /// for their teardown; empty means none remained, not that peers
+    /// acknowledged a close.
+    pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
+}
+
 /// Caller-driven endpoint over an injected transport and entropy source.
 ///
 /// It is `Send` whenever its transport and entropy source are, unless
@@ -504,39 +527,49 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     /// Sends mDNS goodbyes, closes established peers, drives the endpoint
-    /// once more, and consumes it.
+    /// once more, and consumes it: one final drive, then destruction.
     ///
-    /// Returns the final Endpoint events, including capability events still
-    /// queued (Gossipsub events still inside the agent too) and any a failed
-    /// [`Self::poll`] left. Consuming `self` is intentional: dropping the
-    /// transport releases listeners and in-progress connections as well as
-    /// established ones. Every established peer is attempted even if an
-    /// earlier step fails; the first error wins (a close, then the final
-    /// drive). mDNS goodbyes are best effort: one that could not be sent is
-    /// an [`EndpointEvent::MdnsFailed`] among the returned events, not an
-    /// error.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
+    /// The [`ShutdownReport`] carries the final Endpoint events, including
+    /// capability events still queued (Gossipsub events still inside the
+    /// agent too), any a failed [`Self::poll`] left, and those the swarm
+    /// queued even when the final drive fails. Consuming `self` is
+    /// intentional: dropping the transport releases listeners and
+    /// in-progress connections as well as established ones; the report's
+    /// `unfinished` lists those abandoned that way. Every established peer is
+    /// attempted even if an earlier step fails. mDNS goodbyes are best
+    /// effort: one that could not be sent is an
+    /// [`EndpointEvent::MdnsFailed`] among the events, not an error.
+    pub fn shutdown(mut self, now: Now) -> ShutdownReport {
         // The failure is queued as an event too.
         #[cfg(feature = "mdns")]
         drop(self.engine.shutdown_mdns(now));
-        let mut first_error = None;
+        let mut errors = Vec::new();
         for peer_id in self.engine.core.connected_peers() {
-            if let Err(error) = self.engine.core.disconnect(&peer_id, now.monotonic_ms)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = self.engine.core.disconnect(&peer_id, now.monotonic_ms) {
+                errors.push(error);
             }
         }
-        let drove = self.engine.drive(now, &mut Concrete);
-        #[cfg(feature = "pubsub")]
-        {
-            self.engine.collect_agent_events();
-            self.engine.settle(now);
+        if let Err(error) = self.engine.drive(now, &mut Concrete) {
+            errors.push(error);
         }
-        let events = self.engine.take_events();
-        match (first_error, drove) {
-            (Some(error), _) | (None, Err(error)) => Err(error),
-            (None, Ok(())) => Ok(events),
+        // Hand over what the swarm queued without polling again: a failed
+        // drive's leftovers (a disconnect's close failure, say), or what the
+        // final drive's own work produced.
+        for event in self.engine.core.take_buffered_events() {
+            self.engine.ingest(event, now);
+        }
+        #[cfg(feature = "pubsub")]
+        self.engine.collect_agent_events();
+        self.engine.settle(now);
+        ShutdownReport {
+            events: self.engine.take_events(),
+            errors,
+            unfinished: self
+                .engine
+                .core
+                .tracked_connections()
+                .map(|(conn_id, peer)| (conn_id, peer.cloned()))
+                .collect(),
         }
     }
 
@@ -1341,6 +1374,8 @@ mod tests {
         local_address: Multiaddr,
         next_stream_id: u64,
         closed: Rc<Cell<bool>>,
+        /// Fails every close and poll, as a transport that has gone away.
+        broken: bool,
     }
 
     impl Transport for RecordingTransport {
@@ -1388,6 +1423,11 @@ mod tests {
         }
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            if self.broken {
+                return Err(TransportError::PollError {
+                    reason: "transport gone".into(),
+                });
+            }
             self.closed.set(true);
             self.events.push(TransportEvent::Closed {
                 id,
@@ -1397,6 +1437,11 @@ mod tests {
         }
 
         fn poll(&mut self, _: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            if self.broken {
+                return Err(TransportError::PollError {
+                    reason: "transport gone".into(),
+                });
+            }
             Ok(core::mem::take(&mut self.events))
         }
 
@@ -1545,9 +1590,9 @@ mod tests {
             .mdns(BrokenMdns, MdnsConfig::default())
             .build(NoopTransport)
             .expect("mdns endpoint");
-        let events = endpoint
-            .shutdown(Now::from_millis(0))
-            .expect("goodbyes are best effort");
+        let report = endpoint.shutdown(Now::from_millis(0));
+        assert!(report.errors.is_empty(), "goodbyes are best effort");
+        let events = report.events;
         assert!(
             events
                 .iter()
@@ -1629,6 +1674,7 @@ mod tests {
             local_address: direct_addr.clone(),
             next_stream_id: 0,
             closed: Rc::new(Cell::new(false)),
+            broken: false,
         };
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .build(transport)
@@ -1704,6 +1750,7 @@ mod tests {
             local_address: direct_addr.clone(),
             next_stream_id: 0,
             closed: Rc::new(Cell::new(false)),
+            broken: false,
         };
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .build(transport)
@@ -1871,6 +1918,7 @@ mod tests {
             local_address: address.clone(),
             next_stream_id: 0,
             closed: closed.clone(),
+            broken: false,
         };
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .build(transport)
@@ -1888,18 +1936,63 @@ mod tests {
             }
         );
 
-        let events = endpoint
-            .shutdown(Now::from_millis(2))
-            .expect("shutdown succeeds");
+        let report = endpoint.shutdown(Now::from_millis(2));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.unfinished.is_empty(), "{:?}", report.unfinished);
         assert!(
             closed.get(),
             "the established transport connection was closed"
         );
-        assert!(events.iter().any(|event| matches!(
+        assert!(report.events.iter().any(|event| matches!(
             event,
             EndpointEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
                 if peer_id == &remote && closed_id == &conn_id
         )));
+    }
+
+    /// A failed final drive still hands over the events the shutdown
+    /// queued (here the close failure the swarm reported), reports the
+    /// error, and lists the connection the transport drop abandons.
+    #[test]
+    fn a_failed_shutdown_still_reports_its_events_errors_and_unfinished() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([13; 32]);
+        let remote = Ed25519Keypair::from_secret_key_bytes([14; 32]).peer_id();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+        let conn_id = ConnectionId::new(1);
+        let transport = RecordingTransport {
+            events: vec![TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote.clone()),
+            }],
+            local_address: address,
+            next_stream_id: 0,
+            closed: Rc::new(Cell::new(false)),
+            broken: false,
+        };
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(transport)
+            .expect("portable endpoint configuration is valid");
+        endpoint.poll(Now::from_millis(1)).expect("connected");
+        endpoint.engine.core.transport_mut().broken = true;
+
+        let report = endpoint.shutdown(Now::from_millis(2));
+        assert!(
+            matches!(
+                report.errors.as_slice(),
+                [DriverError::Transport(TransportError::PollError { .. })]
+            ),
+            "{:?}",
+            report.errors
+        );
+        assert!(
+            report.events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::Error(error) if error.conn_id == Some(conn_id)
+            )),
+            "the close failure was dropped: {:?}",
+            report.events
+        );
+        assert_eq!(report.unfinished, vec![(conn_id, Some(remote))]);
     }
 
     #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
@@ -1956,7 +2049,9 @@ mod tests {
             0,
         ));
 
-        let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
+        let report = endpoint.shutdown(Now::from_millis(0));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let events = report.events;
         assert!(
             events.iter().any(|event| matches!(
                 event,

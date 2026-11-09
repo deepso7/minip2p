@@ -87,7 +87,7 @@ let events = endpoint.poll(now)?;
 let deadline = endpoint.next_deadline(now);
 ```
 
-The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)` (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the returned events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
+The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)`, which runs one final drive and returns a `ShutdownReport` with its events, every error, and the connections still tracked when the transport is dropped (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the report's events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
 
 ### Capabilities
 
