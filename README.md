@@ -12,7 +12,7 @@ minip2p is built around a few deliberate constraints:
 - Core crates support `no_std + alloc`.
 - There is no `async`/`.await`; callers choose the executor and drive progress.
 - QUIC and TCP sit side by side. The dial address picks the transport. QUIC is `std`-only; TCP is portable down to `no_std`.
-- `unsafe` is forbidden across the workspace.
+- `unsafe` is forbidden across the workspace, with two scoped exceptions: one call in `minip2p-quic` enables Apple's fast UDP datapath (ADR 0019), and the Node binding allows napi-rs's generated registration code while denying `unsafe` in its own source.
 
 The result is a set of reusable protocol state machines and a synchronous `Endpoint` API for applications that want sensible defaults.
 
