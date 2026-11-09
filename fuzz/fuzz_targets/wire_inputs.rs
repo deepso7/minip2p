@@ -1,10 +1,13 @@
 #![no_main]
 
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::LazyLock;
+
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatServer};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::platform::{EntropyError, EntropySource, Now};
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
+use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr, PeerId, Protocol, TransportKind};
 use minip2p_dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
@@ -16,6 +19,7 @@ use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
 use minip2p_multistream_select::MultistreamSelect;
+use minip2p_ping::{PING_PAYLOAD_LEN, PingAction, PingConfig, PingOutput, PingProtocol};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
@@ -25,7 +29,7 @@ use minip2p_relay::{
     StopMessage, StopResponder,
 };
 use minip2p_secure_mux::noise::{
-    NoiseConfig, NoiseExtensions, NoiseHandshakePayload, NoiseRole, NoiseSession,
+    NoiseConfig, NoiseExtensions, NoiseHandshakePayload, NoiseOutput, NoiseRole, NoiseSession,
 };
 use minip2p_secure_mux::yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 use minip2p_secure_mux::{
@@ -34,6 +38,10 @@ use minip2p_secure_mux::{
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+};
+use minip2p_webtransport::{
+    IoError, IoEvent, SessionHandle, StreamHandle, WebTransportClient, WebTransportIo,
+    WebTransportLimits,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -52,6 +60,8 @@ fuzz_target!(|data: &[u8]| {
     fuzz_circuit(data);
     fuzz_relay_server_machines(data);
     fuzz_handshake_machines(data);
+    fuzz_ping(data);
+    fuzz_webtransport_client(data);
 
     // Peer TLS certificates are attacker-controlled X.509 DER.
     let _ = minip2p_tls::verify_libp2p_certificate(
@@ -700,4 +710,475 @@ fn fuzz_webtransport(data: &[u8]) {
     let mut capsules = CapsuleDecoder::new();
     let mut input = data;
     while let Ok(Some(_)) = capsules.decode(&mut input) {}
+}
+
+/// Drives the ping state machine in both roles: the input is the peer's
+/// bytes on an inbound stream (echoed back) and on an outbound stream with a
+/// ping in flight (checked against the payload sent), split at a
+/// data-derived point so the receive buffers see fragments, overflow and
+/// trailing bytes, then both streams are closed.
+fn fuzz_ping(data: &[u8]) {
+    const SENT: [u8; PING_PAYLOAD_LEN] = [7; PING_PAYLOAD_LEN];
+    let peer = fuzz_peer_id();
+    let inbound = StreamId::new(1);
+    let outbound = StreamId::new(2);
+    let split = data.first().map_or(0, |&b| usize::from(b)).min(data.len());
+    let (head, tail) = data.split_at(split);
+
+    let mut ping = PingProtocol::new(PingConfig {
+        request_timeout_ms: 10,
+    });
+    ping.register_inbound_stream(peer.clone(), inbound);
+    let _ = ping.register_outbound_stream(peer.clone(), outbound);
+    let _ = ping.send_ping(&peer, &SENT, 0);
+    // Every payload sent back on the inbound stream.
+    let mut echoes = Vec::new();
+    let mut drain = |ping: &mut PingProtocol| {
+        while let Some(output) = ping.poll_output() {
+            if let PingOutput::Action(PingAction::Send {
+                stream_id, data, ..
+            }) = output
+                && stream_id == inbound
+            {
+                echoes.push(data);
+            }
+        }
+    };
+
+    for chunk in [head, tail] {
+        ping.on_stream_data(&peer, inbound, chunk, 1);
+        ping.on_stream_data(&peer, outbound, chunk, 1);
+        drain(&mut ping);
+    }
+    // Idle again only if the echo matched; otherwise this is refused.
+    let _ = ping.close_outbound_stream_write(&peer);
+    ping.on_stream_data(&peer, StreamId::new(3), head, 2);
+    ping.on_stream_remote_write_closed(&peer, inbound);
+    ping.on_stream_remote_write_closed(&peer, outbound);
+    ping.on_tick(100);
+    ping.on_stream_closed(&peer, outbound);
+    drain(&mut ping);
+
+    // The responder only ever echoes a complete payload the peer sent.
+    for echo in echoes {
+        assert!(data.windows(PING_PAYLOAD_LEN).any(|window| window == echo));
+    }
+}
+
+/// Server-side state of one stream in [`FuzzWtIo`].
+#[derive(Default)]
+struct FuzzWtStream {
+    /// Accepted bytes not yet read by the harness.
+    written: Vec<u8>,
+    /// Accepted writes not yet completed, oldest first.
+    in_flight: VecDeque<usize>,
+    /// Granted and not yet delivered.
+    granted: usize,
+    /// Reset by us: writes are refused.
+    reset: bool,
+    /// The peer finished or reset its side: nothing more is delivered.
+    read_ended: bool,
+    /// The peer stopped our side: writes are refused and never complete.
+    write_stopped: bool,
+}
+
+/// A fake platform for [`fuzz_webtransport_client`]. It keeps the
+/// [`WebTransportIo`] contract (deliveries never exceed grants, completions
+/// match accepted writes, a small in-flight cap forces short writes), so
+/// anything the fuzzer finds is the client's fault, not the fake's.
+#[derive(Default)]
+struct FuzzWtIo {
+    next: u64,
+    streams: BTreeMap<u64, FuzzWtStream>,
+    events: VecDeque<IoEvent>,
+    /// Every write fails, as for a platform that lost its streams.
+    refuse_writes: bool,
+}
+
+impl FuzzWtIo {
+    const IN_FLIGHT_CAP: usize = 128;
+
+    fn handle(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    /// Queues up to `bytes.len()` bytes on `stream`, cut to its grant.
+    fn deliver(&mut self, stream: StreamHandle, bytes: &[u8]) {
+        let Some(state) = self.streams.get_mut(&stream.0) else {
+            return;
+        };
+        let len = if state.read_ended {
+            0
+        } else {
+            bytes.len().min(state.granted)
+        };
+        if len == 0 {
+            return;
+        }
+        state.granted -= len;
+        self.events.push_back(IoEvent::Data {
+            stream,
+            bytes: Bytes::copy_from_slice(&bytes[..len]),
+        });
+    }
+
+    /// The peer ends its side of `stream` with `event` (FIN or reset), once.
+    fn end_read(&mut self, stream: StreamHandle, event: IoEvent) {
+        if let Some(state) = self.streams.get_mut(&stream.0)
+            && !state.read_ended
+        {
+            state.read_ended = true;
+            state.granted = 0;
+            self.events.push_back(event);
+        }
+    }
+
+    /// The peer stops our side of `stream`, discarding its in-flight writes.
+    fn stop_write(&mut self, stream: StreamHandle, code: u8) {
+        if let Some(state) = self.streams.get_mut(&stream.0)
+            && !state.write_stopped
+        {
+            state.write_stopped = true;
+            state.in_flight.clear();
+            self.events.push_back(IoEvent::StopSending { stream, code });
+        }
+    }
+
+    /// Completes the oldest accepted write on `stream`, if any.
+    fn complete(&mut self, stream: StreamHandle) {
+        if let Some(bytes) = self
+            .streams
+            .get_mut(&stream.0)
+            .and_then(|state| state.in_flight.pop_front())
+        {
+            self.events
+                .push_back(IoEvent::WriteCompleted { stream, bytes });
+        }
+    }
+}
+
+impl WebTransportIo for FuzzWtIo {
+    fn connect(&mut self, _url: &str, _certhashes: &[Multihash]) -> Result<SessionHandle, IoError> {
+        Ok(SessionHandle(self.handle()))
+    }
+
+    fn open_stream(&mut self, _session: SessionHandle) -> Result<StreamHandle, IoError> {
+        let stream = StreamHandle(self.handle());
+        self.streams.insert(stream.0, FuzzWtStream::default());
+        self.events.push_back(IoEvent::StreamOpened { stream });
+        Ok(stream)
+    }
+
+    fn write(&mut self, stream: StreamHandle, data: &[u8]) -> Result<usize, IoError> {
+        let refuse = self.refuse_writes;
+        let state = self
+            .streams
+            .get_mut(&stream.0)
+            .filter(|state| !state.reset && !state.write_stopped && !refuse)
+            .ok_or_else(|| IoError("not writable".into()))?;
+        let in_flight: usize = state.in_flight.iter().sum();
+        let accepted = data.len().min(Self::IN_FLIGHT_CAP - in_flight);
+        if accepted > 0 {
+            state.written.extend_from_slice(&data[..accepted]);
+            state.in_flight.push_back(accepted);
+        }
+        Ok(accepted)
+    }
+
+    fn close_write(&mut self, _stream: StreamHandle) {}
+
+    fn reset(&mut self, stream: StreamHandle, _code: u8) {
+        if let Some(state) = self.streams.get_mut(&stream.0) {
+            state.reset = true;
+            state.in_flight.clear();
+            state.granted = 0;
+        }
+    }
+
+    fn stop(&mut self, _stream: StreamHandle, _code: u8) {}
+
+    fn grant_read(&mut self, stream: StreamHandle, bytes: usize) {
+        if let Some(state) = self.streams.get_mut(&stream.0) {
+            state.granted += bytes;
+        }
+    }
+
+    fn close(&mut self, _session: SessionHandle, _code: u32, _reason: &str) {}
+
+    fn poll_event(&mut self) -> Option<IoEvent> {
+        self.events.pop_front()
+    }
+}
+
+/// Reads fuzz bytes as a bounded script of choices.
+struct Script<'a>(&'a [u8]);
+
+impl<'a> Script<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let (&first, rest) = self.0.split_first()?;
+        self.0 = rest;
+        Some(first)
+    }
+
+    fn take(&mut self, len: usize) -> &'a [u8] {
+        let (head, tail) = self.0.split_at(len.min(self.0.len()));
+        self.0 = tail;
+        head
+    }
+}
+
+/// The fixed identities and dial address of [`fuzz_webtransport_client`],
+/// derived once: key setup dominates a run that never gets far.
+struct WtFixture {
+    client: minip2p_identity::Ed25519Keypair,
+    server: minip2p_identity::Ed25519Keypair,
+    addr: PeerAddr,
+    certhashes: Vec<Multihash>,
+}
+
+static WT_FIXTURE: LazyLock<WtFixture> = LazyLock::new(|| {
+    const HASH: &str = "uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
+    let server = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([9; 32]);
+    let addr: PeerAddr = format!(
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/{HASH}/p2p/{}",
+        server.peer_id()
+    )
+    .parse()
+    .expect("static fuzz address");
+    let certhashes = addr.transport().certhashes().copied().collect();
+    WtFixture {
+        client: minip2p_identity::Ed25519Keypair::from_secret_key_bytes([8; 32]),
+        server,
+        addr,
+        certhashes,
+    }
+});
+
+/// Dials a [`WebTransportClient`] over [`FuzzWtIo`] with a real Noise
+/// responder on the server side, then lets the input script the peer and
+/// the caller: honest handshake rounds (fragmented at data-derived points),
+/// injected Noise bytes, server streams, data, FIN, resets, stops, write
+/// completions, caller stream calls, time and the session's end. Pumps are
+/// the most common op, so short inputs get past the handshake and the
+/// connected-session paths run too.
+fn fuzz_webtransport_client(data: &[u8]) {
+    const MAX_OPS: usize = 64;
+    const WINDOW: usize = 256;
+
+    let mut script = Script(data);
+    let mode = script.byte().unwrap_or(0);
+    let fixture = &*WT_FIXTURE;
+    // Mostly the dialed hash; sometimes no extensions or a hash-free list,
+    // which the client must reject.
+    let mut offered = match mode % 4 {
+        0 => None,
+        1 => Some(Vec::new()),
+        _ => Some(fixture.certhashes.clone()),
+    };
+    // Built on the first honest round, so inputs that never pump skip its
+    // key setup.
+    let mut responder: Option<NoiseSession> = None;
+    let mut responder_ok = true;
+
+    let mut client = WebTransportClient::with_limits(
+        FuzzWtIo::default(),
+        fixture.client.clone(),
+        FixedEntropy,
+        WebTransportLimits {
+            max_connections: 2,
+            max_streams_per_connection: 3,
+            max_pending_bytes_per_stream: 100,
+            max_pending_connection_bytes: 200,
+            control_stream_reserve_bytes: 50,
+            stream_receive_window: WINDOW,
+            handshake_timeout_ms: 5_000,
+        },
+    )
+    .expect("valid fuzz limits");
+    let Ok(id) = client.dial(&fixture.addr) else {
+        return;
+    };
+    let session = SessionHandle(client.io_mut().next);
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::SessionReady { session });
+
+    let mut now = 0_u64;
+    // Delivered, unacknowledged bytes per caller stream, from the events.
+    let mut unacked: BTreeMap<StreamId, usize> = BTreeMap::new();
+    for _ in 0..MAX_OPS {
+        let Ok(events) = client.poll(Now::from_millis(now)) else {
+            break;
+        };
+        for event in events {
+            match event {
+                TransportEvent::StreamData {
+                    stream_id, data, ..
+                } => {
+                    let held = unacked.entry(stream_id).or_default();
+                    *held += data.len();
+                    // Grants never let the platform deliver past the window.
+                    assert!(*held <= WINDOW, "{held} unacknowledged bytes");
+                }
+                TransportEvent::Closed { .. } => unacked.clear(),
+                _ => {}
+            }
+        }
+
+        let Some(op) = script.byte() else {
+            break;
+        };
+        let arg = script.byte().unwrap_or(0);
+        let io = client.io_mut();
+        // The Noise stream is the first one the client opens.
+        let noise = StreamHandle(session.0 + 1);
+        let handles: Vec<u64> = io.streams.keys().copied().collect();
+        let chosen = handles
+            .get(usize::from(arg) % handles.len().max(1))
+            .map(|&h| StreamHandle(h));
+        match op % 20 {
+            // An honest handshake round: complete the client's writes, feed
+            // them to the responder and deliver its reply in two fragments.
+            0..=5 => {
+                while io
+                    .streams
+                    .get(&noise.0)
+                    .is_some_and(|s| !s.in_flight.is_empty())
+                {
+                    io.complete(noise);
+                }
+                let written = io
+                    .streams
+                    .get_mut(&noise.0)
+                    .map(|s| core::mem::take(&mut s.written))
+                    .unwrap_or_default();
+                let mut reply = Vec::new();
+                if responder_ok && !written.is_empty() {
+                    let server = responder.get_or_insert_with(|| {
+                        let mut server = NoiseSession::new(NoiseConfig {
+                            role: NoiseRole::Responder,
+                            identity: fixture.server.clone(),
+                            static_secret: [21; 32],
+                            ephemeral_secret: [22; 32],
+                            expected_peer: None,
+                            local_extensions: offered.take().map(|webtransport_certhashes| {
+                                NoiseExtensions {
+                                    webtransport_certhashes,
+                                    stream_muxers: Vec::new(),
+                                }
+                            }),
+                        });
+                        responder_ok = server.start().is_ok();
+                        server
+                    });
+                    responder_ok = responder_ok && server.on_data(written).is_ok();
+                    while let Some(output) = server.poll_output() {
+                        if let NoiseOutput::Outbound(frame) = output {
+                            reply.extend_from_slice(&frame);
+                        }
+                    }
+                }
+                let (head, tail) = reply.split_at(usize::from(arg).min(reply.len()));
+                io.deliver(noise, head);
+                io.deliver(noise, tail);
+            }
+            6 => {
+                let bytes = script.take(usize::from(arg % 64));
+                io.deliver(noise, bytes);
+            }
+            7 => {
+                let stream = StreamHandle(io.handle());
+                io.streams.insert(stream.0, FuzzWtStream::default());
+                io.events
+                    .push_back(IoEvent::IncomingStream { session, stream });
+            }
+            8 => {
+                if let Some(stream) = chosen {
+                    let bytes = script.take(usize::from(arg % 128));
+                    io.deliver(stream, bytes);
+                }
+            }
+            9 => {
+                if let Some(stream) = chosen {
+                    io.end_read(stream, IoEvent::Fin { stream });
+                }
+            }
+            10 => {
+                if let Some(stream) = chosen {
+                    io.end_read(stream, IoEvent::Reset { stream, code: arg });
+                }
+            }
+            11 => {
+                if let Some(stream) = chosen {
+                    io.stop_write(stream, arg);
+                }
+            }
+            12 => {
+                if let Some(stream) = chosen {
+                    io.complete(stream);
+                }
+            }
+            13 => {
+                let _ = client.open_stream(id);
+            }
+            14 => {
+                if let Some(stream) = chosen {
+                    let payload = Bytes::from(vec![arg; usize::from(arg)]);
+                    let _ = client.send_stream(id, StreamId::new(stream.0), payload);
+                }
+            }
+            15 => {
+                if let Some(stream) = chosen {
+                    let _ = client.close_stream_write(id, StreamId::new(stream.0));
+                }
+            }
+            16 => {
+                if let Some(stream) = chosen {
+                    let stream_id = StreamId::new(stream.0);
+                    if client.reset_stream(id, stream_id).is_ok() {
+                        unacked.remove(&stream_id);
+                    }
+                }
+            }
+            17 => {
+                if let Some(stream) = chosen {
+                    let stream_id = StreamId::new(stream.0);
+                    let bytes = usize::from(arg);
+                    if client.ack_stream(id, stream_id, bytes).is_ok()
+                        && let Some(held) = unacked.get_mut(&stream_id)
+                    {
+                        *held = held.saturating_sub(bytes);
+                    }
+                }
+            }
+            // Past the reset grace with small steps, the handshake timeout
+            // with large ones.
+            18 => now = now.saturating_add(u64::from(arg) * 32),
+            _ => match arg % 6 {
+                0 => io.events.push_back(IoEvent::SessionClosed {
+                    session,
+                    code: u32::from(arg),
+                    reason: String::new(),
+                }),
+                1 => io.events.push_back(IoEvent::SessionFailed {
+                    session,
+                    reason: String::new(),
+                }),
+                2 => io.refuse_writes = !io.refuse_writes,
+                3 => {
+                    if let Some(stream) = chosen {
+                        client.set_control_stream(id, StreamId::new(stream.0), true);
+                    }
+                }
+                4 => {
+                    let _ = client.close(id);
+                }
+                _ => {
+                    let _ = client.next_deadline();
+                }
+            },
+        }
+    }
 }
