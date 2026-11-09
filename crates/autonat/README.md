@@ -27,7 +27,9 @@ Each machine takes inputs through methods named for what they do (`on_data`, `on
 use minip2p_autonat::{AutoNatClient, AutoNatClientOutput, AutoNatServer, AutoNatServerOutput};
 
 let mut client = AutoNatClient::new(&our_peer_id, &candidate_addrs);
-let mut server = AutoNatServer::new();
+// One server per inbound stream, told who the connection authenticated and
+// where it observed them (e.g. `Endpoint::connection_remote_addr`).
+let mut server = AutoNatServer::new(remote_peer_id, &observed_remote_addr);
 
 while let Some(AutoNatClientOutput::Outbound(bytes)) = client.poll_output() {
     send_to_server(bytes);
@@ -37,13 +39,25 @@ server.on_data(&bytes_from_client)?;
 while let Some(output) = server.poll_output() {
     match output {
         AutoNatServerOutput::Request(request) => {
-            // Runtime dials request.addrs for request.peer_id, then responds:
+            // Already validated: request.peer_id is the requester, and
+            // request.addrs are only its addresses on the observed IP.
+            // Runtime dials them back, then responds:
             server.respond_public(&request.addrs);
         }
         AutoNatServerOutput::Outbound(bytes) => send_to_client(bytes),
     }
 }
 ```
+
+## Server validation
+
+AutoNAT v1 makes the server refuse to dial anywhere but the requester, or it becomes a traffic reflector. `AutoNatServer::new(remote_peer, observed_addr)` takes the connection's authenticated peer and remote address, and checks every DIAL before the runtime sees it. The server answers these itself and emits no `Request`:
+
+- `E_DIAL_REFUSED` if the connection is relayed (`/p2p-circuit`) or its address carries no IP.
+- `E_BAD_REQUEST` if the DIAL names a peer other than the authenticated one.
+- `E_DIAL_REFUSED` if no candidate address remains once those off the observed IP, relayed ones, DNS names, and any whose `/p2p` names another peer are dropped.
+
+Otherwise `Request` carries only the remaining addresses. Each server sends at most one response; later `respond_*` calls are ignored. Rate limiting stays the runtime's policy.
 
 ## Client outcomes
 
