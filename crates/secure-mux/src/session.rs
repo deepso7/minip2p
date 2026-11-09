@@ -1137,8 +1137,7 @@ mod tests {
         assert_eq!(writes, b"\x03na\n\x07/noise\n");
     }
 
-    #[test]
-    fn a_peer_that_never_reads_upgrade_replies_cannot_grow_the_backlog() {
+    fn started_responder() -> SecureMuxSession {
         let mut responder = SecureMuxSession::new(SessionConfig {
             role: SessionRole::Responder,
             identity: Ed25519Keypair::generate(),
@@ -1149,19 +1148,37 @@ mod tests {
         });
         responder.start().expect("start responder");
         responder
+    }
+
+    #[test]
+    fn a_peer_that_keeps_proposing_upgrades_we_refuse_is_cut_off() {
+        let mut responder = started_responder();
+        responder
             .handle_input(b"\x13/multistream/1.0.0\n".to_vec())
             .expect("header");
 
         // Each refused proposal queues an `na` that nobody pulls, until the
-        // listener's rejection budget fails the negotiation, long before the
-        // handshake backlog bound.
-        let failed = (0..=DEFAULT_MAX_REJECTED_PROPOSALS)
-            .find_map(|_| responder.handle_input(b"\x0b/tls/1.0.0\n".to_vec()).err());
+        // listener's rejection budget fails the negotiation.
+        for _ in 0..DEFAULT_MAX_REJECTED_PROPOSALS {
+            responder
+                .handle_input(b"\x0b/tls/1.0.0\n".to_vec())
+                .expect("refused within the budget");
+        }
+        let failed = responder.handle_input(b"\x0b/tls/1.0.0\n".to_vec());
         assert!(
-            matches!(failed, Some(SessionError::Protocol(ref reason)) if reason.contains("unsupported protocol proposals")),
-            "the session fails once the peer passes the rejection budget: {failed:?}"
+            matches!(failed, Err(SessionError::Protocol(ref reason)) if reason.contains("unsupported protocol proposals")),
+            "the proposal past the budget fails the session: {failed:?}"
         );
-        assert!(responder.writes.bytes <= MAX_HANDSHAKE_BACKLOG);
+    }
+
+    #[test]
+    fn the_handshake_backlog_is_bounded() {
+        let mut responder = started_responder();
+        let failed = responder.write(vec![0; MAX_HANDSHAKE_BACKLOG + 1]);
+        assert!(
+            matches!(failed, Err(SessionError::Protocol(ref reason)) if reason.contains("backlog")),
+            "a write past the bound fails the session: {failed:?}"
+        );
     }
 
     /// Runs two raw Noise sessions through their handshake, returning both in
