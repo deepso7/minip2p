@@ -1,6 +1,6 @@
 # Plan: move the Bench workflow from Fargate to an on-demand EC2 runner
 
-> **Status:** Accepted (revision 8, dedicated-instance design); implemented on branch `bench-ec2-runner`. Replaces the AWS Fargate execution described in [infra/bench/README.md](../../infra/bench/README.md). Everything else in the benchmark contract stays: the tiers, `results.json`, release-only baselines on `bench-data`, informational PR comments, the `aws-bench` approval gate, the same-repository PR guard, and the trusted-scripts / untrusted-build-context split.
+> **Status:** Accepted (revision 8, dedicated-instance design); implemented (historical plan; see [ADR 0025](../adr/0025-benchmarks-on-an-on-demand-ec2-runner.md)). Replaces the AWS Fargate execution described in [infra/bench/README.md](../../infra/bench/README.md). Everything else in the benchmark contract stays: the tiers, `results.json`, release-only baselines on `bench-data`, informational PR comments, the `aws-bench` approval gate for manual runs, the same-repository PR guard, and the trusted-scripts / untrusted-build-context split.
 
 ## Why
 

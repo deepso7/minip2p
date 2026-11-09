@@ -1,6 +1,6 @@
 # Plan: CA-signed WebTransport certificates
 
-> **Status:** Implemented on branch feat/webtransport-ca-certs. Review history: draft reviewed with gpt-6.1-sol (high). Round 1: 9 findings (1 high). Round 2: "ready with changes" (3 findings, 2 of them round-1 fixes judged insufficient). Every finding was checked against the code and fixed. The round-2 fixes were not re-reviewed.
+> **Status:** Implemented (historical plan; see [ADR 0024](../adr/0024-ca-signed-webtransport-certificates.md)). Review history: draft reviewed with gpt-6.1-sol (high). Round 1: 9 findings (1 high). Round 2: "ready with changes" (3 findings, 2 of them round-1 fixes judged insufficient). Every finding was checked against the code and fixed. The round-2 fixes were not re-reviewed.
 
 ## Goal
 

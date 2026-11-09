@@ -1,6 +1,6 @@
 # Plan: run `minip2p-quic` on quinn-proto
 
-> **Status:** Proposed. Approved after three review rounds with gpt-6.1-sol (high): round 1 rejected it pending changes, round 2 approved with changes, round 3 approved. Research and measurements: [quinn-proto migration research](../research/quinn-proto-migration.md). Spike: [`docs/research/quinn-proto-spike/`](../research/quinn-proto-spike/).
+> **Status:** Implemented (historical plan; see [ADR 0014](../adr/0014-quic-engine-quinn-proto.md)). Approved after three review rounds with gpt-6.1-sol (high): round 1 rejected it pending changes, round 2 approved with changes, round 3 approved. Research and measurements: [quinn-proto migration research](../research/quinn-proto-migration.md). Spike: [`docs/research/quinn-proto-spike/`](../research/quinn-proto-spike/).
 
 ## Goal
 

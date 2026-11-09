@@ -8,6 +8,14 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 `PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every disconnect and final-drive `DriverError` (mDNS goodbye failures stay `EndpointEvent::MdnsFailed` in `events`), and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` by binding the report (`let report = endpoint.shutdown(now);`), checking `report.errors` and `report.unfinished`, then using `report.events`. In `@minip2p/web`, a close now delivers those events even after a failed shutdown, followed by `endpointClosed` carrying the real `unfinished` connections; its `outcome` is `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports.
 
+### The AutoNAT server validates dial-back requests
+
+`AutoNatServer::new()` is now `AutoNatServer::new(remote_peer, observed_addr)`: pass the connection's authenticated peer and remote address (`Endpoint::connection_remote_addr`). As AutoNAT v1 requires, the server refuses a DIAL over a relayed connection or one whose observed address has no IP (`E_DIAL_REFUSED`), or naming another peer (`E_BAD_REQUEST`), and `AutoNatRequest::addrs` holds only the candidates on the IP the requester was observed on, dropping relayed candidates and those naming another peer; with none left it answers `E_DIAL_REFUSED`. It answers these itself without emitting a `Request`, and ignores any `respond_*` after its one response. `Default` for `AutoNatServer` is removed.
+
+### Inbound negotiations have the negotiation deadline
+
+An inbound stream the peer has not finished negotiating within `SwarmTimeouts::negotiation_ms` (30 s by default) of its arrival is now reset and reported as a `SwarmEvent::Error` of kind `Multistream` naming the stream, the same report as a broken inbound negotiation. It used to wait as long as its connection lived, so a peer could hold stream slots by opening streams it never negotiated. A host whose peers take longer than that to propose a protocol should raise `negotiation_ms` (`negotiationMs` in the bindings).
+
 ### Gossipsub ignores PRUNE backoff for topics it never joined
 
 A received PRUNE records its backoff only for a topic we subscribe to, or to extend a live backoff for that peer and topic (such as the one `unsubscribe` records). A peer can no longer make us keep one backoff entry per topic name it invents, each for up to `max_backoff_ms`. A PRUNE for a topic we have not joined no longer delays a later `subscribe` from grafting that peer.
