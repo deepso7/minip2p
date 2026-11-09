@@ -15,7 +15,7 @@ Supplements ADR 0012. ADR 0012 bounds received data per transport by connection 
 
 ## The `unsafe` exception for Apple's fast datapath
 
-The workspace forbids `unsafe`. One call is exempt: quinn-udp's `unsafe fn set_apple_fast_path`, made once per socket on every Apple target, iOS included, which switches quinn-udp to the private `sendmsg_x`/`recvmsg_x` (#359). It beat the regular path by 31% on the macOS bench. quinn-udp resolves both symbols through `dlsym` and falls back to `sendmsg`/`recvmsg` when either is missing, which is the guard the call relies on. `minip2p-quic` lowers `unsafe_code` from `forbid` to `deny` and scopes the call with one `#[expect(unsafe_code)]`; its `SAFETY` comment carries the justification, and `AGENTS.md` is unchanged. Apps distributed through the App Store accept the private-API review risk.
+The workspace forbids `unsafe`. One call is exempt: quinn-udp's `unsafe fn set_apple_fast_path`, made once per socket on every Apple target, iOS included, which switches quinn-udp to the private `sendmsg_x`/`recvmsg_x` (#359). It beat the regular path by 31% on the macOS bench. quinn-udp resolves both symbols through `dlsym` and falls back to `sendmsg`/`recvmsg` when either is missing, which is the guard the call relies on. `minip2p-quic` lowers `unsafe_code` from `forbid` to `deny` and scopes the call with one `#[expect(unsafe_code)]`; its `SAFETY` comment carries the justification, and `AGENTS.md` names this exception. Apps distributed through the App Store accept the private-API review risk.
 
 ## Rejected alternatives
 

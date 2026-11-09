@@ -1,5 +1,7 @@
 # PyO3 for the Python bindings
 
+Status: accepted; implementation pending. `crates/python` and the Python SDK do not exist yet.
+
 The Python SDK needs a native binding over `minip2p-ffi-core`, whose doorbell rings from a Rust thread and whose `wait_stopped` blocks until that thread exits. We chose a hand-written **PyO3** binding shell (`crates/python`, `minip2p-python`, `publish = false`, `pyo3` pinned exactly), packaged by maturin as `abi3-py311` wheels, over reusing `crates/ffi`'s UniFFI Python output and over BoltFFI. Full comparison: [docs/research/python-binding-mechanisms.md](../research/python-binding-mechanisms.md).
 
 ## Considered Options

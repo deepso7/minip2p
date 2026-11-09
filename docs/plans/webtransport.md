@@ -1,6 +1,6 @@
 # Plan: libp2p WebTransport (native server + browser SDK)
 
-> **Status:** Proposed, after three rounds of review with gpt-6.1-sol (high):
+> **Status:** Implemented (historical plan; see [ADR 0023](../adr/0023-libp2p-webtransport-server-in-quic-browser-io-behind-a-seam.md)), after three rounds of review with gpt-6.1-sol (high):
 >
 > - round 1: 12 findings, 7 of them high;
 > - round 2: 7 findings, 1 high, plus 6 round-1 fixes judged insufficient;

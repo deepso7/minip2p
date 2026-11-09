@@ -1,6 +1,6 @@
 # Circuit Relay v2 Relay Server for minip2p
 
-> **Status:** Canonical implementation-ready specification, validated by the [Circuit Relay v2 relay-server Wayfinder map](https://github.com/deepso7/minip2p/issues/61).
+> **Status:** Implemented as [`crates/relay-server`](../../crates/relay-server/README.md) (historical plan; admission limits later revised by [ADR 0018](../adr/0018-relay-admission-and-autonat-trust.md)). The specification was validated by the [Circuit Relay v2 relay-server Wayfinder map](https://github.com/deepso7/minip2p/issues/61).
 >
 > **Reference pins:** rust-libp2p `libp2p-relay` 0.22 at [`170c3c81ddd80e7c58b0500563e00a09139e8545`](https://github.com/libp2p/rust-libp2p/tree/170c3c81ddd80e7c58b0500563e00a09139e8545/protocols/relay) and Circuit Relay v2 at [`6b6203ee6f62938ce67efdb33498173f475851c0`](https://github.com/libp2p/specs/blob/6b6203ee6f62938ce67efdb33498173f475851c0/relay/circuit-v2.md).
 
