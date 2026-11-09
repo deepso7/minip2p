@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### A listener rejects at most 16 proposals per stream
+
+A multistream-select listener now answers at most `DEFAULT_MAX_REJECTED_PROPOSALS` (16) unsupported proposals on one stream with `na`; the 17th fails the negotiation with the new `MultistreamError::TooManyRejectedProposals`. Version fallback (a few proposals) is unaffected. Use `MultistreamSelect::listener_with_max_rejected` for another limit, and add an arm if you match `MultistreamError` exhaustively.
+
 ### TCP holds one encrypted frame above the socket (#477)
 
 `TcpConfig::default().max_buffered_send` is now 0, down from 1 MiB: a TCP connection holds one encrypted Yamux frame for its socket at a time, so streams share a slow link in Yamux's round-robin order and pings and window updates are not queued behind up to 1 MiB of earlier writes. The kernel's send buffer still keeps the link busy. To restore the deep queue, set `max_buffered_send: 1024 * 1024` (`limits.tcp.maxBufferedSend` in the bindings).
