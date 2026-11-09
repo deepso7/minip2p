@@ -1318,11 +1318,14 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
 
     // The server vouches for every address it is asked about, five times.
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
-    let mut answered = 0;
+    let mut vouched = 0;
     let mut machines = std::collections::BTreeMap::new();
     let mut client_events = Vec::new();
-    while answered < 5 {
-        assert!(Instant::now() < deadline, "only {answered} probes answered");
+    while vouched < 5 {
+        assert!(
+            Instant::now() < deadline,
+            "only {vouched} probes vouched for"
+        );
         if let Some(event) = client
             .next_event(std::time::Duration::from_millis(5))
             .expect("drive client")
@@ -1360,12 +1363,12 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
                     match output {
                         AutoNatServerOutput::Request(request) => {
                             machine.respond_public(&request.addrs);
+                            vouched += 1;
                         }
                         AutoNatServerOutput::Outbound(bytes) => {
                             server
                                 .send_stream(conn_id, stream_id, bytes)
                                 .expect("send response");
-                            answered += 1;
                         }
                     }
                 }

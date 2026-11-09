@@ -6,7 +6,7 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ### The AutoNAT server validates dial-back requests
 
-`AutoNatServer::new()` is now `AutoNatServer::new(remote_peer, observed_addr)`: pass the connection's authenticated peer and remote address (`Endpoint::connection_remote_addr`). As AutoNAT v1 requires, the server refuses a DIAL over a relayed connection (`E_DIAL_REFUSED`) or naming another peer (`E_BAD_REQUEST`), and `AutoNatRequest::addrs` holds only the candidates on the IP the requester was observed on; with none left it answers `E_DIAL_REFUSED`. It answers these itself without emitting a `Request`, and ignores any `respond_*` after its one response. `Default` for `AutoNatServer` is removed.
+`AutoNatServer::new()` is now `AutoNatServer::new(remote_peer, observed_addr)`: pass the connection's authenticated peer and remote address (`Endpoint::connection_remote_addr`). As AutoNAT v1 requires, the server refuses a DIAL over a relayed connection or one whose observed address has no IP (`E_DIAL_REFUSED`), or naming another peer (`E_BAD_REQUEST`), and `AutoNatRequest::addrs` holds only the candidates on the IP the requester was observed on, dropping relayed candidates and those naming another peer; with none left it answers `E_DIAL_REFUSED`. It answers these itself without emitting a `Request`, and ignores any `respond_*` after its one response. `Default` for `AutoNatServer` is removed.
 
 ### TCP holds one encrypted frame above the socket (#477)
 
