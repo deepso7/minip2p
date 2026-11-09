@@ -1174,7 +1174,7 @@ mod tests {
     #[test]
     fn the_handshake_backlog_is_bounded() {
         let mut responder = started_responder();
-        let failed = responder.write(vec![0; MAX_HANDSHAKE_BACKLOG + 1]);
+        let failed = responder.write(alloc::vec![0; MAX_HANDSHAKE_BACKLOG + 1]);
         assert!(
             matches!(failed, Err(SessionError::Protocol(ref reason)) if reason.contains("backlog")),
             "a write past the bound fails the session: {failed:?}"
