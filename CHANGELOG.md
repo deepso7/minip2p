@@ -8,6 +8,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 `PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every failure, and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` with `shutdown(now).events` and check `errors`. In `@minip2p/web`, `endpointClosed` now carries those close events after a failed shutdown and real `unfinished` connections, and its `outcome` is `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports.
 
+### Gossipsub ignores PRUNE backoff for topics it never joined
+
+A received PRUNE records its backoff only for a topic we subscribe to, or to extend a live backoff for that peer and topic (such as the one `unsubscribe` records). A peer can no longer make us keep one backoff entry per topic name it invents, each for up to `max_backoff_ms`. A PRUNE for a topic we have not joined no longer delays a later `subscribe` from grafting that peer.
+
 ### TCP holds one encrypted frame above the socket (#477)
 
 `TcpConfig::default().max_buffered_send` is now 0, down from 1 MiB: a TCP connection holds one encrypted Yamux frame for its socket at a time, so streams share a slow link in Yamux's round-robin order and pings and window updates are not queued behind up to 1 MiB of earlier writes. The kernel's send buffer still keeps the link busy. To restore the deep queue, set `max_buffered_send: 1024 * 1024` (`limits.tcp.maxBufferedSend` in the bindings).
