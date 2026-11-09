@@ -175,7 +175,8 @@ pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
 /// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
 /// wire bytes of the given response — public with `addrs`, or a dial error.
 pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
-    autonat_answer(request_bytes, |server| match public_addrs {
+    let vouched = public_addrs.unwrap_or_default();
+    autonat_answer(request_bytes, vouched, |server| match public_addrs {
         Some(addrs) => server.respond_public(addrs),
         None => server.respond_error(ResponseStatus::DialError, "dial-back failed"),
     })
@@ -184,24 +185,36 @@ pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>
 /// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
 /// wire bytes of an error response with `status`.
 pub fn autonat_error_response(request_bytes: &[u8], status: ResponseStatus) -> Vec<u8> {
-    autonat_answer(request_bytes, |server| {
+    autonat_answer(request_bytes, &[], |server| {
         server.respond_error(status, "refused")
     })
 }
 
+/// The scripted server observes the local peer on [`LISTEN_ADDR`] or on one
+/// of the `vouched` addresses, whichever the request offers first, so the
+/// request passes the server's dial-back validation.
 #[expect(
     clippy::panic,
     reason = "the shared test helper must fail at the unexpected AutoNAT response"
 )]
-fn autonat_answer(request_bytes: &[u8], respond: impl FnOnce(&mut AutoNatServer)) -> Vec<u8> {
-    let mut server = AutoNatServer::new();
-    server
-        .on_data(request_bytes)
-        .expect("well-formed AutoNAT request");
-    assert!(matches!(
-        server.poll_output(),
-        Some(AutoNatServerOutput::Request(_))
-    ));
+fn autonat_answer(
+    request_bytes: &[u8],
+    vouched: &[Multiaddr],
+    respond: impl FnOnce(&mut AutoNatServer),
+) -> Vec<u8> {
+    let observed = std::iter::once(maddr(LISTEN_ADDR)).chain(vouched.iter().cloned());
+    let mut server = observed
+        .map(|observed| {
+            let mut server = AutoNatServer::new(peer(b"local-peer"), &observed);
+            server
+                .on_data(request_bytes)
+                .expect("well-formed AutoNAT request");
+            server
+        })
+        .find_map(|mut server| {
+            matches!(server.poll_output(), Some(AutoNatServerOutput::Request(_))).then_some(server)
+        })
+        .expect("the request offers an address on an IP the server observes us on");
     respond(&mut server);
     match server.poll_output() {
         Some(AutoNatServerOutput::Outbound(bytes)) => bytes,

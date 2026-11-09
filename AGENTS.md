@@ -10,7 +10,7 @@ minip2p is a minimal libp2p implementation in Rust: small, portable, understanda
 - No `async`/`.await`; remain caller-driven and executor-independent.
 - QUIC and TCP side by side: QUIC is `std`-only; TCP is portable down to `no_std`.
 
-Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, and timers live only in adapters/drivers; pre-1.0, breaking API changes are fine.
+Additional constraints: `unsafe` is forbidden workspace-wide, except one scoped call in `minip2p-quic` (ADR 0019) and napi-rs's generated code in `crates/nodejs`, whose own source still denies it; sockets, clocks, and timers live only in adapters/drivers; pre-1.0, breaking API changes are fine.
 
 ## Commands
 

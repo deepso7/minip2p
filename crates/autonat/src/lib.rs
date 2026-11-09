@@ -16,6 +16,7 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[cfg(test)]
 use minip2p_core::write_uvarint;
@@ -111,14 +112,18 @@ pub enum Reachability {
     },
 }
 
-/// Dial-back request emitted by the server state machine.
+/// Validated dial-back request emitted by the server state machine.
+///
+/// The server only emits a request it has checked against the connection it
+/// arrived on (see [`AutoNatServer::new`]), so every address here is safe to
+/// dial back.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoNatRequest {
-    /// Peer the service should dial back.
+    /// Peer the service should dial back: always the authenticated requester.
     pub peer_id: PeerId,
-    /// Parsed candidate addresses.
+    /// Candidate addresses on the requester's observed IP, in request order.
     pub addrs: Vec<Multiaddr>,
-    /// Raw candidate address bytes from the request.
+    /// Raw bytes of `addrs`, as they arrived in the request.
     pub raw_addrs: Vec<Vec<u8>>,
 }
 
@@ -230,8 +235,12 @@ pub struct AutoNatClient {
     outcome: Option<Reachability>,
 }
 
-/// Server-side AutoNAT request handler.
+/// Server-side AutoNAT request handler for one inbound stream.
 pub struct AutoNatServer {
+    /// The authenticated peer on the other end of the connection.
+    remote_peer: PeerId,
+    /// The IP the requester was observed on, or why dial-backs are refused.
+    observed_ip: Result<IpAddr, &'static str>,
     frames: FrameExchange,
     request: Option<AutoNatRequest>,
     state: ServerState,
@@ -386,9 +395,31 @@ impl AutoNatClient {
 }
 
 impl AutoNatServer {
-    /// Creates a server state machine awaiting one DIAL request.
-    pub fn new() -> Self {
+    /// Creates a server state machine awaiting one DIAL request from
+    /// `remote_peer`, the authenticated peer of the connection the stream
+    /// belongs to, observed at `observed_addr` (the connection's remote
+    /// address).
+    ///
+    /// The DIAL is validated as AutoNAT v1 requires before any of it reaches
+    /// the caller, so a requester cannot point the dial-back at a third
+    /// party. The server answers these itself, and emits no
+    /// [`AutoNatServerOutput::Request`]:
+    ///
+    /// - `E_DIAL_REFUSED` if `observed_addr` is relayed (`/p2p-circuit`) or
+    ///   carries no IP.
+    /// - `E_BAD_REQUEST` if the DIAL names a peer other than `remote_peer`.
+    /// - `E_DIAL_REFUSED` if no candidate address remains after dropping
+    ///   those not on the observed IP, relayed ones, and any whose `/p2p`
+    ///   names another peer.
+    pub fn new(remote_peer: PeerId, observed_addr: &Multiaddr) -> Self {
+        let observed_ip = if is_relayed(observed_addr) {
+            Err("refusing a dial-back requested over a relayed connection")
+        } else {
+            ip_of(observed_addr).ok_or("the requester's observed address has no IP")
+        };
         Self {
+            remote_peer,
+            observed_ip,
             frames: FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING),
             request: None,
             state: ServerState::AwaitingRequest,
@@ -412,6 +443,9 @@ impl AutoNatServer {
     }
 
     /// Queues a successful DIAL_RESPONSE with dialable addresses.
+    ///
+    /// Each server sends at most one response: once it has answered (or
+    /// refused a request itself), further responses are ignored.
     pub fn respond_public(&mut self, addrs: &[Multiaddr]) {
         self.respond(ResponseStatus::Ok, None, addrs);
     }
@@ -435,6 +469,9 @@ impl AutoNatServer {
         mut status_text: Option<String>,
         addrs: &[Multiaddr],
     ) {
+        if self.state == ServerState::Done {
+            return;
+        }
         if let Some(text) = &mut status_text {
             text.truncate(text.floor_char_boundary(MAX_STATUS_TEXT));
         }
@@ -468,14 +505,53 @@ impl AutoNatServer {
         let peer = dial.peer.ok_or(AutoNatError::MissingField("dial.peer"))?;
         let peer_id =
             PeerId::from_bytes(&peer.id).map_err(|e| AutoNatError::InvalidPeerId(e.to_string()))?;
-        let addrs = decode_addrs(&peer.addrs);
+
+        let observed_ip = match self.observed_ip {
+            Ok(ip) => ip,
+            Err(reason) => {
+                self.respond_error(ResponseStatus::DialRefused, reason);
+                return Ok(());
+            }
+        };
+        if peer_id != self.remote_peer {
+            self.respond_error(
+                ResponseStatus::BadRequest,
+                "the DIAL must name the requesting peer",
+            );
+            return Ok(());
+        }
+        let (addrs, raw_addrs): (Vec<_>, Vec<_>) = peer
+            .addrs
+            .into_iter()
+            .filter_map(|raw| Some((Multiaddr::from_bytes(&raw).ok()?, raw)))
+            .filter(|(addr, _)| self.may_dial(addr, observed_ip))
+            .unzip();
+        if addrs.is_empty() {
+            self.respond_error(
+                ResponseStatus::DialRefused,
+                "no candidate address is on the requester's observed IP",
+            );
+            return Ok(());
+        }
         self.request = Some(AutoNatRequest {
             peer_id,
             addrs,
-            raw_addrs: peer.addrs,
+            raw_addrs,
         });
         self.state = ServerState::RequestReady;
         Ok(())
+    }
+
+    /// Whether a candidate address is safe to dial back: it starts with the
+    /// observed IP, is not relayed, and any `/p2p` it carries names the
+    /// requester.
+    fn may_dial(&self, addr: &Multiaddr, observed_ip: IpAddr) -> bool {
+        ip_of(addr) == Some(observed_ip)
+            && !is_relayed(addr)
+            && addr.protocols().iter().all(|p| match p {
+                Protocol::P2p(id) => *id == self.remote_peer,
+                _ => true,
+            })
     }
 }
 
@@ -513,10 +589,18 @@ impl AutoNatServer {
     }
 }
 
-impl Default for AutoNatServer {
-    fn default() -> Self {
-        Self::new()
+/// The IP an address starts with, if it starts with one.
+fn ip_of(addr: &Multiaddr) -> Option<IpAddr> {
+    match addr.protocols().first()? {
+        Protocol::Ip4(octets) => Some(Ipv4Addr::from(*octets).into()),
+        Protocol::Ip6(octets) => Some(Ipv6Addr::from(*octets).into()),
+        _ => None,
     }
+}
+
+/// Whether an address goes through a relay.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.protocols().contains(&Protocol::P2pCircuit)
 }
 
 pub use minip2p_core::{FrameDecode, encode_frame};
@@ -716,6 +800,132 @@ mod tests {
 
     const PEER_ID: &str = "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N";
 
+    /// Where [`server`] observes the requester.
+    const OBSERVED: &str = "/ip4/203.0.113.7/udp/4001/quic-v1";
+
+    /// A server for a requester authenticated as [`PEER_ID`], observed at
+    /// [`OBSERVED`].
+    fn server() -> AutoNatServer {
+        server_at(OBSERVED)
+    }
+
+    fn server_at(observed: &str) -> AutoNatServer {
+        AutoNatServer::new(
+            PeerId::from_str(PEER_ID).unwrap(),
+            &Multiaddr::from_str(observed).unwrap(),
+        )
+    }
+
+    fn addrs(addrs: &[&str]) -> Vec<Multiaddr> {
+        addrs
+            .iter()
+            .map(|a| Multiaddr::from_str(a).unwrap())
+            .collect()
+    }
+
+    /// Feeds `server` a DIAL from `peer_id` offering `offered`, and returns
+    /// what it emits.
+    fn dial(
+        mut server: AutoNatServer,
+        peer_id: &PeerId,
+        offered: &[Multiaddr],
+    ) -> Vec<AutoNatServerOutput> {
+        let mut client = AutoNatClient::new(peer_id, offered);
+        server.on_data(&client.take_outbound()).unwrap();
+        core::iter::from_fn(|| server.poll_output()).collect()
+    }
+
+    /// The status a server answered with on its own, decoded by a client.
+    fn refusal(outputs: Vec<AutoNatServerOutput>) -> ResponseStatus {
+        let [AutoNatServerOutput::Outbound(bytes)] = &outputs[..] else {
+            panic!("expected only a response, got {outputs:?}");
+        };
+        let mut client = AutoNatClient::new(&PeerId::from_str(PEER_ID).unwrap(), &[]);
+        client.on_data(bytes).unwrap();
+        match client.outcome() {
+            Some(Reachability::Unknown { status, .. }) => *status,
+            other => panic!("expected an inconclusive outcome, got {other:?}"),
+        }
+    }
+
+    /// Only candidates on the observed IP reach the caller: other IPs,
+    /// DNS names, relayed addresses and a `/p2p` naming another peer are
+    /// dropped (AutoNAT v1: never dial a third party).
+    #[test]
+    fn only_addresses_on_the_observed_ip_are_requested() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let offered = addrs(&[
+            "/ip4/198.51.100.1/udp/4001/quic-v1",
+            "/ip4/203.0.113.7/tcp/4001",
+            "/dns4/example.com/tcp/4001",
+            "/ip4/203.0.113.7/udp/4001/quic-v1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC/p2p-circuit",
+            "/ip4/203.0.113.7/udp/4001/quic-v1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC",
+            &alloc::format!("/ip4/203.0.113.7/udp/4002/quic-v1/p2p/{PEER_ID}"),
+            "/ip6/::1/udp/4001/quic-v1",
+        ]);
+        let outputs = dial(server(), &peer_id, &offered);
+        let [AutoNatServerOutput::Request(request)] = &outputs[..] else {
+            panic!("expected only a request, got {outputs:?}");
+        };
+        let expected = vec![offered[1].clone(), offered[5].clone()];
+        assert_eq!(request.peer_id, peer_id);
+        assert_eq!(
+            request.raw_addrs,
+            expected.iter().map(Multiaddr::to_bytes).collect::<Vec<_>>()
+        );
+        assert_eq!(request.addrs, expected);
+    }
+
+    #[test]
+    fn a_request_with_no_address_on_the_observed_ip_is_refused() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let offered = addrs(&[
+            "/ip4/198.51.100.1/udp/4001/quic-v1",
+            "/dns4/example.com/tcp/1",
+        ]);
+        assert_eq!(
+            refusal(dial(server(), &peer_id, &offered)),
+            ResponseStatus::DialRefused
+        );
+    }
+
+    #[test]
+    fn a_request_over_a_relayed_connection_is_refused() {
+        let relayed = "/ip4/198.51.100.1/udp/4001/quic-v1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC/p2p-circuit";
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        // Even an address on the relay's own IP is not dialed.
+        let offered = addrs(&["/ip4/198.51.100.1/udp/4001/quic-v1"]);
+        assert_eq!(
+            refusal(dial(server_at(relayed), &peer_id, &offered)),
+            ResponseStatus::DialRefused
+        );
+    }
+
+    #[test]
+    fn a_request_naming_another_peer_is_a_bad_request() {
+        let other = PeerId::from_str("QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC").unwrap();
+        assert_eq!(
+            refusal(dial(server(), &other, &addrs(&[OBSERVED]))),
+            ResponseStatus::BadRequest
+        );
+    }
+
+    /// The caller cannot add a second response after the server refused.
+    #[test]
+    fn a_refused_request_takes_no_further_response() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut server = server();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        server.on_data(&client.take_outbound()).unwrap();
+        let first = server.take_outbound();
+        server.respond_public(&addrs(&[OBSERVED]));
+        assert!(server.take_outbound().is_empty());
+        assert_eq!(
+            refusal(vec![AutoNatServerOutput::Outbound(first)]),
+            ResponseStatus::DialRefused
+        );
+    }
+
     /// A DIAL_RESPONSE whose encoded payload is exactly `len` bytes, padded
     /// through the status text.
     fn response_payload(len: usize) -> Vec<u8> {
@@ -835,7 +1045,7 @@ mod tests {
             })
             .collect();
         let mut client = AutoNatClient::new(&peer_id, &addrs);
-        let mut server = AutoNatServer::new();
+        let mut server = server();
 
         server
             .on_data(&client.take_outbound())
@@ -884,7 +1094,7 @@ mod tests {
             })
             .collect();
 
-        let mut server = AutoNatServer::new();
+        let mut server = server();
         server.respond_public(&addrs);
         let mut client = AutoNatClient::new(&peer_id, &addrs);
         client
@@ -896,7 +1106,7 @@ mod tests {
         assert!(!kept.is_empty() && kept.len() < addrs.len());
         assert_eq!(kept[..], addrs[..kept.len()], "a prefix, in order");
 
-        let mut server = AutoNatServer::new();
+        let mut server = self::server();
         server.respond_error(ResponseStatus::DialError, "é".repeat(MAX_MESSAGE_SIZE));
         let mut client = AutoNatClient::new(&peer_id, &[]);
         client
@@ -913,7 +1123,7 @@ mod tests {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
         let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
-        let mut server = AutoNatServer::new();
+        let mut server = server();
 
         server.on_data(&client.take_outbound()).unwrap();
         let request = server.request().expect("request should decode");
@@ -937,7 +1147,7 @@ mod tests {
             .map(|addr| Multiaddr::from_str(addr).unwrap())
             .collect();
         let mut client = AutoNatClient::new(&peer_id, &requested);
-        let mut server = AutoNatServer::new();
+        let mut server = server();
         server.on_data(&client.take_outbound()).unwrap();
         server.respond_public(returned);
         client.on_data(&server.take_outbound()).unwrap();
@@ -982,8 +1192,8 @@ mod tests {
     #[test]
     fn a_refused_dial_is_inconclusive() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]);
-        let mut server = AutoNatServer::new();
+        let mut client = AutoNatClient::new(&peer_id, &addrs(&[OBSERVED]));
+        let mut server = server();
         server.on_data(&client.take_outbound()).unwrap();
         server.respond_error(ResponseStatus::DialRefused, "rate limited");
         client.on_data(&server.take_outbound()).unwrap();
@@ -999,8 +1209,8 @@ mod tests {
     #[test]
     fn client_maps_dial_error_to_private() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]);
-        let mut server = AutoNatServer::new();
+        let mut client = AutoNatClient::new(&peer_id, &addrs(&[OBSERVED]));
+        let mut server = server();
 
         server.on_data(&client.take_outbound()).unwrap();
         server.respond_error(ResponseStatus::DialError, "all dialbacks failed");
@@ -1021,7 +1231,7 @@ mod tests {
 
         let mut chunk = Vec::new();
         for reason in ["first", "second"] {
-            let mut server = AutoNatServer::new();
+            let mut server = server();
             server.respond_error(ResponseStatus::DialError, reason);
             chunk.extend(server.take_outbound());
         }
@@ -1047,7 +1257,7 @@ mod tests {
             Err(AutoNatError::InvalidMessageType { value: 99 })
         ));
 
-        let mut server = AutoNatServer::new();
+        let mut server = server();
         server.respond_error(ResponseStatus::DialError, "after bad frame");
         client.on_data(&server.take_outbound()).unwrap();
 
@@ -1058,7 +1268,7 @@ mod tests {
 
     #[test]
     fn server_consumes_bad_frame_before_decode_error() {
-        let mut server = AutoNatServer::new();
+        let mut server = server();
 
         let bad_frame = encode_frame(&[TAG_TYPE, 99]);
         assert!(matches!(
@@ -1201,7 +1411,7 @@ mod tests {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
         let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
-        let mut server = AutoNatServer::new();
+        let mut server = server();
 
         let Some(AutoNatClientOutput::Outbound(request_bytes)) = client.poll_output() else {
             panic!("client should emit request bytes");

@@ -79,18 +79,25 @@ pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCO
 /// should use the same window.
 pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 
-/// Default for [`SwarmTimeouts::negotiation_ms`]: how long an outbound
-/// stream may spend in multistream-select negotiation.
+/// Default for [`SwarmTimeouts::negotiation_ms`]: how long an outbound or
+/// inbound stream may spend in multistream-select negotiation.
 ///
 /// The clock starts when the transport reports the stream opened
 /// ([`TransportEvent::StreamOpened`]), so time a transport holds the open
 /// (QUIC waiting for the peer's stream credit) does not count. A stream the
 /// peer has not agreed to by then is reset and reported as a
 /// [`SwarmErrorKind::OpenStreamFailed`] error naming it, timed by the `now`
-/// samples the host passes in. It does not apply to a ping stream or to a
-/// connection's first Identify stream: their own deadlines
+/// samples the host passes in. It does not apply to our own ping stream or to
+/// a connection's first outbound Identify stream: their own deadlines
 /// ([`SwarmTimeouts::ping_ms`], [`SwarmTimeouts::identify_ms`]) cover their
 /// negotiation.
+///
+/// An inbound stream's clock starts when it arrives
+/// ([`TransportEvent::IncomingStream`]), whatever protocol the peer goes on to
+/// propose (ping and Identify included). If the peer has not finished
+/// negotiating by then, the stream is reset and reported as a
+/// [`SwarmErrorKind::Multistream`] error, so a peer cannot hold stream slots
+/// by opening streams it never negotiates.
 pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Default for [`SwarmTimeouts::identify_ms`]: how long a connection's first
@@ -107,7 +114,8 @@ pub const IDENTIFY_TIMEOUT_MS: u64 = 30_000;
 ///
 /// `identify_ms` and `ping_ms` each bound their whole exchange, its
 /// negotiation included, so `negotiation_ms` does not cut them short; it
-/// bounds the negotiation of every other outbound stream. On a slow or
+/// bounds the negotiation of every other outbound stream, and of every
+/// inbound stream. On a slow or
 /// loaded link, size them from how long each exchange actually takes there,
 /// plus slack for a retransmission. The `minip2p-rs` README's deadline table
 /// lists the Endpoint and transport deadlines beside these and how they
@@ -115,8 +123,8 @@ pub const IDENTIFY_TIMEOUT_MS: u64 = 30_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SwarmTimeouts {
     /// How long an outbound stream may negotiate its protocol, from the
-    /// transport's `StreamOpened`; not ping or first-Identify streams.
-    /// Default [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (30 s).
+    /// transport's `StreamOpened` (not ping or first-Identify streams), and
+    /// an inbound stream, from its `IncomingStream`. Default [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (30 s).
     pub negotiation_ms: u64,
     /// How long a connection's first Identify may take (open, negotiation,
     /// reply), from the connection establishing. Default
@@ -192,6 +200,14 @@ impl OwnedStream {
         };
         key(first, ConnectionId::new(0))..=key(last, ConnectionId::new(u64::MAX))
     }
+}
+
+/// An inbound stream in multistream-select negotiation.
+struct PendingInbound {
+    negotiator: MultistreamSelect,
+    /// When the negotiation is given up and the stream reset: the stream's
+    /// arrival plus [`SwarmTimeouts::negotiation_ms`].
+    deadline_ms: u64,
 }
 
 /// Tracks a pending outbound stream that is still negotiating multistream-select.
@@ -431,7 +447,7 @@ pub(crate) struct SwarmState {
 
     // --- Stream tracking ---
     /// Inbound streams being negotiated (server-side multistream-select).
-    inbound_negotiators: BTreeMap<(ConnectionId, StreamId), MultistreamSelect>,
+    inbound_negotiators: BTreeMap<(ConnectionId, StreamId), PendingInbound>,
     /// Outbound streams being negotiated (client-side multistream-select).
     outbound_negotiators: BTreeMap<(ConnectionId, StreamId), PendingOutbound>,
     /// Streams that completed negotiation: maps to the owning protocol.
@@ -884,7 +900,7 @@ impl SwarmState {
     /// when no timer is armed.
     ///
     /// The internal timers are ping attempt deadlines, first-Identify
-    /// deadlines, and outbound negotiation deadlines. All are stored as
+    /// deadlines, and inbound and outbound negotiation deadlines. All are stored as
     /// absolute due times, so `now` is unused; an overdue
     /// timer reports its past due time, which tells the host to run
     /// [`Self::handle_tick`] now.
@@ -892,7 +908,8 @@ impl SwarmState {
         let negotiations = self
             .outbound_negotiators
             .values()
-            .filter_map(|pending| pending.deadline_ms);
+            .filter_map(|pending| pending.deadline_ms)
+            .chain(self.inbound_negotiators.values().map(|p| p.deadline_ms));
         self.pings
             .values()
             .map(|attempt| attempt.deadline_ms)
@@ -1533,7 +1550,7 @@ impl SwarmState {
                     .insert(id, endpoint.transport().clone());
             }
             TransportEvent::IncomingStream { id, stream_id } => {
-                self.handle_incoming_stream(id, stream_id);
+                self.handle_incoming_stream(id, stream_id, now_ms);
             }
             TransportEvent::StreamOpened { id, stream_id } => {
                 // Outbound stream ids come back synchronously from
@@ -1610,6 +1627,7 @@ impl SwarmState {
             self.fail_ping(&peer_id, PingFailure::TimedOut);
         }
         self.expire_outbound_negotiations(now_ms);
+        self.expire_inbound_negotiations(now_ms);
         let expired: Vec<ConnectionId> = self
             .first_identify
             .iter()
@@ -1648,6 +1666,35 @@ impl SwarmState {
                     ),
                 );
             }
+            if self.reset_pending.insert((conn_id, stream_id)) {
+                self.actions
+                    .push_back(Action::ResetStream { conn_id, stream_id });
+            }
+        }
+    }
+
+    /// Gives up the inbound negotiations past their deadline: each is
+    /// reported like a failed negotiation and its stream reset, so a peer
+    /// cannot hold a stream slot by never finishing.
+    fn expire_inbound_negotiations(&mut self, now_ms: u64) {
+        let expired: Vec<(ConnectionId, StreamId)> = self
+            .inbound_negotiators
+            .iter()
+            .filter(|(_, pending)| pending.deadline_ms <= now_ms)
+            .map(|(key, _)| *key)
+            .collect();
+        for (conn_id, stream_id) in expired {
+            self.inbound_negotiators.remove(&(conn_id, stream_id));
+            self.emit_error_for_stream(
+                SwarmErrorKind::Multistream,
+                self.established_peer_for_conn(conn_id),
+                Some(conn_id),
+                Some(stream_id),
+                format!(
+                    "inbound stream {stream_id} did not finish negotiating within {} ms",
+                    self.timeouts.negotiation_ms
+                ),
+            );
             if self.reset_pending.insert((conn_id, stream_id)) {
                 self.actions
                     .push_back(Action::ResetStream { conn_id, stream_id });
@@ -2488,17 +2535,24 @@ impl SwarmState {
         });
     }
 
-    fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+    /// Starts negotiating an inbound stream, with its deadline armed from
+    /// arrival.
+    fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId, now_ms: u64) {
         self.mark_control(conn_id, stream_id, true);
-        let mut listener = MultistreamSelect::listener(self.inbound_protocols.clone());
-        listener.start();
-        self.inbound_negotiators
-            .insert((conn_id, stream_id), listener);
+        let mut negotiator = MultistreamSelect::listener(self.inbound_protocols.clone());
+        negotiator.start();
+        self.inbound_negotiators.insert(
+            (conn_id, stream_id),
+            PendingInbound {
+                negotiator,
+                deadline_ms: now_ms.saturating_add(self.timeouts.negotiation_ms),
+            },
+        );
 
         while let Some(output) = self
             .inbound_negotiators
             .get_mut(&(conn_id, stream_id))
-            .and_then(MultistreamSelect::poll_output)
+            .and_then(|pending| pending.negotiator.poll_output())
         {
             self.handle_multistream_output(conn_id, stream_id, output, &mut None);
         }
@@ -2825,7 +2879,7 @@ impl SwarmState {
     ) -> usize {
         let key = (conn_id, stream_id);
         let negotiator = match self.inbound_negotiators.get_mut(&key) {
-            Some(n) => n,
+            Some(pending) => &mut pending.negotiator,
             None => return 0,
         };
 
@@ -2835,7 +2889,7 @@ impl SwarmState {
         while let Some(output) = self
             .inbound_negotiators
             .get_mut(&key)
-            .and_then(MultistreamSelect::poll_output)
+            .and_then(|pending| pending.negotiator.poll_output())
         {
             if self.handle_multistream_output(conn_id, stream_id, output, &mut negotiated_protocol)
             {
@@ -2850,7 +2904,7 @@ impl SwarmState {
             let remaining = self
                 .inbound_negotiators
                 .get_mut(&key)
-                .map(|n| n.take_remaining_buffer())
+                .map(|pending| pending.negotiator.take_remaining_buffer())
                 .unwrap_or_default();
 
             self.inbound_negotiators.remove(&key);
@@ -3737,6 +3791,114 @@ mod tests {
             },
         );
         assert_eq!(stream_terminals(&drain_events(&mut core), stream), 0);
+    }
+
+    /// A connection to a known peer with one inbound stream that arrived at
+    /// `start` and has not negotiated.
+    fn negotiating_inbound_stream(start: u64) -> (SwarmState, ConnectionId, StreamId) {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"stalled-inbound-peer");
+        let conn = ConnectionId::new(91);
+        let stream = StreamId::new(3);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer, conn);
+        core.handle_transport_event(
+            TransportEvent::IncomingStream {
+                id: conn,
+                stream_id: stream,
+            },
+            start,
+        );
+        core.actions.clear();
+        (core, conn, stream)
+    }
+
+    #[test]
+    fn an_unfinished_inbound_negotiation_is_reset_at_its_deadline() {
+        let start = 1_000;
+        let (mut core, conn, stream) = negotiating_inbound_stream(start);
+        let due = start + OUTBOUND_NEGOTIATION_TIMEOUT_MS;
+        assert_eq!(
+            core.next_deadline(Now::from_millis(start)),
+            Some(Deadline::from_millis(due))
+        );
+
+        core.handle_tick(due - 1);
+        assert!(core.inbound_negotiators.contains_key(&(conn, stream)));
+        assert!(core.actions.is_empty());
+
+        core.handle_tick(due);
+        assert!(!core.inbound_negotiators.contains_key(&(conn, stream)));
+        assert_eq!(
+            core.actions.pop_front(),
+            Some(Action::ResetStream {
+                conn_id: conn,
+                stream_id: stream
+            })
+        );
+        assert!(
+            drain_events(&mut core).iter().any(|event| matches!(
+                event,
+                SwarmEvent::Error(SwarmRuntimeError {
+                    kind: SwarmErrorKind::Multistream,
+                    stream_id: Some(s),
+                    ..
+                }) if *s == stream
+            )),
+            "a stalled inbound negotiation is reported like a failed one"
+        );
+        assert_eq!(core.next_deadline(Now::from_millis(due)), None);
+    }
+
+    #[test]
+    fn a_finished_inbound_negotiation_clears_its_deadline() {
+        const PROTOCOL: &str = "/minip2p/inbound-deadline/1.0.0";
+        let mut core = test_core();
+        core.add_inbound_protocol(PROTOCOL)
+            .expect("service protocol is not reserved");
+        let conn = ConnectionId::new(92);
+        let stream = StreamId::new(1);
+        let peer = PeerId::from_public_key_protobuf(b"finished-inbound-peer");
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer, conn);
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        assert!(core.next_deadline(Now::from_millis(0)).is_some());
+
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(PROTOCOL));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id: stream,
+                data: Bytes::from(offer),
+            },
+        );
+        assert_eq!(
+            core.stream_protocol(conn, stream),
+            Some(&ProtocolKind::User(PROTOCOL.to_string()))
+        );
+        assert_eq!(core.next_deadline(Now::from_millis(0)), None);
+    }
+
+    #[test]
+    fn an_inbound_negotiation_deadline_clears_when_its_connection_closes() {
+        let (mut core, conn, _) = negotiating_inbound_stream(0);
+        assert!(core.next_deadline(Now::from_millis(0)).is_some());
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
+        assert_eq!(core.next_deadline(Now::from_millis(0)), None);
     }
 
     #[test]
@@ -5949,8 +6111,13 @@ mod tests {
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
-        core.inbound_negotiators
-            .insert(key, MultistreamSelect::listener(["/test/1".to_string()]));
+        core.inbound_negotiators.insert(
+            key,
+            PendingInbound {
+                negotiator: MultistreamSelect::listener(["/test/1".to_string()]),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+            },
+        );
         core.outbound_negotiators.insert(
             key,
             PendingOutbound {
