@@ -14,6 +14,8 @@ CodSpeed and Bencher are out. React Native and mobile binding benches are out. T
 
 The comparison model is PR vs a stored `main` baseline on a different hosted runner. Same-job merge-base reruns were considered and rejected.
 
+> **Superseded:** PRs now compare against their merge-base measured in the same run, and only deterministic metrics are classified. See [ADR 0026](../adr/0026-pr-benches-against-the-merge-base-in-the-same-run.md).
+
 ## Tiers
 
 Three parallel jobs in `bench.yml`. A failing tier does not drop the others' rows from the comment.

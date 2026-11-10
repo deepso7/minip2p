@@ -33,21 +33,11 @@ minip2p-transport = { path = "../transport", version = "0.11.8", default-feature
 thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 gungraun = { workspace = true }
 stats_alloc = { workspace = true }
 
 [[bench]]
-name = "publish"
-harness = false
-
-[[bench]]
 name = "publish_ir"
-harness = false
-
-
-[[bench]]
-name = "router"
 harness = false
 
 [[bench]]

@@ -1,83 +1,50 @@
 #!/usr/bin/env python3
-"""Normalize benchmark output and compare schema-version-1 result files."""
+"""Normalize benchmark output, and compare a head result with its base's from the same run."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 TIERS = ("rust-micro", "rust-wall", "node-ffi")
 
 
-class Metric(NamedTuple):
-    higher_is_better: bool
-
-
 # Fixed registry: every row's metric must be listed here. Any tier may use any metric.
 METRICS = {
-    "Ir": Metric(higher_is_better=False),
-    "median_ns": Metric(higher_is_better=False),
-    "mb_per_s": Metric(higher_is_better=True),
-    "wakeups_per_s": Metric(higher_is_better=False),
-    "cpu_ms_per_s": Metric(higher_is_better=False),
-    "allocs_per_mb": Metric(higher_is_better=False),
-    "bytes_allocated_per_mb": Metric(higher_is_better=False),
-    "datagrams_per_mb": Metric(higher_is_better=False),
-    "avg_datagram_bytes": Metric(higher_is_better=True),
-    "datagrams_per_receive_call": Metric(higher_is_better=True),
-    "allocs_per_msg": Metric(higher_is_better=False),
-    "bytes_allocated_per_msg": Metric(higher_is_better=False),
-    "rtt_us_p50": Metric(higher_is_better=False),
-    "rtt_us_p99": Metric(higher_is_better=False),
+    "Ir",
+    "median_ns",
+    "mb_per_s",
+    "wakeups_per_s",
+    "cpu_ms_per_s",
+    "allocs_per_mb",
+    "bytes_allocated_per_mb",
+    "datagrams_per_mb",
+    "avg_datagram_bytes",
+    "datagrams_per_receive_call",
+    "allocs_per_msg",
+    "bytes_allocated_per_msg",
+    "rtt_us_p50",
+    "rtt_us_p99",
 }
-# Classification bands as (metric, tier or None for any, name prefix,
-# (changed %, notable %)); the first matching entry wins. A row under `changed`
-# is noise. Rows that match no entry are informational: their change is shown
-# without a direction. Wall-clock bands sit above the run-to-run noise measured
-# on code-identical runs on the bench instance (p90 / max absolute change).
-BANDS = (
-    # Deterministic: instruction counts, and allocations of isolated agent
-    # operations with fixed inputs.
-    ("Ir", None, "", (1.0, 2.0)),
-    ("allocs_per_msg", None, "", (1.0, 2.0)),
-    ("bytes_allocated_per_msg", None, "", (1.0, 2.0)),
-    # Endpoint e2e (p90 1.3%, max 4.9%) and Node FFI (p90 2%, max 4.8%).
-    ("median_ns", "rust-wall", "e2e/", (5.0, 10.0)),
-    ("median_ns", "node-ffi", "", (5.0, 10.0)),
-    # Criterion micro benches (p90 4%, outliers to 40%).
-    ("median_ns", "rust-wall", "", (10.0, 20.0)),
-    # Throughput (p90 5.4%, max 5.8%).
-    ("mb_per_s", None, "", (5.0, 10.0)),
-    # Idle wakeups are near-deterministic; a change means a new timer.
-    ("wakeups_per_s", None, "", (10.0, 20.0)),
-    # Allocations and datagrams over real transports depend on scheduling, read
-    # chunking and congestion control (p90 1.6%, max 10%).
-    *((metric, None, "", (15.0, 30.0)) for metric in (
-        "allocs_per_mb", "bytes_allocated_per_mb", "datagrams_per_mb",
-        "avg_datagram_bytes", "datagrams_per_receive_call",
-    )),
-    # Ping latency under load is one 200-sample run per release, so rtt_us_p50
-    # (moved 17-40% between releases) and rtt_us_p99 (p90 49%) stay
-    # informational, as does idle cpu_ms_per_s (~0.005 ms/s of timer noise).
-)
+# Changed/notable thresholds (%) of the deterministic metrics, all lower is
+# better: instruction counts, and allocations of isolated agent operations
+# with fixed inputs (`router_allocs` asserts two runs agree). A
+# comparison labels only these rows; every other metric (wall clock,
+# throughput, latency, allocations over real transports) is informational,
+# since code-identical runs on the bench instance move it by tens of percent.
+BANDS = {
+    "Ir": (1.0, 2.0),
+    "allocs_per_msg": (1.0, 2.0),
+    "bytes_allocated_per_msg": (1.0, 2.0),
+}
 EXPECTED_CRITERION = {
-    "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
-    "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
-    "yamux/256KiB/queued_send_16KiB_window_updates", "yamux/1024_streams/sparse_send_8_streams",
-    "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
-    "peer_book_128_peers_16_addrs/next_deadline",
-    "pubsub/gossipsub_publish_32x60KiB",
-    "pubsub/gossipsub_forward_1KiB/8", "pubsub/gossipsub_forward_1KiB/32",
-    "pubsub/gossipsub_forward_1KiB/128", "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
-    "relay_handle_event_same_now_128_pending_hops",
     "quic/idle_poll/1", "quic/idle_poll/64", "quic/idle_poll/256", "quic/idle_poll/512",
     *{
         f"tcp/{group}/{count}"
@@ -121,14 +88,6 @@ GUNGRAUN_NAMES = {
         )
     },
 }
-# Criterion benchmarks that do work their `Ir` twin does not, so a flat Ir row
-# says nothing about them: the sparse Yamux bench also handles each stream's
-# window refill and reuses one session across iterations.
-WALL_ONLY_WORK = {"yamux/1024_streams/sparse_send_8_streams"}
-# Benchmarks renamed since the last release, old name suffix -> new, so a
-# release baseline still lines up with the current rows. Drop entries once a
-# release carries the new names.
-RENAMED_SUFFIXES = {"/next_timeout": "/next_deadline"}
 EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
@@ -189,7 +148,10 @@ def load_json(path: Path) -> Any:
         raise BenchError(f"cannot read {path}: {error}") from error
 
 
-def validate(document: Any) -> dict[str, Any]:
+def validate(document: Any, strict: bool = True) -> dict[str, Any]:
+    """Check a result document. `strict` also requires every tier and metric
+    to be registered; a comparison reads the measured side's rows unstrictly,
+    since a PR may add tiers or metrics this checkout does not know yet."""
     if not isinstance(document, dict) or document.get("schema_version") != SCHEMA_VERSION:
         raise BenchError("results must use schema_version 1")
     if not isinstance(document.get("git_sha"), str) or not document["git_sha"]:
@@ -202,11 +164,11 @@ def validate(document: Any) -> dict[str, Any]:
         if not isinstance(row, dict):
             raise BenchError(f"row {index} must be an object")
         tier, name, metric, value = (row.get(key) for key in ("tier", "name", "metric", "value"))
-        if tier not in TIERS:
+        if not isinstance(tier, str) or not tier or (strict and tier not in TIERS):
             raise BenchError(f"row {index} has unknown tier {tier!r}")
         if not isinstance(name, str) or not name:
             raise BenchError(f"row {index} requires a non-empty name")
-        if not isinstance(metric, str) or metric not in METRICS:
+        if not isinstance(metric, str) or not metric or (strict and metric not in METRICS):
             raise BenchError(f"row {index} has unknown metric {metric!r}")
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise BenchError(f"row {index} requires a finite non-negative value")
@@ -342,15 +304,6 @@ def collect_custom(root: Path, output: Path, git_sha: str, since: Path) -> None:
     write_results(git_sha, rows, output)
 
 
-def git_bytes(tree: str, path: str) -> bytes:
-    result = subprocess.run(
-        ["git", "show", f"{tree}:{path}"], capture_output=True, check=False
-    )
-    if result.returncode:
-        raise BenchError(f"cannot read {path} at {tree}")
-    return result.stdout
-
-
 def ir_seeds(targets: bytes) -> set[str]:
     """The packages of the `ir` lines in `bench/targets`."""
     return {fields[1] for line in targets.decode().splitlines() if (fields := line.split()) and fields[0] == "ir"}
@@ -409,32 +362,30 @@ def reachable_lock(lock: bytes, seeds: set[str]) -> set[tuple]:
     return entries
 
 
-def ir_compatible(baseline_tree: str, current_tree: str) -> tuple[bool, str | None]:
-    """Compare the pins that make instruction counts comparable: the IR
-    benches' part of `Cargo.lock` and `bench/pins.json`."""
+def ir_pins_note(base_source: Path, head_source: Path) -> str | None:
+    """Why the two source trees' instruction counts are not like for like, or
+    None: `bench/pins.json` or the IR benches' part of `Cargo.lock` differs.
+    The comparison still classifies the Ir rows and shows this as a note."""
+
+    def read(source: Path, path: str) -> bytes:
+        try:
+            return (source / path).read_bytes()
+        except OSError as error:
+            raise BenchError(f"cannot read {path}") from error
+
     try:
-        # The current tree's IR benches: the baseline may predate bench/targets.
-        seeds = ir_seeds(git_bytes(current_tree, "bench/targets"))
-        before_lock = reachable_lock(git_bytes(baseline_tree, "Cargo.lock"), seeds)
-        after_lock = reachable_lock(git_bytes(current_tree, "Cargo.lock"), seeds)
-    except BenchError as error:
-        return False, f"incompatible Ir pins: {error}"
-    if before_lock != after_lock:
-        return False, "incompatible Ir pins: Cargo.lock differs for the IR benches"
-    try:
-        before_bytes = git_bytes(baseline_tree, "bench/pins.json")
-        after_bytes = git_bytes(current_tree, "bench/pins.json")
-    except BenchError:
-        return False, "incompatible Ir pins: pin manifest unavailable"
-    try:
-        before = json.loads(before_bytes)
-        after = json.loads(after_bytes)
-    except json.JSONDecodeError as error:
-        raise BenchError(f"invalid bench/pins.json: {error}") from error
-    for key, label in IR_PINS.items():
-        if before.get(key) != after.get(key):
-            return False, f"incompatible Ir pins: {label} differs"
-    return True, None
+        # The head's IR benches: the base may not have a new one yet.
+        seeds = ir_seeds(read(head_source, "bench/targets"))
+        if reachable_lock(read(base_source, "Cargo.lock"), seeds) != reachable_lock(read(head_source, "Cargo.lock"), seeds):
+            return "`Cargo.lock` differs between base and head for the IR benches"
+        before = json.loads(read(base_source, "bench/pins.json"))
+        after = json.loads(read(head_source, "bench/pins.json"))
+    except (BenchError, json.JSONDecodeError) as error:
+        return f"could not compare base and head ({markdown_code(str(error))})"
+    changed = [label for key, label in IR_PINS.items() if before.get(key) != after.get(key)]
+    if not changed:
+        return None
+    return f"{', '.join(changed)} {'differs' if len(changed) == 1 else 'differ'} between base and head"
 
 
 @dataclass(frozen=True)
@@ -442,83 +393,42 @@ class ComparedRow:
     tier: str
     name: str
     metric: str
-    baseline: float | int | None
-    current: float | int | None
+    base: float | int | None
+    head: float | int | None
     delta: float | None
+    # `notable`, `changed` or `negligible` for a banded row; `informational`
+    # for every other row both sides have; `new` or `removed` otherwise.
     classification: str
-    direction: str
-    reason: str | None = None
+    direction: str = ""
 
 
-def current_name(name: str) -> str:
-    """A baseline benchmark name under its current name (see `RENAMED_SUFFIXES`)."""
-    for old, new in RENAMED_SUFFIXES.items():
-        if name.endswith(old):
-            return name[: -len(old)] + new
-    return name
+def tier_order(tier: str) -> int:
+    return TIERS.index(tier) if tier in TIERS else len(TIERS)
 
 
-def band(tier: str, name: str, metric: str) -> tuple[float, float] | None:
-    """The row's (changed, notable) band from `BANDS`, or None when informational."""
-    for band_metric, band_tier, prefix, thresholds in BANDS:
-        if band_metric == metric and band_tier in (None, tier) and name.startswith(prefix):
-            return thresholds
-    return None
-
-
-def compare_rows(
-    current: dict[str, Any], baseline: dict[str, Any] | None, ir_reason: str | None
-) -> list[ComparedRow]:
-    old = {} if baseline is None else {
-        (row["tier"], current_name(row["name"]), row["metric"]): row["value"]
-        for row in baseline["rows"]
-    }
+def compare_rows(base: dict[str, Any], head: dict[str, Any]) -> list[ComparedRow]:
+    """Head's rows against base's, matched by (tier, name, metric). Only
+    metrics in `BANDS` get a class and direction."""
+    before = {(row["tier"], row["name"], row["metric"]): row["value"] for row in base["rows"]}
+    after = {(row["tier"], row["name"], row["metric"]): row["value"] for row in head["rows"]}
     compared = []
-    for row in current["rows"]:
-        key = (row["tier"], row["name"], row["metric"])
-        reason = "no baseline" if baseline is None else None
-        if reason is None and key not in old:
-            reason = "missing baseline row"
-        if reason is None and row["metric"] == "Ir" and ir_reason:
-            reason = ir_reason
-        baseline_value = old.get(key)
-        if reason is not None:
-            compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", reason))
+    for key in before.keys() | after.keys():
+        old, new = before.get(key), after.get(key)
+        if old is None or new is None:
+            compared.append(ComparedRow(*key, old, new, None, "new" if old is None else "removed"))
             continue
-        if baseline_value == 0:
-            compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", "zero baseline"))
-            continue
-        delta = (row["value"] - baseline_value) / baseline_value * 100
-        thresholds = band(*key)
+        delta = None if old == 0 else (new - old) / old * 100
+        thresholds = BANDS.get(key[2])
         if thresholds is None:
-            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", ""))
+            compared.append(ComparedRow(*key, old, new, delta, "informational"))
             continue
-        better = -delta if METRICS[row["metric"]].higher_is_better else delta
-        direction = "improved" if better < 0 else "regressed" if better > 0 else ""
+        direction = "regressed" if new > old else "improved"
         changed, notable = thresholds
-        magnitude = abs(delta)
-        classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "noise"
-        compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
-    # A Criterion row is informational when its benchmark's Ir row is noise:
-    # memory-bound wall rows swing 28-45% on the bench instance while their Ir
-    # stays flat, so with unchanged instructions the swing is not a code change.
-    # `WALL_ONLY_WORK` rows keep their band.
-    flat = {
-        row.name
-        for row in compared
-        if row.tier == "rust-micro" and row.metric == "Ir" and row.classification == "noise"
-    } - WALL_ONLY_WORK
-    compared = [
-        replace(row, classification="informational", direction="")
-        if row.reason is None and row.tier == "rust-wall" and row.metric == "median_ns" and row.name in flat
-        else row
-        for row in compared
-    ]
-    current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
-    for key, baseline_value in old.items():
-        if key not in current_keys:
-            compared.append(ComparedRow(*key, baseline_value, None, None, "unclassified", "", "missing current row"))
-    compared.sort(key=lambda row: (TIERS.index(row.tier), row.name, row.metric))
+        # A zero base has no percentage; any change from it is notable.
+        magnitude = abs(delta) if delta is not None else 0.0 if new == old else math.inf
+        classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "negligible"
+        compared.append(ComparedRow(*key, old, new, delta, classification, "" if classification == "negligible" else direction))
+    compared.sort(key=lambda row: (tier_order(row.tier), row.name, row.metric))
     return compared
 
 
@@ -543,73 +453,58 @@ def markdown_code(value: str) -> str:
     return f"`{value}`"
 
 
-# Unclassified rows that stay in the top table: rows only one side has.
-UNMATCHED = ("missing baseline row", "missing current row")
-
-
-def row_table(rows: list[ComparedRow], with_reason: bool) -> list[str]:
-    lines = ["| tier | benchmark | metric | baseline | current | Δ% | class | direction |", "| --- | --- | --- | ---: | ---: | ---: | --- | --- |"]
+def row_table(rows: list[ComparedRow], labeled: bool) -> list[str]:
+    header = "| tier | benchmark | metric | base | head | Δ% |"
+    rule = "| --- | --- | --- | ---: | ---: | ---: |"
+    if labeled:
+        header += " class | direction |"
+        rule += " --- | --- |"
+    lines = [header, rule]
     for row in rows:
         delta = "—" if row.delta is None else f"{row.delta:+.2f}%"
-        classification = row.classification if row.reason is None or not with_reason else f"{row.classification} ({row.reason})"
-        lines.append(f"| {row.tier} | {markdown_code(row.name)} | `{row.metric}` | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
+        line = f"| {markdown_code(row.tier)} | {markdown_code(row.name)} | {markdown_code(row.metric)} | {display_value(row.base)} | {display_value(row.head)} | {delta} |"
+        lines.append(line + (f" {row.classification} | {row.direction} |" if labeled else ""))
     return lines
 
 
+def details(summary: str, rows: list[ComparedRow], labeled: bool) -> list[str]:
+    return ["", f"<details><summary>{summary} ({len(rows)})</summary>", "", *row_table(rows, labeled), "", "</details>"] if rows else []
+
+
 def render(
-    baseline: dict[str, Any] | None,
+    base: dict[str, Any],
+    head: dict[str, Any],
     rows: list[ComparedRow],
-    baseline_label: str | None = None,
-    head_sha: str | None = None,
+    base_ref: str | None = None,
     run_url: str | None = None,
-    latest_release: str | None = None,
+    pins_note: str | None = None,
 ) -> str:
-    """The sticky PR comment: rows beyond their band and unmatched rows up top,
-    every other row in a collapsed block, shared unclassified reasons once."""
+    """The sticky PR comment: changed deterministic rows and rows only one side
+    has up top, negligible and informational rows collapsed below."""
     lines = ["<!-- bench-comment -->", "## Benchmark comparison", ""]
-    head = "unknown" if head_sha is None else head_sha[:12]
-    lines.append(f"- Head: {markdown_code(head)}" + ("" if run_url is None else f" ([run]({run_url}))"))
-    if baseline is None:
-        lines.append("- Baseline: none")
-    else:
-        sha = baseline["git_sha"][:12]
-        name = sha if baseline_label is None else f"{baseline_label} ({sha})"
-        lines.append(f"- Baseline: {markdown_code(name)}, the newest release with a stored baseline rather than the PR base, so changes already on `main` show up too.")
-        if latest_release and baseline_label and latest_release != baseline_label:
-            lines += ["", f"> [!WARNING]\n> The baseline is stale: the latest release is {markdown_code(latest_release)}, which has no stored baseline."]
-    classifications = ("noise", "changed", "notable", "informational", "unclassified")
-    lines += ["", "| tier | noise | changed | notable | informational | unclassified |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
-    for tier in TIERS:
-        tier_rows = [row for row in rows if row.tier == tier]
-        counts = {name: sum(row.classification == name for row in tier_rows) for name in classifications}
-        lines.append(f"| {tier} | {counts['noise']} | {counts['changed']} | {counts['notable']} | {counts['informational']} | {counts['unclassified']} |")
-    beyond = [row.classification in ("changed", "notable") or row.reason in UNMATCHED for row in rows]
-    top = [row for row, up in zip(rows, beyond) if up]
-    rest = [row for row, up in zip(rows, beyond) if not up]
-    reasons: dict[str, int] = {}
-    for row in rest:
-        if row.reason is not None:
-            reasons[row.reason] = reasons.get(row.reason, 0) + 1
-    lines += ["", "### Beyond the noise band", ""]
-    lines += row_table(top, with_reason=True) if top else ["None."]
-    if reasons:
-        lines += ["", *(f"- {count} rows unclassified: {reason}" for reason, count in reasons.items())]
-    if rest:
-        lines += ["", f"<details><summary>Other rows ({len(rest)})</summary>", "", *row_table(rest, with_reason=False), "", "</details>"]
+    lines.append(f"- Head: {markdown_code(head['git_sha'][:12])}" + ("" if run_url is None else f" ([run]({run_url}))"))
+    merge_base = "" if base_ref is None else f", the merge-base with {markdown_code(base_ref)}"
+    lines.append(f"- Base: {markdown_code(base['git_sha'][:12])}{merge_base}, measured in the same run.")
+    lines.append(f"- Only {', '.join(f'`{metric}`' for metric in BANDS)} rows are classified; wall-clock and other timing rows are informational.")
+    if pins_note:
+        lines += ["", f"> [!NOTE]\n> Ir pins: {pins_note}, so `Ir` deltas may include that change."]
+    top = [row for row in rows if row.classification in ("notable", "changed", "new", "removed")]
+    lines += ["", "### Changed", ""]
+    lines += row_table(top, labeled=True) if top else ["None."]
+    lines += details("Negligible", [row for row in rows if row.classification == "negligible"], labeled=False)
+    lines += details("Informational", [row for row in rows if row.classification == "informational"], labeled=False)
     return "\n".join(lines) + "\n"
 
 
 def command_compare(args: argparse.Namespace) -> None:
-    current = validate(load_json(args.current))
-    baseline = None if args.baseline is None else validate(load_json(args.baseline))
-    ir_reason = None
-    if baseline is not None and args.check_ir_pins:
-        compatible, ir_reason = ir_compatible(args.baseline_tree or baseline["git_sha"], args.current_tree or current["git_sha"])
-        if compatible:
-            ir_reason = None
-    rows = compare_rows(current, baseline, ir_reason)
+    base = validate(load_json(args.base), strict=False)
+    head = validate(load_json(args.head), strict=False)
+    pins_note = None
+    if args.base_source is not None and args.head_source is not None:
+        pins_note = ir_pins_note(args.base_source, args.head_source)
+    rows = compare_rows(base, head)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render(baseline, rows, args.baseline_label, current["git_sha"], args.run_url, args.latest_release))
+    args.output.write_text(render(base, head, rows, args.base_ref, args.run_url, pins_note))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -646,16 +541,14 @@ def parser() -> argparse.ArgumentParser:
     custom_parser.add_argument("--git-sha", required=True)
     custom_parser.add_argument("--since", type=Path, required=True)
     custom_parser.set_defaults(run=lambda args: collect_custom(args.root, args.output, args.git_sha, args.since))
-    compare_parser = commands.add_parser("compare")
-    compare_parser.add_argument("--current", type=Path, required=True)
-    compare_parser.add_argument("--baseline", type=Path)
+    compare_parser = commands.add_parser("compare", help="compare a head result with its base's from the same run")
+    compare_parser.add_argument("--base", type=Path, required=True)
+    compare_parser.add_argument("--head", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
-    compare_parser.add_argument("--check-ir-pins", action="store_true")
-    compare_parser.add_argument("--baseline-tree")
-    compare_parser.add_argument("--baseline-label")
-    compare_parser.add_argument("--current-tree")
+    compare_parser.add_argument("--base-source", type=Path, help="the base's source tree, to note differing Ir pins")
+    compare_parser.add_argument("--head-source", type=Path, help="the head's source tree, to note differing Ir pins")
+    compare_parser.add_argument("--base-ref", help="the branch whose merge-base is the base")
     compare_parser.add_argument("--run-url")
-    compare_parser.add_argument("--latest-release", help="the repository's latest release, to flag a stale baseline")
     compare_parser.set_defaults(run=command_compare)
     return root
 

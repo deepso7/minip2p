@@ -43,12 +43,7 @@ hmac = { version = "0.13.0", default-features = false }
 
 [dev-dependencies]
 minip2p-identity = { path = "../identity", features = ["ed25519", "std"] }
-criterion = { workspace = true }
 gungraun = { workspace = true }
-
-[[bench]]
-name = "data_path"
-harness = false
 
 [[bench]]
 name = "data_path_ir"

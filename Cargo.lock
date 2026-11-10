@@ -1136,7 +1136,6 @@ version = "0.11.8"
 dependencies = [
  "base64ct",
  "bytes",
- "criterion",
  "getrandom 0.4.3",
  "gungraun",
  "minip2p-identity",
@@ -1155,7 +1154,6 @@ dependencies = [
 name = "minip2p-discovery"
 version = "0.11.8"
 dependencies = [
- "criterion",
  "gungraun",
  "minip2p-core",
  "minip2p-identity",
@@ -1285,7 +1283,6 @@ dependencies = [
 name = "minip2p-pubsub"
 version = "0.11.8"
 dependencies = [
- "criterion",
  "gungraun",
  "minip2p-core",
  "minip2p-identity",
@@ -1330,7 +1327,6 @@ dependencies = [
 name = "minip2p-relay-server"
 version = "0.11.8"
 dependencies = [
- "criterion",
  "gungraun",
  "minip2p-core",
  "minip2p-identity",
@@ -1392,7 +1388,6 @@ name = "minip2p-secure-mux"
 version = "0.11.8"
 dependencies = [
  "chacha20poly1305",
- "criterion",
  "gungraun",
  "hmac",
  "minip2p-core",

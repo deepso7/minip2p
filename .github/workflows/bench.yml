@@ -3,9 +3,10 @@ name: Bench
 on:
   release:
     types: [published]
-  # A writer adds the `bench` label to measure a PR's head, typically once
-  # before merging; the run removes the label, so adding it again re-measures
-  # (after a fix, say). Pushes alone never start a run.
+  # A writer adds the `bench` label to measure a PR's head against its
+  # merge-base, both in the same run, typically once before merging; the run
+  # removes the label, so adding it again re-measures (after a fix, say).
+  # Pushes alone never start a run.
   pull_request_target:
     branches: [main]
     types: [labeled]
@@ -15,6 +16,10 @@ on:
     inputs:
       ref:
         description: Commit, branch or tag to measure (default branch when empty)
+        required: false
+        default: ""
+      base:
+        description: Also measure the merge-base of `ref` with this branch or commit, and compare the two as a PR run does
         required: false
         default: ""
       baseline:
@@ -37,6 +42,8 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'ap-south-1' }}
+  # A PR run, or a dispatch with `base`, measures two trees and compares them.
+  AB_RUN: ${{ github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.base != '') }}
 
 jobs:
   # Wakes the self-hosted bench instance (normally stopped; its watchdog
@@ -72,8 +79,13 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
+      - name: Check dispatch inputs
+        if: github.event_name == 'workflow_dispatch' && inputs.base != '' && (inputs.baseline || inputs.sweep != '')
+        run: |
+          echo "a run with base set compares two trees; it cannot also record a baseline or sweep" >&2
+          exit 1
       # Fails a baseline dispatch before the instance starts unless it names
       # what a `release` run would have measured.
       - name: Check baseline tag
@@ -114,11 +126,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
       # The scripts and Dockerfile that drive the bench host always come from
-      # the trusted checkout above; a PR head or a dispatched `ref` is only
-      # the code measured (the image's build context), checked out beside it.
+      # the trusted checkout above; a PR head, a dispatched `ref` and an A/B
+      # run's merge-base are only the code measured (image build contexts),
+      # checked out beside it.
       - name: Check out benchmark source
         if: github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -129,8 +142,31 @@ jobs:
       - name: Resolve benchmark source
         id: source
         env:
-          SOURCE_DIR: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && format('{0}/bench-source', github.workspace) || github.workspace }}
-        run: echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          SOURCE_DIR: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
+        run: |
+          echo "dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # The base side of an A/B run: where the measured code forked from the
+      # base branch, so commits merged there since are not attributed to it.
+      - name: Resolve merge-base
+        id: merge-base
+        if: env.AB_RUN == 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || inputs.base }}
+          HEAD_SHA: ${{ steps.source.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/compare/$BASE_REF...$HEAD_SHA?per_page=1" \
+            | jq -er .merge_base_commit.sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check out merge-base
+        if: env.AB_RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.merge-base.outputs.sha }}
+          path: bench-base
+          persist-credentials: false
       # `exec` makes the helper the step's process, so the runner's
       # cancellation signals reach its traps.
       - name: Measure
@@ -138,8 +174,12 @@ jobs:
         env:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
           BENCH_SWEEP: ${{ inputs.sweep }}
-          BENCH_CONTEXT: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
+          BENCH_CONTEXT: ${{ steps.source.outputs.dir }}
+          BENCH_BASE_CONTEXT: ${{ env.AB_RUN == 'true' && 'bench-base' || '' }}
+          BENCH_BASE_GIT_SHA: ${{ steps.merge-base.outputs.sha }}
         run: exec scripts/run-bench-container.sh
+      # A single measurement (release, baseline or plain dispatch) becomes the
+      # result slice the `baseline` job stores; an A/B run is compared below.
       - name: Prepare result slice
         id: result
         if: always()
@@ -148,23 +188,52 @@ jobs:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          complete=false
           mkdir -p target/bench-artifacts
+          if [ -n "$PR_NUMBER" ]; then
+            printf '%s\n' "$PR_NUMBER" > target/bench-artifacts/pr-number
+            printf '%s\n' "$BENCH_GIT_SHA" > target/bench-artifacts/head-sha
+          fi
+          if [ "$AB_RUN" = true ]; then
+            exit 0
+          fi
+          complete=false
           if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-artifacts/current.json --output target/bench-artifacts/current.json --git-sha "$BENCH_GIT_SHA"; then
             complete=true
           else
             jq -n --arg sha "$BENCH_GIT_SHA" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/current.json
           fi
-          if [ -n "$PR_NUMBER" ]; then
-            printf '%s\n' "$PR_NUMBER" > target/bench-artifacts/pr-number
-            printf '%s\n' "$BENCH_GIT_SHA" > target/bench-artifacts/head-sha
-          fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
+      # The comparator runs from the trusted checkout, so a PR cannot change
+      # how its own result is judged; each side's rows were already checked
+      # by that side's own harness inside its container.
+      - name: Compare
+        id: compare
+        if: env.AB_RUN == 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || inputs.base }}
+          HEAD_DIR: ${{ steps.source.outputs.dir }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p target/bench-comparison
+          python3 scripts/bench_results.py compare --base target/bench-artifacts/base.json --head target/bench-artifacts/head.json \
+            --base-source bench-base --head-source "$HEAD_DIR" --base-ref "$BASE_REF" --run-url "$RUN_URL" \
+            --output target/bench-comparison/comparison.md
+          if [ -n "$PR_NUMBER" ]; then
+            printf '%s\n' "$PR_NUMBER" > target/bench-comparison/pr-number
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: bench-results
           path: target/bench-artifacts/
+          if-no-files-found: error
+      # Bench comment posts it on the PR; a dispatch keeps it as an artifact.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.compare.outcome == 'success'
+        with:
+          name: bench-comparison
+          path: target/bench-comparison/
           if-no-files-found: error
 
   # The weekly schedule connects the runner so GitHub does not remove it
@@ -230,65 +299,3 @@ jobs:
             fi
           done
           exit 1
-
-  compare:
-    if: >-
-      github.event_name == 'pull_request_target' && needs.bench.result == 'success' && needs.bench.outputs.complete == 'true'
-    needs: [bench]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: bench-*
-          path: ${{ runner.temp }}/bench-slices
-          merge-multiple: true
-      - name: Merge result slices
-        run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/current.json" --git-sha "$(git rev-parse HEAD)"
-      - name: Read baseline
-        id: baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Optional: only used to flag a baseline older than the latest release.
-          latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
-          echo "latest-release=$latest_release" >> "$GITHUB_OUTPUT"
-          if ! git fetch --depth=1 origin bench-data; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! baseline_sha=$(git show FETCH_HEAD:latest 2>/dev/null) \
-            || ! git show "FETCH_HEAD:$baseline_sha.json" > "$RUNNER_TEMP/baseline.json"; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          baseline_release=$(git show FETCH_HEAD:latest-release 2>/dev/null || printf 'unknown')
-          git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || git fetch origin "$baseline_sha"
-          echo "available=true" >> "$GITHUB_OUTPUT"
-          echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
-          echo "release=$baseline_release" >> "$GITHUB_OUTPUT"
-      - name: Compare with baseline
-        if: steps.baseline.outputs.available == 'true'
-        env:
-          BASELINE_LABEL: ${{ steps.baseline.outputs.release }}
-          LATEST_RELEASE: ${{ steps.baseline.outputs.latest-release }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: >-
-          python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --baseline "$RUNNER_TEMP/baseline.json" --output "$RUNNER_TEMP/comparison.md" --baseline-label "$BASELINE_LABEL" --check-ir-pins --baseline-tree "${{ steps.baseline.outputs.sha }}" --current-tree "${{ github.event.pull_request.head.sha }}" --run-url "$RUN_URL" --latest-release "$LATEST_RELEASE"
-      - name: Compare without baseline
-        if: steps.baseline.outputs.available != 'true'
-        env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md" --run-url "$RUN_URL"
-      - name: Prepare comparison artifact
-        run: printf '%s\n' "${{ github.event.pull_request.number }}" > "$RUNNER_TEMP/pr-number"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bench-comparison
-          path: |
-            ${{ runner.temp }}/comparison.md
-            ${{ runner.temp }}/pr-number
-          if-no-files-found: error

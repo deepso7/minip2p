@@ -13,12 +13,6 @@ ir        minip2p-discovery     -                                 peer_book_ir
 ir        minip2p-pubsub        -                                 publish_ir
 ir        minip2p-pubsub        -                                 router_ir
 ir        minip2p-relay-server  -                                 relay_server_event_ir
-criterion minip2p-core          -                                 multiaddr
-criterion minip2p-secure-mux    -                                 data_path
-criterion minip2p-discovery     -                                 peer_book
-criterion minip2p-pubsub        -                                 publish
-criterion minip2p-pubsub        -                                 router
-criterion minip2p-relay-server  -                                 relay_server_event
 criterion minip2p-quic          -                                 idle_poll
 criterion minip2p-tcp           -                                 readiness_poll
 criterion minip2p-rs            tcp                               endpoint_e2e

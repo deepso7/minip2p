@@ -27,12 +27,7 @@ minip2p-identity = { path = "../identity", version = "0.11.8", default-features 
 thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 gungraun = { workspace = true }
-
-[[bench]]
-name = "multiaddr"
-harness = false
 
 [[bench]]
 name = "multiaddr_ir"

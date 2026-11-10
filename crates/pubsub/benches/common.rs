@@ -23,7 +23,7 @@ use minip2p_pubsub::{
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
-pub const PEER_COUNT: u16 = 32;
+const PEER_COUNT: u16 = 32;
 const PAYLOAD_LEN: usize = 60 * 1024;
 pub const TOPIC: &str = "benchmark";
 const INITIAL_SEQNO: u64 = 100;
@@ -215,7 +215,7 @@ pub fn setup() -> (GossipsubAgent, Vec<u8>) {
 // --- Forwarding --------------------------------------------------------------
 
 /// Payload of the forwarded message.
-pub const FORWARD_PAYLOAD_LEN: usize = 1024;
+const FORWARD_PAYLOAD_LEN: usize = 1024;
 
 /// A mesh of `n` peers and one inbound frame, delivered by the first mesh
 /// peer and authored and StrictSigned by that same peer, carrying a fresh
@@ -299,7 +299,7 @@ const HEARTBEAT_TOPICS: u16 = 100;
 const HEARTBEAT_CACHE_WINDOWS: u64 = 5;
 const HEARTBEAT_GOSSIP_WINDOWS: usize = 3;
 /// When the measured heartbeat is due.
-pub const HEARTBEAT_AT_MS: u64 = HEARTBEAT_INTERVAL_MS * HEARTBEAT_CACHE_WINDOWS;
+const HEARTBEAT_AT_MS: u64 = HEARTBEAT_INTERVAL_MS * HEARTBEAT_CACHE_WINDOWS;
 const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
 fn heartbeat_topic(index: u16) -> String {

@@ -98,7 +98,7 @@ The session bounds inbound frame lengths, stream count, per-stream queued sends,
 
 Clients allocate odd stream IDs and servers allocate even stream IDs. The default `receive_window` is the specification's 256 KiB (`DEFAULT_RECEIVE_WINDOW`). A host may raise it for long, fat paths; a stream still starts from the 256 KiB credit, and the difference is granted with its first window update.
 
-The interoperability fixture is described in [`tests/fixtures/yamux`](tests/fixtures/yamux/README.md). The `data_path` and `data_path_ir` benches measure the Yamux session's send and receive paths.
+The interoperability fixture is described in [`tests/fixtures/yamux`](tests/fixtures/yamux/README.md). The `data_path_ir` bench counts the instructions of the Yamux session's send and receive paths.
 
 ## no_std
 
