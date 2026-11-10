@@ -1,14 +1,23 @@
 //! The browser host over an in-memory transport: config limits, the pump,
 //! commands and close, without wasm or a browser.
 
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+    rc::Rc,
+};
 
-use minip2p::{Ed25519Keypair, Now, PeerId};
+use minip2p::{
+    Bytes, ConnectionId, Deadline, Ed25519Keypair, Multiaddr, Now, PeerAddr, PeerId, StreamId,
+    Transport, TransportError,
+};
 use minip2p_core::Multihash;
 use minip2p_ffi_core::{
     CloseOutcome, ConfigCapability, ConnectTarget, EndpointConfig, FfiError, P2pEvent,
+    UnfinishedConnection,
 };
 use minip2p_test_support::InMemoryTransport;
+use minip2p_transport::TransportEvent;
 use minip2p_web::{Host, WebEntropy};
 use minip2p_webtransport::{
     IoError, IoEvent, SessionHandle, StreamHandle, WebTransportClient, WebTransportIo,
@@ -280,6 +289,163 @@ fn close_carries_endpoint_closed_last_and_stops_commands() {
     // A second close is a no-op.
     a.close(Now::from_millis(34));
     assert!(a.drain_events(LIMIT).is_empty());
+}
+
+/// How a [`Breakable`] transport behaves from now on.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Up,
+    /// Closes and polls fail, as a browser transport that has gone away.
+    Gone,
+    /// Closes are accepted but never complete, as a peer that never answers.
+    Deaf,
+}
+
+/// An in-memory transport switched between [`Mode`]s by the test.
+struct Breakable(InMemoryTransport, Rc<Cell<Mode>>);
+
+impl Breakable {
+    fn gone(&self) -> Result<(), TransportError> {
+        if self.1.get() == Mode::Gone {
+            return Err(TransportError::PollError {
+                reason: "transport gone".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Transport for Breakable {
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        self.0.dial(addr)
+    }
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        self.0.listen(addr)
+    }
+    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+        self.0.open_stream(id)
+    }
+    fn send_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+    ) -> Result<(), TransportError> {
+        self.0.send_stream(id, stream_id, data)
+    }
+    fn close_stream_write(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        self.0.close_stream_write(id, stream_id)
+    }
+    fn reset_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        self.0.reset_stream(id, stream_id)
+    }
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        self.0.ack_stream(id, stream_id, bytes)
+    }
+    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        self.gone()?;
+        if self.1.get() == Mode::Deaf {
+            return Ok(());
+        }
+        self.0.close(id)
+    }
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        self.gone()?;
+        self.0.poll(now)
+    }
+    fn next_deadline(&self) -> Option<Deadline> {
+        self.0.next_deadline()
+    }
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        self.0.local_addresses()
+    }
+}
+
+/// Host `a` over a [`Breakable`] transport, connected to `b` and settled,
+/// with the switch for its mode. `b`'s host is pumped alongside, then dropped.
+fn connected_breakable(
+    a: InMemoryTransport,
+    b: InMemoryTransport,
+) -> (Host<Breakable>, Rc<Cell<Mode>>) {
+    let mode = Rc::new(Cell::new(Mode::Up));
+    let mut a = Host::new(vec![1; 32], config(), |_| Breakable(a, mode.clone())).expect("a");
+    let mut b = Host::new(vec![2; 32], config(), |_| b).expect("b");
+    a.start().expect("start a");
+    b.start().expect("start b");
+    for ms in 0..32 {
+        a.pump(Now::from_millis(ms));
+        b.pump(Now::from_millis(ms));
+        a.drain_events(LIMIT);
+        b.drain_events(LIMIT);
+    }
+    (a, mode)
+}
+
+/// A clean shutdown that leaves a connection still tracked ends
+/// `DeadlineExpired`, as std `close_within(Duration::ZERO)` does, so apps
+/// checking `outcome !== "Drained"` see the abandoned connection.
+#[test]
+fn a_close_that_abandons_a_connection_ends_deadline_expired() {
+    let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
+    let conn_id = a.connection_id();
+    let (mut a, mode) = connected_breakable(a, b);
+    mode.set(Mode::Deaf);
+    a.close(Now::from_millis(32));
+    let events = a.drain_events(LIMIT);
+    assert_eq!(
+        events.last(),
+        Some(&P2pEvent::EndpointClosed {
+            outcome: CloseOutcome::DeadlineExpired,
+            unfinished: vec![UnfinishedConnection {
+                conn_id: conn_id.as_u64(),
+                peer_id: Some(peer(2).to_base58()),
+            }],
+        }),
+        "{events:?}"
+    );
+}
+
+/// A shutdown whose transport fails still carries its events (the close
+/// failure), ends `Failed`, and names the connection it abandoned.
+#[test]
+fn a_failed_close_carries_its_events_and_unfinished_connections() {
+    let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
+    let conn_id = a.connection_id();
+    let (mut a, mode) = connected_breakable(a, b);
+    mode.set(Mode::Gone);
+    a.close(Now::from_millis(32));
+    let events = a.drain_events(LIMIT);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            P2pEvent::EndpointError { conn_id: Some(id), .. } if *id == conn_id.as_u64()
+        )),
+        "the close failure was dropped: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&P2pEvent::EndpointClosed {
+            outcome: CloseOutcome::Failed,
+            unfinished: vec![UnfinishedConnection {
+                conn_id: conn_id.as_u64(),
+                peer_id: Some(peer(2).to_base58()),
+            }],
+        }),
+        "{events:?}"
+    );
 }
 
 #[test]

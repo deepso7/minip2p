@@ -1491,6 +1491,7 @@ dependencies = [
  "minip2p-pubsub",
  "minip2p-rs",
  "minip2p-test-support",
+ "minip2p-transport",
  "minip2p-webtransport",
  "serde",
  "serde-wasm-bindgen",

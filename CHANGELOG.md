@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Portable shutdown returns a report
+
+`PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every disconnect and final-drive `DriverError` (mDNS goodbye failures stay `EndpointEvent::MdnsFailed` in `events`), and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` by binding the report (`let report = endpoint.shutdown(now);`), checking `report.errors` and `report.unfinished`, then using `report.events`. In `@minip2p/web`, a close now delivers those events even after a failed shutdown, followed by `endpointClosed` carrying the real `unfinished` connections; its `outcome` is `Failed` if the shutdown hit any error, else `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports, else `Drained`.
+
 ### A listener rejects at most 16 proposals per stream
 
 A multistream-select listener now answers at most `DEFAULT_MAX_REJECTED_PROPOSALS` (16) unsupported proposals on one stream with `na`; the 17th fails the negotiation with the new `MultistreamError::TooManyRejectedProposals`. Version fallback (a few proposals) is unaffected. Use `MultistreamSelect::listener_with_max_rejected` for another limit, and add an arm if you match `MultistreamError` exhaustively.
