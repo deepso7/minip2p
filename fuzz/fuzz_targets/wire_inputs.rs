@@ -611,11 +611,42 @@ fn fuzz_autonat(data: &[u8]) {
     let _ = minip2p_autonat::decode_frame(data);
     let (head, tail) = data.split_at(data.len() / 2);
 
-    let mut server = AutoNatServer::new();
+    let observed: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1"
+        .parse()
+        .expect("valid observed address");
+    let mut server = AutoNatServer::new(fuzz_peer_id(), &observed);
     for chunk in [head, tail] {
         let _ = server.on_data(chunk);
     }
     while server.poll_output().is_some() {}
+
+    // A well-formed DIAL from the authenticated requester, carrying fuzzed
+    // addresses, so the observed-IP filter and the forwarding path run too
+    // (raw bytes almost never name the requester's peer id).
+    let offered: Vec<Multiaddr> = data
+        .chunks(24)
+        .filter_map(|chunk| Multiaddr::from_bytes(chunk).ok())
+        .collect();
+    let mut dial = AutoNatClient::new(&fuzz_peer_id(), &offered);
+    let mut server = AutoNatServer::new(fuzz_peer_id(), &observed);
+    while let Some(output) = dial.poll_output() {
+        if let minip2p_autonat::AutoNatClientOutput::Outbound(bytes) = output {
+            let _ = server.on_data(&bytes);
+        }
+    }
+    while let Some(output) = server.poll_output() {
+        if let minip2p_autonat::AutoNatServerOutput::Request(request) = output {
+            assert!(
+                request
+                    .addrs
+                    .iter()
+                    .all(|addr| addr.protocols().first() == observed.protocols().first()),
+                "the server forwarded an address off the observed IP: {:?}",
+                request.addrs
+            );
+            server.respond_public(&request.addrs);
+        }
+    }
 
     let mut client = AutoNatClient::new(&fuzz_peer_id(), &[]);
     for chunk in [head, tail] {
