@@ -467,6 +467,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-multistream-select",
+ "minip2p-ping",
  "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-secure-mux",
