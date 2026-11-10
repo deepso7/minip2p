@@ -123,9 +123,9 @@ const ACTIVE_STREAMS: usize = 8;
 const SPARSE_LEN: usize = 64;
 
 /// A client with `IDLE_STREAMS` opened, announced, idle streams, the
-/// `ACTIVE_STREAMS` of them spread evenly across the ids to send on, and the
-/// payload to send.
-fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>) {
+/// `ACTIVE_STREAMS` of them spread evenly across the ids to send on, the
+/// payload to send, and the window updates that return its credit.
+fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>, Vec<u8>) {
     let config = YamuxConfig {
         max_streams: IDLE_STREAMS,
         receive_window: DEFAULT_RECEIVE_WINDOW,
@@ -136,21 +136,30 @@ fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>) {
         .map(|_| session.open_stream().expect("open stream"))
         .collect();
     while session.poll_output().is_some() {}
-    let active = streams
+    let active: Vec<u32> = streams
         .iter()
         .copied()
         .step_by(IDLE_STREAMS / ACTIVE_STREAMS)
         .collect();
-    (session, active, vec![0x5a; SPARSE_LEN])
+    let refills = active
+        .iter()
+        .flat_map(|&stream| {
+            Frame::window_update(stream, 0, SPARSE_LEN as u32)
+                .expect("valid frame")
+                .encode()
+        })
+        .collect();
+    (session, active, vec![0x5a; SPARSE_LEN], refills)
 }
 
 // Many open, idle streams with a few doing work: the per-poll cost of
-// finding the streams that owe a frame.
+// finding the streams that owe a frame, then the window updates that refill
+// the spent credit.
 #[library_benchmark]
 #[bench::sparse_send_8_of_1024_streams(idle_streams_sender())]
-fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>)) {
-    let (mut session, active, data) = input;
-    for stream in active {
+fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>, Vec<u8>)) {
+    let (mut session, active, data, refills) = input;
+    for &stream in &active {
         session
             .send(stream, Bytes::from(data.clone()))
             .expect("send");
@@ -158,6 +167,7 @@ fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>)) {
     while let Some(frame) = session.poll_frame() {
         black_box(frame);
     }
+    session.handle_data(&refills).expect("window updates");
 }
 
 library_benchmark_group!(

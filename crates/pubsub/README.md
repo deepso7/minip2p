@@ -49,5 +49,6 @@ Fixtures live in `benches/common.rs`; every measurement uses a fresh one built o
 
 ```bash
 cargo bench -p minip2p-pubsub --bench router_allocs
+cargo bench -p minip2p-pubsub --bench publish_ir  # needs Valgrind
 cargo bench -p minip2p-pubsub --bench router_ir   # needs Valgrind
 ```
