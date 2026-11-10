@@ -30,3 +30,7 @@ Supersedes the comparison model of [the PR benchmarking plan](../plans/pr-benchm
 - A PR run builds two images and measures twice: about 30 minutes of measuring instead of about 14, inside the 90-minute job limit. Both images exist at once, so a run needs more free disk.
 - Interleaving is per tier, not per bench target: the base side runs its own `scripts/run-benches.sh`, which only knows whole passes.
 - Wall-clock regressions are no longer called out. They are still visible in the informational table and, over releases, on `bench-data`.
+
+## Addendum: quick wall-clock benches on A/B runs
+
+Once wall-clock rows stopped gating anything, measuring them in full on both sides cost most of a PR run: each side's `wall` pass took 7–8 minutes on the instance. `scripts/run-bench-container.sh` now sets `MINIP2P_BENCH_QUICK=1` for A/B runs only and passes it into both containers; the benches read it themselves, since the base side runs its own `scripts/run-benches.sh`, which would not know a new flag. Criterion runs 10 samples over 1 s without plots, `endpoint_idle` measures a 4 s window, `endpoint_rtt` times one transfer per case and `endpoint_ping_load` takes 100 samples; every row stays a rate, median or percentile. Locally this cut a `wall` pass from about 499 s to about 209 s, so a PR run should spend about 9 minutes less measuring. Release and baseline runs measure in full. A base tree from before the knob ignores it, so the first PR after it compares a full base with a quick head, which is acceptable for informational rows.

@@ -7,7 +7,9 @@
 //! limits: per case, a fresh connection, a warm-up transfer, then
 //! [`PR_RUNS`] timed transfers of 32 MiB on fresh streams, reporting the
 //! median as `endpoint_rtt/{quic,tcp}/100m_100ms` `mb_per_s` in
-//! `target/bench-results/custom/endpoint_rtt.json`. The TCP case measures
+//! `target/bench-results/custom/endpoint_rtt.json`. With
+//! `MINIP2P_BENCH_QUICK=1` it times one transfer per case instead; the runs
+//! agree closely, since the link, not scheduling, sets the rate. The TCP case measures
 //! Yamux credit at the RTT, not kernel TCP (see `support::delay`).
 //!
 //! With `MINIP2P_RTT_SWEEP` set it instead runs one window sweep and appends
@@ -141,7 +143,8 @@ fn pr_bench() {
             quic: QuicLimits::default(),
             tcp: TcpConfig::default(),
         };
-        let samples = measure(profile, &point, PR_TOTAL, PR_RUNS);
+        let runs = if support::quick::quick() { 1 } else { PR_RUNS };
+        let samples = measure(profile, &point, PR_TOTAL, runs);
         let results = [(point, samples)];
         // The row still goes out, so the pipeline keeps its shape, but a
         // link that failed calibration is called out next to it.

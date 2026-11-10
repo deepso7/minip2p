@@ -10,7 +10,8 @@
 //! takes [`SAMPLES`] samples with at most one ping outstanding, each sent
 //! [`INTERVAL`] after the previous one or as soon as it completes, whichever
 //! is later. A sample that takes longer than [`SAMPLE_TIMEOUT`], or a
-//! `PingFailed`, fails the run.
+//! `PingFailed`, fails the run. With `MINIP2P_BENCH_QUICK=1` it takes
+//! [`QUICK_SAMPLES`] instead.
 //!
 //! Loads, running on M throughout the sampling window, with the load peers on
 //! loopback QUIC:
@@ -51,8 +52,9 @@ const TCP: &str = "/ip4/127.0.0.1/tcp/0";
 /// Pings before sampling, opening and settling the ping stream.
 const WARMUP: usize = 5;
 const SAMPLES: usize = 200;
-/// Samples between load progress checks; divides [`SAMPLES`], so the last
-/// sample is checked.
+const QUICK_SAMPLES: usize = 100;
+/// Samples between load progress checks; divides [`SAMPLES`] and
+/// [`QUICK_SAMPLES`], so the last sample is checked.
 const CHECKPOINT: usize = 10;
 /// Minimum spacing between consecutive pings.
 const INTERVAL: Duration = Duration::from_millis(50);
@@ -291,7 +293,7 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
 }
 
 /// The `rtt_us_p50` and `rtt_us_p99` rows for one load over one transport.
-fn case(kind: LoadKind, listen: &str) -> Vec<String> {
+fn case(kind: LoadKind, listen: &str, samples: usize) -> Vec<String> {
     let (mut m, load) = match kind {
         LoadKind::Idle => (
             bind_measured(Endpoint::builder()).0,
@@ -328,9 +330,9 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
     let mut checkpoint = load.progress();
     let mut checked_at = Instant::now();
     let mut advanced = 0;
-    let mut rtts = Vec::with_capacity(SAMPLES);
+    let mut rtts = Vec::with_capacity(samples);
     let mut sent_at = Instant::now();
-    for index in 0..SAMPLES {
+    for index in 0..samples {
         if index > 0 {
             // Keep driving M (and so its load) until the next ping is due.
             sent_at = (sent_at + INTERVAL).max(Instant::now());
@@ -362,7 +364,7 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
 
     rtts.sort_unstable();
     let rank = |p: usize| {
-        let rtt = rtts.get((SAMPLES * p).div_ceil(100) - 1).expect("rank");
+        let rtt = rtts.get((samples * p).div_ceil(100) - 1).expect("rank");
         rtt.as_secs_f64() * 1e6
     };
     let (p50, p99) = (rank(50), rank(99));
@@ -372,7 +374,7 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
         "quic"
     };
     let name = format!("endpoint_ping_load/{}/{transport}", kind.name());
-    println!("{name}: p50 {p50:.0} us, p99 {p99:.0} us over {SAMPLES} samples{advanced}");
+    println!("{name}: p50 {p50:.0} us, p99 {p99:.0} us over {samples} samples{advanced}");
     [("rtt_us_p50", p50), ("rtt_us_p99", p99)]
         .into_iter()
         .map(|(metric, value)| {
@@ -382,10 +384,15 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
 }
 
 fn main() {
+    let samples = if support::quick::quick() {
+        QUICK_SAMPLES
+    } else {
+        SAMPLES
+    };
     let mut rows = Vec::new();
     for kind in [LoadKind::Idle, LoadKind::Relay, LoadKind::Pubsub] {
         for listen in [TCP, QUIC] {
-            rows.extend(case(kind, listen));
+            rows.extend(case(kind, listen, samples));
         }
     }
 

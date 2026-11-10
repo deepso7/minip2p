@@ -31,10 +31,17 @@
 //! `full_no_mdns` with `quic_only` for the second transport and the other
 //! services.
 //!
+//! With `MINIP2P_BENCH_QUICK=1` the window is [`QUICK_WINDOW`]. A shorter
+//! window catches fewer of `full`'s mDNS timers, so its rows compare only
+//! with other quick runs.
+//!
 //! Rows go to `target/bench-results/custom/endpoint_idle.json` for the
 //! `custom` collector in `scripts/bench_results.py`.
 
 use std::time::{Duration, Instant};
+
+#[path = "support/quick.rs"]
+mod quick;
 
 use cpu_time::ProcessTime;
 use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerDiscoveryConfig};
@@ -44,6 +51,8 @@ use minip2p_transport::bench::{WaitCounters, wait_counters};
 const SETTLE: Duration = Duration::from_secs(2);
 /// The measured idle window.
 const WINDOW: Duration = Duration::from_secs(10);
+/// The window under `MINIP2P_BENCH_QUICK=1`.
+const QUICK_WINDOW: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy)]
 struct Variant {
@@ -139,14 +148,14 @@ struct Measured {
     cpu: Duration,
 }
 
-fn measure(variant: Variant) -> Measured {
+fn measure(variant: Variant, window: Duration) -> Measured {
     let mut endpoint = bind(variant);
     drive(&mut endpoint, Instant::now() + SETTLE);
 
     let counters = wait_counters();
     let cpu = ProcessTime::now();
     let started = Instant::now();
-    drive(&mut endpoint, started + WINDOW);
+    drive(&mut endpoint, started + window);
     let measured = Measured {
         counters: wait_counters().since(&counters),
         wall: started.elapsed(),
@@ -162,6 +171,7 @@ fn measure(variant: Variant) -> Measured {
 }
 
 fn main() {
+    let window = if quick::quick() { QUICK_WINDOW } else { WINDOW };
     let mut rows = Vec::new();
     for variant in VARIANTS {
         if variant.ipv6
@@ -179,7 +189,7 @@ fn main() {
             counters,
             wall,
             cpu,
-        } = measure(variant);
+        } = measure(variant, window);
         let seconds = wall.as_secs_f64();
         let wakeups_per_s = counters.wakeups() as f64 / seconds;
         let cpu_ms_per_s = cpu.as_secs_f64() * 1e3 / seconds;
