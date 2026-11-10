@@ -57,10 +57,15 @@ containers=("${sides[@]/#/$name-}")
 rm -rf "$work" "$output"
 mkdir -p "$quarantine" "$output"
 
+# Keeps the log for the artifact, plus the latest pass's own log, which holds
+# the output of a pass that a cancellation or timeout cut short.
 keep_log() {
-  if [[ -f "$work/bench.log" ]]; then
-    cp "$work/bench.log" "$output/bench.log" || true
-  fi
+  local log
+  for log in bench.log pass.log; do
+    if [[ -f "$work/$log" ]]; then
+      cp "$work/$log" "$output/$log" || true
+    fi
+  done
 }
 
 # Cancellation: GitHub allows about ten seconds (SIGINT, 7.5 s, SIGTERM), so
