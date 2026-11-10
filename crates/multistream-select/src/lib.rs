@@ -28,6 +28,9 @@ const MAX_MESSAGE_LEN: usize = 1024;
 /// (and so length-checked) until then; an honest peer sends a header and a
 /// proposal or two, well under this.
 const MAX_UNSTARTED_BUFFER: usize = 4 * MAX_MESSAGE_LEN;
+/// Unsupported proposals a listener answers with `na` per stream before it
+/// fails the negotiation; see [`MultistreamSelect::listener_with_max_rejected`].
+pub const DEFAULT_MAX_REJECTED_PROPOSALS: usize = 16;
 
 /// Output produced by the negotiation state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,14 +65,22 @@ pub enum MultistreamError {
     UnexpectedProtocolResponse { actual: String },
     #[error("{len} bytes received before start (max {MAX_UNSTARTED_BUFFER})")]
     TooMuchBeforeStart { len: usize },
+    /// The dialer kept proposing protocols this listener does not support.
+    #[error("more than {max} unsupported protocol proposals")]
+    TooManyRejectedProposals { max: usize },
 }
 
 /// Which side of the negotiation this is, with the data only that side needs.
 enum Role {
     /// Initiated the stream and proposes one protocol.
     Dialer { desired: String },
-    /// Accepted the stream and answers proposals from this set.
-    Listener { supported: BTreeSet<String> },
+    /// Accepted the stream and answers proposals from this set, rejecting at
+    /// most `rejections_left` more before it fails.
+    Listener {
+        supported: BTreeSet<String>,
+        max_rejected: usize,
+        rejections_left: usize,
+    },
 }
 
 /// Internal state machine states for the multistream-select handshake.
@@ -104,10 +115,30 @@ impl MultistreamSelect {
         })
     }
 
-    /// Creates a listener that accepts connections for the given protocols.
+    /// Creates a listener that accepts connections for the given protocols,
+    /// rejecting up to [`DEFAULT_MAX_REJECTED_PROPOSALS`] unsupported ones.
     pub fn listener(protocols: impl IntoIterator<Item = String>) -> Self {
+        Self::listener_with_max_rejected(protocols, DEFAULT_MAX_REJECTED_PROPOSALS)
+    }
+
+    /// Creates a listener that answers at most `max_rejected` unsupported
+    /// proposals on this stream with `na`, counted across every
+    /// [`on_data`](Self::on_data) call (the multistream header does not
+    /// count). Proposal `max_rejected + 1` fails the negotiation with
+    /// [`MultistreamError::TooManyRejectedProposals`] instead of an `na`.
+    ///
+    /// The multistream-select spec sets no limit; this is a resource policy
+    /// that bounds the work a peer can cause on one stream before it has
+    /// agreed on a protocol. A dialer falling back across versions (such as
+    /// meshsub 1.2 then 1.1) needs only a few.
+    pub fn listener_with_max_rejected(
+        protocols: impl IntoIterator<Item = String>,
+        max_rejected: usize,
+    ) -> Self {
         Self::new(Role::Listener {
             supported: protocols.into_iter().collect(),
+            max_rejected,
+            rejections_left: max_rejected,
         })
     }
 
@@ -190,31 +221,35 @@ impl MultistreamSelect {
         self.process_buffer();
     }
 
-    /// Handles every complete message buffered so far.
+    /// Handles every complete message buffered so far, then drops the
+    /// consumed bytes in one shift. What follows them (a partial frame, or
+    /// bytes pipelined after a successful negotiation) stays buffered.
     fn process_buffer(&mut self) {
+        let mut offset = 0;
         while matches!(
             self.state,
             State::WaitingForRemoteHeader | State::Negotiating
         ) {
-            let (next_state, produced, consumed) = match decode_message(&self.recv_buf) {
-                DecodeResult::Complete { payload, consumed } => {
-                    let (next_state, produced) = handle_message(&self.role, self.state, payload);
-                    (next_state, produced, consumed)
-                }
-                DecodeResult::Incomplete => break,
-                DecodeResult::Error(err) => {
-                    self.state = State::Done;
-                    self.pending_outputs
-                        .push_back(MultistreamOutput::ProtocolError {
-                            reason: err.to_string(),
-                        });
-                    break;
-                }
-            };
-            self.recv_buf.drain(..consumed);
+            let (next_state, produced) =
+                match decode_message(self.recv_buf.get(offset..).unwrap_or_default()) {
+                    DecodeResult::Complete { payload, consumed } => {
+                        offset += consumed;
+                        handle_message(&mut self.role, self.state, payload)
+                    }
+                    DecodeResult::Incomplete => break,
+                    DecodeResult::Error(err) => {
+                        self.state = State::Done;
+                        self.pending_outputs
+                            .push_back(MultistreamOutput::ProtocolError {
+                                reason: err.to_string(),
+                            });
+                        break;
+                    }
+                };
             self.state = next_state;
             self.pending_outputs.extend(produced);
         }
+        self.recv_buf.drain(..offset);
     }
 
     /// Returns the next pending output, if any.
@@ -227,7 +262,7 @@ impl MultistreamSelect {
 }
 
 /// Processes a single decoded protocol line.
-fn handle_message(role: &Role, state: State, line: &str) -> (State, Vec<MultistreamOutput>) {
+fn handle_message(role: &mut Role, state: State, line: &str) -> (State, Vec<MultistreamOutput>) {
     match (state, role) {
         (State::WaitingForRemoteHeader, _) => {
             if line != MULTISTREAM_PROTOCOL_ID {
@@ -238,7 +273,14 @@ fn handle_message(role: &Role, state: State, line: &str) -> (State, Vec<Multistr
             // The dialer's proposal went out with its header in `start`.
             (State::Negotiating, Vec::new())
         }
-        (State::Negotiating, Role::Listener { supported }) => {
+        (
+            State::Negotiating,
+            Role::Listener {
+                supported,
+                max_rejected,
+                rejections_left,
+            },
+        ) => {
             if supported.contains(line) {
                 (
                     State::Done,
@@ -249,7 +291,10 @@ fn handle_message(role: &Role, state: State, line: &str) -> (State, Vec<Multistr
                         },
                     ],
                 )
+            } else if *rejections_left == 0 {
+                protocol_error(MultistreamError::TooManyRejectedProposals { max: *max_rejected })
             } else {
+                *rejections_left -= 1;
                 (
                     // A dialer may propose another protocol on the same
                     // stream after `na` (for example rust-libp2p tries
@@ -485,6 +530,126 @@ mod tests {
             ]
         );
         assert!(listener.is_done());
+    }
+
+    /// A started listener for `PING` that has read the dialer's header.
+    fn negotiating_listener(mut listener: MultistreamSelect) -> MultistreamSelect {
+        let _ = listener.start_drained();
+        assert!(
+            listener
+                .receive(&encode_message(MULTISTREAM_PROTOCOL_ID))
+                .is_empty()
+        );
+        listener
+    }
+
+    /// `n` distinct unsupported proposals, framed back to back.
+    fn unsupported_proposals(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| encode_message(&alloc::format!("/unsupported/{i}")))
+            .collect()
+    }
+
+    fn rejections(n: usize) -> Vec<MultistreamOutput> {
+        (0..n)
+            .flat_map(|_| {
+                [
+                    MultistreamOutput::OutboundData(encode_message(NOT_AVAILABLE)),
+                    MultistreamOutput::NotAvailable,
+                ]
+            })
+            .collect()
+    }
+
+    fn too_many_rejected(max: usize) -> MultistreamOutput {
+        MultistreamOutput::ProtocolError {
+            reason: MultistreamError::TooManyRejectedProposals { max }.to_string(),
+        }
+    }
+
+    #[test]
+    fn listener_fails_after_the_rejection_budget() {
+        let mut listener = negotiating_listener(MultistreamSelect::listener([PING.to_string()]));
+
+        // Counted across reads: one per call up to the budget.
+        for _ in 0..DEFAULT_MAX_REJECTED_PROPOSALS {
+            assert_eq!(listener.receive(&unsupported_proposals(1)), rejections(1));
+        }
+        assert!(!listener.is_done());
+
+        // The next one fails without an `na`, and the stream ignores the rest.
+        let mut tail = unsupported_proposals(1);
+        tail.extend_from_slice(&encode_message(PING));
+        assert_eq!(
+            listener.receive(&tail),
+            vec![too_many_rejected(DEFAULT_MAX_REJECTED_PROPOSALS)]
+        );
+        assert!(listener.is_done());
+    }
+
+    #[test]
+    fn listener_honours_a_configured_rejection_budget() {
+        let mut listener = negotiating_listener(MultistreamSelect::listener_with_max_rejected(
+            [PING.to_string()],
+            2,
+        ));
+        let mut out = rejections(2);
+        out.push(too_many_rejected(2));
+        assert_eq!(listener.receive(&unsupported_proposals(3)), out);
+
+        // A budget of zero fails on the first unsupported proposal.
+        let mut strict = negotiating_listener(MultistreamSelect::listener_with_max_rejected(
+            [PING.to_string()],
+            0,
+        ));
+        assert_eq!(
+            strict.receive(&unsupported_proposals(1)),
+            vec![too_many_rejected(0)]
+        );
+    }
+
+    #[test]
+    fn many_messages_in_one_read_keep_the_pipelined_tail() {
+        let mut listener = MultistreamSelect::listener([PING.to_string()]);
+        let _ = listener.start_drained();
+
+        let app_bytes = b"\x00\x01ping-payload";
+        let mut chunk = encode_message(MULTISTREAM_PROTOCOL_ID);
+        chunk.extend_from_slice(&unsupported_proposals(DEFAULT_MAX_REJECTED_PROPOSALS));
+        chunk.extend_from_slice(&encode_message(PING));
+        chunk.extend_from_slice(app_bytes);
+
+        let mut expected = rejections(DEFAULT_MAX_REJECTED_PROPOSALS);
+        expected.push(MultistreamOutput::OutboundData(encode_message(PING)));
+        expected.push(MultistreamOutput::Negotiated {
+            protocol: PING.to_string(),
+        });
+        assert_eq!(listener.receive(&chunk), expected);
+        assert_eq!(listener.take_remaining_buffer(), app_bytes);
+    }
+
+    #[test]
+    fn partial_trailing_frame_survives_a_read() {
+        let mut listener = MultistreamSelect::listener([PING.to_string()]);
+        let _ = listener.start_drained();
+
+        let proposal = encode_message(PING);
+        let (head, tail) = proposal.split_at(proposal.len() / 2);
+        let mut chunk = encode_message(MULTISTREAM_PROTOCOL_ID);
+        chunk.extend_from_slice(&unsupported_proposals(1));
+        chunk.extend_from_slice(head);
+
+        assert_eq!(listener.receive(&chunk), rejections(1));
+        assert_eq!(
+            listener.receive(tail),
+            vec![
+                MultistreamOutput::OutboundData(proposal.clone()),
+                MultistreamOutput::Negotiated {
+                    protocol: PING.to_string()
+                }
+            ]
+        );
+        assert!(listener.take_remaining_buffer().is_empty());
     }
 
     #[test]

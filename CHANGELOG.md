@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### A listener rejects at most 16 proposals per stream
+
+A multistream-select listener now answers at most `DEFAULT_MAX_REJECTED_PROPOSALS` (16) unsupported proposals on one stream with `na`; the 17th fails the negotiation with the new `MultistreamError::TooManyRejectedProposals`. Version fallback (a few proposals) is unaffected. Use `MultistreamSelect::listener_with_max_rejected` for another limit, and add an arm if you match `MultistreamError` exhaustively.
+
 ### The AutoNAT server validates dial-back requests
 
 `AutoNatServer::new()` is now `AutoNatServer::new(remote_peer, observed_addr)`: pass the connection's authenticated peer and remote address (`Endpoint::connection_remote_addr`). As AutoNAT v1 requires, the server refuses a DIAL over a relayed connection or one whose observed address has no IP (`E_DIAL_REFUSED`), or naming another peer (`E_BAD_REQUEST`), and `AutoNatRequest::addrs` holds only the candidates on the IP the requester was observed on, dropping relayed candidates and those naming another peer; with none left it answers `E_DIAL_REFUSED`. It answers these itself without emitting a `Request`, and ignores any `respond_*` after its one response. `Default` for `AutoNatServer` is removed.
