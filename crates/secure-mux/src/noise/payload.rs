@@ -178,10 +178,10 @@ mod tests {
     fn encode_matches_known_payload_bytes() {
         let payload = NoiseHandshakePayload {
             identity_key: b"key".to_vec(),
-            identity_sig: vec![7; 4],
+            identity_sig: alloc::vec![7; 4],
             extensions: Some(NoiseExtensions {
                 webtransport_certhashes: Vec::new(),
-                stream_muxers: vec!["m".into()],
+                stream_muxers: alloc::vec!["m".into()],
             }),
         };
         assert_eq!(
@@ -197,10 +197,10 @@ mod tests {
         // message NoiseExtensions { repeated bytes webtransport_certhashes = 1;
         //                           repeated string stream_muxers = 2; }
         let extensions = NoiseExtensions {
-            webtransport_certhashes: vec![Multihash::wrap(0x12, &[0xab; 32]).unwrap()],
-            stream_muxers: vec!["/yamux/1.0.0".into()],
+            webtransport_certhashes: alloc::vec![Multihash::wrap(0x12, &[0xab; 32]).unwrap()],
+            stream_muxers: alloc::vec!["/yamux/1.0.0".into()],
         };
-        let mut expected = vec![0x0a, 34, 0x12, 32];
+        let mut expected = alloc::vec![0x0a, 34, 0x12, 32];
         expected.extend_from_slice(&[0xab; 32]);
         expected.extend_from_slice(&[0x12, 12]);
         expected.extend_from_slice(b"/yamux/1.0.0");
@@ -224,12 +224,12 @@ mod tests {
     #[test]
     fn payload_carries_typed_extensions() {
         let extensions = NoiseExtensions {
-            webtransport_certhashes: vec![Multihash::wrap(0x12, &[1; 32]).unwrap()],
+            webtransport_certhashes: alloc::vec![Multihash::wrap(0x12, &[1; 32]).unwrap()],
             stream_muxers: Vec::new(),
         };
         let payload = NoiseHandshakePayload {
             identity_key: b"key".to_vec(),
-            identity_sig: vec![7; 4],
+            identity_sig: alloc::vec![7; 4],
             extensions: Some(extensions),
         };
         assert_eq!(

@@ -2565,7 +2565,7 @@ mod tests {
         client.handle_data(&open).unwrap();
         while client.poll_frame().is_some() {}
 
-        let frame = Frame::data(2, 0, vec![7; window]).unwrap().encode();
+        let frame = Frame::data(2, 0, alloc::vec![7; window]).unwrap().encode();
         client.handle_data(&frame).unwrap();
         let delivered: usize = client
             .poll_events()
@@ -2595,7 +2595,7 @@ mod tests {
         server.handle_data(&open.encode()).unwrap();
         server.poll_events();
         let window = window as usize;
-        let payload = Bytes::from(vec![7; window]);
+        let payload = Bytes::from(alloc::vec![7; window]);
         // The server may now send the whole window without an update.
         let mut sent = 0;
         while sent < window {
