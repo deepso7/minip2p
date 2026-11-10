@@ -2202,13 +2202,28 @@ fn data_after_a_close_capsule_is_stopped_even_when_our_fin_ack_lands_in_the_same
     let (mut server, mut peer, _) = established(DRAFT02);
     let mut events = Vec::new();
     idle(&mut server, &mut peer, &mut events, 50);
+    // Loopback may deliver a datagram a little after it was sent (macOS
+    // does): take in any straggler from the idle exchange, so the only
+    // datagram that can reach the client next is the answer to the capsule.
+    std::thread::sleep(Duration::from_millis(30));
+    peer.raw.receive();
     let connect = peer.connect.expect("CONNECT");
     peer.capsule(&Capsule::CloseSession {
         code: 42,
         reason: String::new(),
     });
     peer.raw.service();
-    events.extend(server.poll(now()).expect("poll the capsule"));
+    // Poll until the server's answer to the capsule (its FIN) has reached the
+    // client's socket, left unread.
+    let start = Instant::now();
+    while !crate::socket::has_queued_input(&peer.raw.socket) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no answer to the capsule"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(server.poll(now()).expect("poll the capsule"));
+    }
     // Trailing data goes out before the client has seen the server's FIN;
     // the FIN's acknowledgement follows, and one server poll reads both.
     peer.capsule(&Capsule::MaxData(4096));
