@@ -358,3 +358,5 @@ scripts/rtt-sweep.sh quic-stream yamux  # just these
 ```bash
 cargo bench -p minip2p-rs --features tcp,relay,relay-server,pubsub --bench endpoint_ping_load
 ```
+
+`MINIP2P_BENCH_QUICK=1` shortens the wall-clock benches for PR comparison runs, which set it: `endpoint_e2e` takes 10 Criterion samples over 1 s, `endpoint_idle` a 4 s window, `endpoint_rtt` one timed transfer per case and `endpoint_ping_load` 100 samples. Every row is still a rate, median or percentile, so a quick run compares with another quick run; `endpoint_throughput` is already short and ignores it.

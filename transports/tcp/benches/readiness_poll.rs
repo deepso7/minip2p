@@ -49,9 +49,6 @@ fn attached<S: minip2p_transport::PollSource>(source: &mut S) -> SharedPoll {
 
 fn readiness_poll(c: &mut Criterion) {
     let mut group = c.benchmark_group("tcp/readiness_poll");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
 
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
@@ -63,9 +60,6 @@ fn readiness_poll(c: &mut Criterion) {
 
     // Many connections, one of them ready: the cost of finding it.
     let mut group = c.benchmark_group("tcp/readiness_poll_sparse");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             let mut ready = establish(count);
@@ -83,9 +77,6 @@ fn readiness_poll(c: &mut Criterion) {
 fn transport_poll(c: &mut Criterion) {
     // Nothing is ready: what a poll costs before it finds any work.
     let mut group = c.benchmark_group("tcp/transport_poll_idle");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             let mut pair = upgraded(count);
@@ -101,9 +92,6 @@ fn transport_poll(c: &mut Criterion) {
 
     // One connection carries a byte per iteration, rotating across them.
     let mut group = c.benchmark_group("tcp/transport_poll_sparse");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             let mut pair = upgraded(count);
@@ -392,5 +380,27 @@ fn deliver_one(pair: &mut UpgradedSet, index: usize) {
     }
 }
 
-criterion_group!(benches, readiness_poll, transport_poll);
+/// The groups' Criterion settings, or a shorter run without plots with
+/// `MINIP2P_BENCH_QUICK=1`, which PR comparison runs set.
+fn config() -> Criterion {
+    let quick = std::env::var_os("MINIP2P_BENCH_QUICK").is_some_and(|value| value == "1");
+    if quick {
+        Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(500))
+            .measurement_time(Duration::from_secs(1))
+            .without_plots()
+    } else {
+        Criterion::default()
+            .sample_size(20)
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(3))
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = config();
+    targets = readiness_poll, transport_poll
+}
 criterion_main!(benches);

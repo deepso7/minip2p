@@ -12,9 +12,6 @@ const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn idle_poll(c: &mut Criterion) {
     let mut group = c.benchmark_group("quic/idle_poll");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
 
     for &count in COUNTS {
         let (mut server, _client) = establish(count);
@@ -105,5 +102,27 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
     (server, client)
 }
 
-criterion_group!(benches, idle_poll);
+/// The groups' Criterion settings, or a shorter run without plots with
+/// `MINIP2P_BENCH_QUICK=1`, which PR comparison runs set.
+fn config() -> Criterion {
+    let quick = std::env::var_os("MINIP2P_BENCH_QUICK").is_some_and(|value| value == "1");
+    if quick {
+        Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(500))
+            .measurement_time(Duration::from_secs(1))
+            .without_plots()
+    } else {
+        Criterion::default()
+            .sample_size(20)
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(3))
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = config();
+    targets = idle_poll
+}
 criterion_main!(benches);

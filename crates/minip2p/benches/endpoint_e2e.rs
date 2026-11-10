@@ -1,3 +1,6 @@
+#[path = "support/quick.rs"]
+mod quick;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
@@ -376,5 +379,23 @@ fn endpoint_e2e(c: &mut Criterion) {
     suite(c, Kind::Quic, "quic");
 }
 
-criterion_group!(benches, endpoint_e2e);
+/// Criterion's defaults, or a shorter run without plots with
+/// `MINIP2P_BENCH_QUICK=1`, which PR comparison runs set.
+fn config() -> Criterion {
+    if quick::quick() {
+        Criterion::default()
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(500))
+            .measurement_time(Duration::from_secs(1))
+            .without_plots()
+    } else {
+        Criterion::default()
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = config();
+    targets = endpoint_e2e
+}
 criterion_main!(benches);

@@ -1,6 +1,7 @@
 //! Endpoint setup shared by the Endpoint benches: event helpers, a driver
 //! thread, the three-Endpoint forced relayed circuit, bulk transfers
-//! ([`bulk`]) and an emulated link ([`delay`]).
+//! ([`bulk`]), an emulated link ([`delay`]) and the quick-run switch
+//! ([`quick`]).
 
 #![allow(
     dead_code,
@@ -9,6 +10,7 @@
 
 pub mod bulk;
 pub mod delay;
+pub mod quick;
 
 use std::sync::{
     Arc,

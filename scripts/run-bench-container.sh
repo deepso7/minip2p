@@ -11,7 +11,9 @@
 #   BENCH_CONTEXT        build context holding the measured code (default `.`)
 #   BENCH_BASE_CONTEXT   build context of a base tree to measure alongside it;
 #                        the result is then base.json and head.json instead
-#                        of current.json
+#                        of current.json, and both sides run with
+#                        MINIP2P_BENCH_QUICK=1: shorter wall-clock benches,
+#                        whose rows a comparison only reports
 #   BENCH_BASE_GIT_SHA   the base tree's commit (required with BENCH_BASE_CONTEXT)
 #   BENCH_SWEEP          emulated-link sweeps to run instead of the benchmarks
 #                        (scripts/rtt-sweep.sh names, space-separated, or
@@ -21,6 +23,8 @@ set -euo pipefail
 
 : "${BENCH_GIT_SHA:?BENCH_GIT_SHA is required}"
 export BENCH_SWEEP=${BENCH_SWEEP:-}
+# Set below for an A/B run; release and baseline runs measure in full.
+export MINIP2P_BENCH_QUICK=
 
 if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
   run_id=${BENCH_RUN_ID:-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT:-1}}
@@ -45,6 +49,7 @@ if [[ -n "${BENCH_BASE_CONTEXT:-}" ]]; then
     exit 2
   fi
   sides=(base head)
+  MINIP2P_BENCH_QUICK=1
   context[base]=$BENCH_BASE_CONTEXT sha[base]=$BENCH_BASE_GIT_SHA
   context[head]=${BENCH_CONTEXT:-.} sha[head]=$BENCH_GIT_SHA
 else
@@ -141,7 +146,7 @@ run_pass() {
   rm -f "$work/exit-code"
   {
     status=0
-    docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP "$name-$side" \
+    docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK "$name-$side" \
       bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
     echo "$status" > "$work/exit-code"
   } | head -c "$log_max_bytes" > "$work/pass.log" &

@@ -128,6 +128,8 @@ Each result row names one metric from the fixed `METRICS` registry in `scripts/b
 
 A PR run, or a dispatch with `base`, resolves the head's merge-base with the base branch through the compare API, checks it out into `bench-base/`, and passes it to `scripts/run-bench-container.sh` as `BENCH_BASE_CONTEXT`. Each tree gets its own image (sharing the BuildKit cache) and container, and each validates its own rows with its own harness and registries. `Ir` runs once per side; the `wall` and `node` passes alternate which side goes first, so drift on the host hits both alike. The run writes `base.json` and `head.json`, and the `Compare` step runs the trusted checkout's `bench_results.py compare` on them. Both images and containers are removed when the run ends. The decision is [ADR 0026](../../docs/adr/0026-pr-benches-against-the-merge-base-in-the-same-run.md).
 
+An A/B run also passes `MINIP2P_BENCH_QUICK=1` into both containers, which shortens the wall-clock benches whose rows the comparison only reports: Criterion takes 10 samples over 1 s after a 0.5 s warm-up, without plots, `endpoint_idle` a 4 s window, `endpoint_rtt` one timed transfer per case and `endpoint_ping_load` 100 samples. That roughly halves each side's `wall` pass (about 8.3 minutes to 3.5 on a 12-core laptop). Every such row is still a rate, median or percentile, so base and head compare. Release and baseline runs leave it unset and measure in full, so `bench-data` history stays comparable. A base tree from before the knob ignores it and measures in full, so the first PR after the change compares a full base with a quick head; those rows are informational either way.
+
 The comparison matches rows by (tier, name, metric) and reads head's rows without requiring their tier or metric to be registered, since a PR may add one. Only the deterministic metrics in `BANDS`, `Ir` and the per-message `allocs_per_msg` and `bytes_allocated_per_msg`, get a class: `notable` from 2%, `changed` from 1%, otherwise `negligible`, with a direction. Every other row (wall clock, throughput, latency, idle wakeups and CPU, allocations and datagrams over real transports, Node FFI) is informational. If `bench/pins.json`, or the part of `Cargo.lock` reachable from the `ir` lines' packages in `bench/targets`, differs between the two trees, the comment says so in a note; the `Ir` rows are still compared.
 
 ### Release history resets
@@ -144,7 +146,7 @@ A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or 
 
 ## Cost
 
-On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A release run, including boot and the idle tail, takes about 25 minutes, about $0.11; a PR run measures two trees and takes about 40 minutes, about $0.17. The 20-minute lease bounds the shortest stay, so the weekly keepalive costs about the same. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $13/month.
+On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A release run, including boot and the idle tail, takes about 25 minutes, about $0.11; a PR run measures two trees and takes about 30 minutes, about $0.13. The 20-minute lease bounds the shortest stay, so the weekly keepalive costs about the same. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $13/month.
 
 ## Running by hand on the instance
 
