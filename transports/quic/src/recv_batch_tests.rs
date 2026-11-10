@@ -245,14 +245,25 @@ fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
         "window",
         |events| stream_bytes(events, stream).len() == WINDOW,
     );
-    std::thread::sleep(Duration::from_millis(2));
-    discard_raw(&peer);
+    // The read returns the window's credit, but loopback may deliver the
+    // server's MAX_STREAM_DATA after the poll that sent it (macOS does), so
+    // wait for it rather than assume it arrived. Nothing is sent once the
+    // marker is accepted, so it leaves in the packet built below.
+    let start = Instant::now();
+    while peer.write(stream, b"marker") == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no credit for the marker"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        peer.pump();
+        server.poll(now()).expect("poll");
+    }
 
     // One stream datagram, then junk of the same size in the same burst: one
     // receive call where the platform batches receives, and one GRO batch
     // where it coalesces a segmented train. Where the platform does neither,
     // each datagram has its own call and allocation anyway.
-    assert_eq!(peer.write(stream, b"marker"), 6);
     let mut train = Vec::new();
     let transmit = peer
         .conn()

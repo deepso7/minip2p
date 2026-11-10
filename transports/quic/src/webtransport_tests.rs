@@ -2208,7 +2208,18 @@ fn data_after_a_close_capsule_is_stopped_even_when_our_fin_ack_lands_in_the_same
         reason: String::new(),
     });
     peer.raw.service();
-    events.extend(server.poll(now()).expect("poll the capsule"));
+    // Loopback may deliver a datagram a little after it was sent (macOS
+    // does), so poll until the server has answered the capsule with its FIN,
+    // leaving that answer unread on the client's socket.
+    let start = Instant::now();
+    while peer.raw.socket.peek_from(&mut [0; 1]).is_err() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no answer to the capsule"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(server.poll(now()).expect("poll the capsule"));
+    }
     // Trailing data goes out before the client has seen the server's FIN;
     // the FIN's acknowledgement follows, and one server poll reads both.
     peer.capsule(&Capsule::MaxData(4096));
