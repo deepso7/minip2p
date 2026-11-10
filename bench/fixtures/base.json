@@ -1,24 +1,30 @@
 {
   "schema_version": 1,
-  "git_sha": "baseline",
+  "git_sha": "base",
   "rows": [
     {
       "tier": "rust-micro",
-      "name": "micro/noise",
+      "name": "micro/negligible",
       "metric": "Ir",
       "value": 1000
     },
     {
       "tier": "rust-micro",
-      "name": "micro/boundary",
+      "name": "micro/regressed",
       "metric": "Ir",
       "value": 1000
     },
     {
       "tier": "rust-wall",
-      "name": "wall/changed",
+      "name": "wall/slower",
       "metric": "median_ns",
       "value": 100
+    },
+    {
+      "tier": "rust-wall",
+      "name": "wall/removed",
+      "metric": "median_ns",
+      "value": 10
     }
   ]
 }

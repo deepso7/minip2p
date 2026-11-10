@@ -18,3 +18,7 @@ core.*
 bindings/ts/node/*.node
 bindings/ts/node-platforms/*/*.node
 crates/nodejs/*.node
+# The Bench workflow's other checkouts, when the trusted checkout is itself
+# the build context.
+bench-source
+bench-base

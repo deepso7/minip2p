@@ -31,14 +31,9 @@ minip2p-transport = { path = "../transport", version = "0.11.8", default-feature
 thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 gungraun = { workspace = true }
 minip2p-identity = { path = "../identity", version = "0.11.8" }
 minip2p-nat = { path = "../nat", version = "0.11.8" }
-
-[[bench]]
-name = "relay_server_event"
-harness = false
 
 [[bench]]
 name = "relay_server_event_ir"
