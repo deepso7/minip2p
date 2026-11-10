@@ -55,7 +55,7 @@ AutoNAT v1 makes the server refuse to dial anywhere but the requester, or it bec
 
 - `E_DIAL_REFUSED` if the connection is relayed (`/p2p-circuit`) or its address carries no IP.
 - `E_BAD_REQUEST` if the DIAL names a peer other than the authenticated one.
-- `E_DIAL_REFUSED` if no candidate address remains once those off the observed IP, relayed ones, DNS names, and any whose `/p2p` names another peer are dropped.
+- `E_DIAL_REFUSED` if no candidate address remains once those off the observed IP, relayed ones, DNS names, and any whose `/p2p` names another peer are dropped. An IPv4-mapped IPv6 address (`/ip6/::ffff:a.b.c.d`, as a dual-stack listener may observe an IPv4 peer) counts as the IPv4 address it maps; the candidates forwarded are unchanged.
 
 Otherwise `Request` carries only the remaining addresses. Each server sends at most one response; later `respond_*` calls are ignored. Rate limiting stays the runtime's policy.
 

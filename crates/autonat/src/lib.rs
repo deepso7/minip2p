@@ -410,7 +410,8 @@ impl AutoNatServer {
     /// - `E_BAD_REQUEST` if the DIAL names a peer other than `remote_peer`.
     /// - `E_DIAL_REFUSED` if no candidate address remains after dropping
     ///   those not on the observed IP, relayed ones, and any whose `/p2p`
-    ///   names another peer.
+    ///   names another peer. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
+    ///   is on the same IP as the IPv4 address it maps.
     pub fn new(remote_peer: PeerId, observed_addr: &Multiaddr) -> Self {
         let observed_ip = if is_relayed(observed_addr) {
             Err("refusing a dial-back requested over a relayed connection")
@@ -589,11 +590,16 @@ impl AutoNatServer {
     }
 }
 
-/// The IP an address starts with, if it starts with one.
+/// The IP an address starts with, if it starts with one. An IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`, as a dual-stack listener may observe an IPv4
+/// peer) is returned as the IPv4 address it maps, so it matches that host.
 fn ip_of(addr: &Multiaddr) -> Option<IpAddr> {
     match addr.protocols().first()? {
         Protocol::Ip4(octets) => Some(Ipv4Addr::from(*octets).into()),
-        Protocol::Ip6(octets) => Some(Ipv6Addr::from(*octets).into()),
+        Protocol::Ip6(octets) => {
+            let ip = Ipv6Addr::from(*octets);
+            Some(ip.to_ipv4_mapped().map_or(ip.into(), IpAddr::V4))
+        }
         _ => None,
     }
 }
@@ -874,6 +880,37 @@ mod tests {
             expected.iter().map(Multiaddr::to_bytes).collect::<Vec<_>>()
         );
         assert_eq!(request.addrs, expected);
+    }
+
+    /// Whether a server observing the requester at `observed` forwards the
+    /// single candidate `candidate`.
+    fn forwards(observed: &str, candidate: &str) -> bool {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let outputs = dial(server_at(observed), &peer_id, &addrs(&[candidate]));
+        matches!(&outputs[..], [AutoNatServerOutput::Request(_)])
+    }
+
+    /// A dual-stack listener can observe an IPv4 host as an IPv4-mapped IPv6
+    /// address; that is the same host as its plain IPv4 candidates.
+    #[test]
+    fn an_ipv4_mapped_ipv6_address_matches_its_ipv4_host() {
+        assert!(forwards(
+            "/ip6/::ffff:203.0.113.7/udp/4001/quic-v1",
+            "/ip4/203.0.113.7/tcp/4001",
+        ));
+        assert!(forwards(
+            "/ip4/203.0.113.7/udp/4001/quic-v1",
+            "/ip6/::ffff:203.0.113.7/tcp/4001",
+        ));
+        assert!(!forwards(
+            "/ip6/2001:db8::1/udp/4001/quic-v1",
+            "/ip4/203.0.113.7/tcp/4001",
+        ));
+        // The deprecated IPv4-compatible form is not an IPv4 host.
+        assert!(!forwards(
+            "/ip6/::203.0.113.7/udp/4001/quic-v1",
+            "/ip4/203.0.113.7/tcp/4001",
+        ));
     }
 
     #[test]
