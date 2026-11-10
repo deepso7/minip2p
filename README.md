@@ -178,3 +178,5 @@ All published Rust and TypeScript packages share one version. Releases also incl
 ## License
 
 [MIT](LICENSE)
+
+<!-- bench A/B smoke test: do not merge -->
