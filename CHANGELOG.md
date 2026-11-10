@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### The AutoNAT server treats IPv4-mapped IPv6 as IPv4
+
+`AutoNatServer` now matches an IPv4-mapped IPv6 address (`/ip6/::ffff:a.b.c.d`) to the IPv4 address it maps, on either the observed address or a candidate, so a request a dual-stack listener used to refuse with `E_DIAL_REFUSED` is forwarded; no migration is needed.
+
 ### Portable shutdown returns a report
 
 `PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every disconnect and final-drive `DriverError` (mDNS goodbye failures stay `EndpointEvent::MdnsFailed` in `events`), and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` by binding the report (`let report = endpoint.shutdown(now);`), checking `report.errors` and `report.unfinished`, then using `report.events`. In `@minip2p/web`, a close now delivers those events even after a failed shutdown, followed by `endpointClosed` carrying the real `unfinished` connections; its `outcome` is `Failed` if the shutdown hit any error, else `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports, else `Drained`.
