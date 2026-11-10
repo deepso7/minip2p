@@ -48,6 +48,7 @@ minip2p-rs|no-default|mdns,discovery|release
 minip2p-rs|no-default|smoltcp,relay,discovery,relay-server|ci
 minip2p-tcp|default|smoltcp|ci
 minip2p-mdns|default|smoltcp|ci
+minip2p-secure-mux|no-default||ci
 minip2p-transport|default|bench|release
 minip2p-quic|default|diagnostics|ci
 minip2p-ffi-core|no-default|serde|release
