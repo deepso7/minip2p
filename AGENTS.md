@@ -52,6 +52,7 @@ The default swarm composes only identify + ping + protocols registered via `Swar
 
 - Every crate has a README and rustdoc on all public APIs; keep both current.
 - Wire-facing decoders get fuzz coverage via the `wire_inputs` target in `fuzz/`.
+- If a PR touches a perf-sensitive path, add the `bench` label on the PR to bench it and review the results comment for regressions.
 
 ## Coding Preferences
 
