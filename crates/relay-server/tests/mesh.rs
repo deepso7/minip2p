@@ -13,7 +13,7 @@ use minip2p_relay_server::{
     RelayServerEvent, Status, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::ConnectionId;
+use minip2p_transport::{ConnectionId, ConnectionNamespace};
 
 use common::mesh::{Mesh, link, member};
 use common::nat_client::{
@@ -411,6 +411,33 @@ fn a_stale_claim_tried_first_falls_through_to_the_live_one() {
         assert_eq!(opened_events(&mesh.nodes[C].events()), [Some(member(B))]);
         bob.assert_opened(&mut mesh, at(2));
     }
+}
+
+#[test]
+fn a_local_stop_that_fails_to_open_falls_through_to_a_remote_claim() {
+    let mut mesh = mesh(defaults());
+    mesh.reserve(A, &alice(), key(ALICE_CONN_2, 1), at(0));
+    mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(0));
+    // C's swarm already lost Alice; the agent has not heard yet.
+    mesh.nodes[C].swarm.forget(&alice());
+
+    let bob = Bob::dial(&mut mesh, C, Dialer::Scripted, at(1));
+    assert_eq!(forward_opens(&mesh, C, A), 1);
+    mesh.answer_stop(A, &alice(), Status::Ok, at(1));
+    bob.assert_opened(&mut mesh, at(1));
+}
+
+#[test]
+fn a_replaced_link_keeps_connects_waiting_for_the_new_snapshot() {
+    let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
+    mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
+
+    let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
+    mesh.nodes[C].replace(&member(B), link(B), new_link, false, 2);
+    // Not pumped: the harness only carries the original links.
+    let calls = mesh.nodes[C].calls();
+    assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
+    assert_eq!(mesh.nodes[C].circuit_count(), 1);
 }
 
 #[test]

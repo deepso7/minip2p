@@ -80,16 +80,17 @@ pub const fn is_backbone_connection(conn_id: ConnectionId) -> bool {
     tag == ConnectionNamespace::MESH_IPV4.get() || tag == ConnectionNamespace::MESH_IPV6.get()
 }
 
-/// Installs the backbone swarm's mesh protocols, inbound and outbound:
-/// directory and forward. Neither is advertised.
+/// Installs the backbone swarm's mesh protocols, directory and forward,
+/// inbound, outbound and advertised. Advertising matters: once a member's
+/// Identify arrives, the swarm refuses opens for protocols it did not
+/// advertise. The backbone only talks to members, so nobody else sees them.
 pub fn register_backbone_roles<T, E>(swarm: &mut SwarmCore<T, E>) -> Result<(), SwarmError>
 where
     T: Transport,
     E: EntropySource,
 {
     for protocol in [DIRECTORY_PROTOCOL_ID, FORWARD_PROTOCOL_ID] {
-        swarm.add_inbound_protocol(protocol)?;
-        swarm.add_outbound_protocol(protocol)?;
+        swarm.add_protocol(protocol)?;
     }
     Ok(())
 }

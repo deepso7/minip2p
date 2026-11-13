@@ -881,10 +881,7 @@ impl RelayServerAgent {
             }
             SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
                 if self.is_backbone(*new) {
-                    // A member's link holds no reservation to move: the old
-                    // link goes first, so the new one starts a fresh sync.
-                    self.on_connection_closed(io, peer_id, *old);
-                    self.on_backbone_established(io, peer_id.clone(), *new);
+                    self.on_backbone_replaced(io, peer_id, *old, *new);
                 } else {
                     self.on_connection_replaced(io, peer_id, *old, *new, is_circuit);
                 }
@@ -2475,7 +2472,9 @@ impl RelayServerAgent {
             destination_pipelined: Vec::new(),
             source_eof: false,
         };
-        if let Some(conn_id) = destination_conn {
+        // A mesh node routes even a local reservation through resolution, so
+        // a local STOP that fails to open falls through to remote claims.
+        if let Some(conn_id) = destination_conn.filter(|_| self.mesh.is_none()) {
             // Admitted: only now does the request cost a token.
             self.consume_circuit_token(&pending, now_ms);
             match self.open_stop(io, &pending.destination_peer_id, conn_id) {

@@ -123,6 +123,12 @@ impl FakeSwarm {
             .or_insert_with(|| maddr(DEFAULT_REMOTE_ADDR));
     }
 
+    /// Forgets `peer`'s connection without telling the agent, as when the
+    /// swarm closed it and the event is still on its way.
+    pub fn forget(&mut self, peer: &PeerId) {
+        self.connections.remove(peer);
+    }
+
     pub fn take_calls(&mut self) -> Vec<Call> {
         core::mem::take(&mut self.calls)
     }

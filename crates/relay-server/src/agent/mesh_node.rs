@@ -148,6 +148,27 @@ impl RelayServerAgent {
         self.open_directory(io, peer);
     }
 
+    /// A member's link was replaced. It holds no reservation to move, so
+    /// the old link goes first and the new one starts a fresh sync. The
+    /// member stays connected and unsynced throughout, so CONNECTs waiting
+    /// on it, or falling back from a forward on the old link, keep waiting
+    /// for the new link's snapshot instead of failing.
+    pub(super) fn on_backbone_replaced(
+        &mut self,
+        io: &mut Io<'_>,
+        peer: &PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
+    ) {
+        if self.on_backbone_closed(peer, old)
+            && let Some(mesh) = &mut self.mesh
+        {
+            mesh.directory.member_connected(peer.clone());
+        }
+        self.on_connection_closed(io, peer, old);
+        self.on_backbone_established(io, peer.clone(), new);
+    }
+
     /// Forgets the link `conn_id` to `peer`, dropping the member's entries.
     /// Returns whether it was the member's current link; the caller then
     /// re-resolves the CONNECTs waiting on it.
