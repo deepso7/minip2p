@@ -183,6 +183,9 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
 fn pinned_rust_libp2p_connects_across_a_relay_mesh() {
     use minip2p::{Ed25519Keypair, PeerAddr, RelayMeshConfig};
 
+    // Built before the relays bind: nothing drives them while it builds,
+    // and an idle backbone left undriven that long goes stale.
+    build_client();
     let public = Ed25519Keypair::generate();
     let backbones = [Ed25519Keypair::generate(), Ed25519Keypair::generate()];
     // Ports no socket holds now, so each node can list the other before
