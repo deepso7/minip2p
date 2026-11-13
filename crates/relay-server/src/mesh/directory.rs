@@ -3,9 +3,9 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use minip2p_core::{FrameExchange, PeerId};
+use minip2p_core::PeerId;
 
-use super::codec::{DirectoryMessage, MAX_MESH_MESSAGE_SIZE, MeshMessageError};
+use super::codec::{DirectoryMessage, MeshMessageError, decode_mesh_frame};
 
 /// Default for [`Directory::new`]'s per-member entry cap.
 pub const DEFAULT_MAX_DIRECTORY_ENTRIES_PER_MEMBER: usize = 4096;
@@ -47,8 +47,9 @@ pub enum DirectoryResetReason {
 /// Directory state for one connected member.
 #[derive(Clone, Debug)]
 struct Member<S> {
-    /// The current inbound directory stream and its frame buffer.
-    stream: Option<(S, FrameExchange)>,
+    /// The current inbound directory stream and the bytes of its next,
+    /// still incomplete frame.
+    stream: Option<(S, Vec<u8>)>,
     /// Whether the current stream has delivered `Synced`.
     synced: bool,
     /// Reserved peer to its expiry, UTC UNIX seconds.
@@ -122,10 +123,7 @@ impl<S: Eq> Directory<S> {
     pub fn stream_opened(&mut self, member: PeerId, stream: S) {
         let state = self.members.entry(member).or_insert_with(Member::new);
         state.clear();
-        state.stream = Some((
-            stream,
-            FrameExchange::with_trailing(MAX_MESH_MESSAGE_SIZE, usize::MAX),
-        ));
+        state.stream = Some((stream, Vec::new()));
     }
 
     /// Applies bytes read from `member`'s directory stream `stream`.
@@ -137,7 +135,7 @@ impl<S: Eq> Directory<S> {
         let Some(state) = self.members.get_mut(member) else {
             return DirectoryInput::Ignored;
         };
-        let Some((_, frames)) = state
+        let Some((_, buffer)) = state
             .stream
             .as_mut()
             .filter(|(current, _)| current == stream)
@@ -145,32 +143,37 @@ impl<S: Eq> Directory<S> {
             return DirectoryInput::Ignored;
         };
 
+        // Decode with a cursor and drop the consumed bytes once at the end, so
+        // a snapshot read in one go costs time linear in its size.
+        buffer.extend_from_slice(data);
+        let mut consumed = 0;
         let mut became_synced = false;
-        let result = frames
-            .push(data)
-            .map_err(MeshMessageError::from)
-            .and_then(|()| {
-                while let Some(message) = frames.next_frame(DirectoryMessage::decode)? {
-                    match message {
-                        DirectoryMessage::Present { peer, expires_unix } => {
-                            if !state.entries.contains_key(&peer)
-                                && state.entries.len() >= max_entries
-                            {
-                                return Ok(Some(DirectoryResetReason::TooManyEntries));
-                            }
-                            state.entries.insert(peer, expires_unix);
+        let result = (|| {
+            while let Some((message, used)) = decode_mesh_frame(
+                buffer.get(consumed..).unwrap_or_default(),
+                DirectoryMessage::decode,
+            )? {
+                consumed += used;
+                match message {
+                    DirectoryMessage::Present { peer, expires_unix } => {
+                        if !state.entries.contains_key(&peer) && state.entries.len() >= max_entries
+                        {
+                            return Ok(Some(DirectoryResetReason::TooManyEntries));
                         }
-                        DirectoryMessage::Gone { peer } => {
-                            state.entries.remove(&peer);
-                        }
-                        DirectoryMessage::Synced => {
-                            became_synced |= !state.synced;
-                            state.synced = true;
-                        }
+                        state.entries.insert(peer, expires_unix);
+                    }
+                    DirectoryMessage::Gone { peer } => {
+                        state.entries.remove(&peer);
+                    }
+                    DirectoryMessage::Synced => {
+                        became_synced |= !state.synced;
+                        state.synced = true;
                     }
                 }
-                Ok(None)
-            });
+            }
+            Ok(None)
+        })();
+        buffer.drain(..consumed);
 
         let reset = match result {
             Ok(None) if became_synced => return DirectoryInput::Synced,

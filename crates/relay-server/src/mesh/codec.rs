@@ -25,7 +25,7 @@
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    FrameFault, PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_frame,
+    PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_frame,
     encode_varint_field, read_len_delimited, read_tag, read_varint_value, skip_field,
 };
 use minip2p_relay::{Limit, RelayMessageError, Status};
@@ -114,18 +114,6 @@ pub enum MeshMessageError {
         /// The protobuf field name.
         field: &'static str,
     },
-}
-
-impl From<FrameFault> for MeshMessageError {
-    fn from(fault: FrameFault) -> Self {
-        match fault {
-            FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
-            // A decoder pushes and drains frame by frame, so the buffer bound
-            // is only crossed by a frame that is itself too large.
-            FrameFault::Overflow { len, .. } => Self::FrameTooLarge { len: len as u64 },
-            FrameFault::Wire(e) => Self::Wire(e),
-        }
-    }
 }
 
 impl From<RelayMessageError> for MeshMessageError {
