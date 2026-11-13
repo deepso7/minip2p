@@ -24,7 +24,9 @@ Run `just interop-relay-rust` to start a minip2p TCP relay and two independent r
 
 The gate requires a reservation, the relay's Identify HOP advertisement, HOP CONNECT and STOP establishment, and successful ping traffic (bytes accepted in both directions). It configures non-default duration and byte limits and asserts that rust-libp2p decodes the exact values on RESERVE and both circuit legs. Successful reservation proves rust-libp2p accepts minip2p's `voucher: None`. The gate does not assert deliberate minip2p deviations as upstream parity. It is ignored in ordinary tests because it downloads/builds the pinned foreign implementation and owns loopback sockets.
 
-Recorded environment/result: macOS arm64, Rust stable 1.91-compatible toolchain, `just interop-relay-rust`: success (2026-08-20).
+The same recipe runs a second case against a two-node relay mesh: two minip2p relay Endpoints share one public identity and link over a loopback QUIC backbone. The destination reserves on the first node and the source dials through the second, so the unchanged rust-libp2p clients complete CONNECT/STOP and ping across the backbone, and both nodes report the circuit with the other's backbone peer ID in `via`. The go-libp2p harness has no relay-client mode, so the mesh is covered against rust-libp2p only.
+
+Recorded environment/result: macOS arm64, Rust stable 1.91-compatible toolchain, `just interop-relay-rust`: success (2026-08-20). Linux x86_64 (Ubuntu 26.04), Rust 1.99, both cases including the mesh: success (2026-11-13).
 
 ## Still separate
 
