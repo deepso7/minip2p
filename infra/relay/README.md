@@ -34,7 +34,7 @@ Certbot renews about 30 days before expiry. To test the whole path:
 
 ```bash
 sudo certbot renew --cert-name relay.minip2p.com --force-renewal
-sudo openssl x509 -noout -enddate -in /etc/minip2p-relay/tls/fullchain.pem
+sudo openssl x509 -noout -enddate -in /etc/letsencrypt/live/relay.minip2p.com/fullchain.pem
 minip2p-relay service logs
 ```
 
