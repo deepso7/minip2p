@@ -2,7 +2,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use minip2p::{Multiaddr, PeerAddr, RateLimit, RelayServerConfig};
+use minip2p::{Multiaddr, PeerAddr, Protocol, RateLimit, RelayServerConfig};
 
 #[derive(Debug)]
 pub struct Options {
@@ -147,9 +147,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     if options.quic_binds.len() > 2 {
         return Err("--quic accepts at most one IPv4 and one IPv6 address".into());
     }
-    if mesh_listen.len() > 2 {
-        return Err("--mesh-listen accepts at most one IPv4 and one IPv6 address".into());
-    }
+    check_mesh(&mesh_listen, &mesh_members)?;
     options.mesh = match mesh_key {
         // An ephemeral public identity can't be shared with the other nodes.
         Some(_) if options.key_path.is_none() => {
@@ -188,7 +186,30 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
 /// Resolves one `HOST:PORT` bind to the single socket address it binds: the
 /// resolver's first answer. One flag is one socket, as before binds became
 /// listen multiaddrs; repeat the flag (or pass IPs) to bind both families.
-fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
+/// Checks mesh settings the relay would only reject once bound, so that
+/// `service install` refuses them before replacing a working unit.
+pub(crate) fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<(), String> {
+    if listen.len() > 2 {
+        return Err("--mesh-listen accepts at most one IPv4 and one IPv6 address".into());
+    }
+    for member in members {
+        if !matches!(
+            member.transport().protocols(),
+            [
+                Protocol::Ip4(_) | Protocol::Ip6(_),
+                Protocol::Udp(_),
+                Protocol::QuicV1
+            ]
+        ) {
+            return Err(format!(
+                "--mesh-member {member} must be /ip4|ip6/IP/udp/PORT/quic-v1/p2p/BACKBONE_ID"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
     value
         .to_socket_addrs()
         .map_err(|error| {
@@ -391,5 +412,20 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("invalid --mesh-member"), "{error}");
+    }
+
+    #[test]
+    fn check_mesh_rejects_what_the_relay_would_refuse_at_bind() {
+        let dns: PeerAddr = "/dns4/relay.example.com/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .parse()
+            .unwrap();
+        let error = check_mesh(&[], &[dns]).unwrap_err();
+        assert!(error.contains("must be /ip4|ip6"), "{error}");
+        let listen: Vec<SocketAddr> = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let error = check_mesh(&listen, &[]).unwrap_err();
+        assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
     }
 }

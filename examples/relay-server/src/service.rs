@@ -67,6 +67,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>>
                     .cloned()
                     .collect(),
             };
+            crate::cli::check_mesh(&mesh.listen, &mesh.members)?;
             // `--mesh-listen` and `--mesh-member` imply `--mesh`.
             let mesh =
                 (matches.get_flag("mesh") || !mesh.listen.is_empty() || !mesh.members.is_empty())
@@ -546,7 +547,7 @@ fn command() -> ClapCommand {
                     Arg::new("mesh-listen")
                         .long("mesh-listen")
                         .value_name("HOST:PORT")
-                        .value_parser(value_parser!(SocketAddr))
+                        .value_parser(|value: &str| crate::cli::socket("--mesh-listen", value.to_owned()))
                         .action(ArgAction::Append)
                         .help("Exact backbone UDP bind (repeatable; default 0.0.0.0:19877 and [::]:19877); implies --mesh"),
                 )
