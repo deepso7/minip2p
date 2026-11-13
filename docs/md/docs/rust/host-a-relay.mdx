@@ -5,6 +5,8 @@ description: Install and run the minip2p circuit relay on a Linux server.
 
 The relay server runs as one process and listens on TCP and QUIC over IPv4 and IPv6. By default it uses port `19876` and falls back to whichever address family the host supports.
 
+To try relaying without a server, use the project's [public relay](/docs/reference/public-relay).
+
 You need a Linux x86-64 or ARM64 server with a public IP address. Allow inbound TCP and UDP traffic on port `19876`. TCP carries the TCP transport; UDP carries QUIC.
 
 ### Install the relay
