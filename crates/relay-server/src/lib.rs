@@ -38,6 +38,7 @@ mod address;
 mod agent;
 mod config;
 mod limiter;
+pub mod mesh;
 mod swarm;
 mod types;
 
@@ -46,7 +47,7 @@ pub use agent::RelayServerAgent;
 pub use config::{
     RateLimit, RelayServerConfig, RelayServerConfigError, RelayServerConfigErrorKind,
 };
-pub use minip2p_relay::Status;
+pub use minip2p_relay::{Limit, Status};
 pub use swarm::{RelaySwarm, RelaySwarmError};
 pub use types::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RelayServerEvent,

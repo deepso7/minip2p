@@ -15,6 +15,13 @@ The first `handle_event` at each `Now` sample processes due deadlines before dis
 
 Admission, cancellation, connection close, `next_deadline`, and a tick with nothing due are indexed by connection, peer, stream, and deadline, so their cost does not grow with unrelated reservations or circuits. The `relay_server_event_ir` bench runs each case at 100, 1k, and 10k reservations and circuits to show it.
 
+## Relay mesh (in progress)
+
+The `mesh` module is the groundwork for serving one relay identity from several nodes (see `docs/plans/relay-mesh.md`); the agent does not use it yet. It holds:
+
+- The wire codec for `/minip2p/relay-mesh/directory/1.0.0` (`DirectoryMessage`: `Present { peer, expires_unix }`, `Gone { peer }`, `Synced`) and `/minip2p/relay-mesh/forward/1.0.0` (`ForwardMessage`: `Forward { source, destination, limit }` and a `Status` reply with Circuit Relay v2 codes). Frames are length-prefixed protobuf capped at 8 KiB, like relay control frames.
+- `Directory<S>`, a node's view of which peers hold reservations on which member, keyed by each member's backbone peer ID. It owns each member's current inbound directory stream: a newer stream supersedes the old one and clears its entries, input on a superseded stream is ignored, and a stream end or disconnect drops the member's entries. A malformed frame or more than `max_entries_per_member` peers (4,096 by default) returns `DirectoryInput::Reset`, and the caller resets the stream. `claims(destination, now_unix)` lists unexpired remote claims, latest expiry first and ties by lower member peer ID; `has_unsynced_member()` tells a CONNECT with no claim whether to wait for a snapshot.
+
 ## Compatibility contract
 
 | Area | Behavior | Classification |
