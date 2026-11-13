@@ -48,11 +48,11 @@ Not carried out yet. These steps turn `relay.minip2p.com` into a relay mesh: sev
 
 ### Regions
 
-| Region | Role |
-| --- | --- |
-| `ap-south-1` (Mumbai) | the current instance; keeps its identity |
-| `eu-central-1` (Frankfurt) | new |
-| `us-east-1` | new |
+| Region                     | Role                                     |
+| -------------------------- | ---------------------------------------- |
+| `ap-south-1` (Mumbai)      | the current instance; keeps its identity |
+| `eu-central-1` (Frankfurt) | new                                      |
+| `us-east-1`                | new                                      |
 
 Give every node an Elastic IP, Mumbai included: the current instance has an auto-assigned IPv4 address that changes on stop/start, and the member list and DNS records need fixed addresses. Attach Mumbai's before any DNS change, and update its `A` record to it. Keep NTP running on every node (Ubuntu's default `systemd-timesyncd` is enough): reservation expiries cross the backbone as UNIX seconds.
 
@@ -115,6 +115,7 @@ The instance role needs, as in the [plugin's policy](https://certbot-dns-route53
    ```
 
    Note its `mesh listening=` line and build its member entry.
+
 2. **New regions.** On each new node: attach its Elastic IP, install the relay, fetch the identity key from SSM, and set up its certificate. Then install with the imported identity and a backbone key, still without members:
 
    ```bash
@@ -127,6 +128,7 @@ The instance role needs, as in the [plugin's policy](https://certbot-dns-route53
    ```
 
    Check that its `[relay] peer=` line shows `12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf`, and build its member entry from its `mesh listening=` line.
+
 3. **Member list.** With every node's entry known, rerun `service install` on every node, Mumbai included, with the same flags as before minus `--import-key`, plus the full list. Every node takes the same list and skips its own entry:
 
    ```bash
@@ -139,6 +141,7 @@ The instance role needs, as in the [plugin's policy](https://certbot-dns-route53
    ```
 
    A node closes backbone connections from peers not on its list, so links come up once both ends have it.
+
 4. **Check the links,** then **switch DNS.** Every node's logs should show `[relay] mesh member=<id> up` for every other member. Then replace the single records with the latency records (DNS step 4).
 5. **Verify live.** From a client in each region, connect to a peer reserved from another region through `relay.minip2p.com`. The entry node logs `circuit opened … via=<holding node's backbone id>`.
 
