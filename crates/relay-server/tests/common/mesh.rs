@@ -73,11 +73,9 @@ impl Mesh {
             held: held.iter().copied().collect(),
             held_calls: Vec::new(),
         };
-        for i in 0..count {
-            for j in 0..count {
-                if i != j {
-                    mesh.nodes[i].establish(&member(j), link(j));
-                }
+        for (i, node) in mesh.nodes.iter_mut().enumerate() {
+            for j in (0..count).filter(|&j| j != i) {
+                node.establish(&member(j), link(j));
             }
         }
         mesh.pump(at(0));
