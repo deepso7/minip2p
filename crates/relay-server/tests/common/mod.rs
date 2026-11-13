@@ -9,6 +9,9 @@
     reason = "each integration test imports only the shared helpers it needs"
 )]
 
+pub mod mesh;
+pub mod nat_client;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
