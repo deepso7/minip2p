@@ -1,0 +1,46 @@
+---
+title: Public relay
+description: Addresses of the minip2p project's public Circuit Relay v2 server for testing and demos.
+---
+
+The project runs one public Circuit Relay v2 server at `relay.minip2p.com`. Use it to try relayed connections, reservations, and browser reachability without [hosting your own relay](/docs/rust/host-a-relay).
+
+It is a best-effort service on a small instance, with the relay's default reservation, circuit, and rate limits and no uptime guarantee. Host your own relay for production.
+
+## Addresses
+
+The relay listens on port `19876` over IPv4 and IPv6. All addresses name the same peer:
+
+| Transport | Address |
+| --- | --- |
+| TCP | `/dns/relay.minip2p.com/tcp/19876/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf` |
+| QUIC | `/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf` |
+| WebTransport | `/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf` |
+
+The WebTransport address has no `/certhash`: the relay serves a CA-signed certificate for `relay.minip2p.com` ([Stable browser addresses](/docs/rust/webtransport-certificates)), so the address doesn't change when the certificate renews.
+
+## Use it
+
+From Rust, with the `relay` feature ([Traverse NAT](/docs/rust/traverse-nat)):
+
+```rust
+use minip2p::{Endpoint, PeerAddr};
+
+let relay: PeerAddr =
+    "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf"
+        .parse()?;
+let mut node = Endpoint::builder().relay(relay).listen_default()?.bind()?;
+```
+
+From a browser, pass the WebTransport address in `relays` ([Web setup](/docs/typescript/setup-web#relays)):
+
+```ts
+import { Minip2p, generateSecretKey } from "@minip2p/web";
+
+const endpoint = Minip2p.create({
+  secretKey: generateSecretKey(),
+  relays: [
+    "/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf",
+  ],
+});
+```
