@@ -1159,14 +1159,14 @@ impl Endpoint {
         // The failure is queued as an event too, and drained below.
         #[cfg(feature = "mdns")]
         drop(self.shutdown());
-        #[cfg(all(feature = "relay-server", feature = "quic"))]
-        {
-            let now = self.now();
-            self.engine.shutdown_backbone(now);
-        }
         let drain_by = std::time::Instant::now() + timeout;
         loop {
             report.errors.extend(self.disconnect_established());
+            #[cfg(all(feature = "relay-server", feature = "quic"))]
+            {
+                let now = self.now();
+                self.engine.shutdown_backbone(now);
+            }
             // Out of time or failed: hand over what the swarm already queued
             // (a disconnect's close failure, say) without polling again.
             let (polled, last, now) = if std::time::Instant::now() >= drain_by {
@@ -1227,6 +1227,8 @@ impl Endpoint {
             .tracked_connections()
             .map(|(conn_id, peer)| (conn_id, peer.cloned()))
             .collect();
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        report.unfinished.extend(self.engine.backbone_connections());
         if report.outcome == CloseOutcome::Drained && !report.unfinished.is_empty() {
             report.outcome = CloseOutcome::DeadlineExpired;
         }
@@ -1234,7 +1236,11 @@ impl Endpoint {
     }
 
     fn close_drain_busy(&self) -> bool {
-        !self.engine.core.connected_peers().is_empty() || self.engine.core.has_tracked_connections()
+        let busy = !self.engine.core.connected_peers().is_empty()
+            || self.engine.core.has_tracked_connections();
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        let busy = busy || !self.engine.backbone_connections().is_empty();
+        busy
     }
 
     /// Disconnects every established peer, returning each failure.

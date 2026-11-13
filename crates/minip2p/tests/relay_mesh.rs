@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, NatConfig,
-    NatEvent, Path, PeerAddr, PeerId, RelayMeshConfig, RelayServerEvent,
+    CloseOutcome, ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome,
+    NatConfig, NatEvent, Path, PeerAddr, PeerId, RelayMeshConfig, RelayServerEvent,
     RelayServerRuntimeErrorKind, ReservationPolicy, WaitHandle,
 };
 
@@ -447,4 +447,22 @@ fn a_backbone_connection_from_a_non_member_is_closed() {
             .any(|event| matches!(event, EndpointEvent::RelayMeshMemberUp { .. })),
         "a non-member came up as a member"
     );
+}
+
+#[test]
+fn close_waits_for_a_pending_member_dial() {
+    // The member's port has no listener, so the backbone dial stays pending.
+    let member = backbone_addr(free_udp_port(), &Ed25519Keypair::generate());
+    let mut relay = bind_relay(
+        &Ed25519Keypair::generate(),
+        &Ed25519Keypair::generate(),
+        0,
+        vec![member],
+    );
+    // The first drive dials every member.
+    drop(relay.poll());
+
+    let report = relay.close_within(Duration::from_millis(200));
+    assert_eq!(report.outcome, CloseOutcome::DeadlineExpired, "{report:?}");
+    assert_eq!(report.unfinished.len(), 1, "{report:?}");
 }

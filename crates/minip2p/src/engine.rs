@@ -655,8 +655,26 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         Ok(())
     }
 
+    /// The backbone's still-tracked connections (pending dials included),
+    /// for a closing endpoint's drain.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    pub(crate) fn backbone_connections(&self) -> Vec<(ConnectionId, Option<PeerId>)> {
+        self.relay_server
+            .as_ref()
+            .and_then(|relay_server| relay_server.backbone.as_ref())
+            .map(|backbone| {
+                backbone
+                    .core
+                    .tracked_connections()
+                    .map(|(conn_id, peer)| (conn_id, peer.cloned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Stops a relay-mesh node's redials and disconnects its members, for
-    /// a closing endpoint.
+    /// a closing endpoint. Repeated on every drain pass, so a member dial
+    /// that establishes mid-drain is disconnected too.
     #[cfg(all(feature = "relay-server", feature = "quic"))]
     pub(crate) fn shutdown_backbone(&mut self, now: Now) {
         if let Some(backbone) = self
