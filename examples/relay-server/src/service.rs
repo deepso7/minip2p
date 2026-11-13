@@ -2,16 +2,19 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgAction, Command as ClapCommand, value_parser};
+use minip2p::PeerAddr;
 
 const SERVICE_NAME: &str = "minip2p-relay";
 const SERVICE_USER: &str = "minip2p-relay";
 const STATE_DIR: &str = "/var/lib/minip2p-relay";
 const IDENTITY_PATH: &str = "/var/lib/minip2p-relay/identity.key";
+const MESH_KEY_PATH: &str = "/var/lib/minip2p-relay/mesh.key";
 const IDENTITY_STAGING_DIR: &str = "/var/lib";
 const EXECUTABLE_PATH: &str = "/usr/local/bin/minip2p-relay";
 const UNIT_PATH: &str = "/etc/systemd/system/minip2p-relay.service";
@@ -52,7 +55,23 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>>
                 None if matches.get_flag("webtransport") => WebTransport::Derived,
                 None => WebTransport::Off,
             };
-            install(hostname, import_key, webtransport)
+            let mesh = Mesh {
+                listen: matches
+                    .get_many::<SocketAddr>("mesh-listen")
+                    .unwrap_or_default()
+                    .copied()
+                    .collect(),
+                members: matches
+                    .get_many::<PeerAddr>("mesh-member")
+                    .unwrap_or_default()
+                    .cloned()
+                    .collect(),
+            };
+            // `--mesh-listen` and `--mesh-member` imply `--mesh`.
+            let mesh =
+                (matches.get_flag("mesh") || !mesh.listen.is_empty() || !mesh.members.is_empty())
+                    .then_some(mesh);
+            install(hostname, import_key, webtransport, mesh.as_ref())
         }
         Some(("status", _)) => {
             require_linux()?;
@@ -107,6 +126,14 @@ enum WebTransport<'a> {
     CaCertificate((&'a Path, &'a Path)),
 }
 
+/// `--mesh`: the relay joins a relay mesh under a backbone key the service
+/// creates at [`MESH_KEY_PATH`] on first start.
+struct Mesh {
+    /// Exact backbone binds; empty keeps the relay's default.
+    listen: Vec<SocketAddr>,
+    members: Vec<PeerAddr>,
+}
+
 /// Quotes one ExecStart path for systemd, naming `what` in errors. `%` and
 /// `$` are doubled, because systemd expands specifiers and variables even
 /// inside quotes.
@@ -130,6 +157,7 @@ fn unit_file(
     executable: &Path,
     hostname: &str,
     webtransport: WebTransport<'_>,
+    mesh: Option<&Mesh>,
 ) -> Result<String, Box<dyn Error>> {
     let executable = quoted(executable, "relay executable")?;
     let webtransport = match webtransport {
@@ -141,6 +169,18 @@ fn unit_file(
             quoted(key, "--webtransport-key")?
         ),
     };
+    // Socket and peer addresses print without spaces, quotes, `%` or `$`.
+    let mesh = mesh.map_or_else(String::new, |mesh| {
+        let listen = mesh
+            .listen
+            .iter()
+            .map(|addr| format!(" --mesh-listen {addr}"));
+        let members = mesh
+            .members
+            .iter()
+            .map(|addr| format!(" --mesh-member {addr}"));
+        format!(" --mesh-key {MESH_KEY_PATH}") + &listen.chain(members).collect::<String>()
+    });
     Ok(format!(
         "[Unit]\n\
 Description=minip2p circuit relay\n\
@@ -150,7 +190,7 @@ Wants=network-online.target\n\
 [Service]\n\
 User=minip2p-relay\n\
 Group=minip2p-relay\n\
-ExecStart={executable} --key /var/lib/minip2p-relay/identity.key --announce /dns/{hostname}/tcp/19876 --announce /dns/{hostname}/udp/19876/quic-v1{webtransport}\n\
+ExecStart={executable} --key /var/lib/minip2p-relay/identity.key --announce /dns/{hostname}/tcp/19876 --announce /dns/{hostname}/udp/19876/quic-v1{webtransport}{mesh}\n\
 Restart=on-failure\n\
 RestartSec=5\n\
 StandardInput=null\n\
@@ -170,6 +210,7 @@ fn install(
     hostname: &str,
     import_key: Option<&Path>,
     webtransport: WebTransport<'_>,
+    mesh: Option<&Mesh>,
 ) -> Result<(), Box<dyn Error>> {
     // The unit runs from an unspecified directory; check before touching the host.
     if let WebTransport::CaCertificate((chain, key)) = webtransport
@@ -180,7 +221,7 @@ fn install(
     require_linux()?;
     require_root()?;
     // Built first, so a rejected path fails before anything is installed.
-    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname, webtransport)?;
+    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname, webtransport, mesh)?;
     let imported_identity = import_key.map(read_import_identity).transpose()?;
     if imported_identity.is_some() && Path::new(IDENTITY_PATH).exists() {
         return Err(format!(
@@ -233,6 +274,12 @@ fn install(
     println!("installed and started {SERVICE_NAME}.service");
     println!("identity={IDENTITY_PATH}");
     println!("open inbound TCP and UDP port 19876 for IPv4 and IPv6");
+    if mesh.is_some() {
+        println!("mesh_key={MESH_KEY_PATH}");
+        println!(
+            "open the backbone port (UDP 19877 by default) to the other members only; this node's backbone address is the `[relay] mesh listening=` log line"
+        );
+    }
     println!("logs: minip2p-relay service logs");
     Ok(())
 }
@@ -264,6 +311,9 @@ fn uninstall() -> Result<(), Box<dyn Error>> {
         println!("{SERVICE_NAME}.service is not installed");
     }
     println!("identity preserved at {IDENTITY_PATH}");
+    if Path::new(MESH_KEY_PATH).exists() {
+        println!("mesh key preserved at {MESH_KEY_PATH}");
+    }
     Ok(())
 }
 
@@ -485,6 +535,28 @@ fn command() -> ClapCommand {
                         .value_parser(value_parser!(PathBuf))
                         .requires("webtransport-cert")
                         .help("The --webtransport-cert private key (PEM)"),
+                )
+                .arg(
+                    Arg::new("mesh")
+                        .long("mesh")
+                        .action(ArgAction::SetTrue)
+                        .help("Join a relay mesh under a backbone key created at /var/lib/minip2p-relay/mesh.key"),
+                )
+                .arg(
+                    Arg::new("mesh-listen")
+                        .long("mesh-listen")
+                        .value_name("HOST:PORT")
+                        .value_parser(value_parser!(SocketAddr))
+                        .action(ArgAction::Append)
+                        .help("Exact backbone UDP bind (repeatable; default 0.0.0.0:19877 and [::]:19877); implies --mesh"),
+                )
+                .arg(
+                    Arg::new("mesh-member")
+                        .long("mesh-member")
+                        .value_name("PEER_ADDR")
+                        .value_parser(|value: &str| value.parse::<PeerAddr>().map_err(|error| error.to_string()))
+                        .action(ArgAction::Append)
+                        .help("A member's backbone /ip4|ip6/.../udp/PORT/quic-v1/p2p/ID (repeatable); implies --mesh"),
                 ),
         )
         .subcommand(ClapCommand::new("status").about("Show the systemd service status"))
@@ -508,6 +580,7 @@ mod tests {
             Path::new("/opt/minip2p relay/minip2p-relay"),
             "relay.minip2p.com",
             WebTransport::Off,
+            None,
         )
         .unwrap();
 
@@ -538,11 +611,12 @@ WantedBy=multi-user.target\n"
     }
 
     /// The ExecStart line of a unit for `relay.minip2p.com`.
-    fn exec_start(webtransport: WebTransport<'_>) -> String {
+    fn exec_start(webtransport: WebTransport<'_>, mesh: Option<&Mesh>) -> String {
         let unit = unit_file(
             Path::new("/usr/local/bin/minip2p-relay"),
             "relay.minip2p.com",
             webtransport,
+            mesh,
         )
         .unwrap();
         unit.lines()
@@ -555,16 +629,40 @@ WantedBy=multi-user.target\n"
     fn unit_passes_webtransport_through() {
         let base = "\"/usr/local/bin/minip2p-relay\" --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.minip2p.com/tcp/19876 --announce /dns/relay.minip2p.com/udp/19876/quic-v1";
         assert_eq!(
-            exec_start(WebTransport::Derived),
+            exec_start(WebTransport::Derived, None),
             format!("{base} --webtransport")
         );
         assert_eq!(
-            exec_start(WebTransport::CaCertificate((
-                Path::new("/etc/minip2p-relay/tls/full\"chain.pem"),
-                Path::new("/etc/minip2p relay/%h$HOME.pem"),
-            ))),
+            exec_start(
+                WebTransport::CaCertificate((
+                    Path::new("/etc/minip2p-relay/tls/full\"chain.pem"),
+                    Path::new("/etc/minip2p relay/%h$HOME.pem"),
+                )),
+                None
+            ),
             format!(
                 "{base} --webtransport --webtransport-cert \"/etc/minip2p-relay/tls/full\\\"chain.pem\" --webtransport-key \"/etc/minip2p relay/%%h$$HOME.pem\" --announce /dns/relay.minip2p.com/udp/19876/quic-v1/webtransport"
+            )
+        );
+    }
+
+    #[test]
+    fn unit_passes_the_mesh_through() {
+        let base = "\"/usr/local/bin/minip2p-relay\" --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.minip2p.com/tcp/19876 --announce /dns/relay.minip2p.com/udp/19876/quic-v1";
+        let mut mesh = Mesh {
+            listen: Vec::new(),
+            members: Vec::new(),
+        };
+        assert_eq!(
+            exec_start(WebTransport::Off, Some(&mesh)),
+            format!("{base} --mesh-key /var/lib/minip2p-relay/mesh.key")
+        );
+        mesh.listen = vec!["198.51.100.7:19877".parse().unwrap()];
+        mesh.members = vec!["/ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse().unwrap()];
+        assert_eq!(
+            exec_start(WebTransport::Derived, Some(&mesh)),
+            format!(
+                "{base} --webtransport --mesh-key /var/lib/minip2p-relay/mesh.key --mesh-listen 198.51.100.7:19877 --mesh-member /ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
             )
         );
     }

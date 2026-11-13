@@ -14,8 +14,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use minip2p::{
-    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, Multiaddr, PeerAddr,
-    RelayServerEvent,
+    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, Multiaddr, PeerAddr, PeerId,
+    RelayMeshConfig, RelayServerEvent,
 };
 use minip2p_example_common::load_keypair;
 use minip2p_tls::Validity;
@@ -25,6 +25,8 @@ const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
 const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/19876/quic-v1";
 const DEFAULT_IPV4_TCP: &str = "/ip4/0.0.0.0/tcp/19876";
 const DEFAULT_IPV6_TCP: &str = "/ip6/::/tcp/19876";
+const DEFAULT_IPV4_MESH: &str = "/ip4/0.0.0.0/udp/19877/quic-v1";
+const DEFAULT_IPV6_MESH: &str = "/ip6/::/udp/19877/quic-v1";
 const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone, Copy, Debug)]
 enum AutomaticBind {
@@ -59,6 +61,11 @@ fn main() {
 fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = cli::parse(args)?;
     let identity = load_keypair(options.key_path.as_deref(), "relay")?;
+    let backbone = options
+        .mesh
+        .as_ref()
+        .map(|mesh| load_keypair(Some(&mesh.key_path), "mesh"))
+        .transpose()?;
     // Watch before the first load, so a renewal in between is noticed.
     let mut watched = options
         .webtransport_certificate
@@ -69,7 +76,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         .map(|watched| certificate::load(&watched.paths))
         .transpose()?;
 
-    let mut endpoint = bind_endpoint(&options, identity, certificate.as_ref())?;
+    let mut endpoint = bind_endpoint(&options, identity, backbone, certificate.as_ref())?;
     endpoint.set_relay_server_accepting(options.accepting)?;
 
     println!(
@@ -77,6 +84,11 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         endpoint.peer_id(),
         options.accepting
     );
+    // What the other mesh nodes list for this one in --mesh-member, with a
+    // wildcard IP replaced by this node's public one.
+    for address in endpoint.relay_mesh_addresses() {
+        println!("[relay] mesh listening={address}");
+    }
     let listening = endpoint.listen_all()?;
     for address in &listening {
         println!("[relay] listening={address}");
@@ -171,6 +183,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         match endpoint.wait(Duration::from_millis(250))? {
             EndpointWaitOutcome::Event(EndpointEvent::RelayServer(event)) => print_event(event),
+            EndpointWaitOutcome::Event(EndpointEvent::RelayMeshMemberUp { peer_id }) => {
+                println!("[relay] mesh member={peer_id} up")
+            }
+            EndpointWaitOutcome::Event(EndpointEvent::RelayMeshMemberDown { peer_id }) => {
+                println!("[relay] mesh member={peer_id} down")
+            }
             EndpointWaitOutcome::Event(event) => println!("[endpoint] {event:?}"),
             _ => {}
         }
@@ -200,6 +218,7 @@ fn reload_certificate(
 fn bind_endpoint(
     options: &cli::Options,
     identity: Ed25519Keypair,
+    backbone: Option<Ed25519Keypair>,
     certificate: Option<&certificate::Certificate>,
 ) -> Result<Endpoint, Box<dyn Error>> {
     let automatic = [
@@ -207,15 +226,26 @@ fn bind_endpoint(
         AutomaticBind::Ipv4,
         AutomaticBind::Ipv6,
     ];
-    let modes: &[AutomaticBind] = if options.quic_binds.is_empty() || options.tcp_binds.is_empty() {
-        &automatic
-    } else {
-        &automatic[..1]
-    };
+    let automatic_mesh = options
+        .mesh
+        .as_ref()
+        .is_some_and(|mesh| mesh.listen.is_empty());
+    let modes: &[AutomaticBind] =
+        if options.quic_binds.is_empty() || options.tcp_binds.is_empty() || automatic_mesh {
+            &automatic
+        } else {
+            &automatic[..1]
+        };
     let mut last_error = None;
 
     for &mode in modes {
-        match try_bind(options, identity.clone(), certificate, mode) {
+        match try_bind(
+            options,
+            identity.clone(),
+            backbone.clone(),
+            certificate,
+            mode,
+        ) {
             Ok(endpoint) => {
                 if !matches!(mode, AutomaticBind::Both) {
                     eprintln!("[relay] dual-stack bind unavailable; using {mode:?}");
@@ -232,6 +262,7 @@ fn bind_endpoint(
 fn try_bind(
     options: &cli::Options,
     identity: Ed25519Keypair,
+    backbone: Option<Ed25519Keypair>,
     certificate: Option<&certificate::Certificate>,
     mode: AutomaticBind,
 ) -> Result<Endpoint, Box<dyn Error>> {
@@ -282,6 +313,27 @@ fn try_bind(
 
     if !options.announce_addrs.is_empty() {
         builder = builder.relay_server_announce_addrs(options.announce_addrs.clone())?;
+    }
+    if let (Some(mesh), Some(identity)) = (&options.mesh, backbone) {
+        let listen: Vec<String> = if mesh.listen.is_empty() {
+            automatic_addrs(mode, DEFAULT_IPV4_MESH, DEFAULT_IPV6_MESH)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        } else {
+            mesh.listen
+                .iter()
+                .map(|&address| listen_multiaddr(address, "udp", "/quic-v1"))
+                .collect()
+        };
+        builder = builder.relay_mesh(RelayMeshConfig {
+            identity,
+            listen: listen
+                .iter()
+                .map(|address| address.parse())
+                .collect::<Result<_, _>>()?,
+            members: mesh.members.clone(),
+        });
     }
     Ok(builder.bind()?)
 }
@@ -363,19 +415,22 @@ fn print_event(event: RelayServerEvent) {
         RelayServerEvent::CircuitOpened {
             source_peer_id,
             destination_peer_id,
-            ..
+            via,
         } => println!(
-            "[relay] circuit opened source={source_peer_id} destination={destination_peer_id}"
+            "[relay] circuit opened source={source_peer_id} destination={destination_peer_id}{}",
+            via_field(via.as_ref())
         ),
         RelayServerEvent::CircuitClosed {
             source_peer_id,
             destination_peer_id,
             bytes,
             reason,
-            ..
+            via,
         } => println!(
-            "[relay] circuit closed source={source_peer_id} destination={destination_peer_id} source_to_destination_bytes={} destination_to_source_bytes={} cause={reason:?}",
-            bytes.source_to_destination, bytes.destination_to_source
+            "[relay] circuit closed source={source_peer_id} destination={destination_peer_id} source_to_destination_bytes={} destination_to_source_bytes={} cause={reason:?}{}",
+            bytes.source_to_destination,
+            bytes.destination_to_source,
+            via_field(via.as_ref())
         ),
         RelayServerEvent::AddrsRejected { source, error } => {
             eprintln!("[relay] {source:?} addresses rejected, keeping the previous ones: {error}")
@@ -392,6 +447,12 @@ fn print_event(event: RelayServerEvent) {
             error.detail
         ),
     }
+}
+
+/// ` via=<backbone peer>` for a circuit that crossed the relay mesh, else
+/// nothing, so a standalone relay logs as before.
+fn via_field(via: Option<&PeerId>) -> String {
+    via.map_or_else(String::new, |peer| format!(" via={peer}"))
 }
 
 /// Whether an `--announce` is a WebTransport address, with or without its

@@ -224,3 +224,102 @@ fn a_renewed_ca_certificate_is_served_without_a_restart() {
         Some("[relay] webtransport certificate reloaded not_after=2125-12-31T00:00:00Z")
     );
 }
+
+/// Writes `keypair` as a relay key file: hex secret, owner-only.
+#[cfg(unix)]
+fn write_key(path: &std::path::Path, keypair: &minip2p::Ed25519Keypair) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let hex: String = keypair
+        .secret_key_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(hex.as_bytes()))
+        .expect("write a key file");
+}
+
+#[cfg(unix)]
+#[test]
+fn two_mesh_nodes_report_each_other_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let public = dir.path().join("identity.key");
+    write_key(&public, &minip2p::Ed25519Keypair::generate());
+    let nodes: Vec<_> = (0..2)
+        .map(|index| {
+            let key = dir.path().join(format!("mesh-{index}.key"));
+            let keypair = minip2p::Ed25519Keypair::generate();
+            write_key(&key, &keypair);
+            // A port no socket holds now, so each node can list the other.
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let member = format!(
+                "/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{}",
+                keypair.peer_id()
+            );
+            (key, port, member)
+        })
+        .collect();
+
+    let mut relays = Vec::new();
+    let (lines, receiver) = mpsc::channel();
+    for (index, (key, port, _)) in nodes.iter().enumerate() {
+        let mut relay = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
+            .args(["--quic", "127.0.0.1:0", "--tcp", "127.0.0.1:0", "--key"])
+            .arg(&public)
+            .arg("--mesh-key")
+            .arg(key)
+            .args(["--mesh-listen", &format!("127.0.0.1:{port}")])
+            .args(
+                nodes
+                    .iter()
+                    .flat_map(|(_, _, member)| ["--mesh-member", member]),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = relay.stdout.take().unwrap();
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if lines.send((index, line.unwrap())).is_err() {
+                    break;
+                }
+            }
+        });
+        relays.push(relay);
+    }
+
+    let mut listening = [false; 2];
+    let mut up = [false; 2];
+    while !(listening.iter().all(|&seen| seen) && up.iter().all(|&seen| seen)) {
+        let Ok((index, line)) = receiver.recv_timeout(Duration::from_secs(20)) else {
+            break;
+        };
+        let (own, other) = (&nodes[index].2, &nodes[1 - index].2);
+        listening[index] |= line == format!("[relay] mesh listening={own}");
+        let other_peer = other.rsplit('/').next().unwrap();
+        up[index] |= line == format!("[relay] mesh member={other_peer} up");
+    }
+    for mut relay in relays {
+        relay.kill().unwrap();
+        relay.wait().unwrap();
+    }
+
+    assert_eq!(
+        listening, [true; 2],
+        "each node prints its backbone address"
+    );
+    assert_eq!(up, [true; 2], "each node reports the other member up");
+}
