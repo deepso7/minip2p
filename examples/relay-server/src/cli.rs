@@ -189,8 +189,14 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
 /// Checks mesh settings the relay would only reject once bound, so that
 /// `service install` refuses them before replacing a working unit.
 pub(crate) fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<(), String> {
-    if listen.len() > 2 {
-        return Err("--mesh-listen accepts at most one IPv4 and one IPv6 address".into());
+    // The backbone transport binds one socket per family.
+    for ipv4 in [true, false] {
+        let mut family = listen.iter().filter(|address| address.is_ipv4() == ipv4);
+        if let Some(first) = family.next()
+            && family.any(|address| address != first)
+        {
+            return Err("--mesh-listen accepts at most one IPv4 and one IPv6 address".into());
+        }
     }
     for member in members {
         if !matches!(
@@ -421,7 +427,7 @@ mod tests {
             .unwrap();
         let error = check_mesh(&[], &[dns]).unwrap_err();
         assert!(error.contains("must be /ip4|ip6"), "{error}");
-        let listen: Vec<SocketAddr> = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]
+        let listen: Vec<SocketAddr> = ["0.0.0.0:19877", "127.0.0.1:19878"]
             .iter()
             .map(|address| address.parse().unwrap())
             .collect();
