@@ -2819,8 +2819,20 @@ impl RelayServerAgent {
         for peer in circuit_endpoints(source, destination) {
             *self.peer_circuits.entry(peer.clone()).or_default() += 1;
         }
+        self.hold_circuit_ips(source_ip, destination_ip);
+    }
+
+    /// Counts one more circuit against each admission key, one shared by
+    /// both ends once.
+    fn hold_circuit_ips(&mut self, source_ip: Option<&IpKey>, destination_ip: Option<&IpKey>) {
         for ip in circuit_ip_keys(source_ip, destination_ip) {
             self.ip_tally.add(Some(ip), Held::Circuits);
+        }
+    }
+
+    fn release_circuit_ips(&mut self, source_ip: Option<&IpKey>, destination_ip: Option<&IpKey>) {
+        for ip in circuit_ip_keys(source_ip, destination_ip) {
+            self.ip_tally.remove(Some(ip), Held::Circuits);
         }
     }
 
@@ -2831,9 +2843,7 @@ impl RelayServerAgent {
         source_ip: Option<&IpKey>,
         destination_ip: Option<&IpKey>,
     ) {
-        for ip in circuit_ip_keys(source_ip, destination_ip) {
-            self.ip_tally.remove(Some(ip), Held::Circuits);
-        }
+        self.release_circuit_ips(source_ip, destination_ip);
         for peer in circuit_endpoints(source, destination) {
             if let Some(count) = self.peer_circuits.get_mut(peer) {
                 *count -= 1;

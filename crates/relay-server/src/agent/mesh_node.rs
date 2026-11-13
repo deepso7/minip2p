@@ -555,8 +555,34 @@ impl RelayServerAgent {
             return;
         };
         let destination = circuit.destination_peer_id.clone();
+        let source_ip = circuit.source_ip.clone();
+        let held_ip = circuit.destination_ip.clone();
+        // The destination may have reserved here since admission. Its IP
+        // then joins the circuit's accounting, under the same cap.
+        let local_ip = self
+            .live_reservation(&destination)
+            .and_then(|conn_id| self.connection_ip(conn_id));
+        let ip_changes = local_ip.is_some() && local_ip != held_ip;
+        if ip_changes
+            && local_ip != source_ip
+            && self.ip_tally.is_full(
+                local_ip.as_ref(),
+                Held::Circuits,
+                self.config.max_circuits_per_ip,
+            )
+        {
+            self.fail_pending_connect(io, source_stream, Status::ResourceLimitExceeded);
+            return;
+        }
+        let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
+            return;
+        };
         let mut resolution = core::mem::take(&mut circuit.resolution);
         let routed = self.route(io, &destination, &mut resolution);
+        if ip_changes && matches!(routed, Ok(Route::Stop { .. })) {
+            self.release_circuit_ips(source_ip.as_ref(), held_ip.as_ref());
+            self.hold_circuit_ips(source_ip.as_ref(), local_ip.as_ref());
+        }
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
@@ -564,6 +590,9 @@ impl RelayServerAgent {
         match routed {
             Ok(Route::Wait) => {}
             Ok(route) => {
+                if ip_changes && matches!(route, Route::Stop { .. }) {
+                    circuit.destination_ip = local_ip;
+                }
                 circuit.route(route);
                 if let Some(conn_id) = circuit.destination_conn_id {
                     self.pending_by_destination.insert((conn_id, source_stream));

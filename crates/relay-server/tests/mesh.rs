@@ -430,6 +430,37 @@ fn a_connect_during_a_snapshot_waits_for_synced() {
 }
 
 #[test]
+fn a_waiting_connect_that_turns_local_respects_the_destinations_ip_cap() {
+    let mut configs = defaults();
+    configs[C].max_circuits_per_ip = 1;
+    let mut mesh = Mesh::with_held(configs.into(), &[(B, C)]);
+    let full_ip = "/ip4/203.0.113.1/tcp/1";
+    for conn in [ALICE_CONN, 30, 31] {
+        mesh.nodes[C]
+            .swarm
+            .remote_addrs
+            .insert(ConnectionId::new(conn), common::maddr(full_ip));
+    }
+    // Carol's circuit to Dave fills the cap on Alice's future IP.
+    let (carol, dave) = (peer(b"mesh-carol"), peer(b"mesh-dave"));
+    mesh.reserve(C, &dave, key(30, 1), at(0));
+    mesh.connect(C, &carol, key(31, 2), &dave, at(0));
+    mesh.calls(C);
+
+    // Bob waits on B's snapshot; meanwhile Alice reserves on C itself.
+    mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
+    assert_eq!(mesh.hop_status(C, bob_stream()).0, None);
+    mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(1));
+
+    mesh.release_directory(B, C, at(2));
+    assert_eq!(
+        mesh.hop_status(C, bob_stream()).0,
+        Some(Status::ResourceLimitExceeded)
+    );
+    mesh.nodes[C].assert_indexes_consistent();
+}
+
+#[test]
 fn a_connect_waiting_on_a_member_whose_link_drops_has_no_reservation() {
     let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
     mesh.reserve(B, &alice(), key(ALICE_CONN, 1), at(0));
