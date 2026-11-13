@@ -415,8 +415,16 @@ fn a_stale_claim_tried_first_falls_through_to_the_live_one() {
 
 #[test]
 fn a_local_stop_that_fails_to_open_falls_through_to_a_remote_claim() {
-    let mut mesh = mesh(defaults());
+    let mut configs = defaults();
+    configs[C].max_circuits_per_ip = 1;
+    let mut mesh = mesh(configs);
     mesh.reserve(A, &alice(), key(ALICE_CONN_2, 1), at(0));
+    // One circuit per IP on C; Alice's stale connection has her own.
+    let alice_ip = "/ip4/203.0.113.1/tcp/1";
+    mesh.nodes[C]
+        .swarm
+        .remote_addrs
+        .insert(ConnectionId::new(ALICE_CONN), common::maddr(alice_ip));
     mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(0));
     // C's swarm already lost Alice; the agent has not heard yet.
     mesh.nodes[C].swarm.forget(&alice());
@@ -425,6 +433,22 @@ fn a_local_stop_that_fails_to_open_falls_through_to_a_remote_claim() {
     assert_eq!(forward_opens(&mesh, C, A), 1);
     mesh.answer_stop(A, &alice(), Status::Ok, at(1));
     bob.assert_opened(&mut mesh, at(1));
+    // The forwarded circuit does not hold the stale connection's IP.
+    mesh.nodes[C].assert_indexes_consistent();
+    mesh.nodes[C].close_connection(&alice(), ConnectionId::new(ALICE_CONN), 2);
+    mesh.pump(at(2));
+    mesh.nodes[C].events();
+    // Carol to Dave, both on Alice's old IP, fit under its cap of one.
+    let dave = peer(b"mesh-dave");
+    for conn in [30, 31] {
+        mesh.nodes[C]
+            .swarm
+            .remote_addrs
+            .insert(ConnectionId::new(conn), common::maddr(alice_ip));
+    }
+    mesh.reserve(C, &dave, key(30, 1), at(2));
+    mesh.connect(C, &peer(b"mesh-carol"), key(31, 2), &dave, at(2));
+    assert_eq!(mesh.hop_status(C, key(31, 2)).0, None, "not refused");
 }
 
 #[test]

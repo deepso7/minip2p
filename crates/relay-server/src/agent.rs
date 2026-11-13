@@ -2491,6 +2491,11 @@ impl RelayServerAgent {
             let mut resolution = Resolution::default();
             match self.route(io, &pending.destination_peer_id.clone(), &mut resolution) {
                 Ok(route) => {
+                    // Only a local STOP holds the destination's IP; a stale
+                    // local reservation's must not ride along to a forward.
+                    if !matches!(route, Route::Stop { .. }) {
+                        pending.destination_ip = None;
+                    }
                     pending.route(route);
                     pending.resolution = resolution;
                     self.consume_circuit_token(&pending, now_ms);
