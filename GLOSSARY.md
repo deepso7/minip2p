@@ -76,6 +76,24 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **force_relay**: Keep the selected path Relayed: no direct candidate dials and no hole punch. The circuit upgrade is the same as without the flag.
 
+### Relay mesh
+
+**Relay mesh**: Several relay servers that serve one relay address together, from different regions behind geo DNS (ADR 0027). Each node forwards a CONNECT for a peer reserved on another node to that node. Membership is a static list. _Avoid_: relay cluster, federation
+
+**Mesh node**: One relay process in a Relay mesh, running under the shared Public identity and its own Backbone identity. _Avoid_: region (a region hosts a node)
+
+**Public identity**: The key every Mesh node shares, whose peer ID is the relay peer ID in the published address. Clients see only it, and it is never used on the Backbone. Replacing it changes every published address.
+
+**Backbone identity**: A Mesh node's own key for the Backbone. The member list names each node by its backbone peer ID, which is also how a node recognizes the other members. _Avoid_: mesh key (that is the file holding it)
+
+**Backbone**: The QUIC links between Mesh nodes, authenticated with Backbone identities and carried by a second swarm in the relay's Endpoint on its own port (UDP `19877` by default). Each pair of members keeps one link, redialed with backoff when lost.
+
+**Directory**: A Mesh node's view of which peers hold reservations on which other node, built from the snapshot and updates each member pushes on its directory stream. A member's entries go when its stream or link does. _Avoid_: registry, shared reservation store
+
+**Entry node**: The Mesh node a dialer's HOP CONNECT reaches. It applies the dialer's admission checks and, with no local reservation for the destination, forwards the circuit to the Holding node it finds in its Directory.
+
+**Holding node**: The Mesh node where the destination holds its reservation. It opens STOP to the destination for a forwarded circuit and never forwards it again (single hop).
+
 ### WebTransport
 
 **WebTransport session**: One browser's libp2p connection carried over HTTP/3 WebTransport on a QUIC connection, authenticated by Noise rather than by TLS. A QUIC connection carries at most one. _Avoid_: WT connection, h3 connection

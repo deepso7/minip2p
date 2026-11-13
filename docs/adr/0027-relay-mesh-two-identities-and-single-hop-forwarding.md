@@ -1,0 +1,22 @@
+# Relay mesh: two identities per node, a backbone swarm, single-hop forwarding
+
+We want the public relay served from several regions behind one address, `/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooW…`, with geo DNS picking the region and no client changes ([plan](../plans/relay-mesh.md)). A reservation lives in one relay process, and no client can steer a CONNECT to the region holding it: minip2p, rust-libp2p and go-libp2p all send RESERVE and CONNECT over whatever connection they already have to the relay's peer ID. So the regions form a relay mesh. Each node pushes its local reservations to the others, and a node that gets a CONNECT for a peer reserved elsewhere forwards the circuit there. Tailscale's DERP mesh is the model: a static member list, pushed presence, and single-hop forwarding. We decided:
+
+- **Two identities per node (plan Decision 1).** Every node loads the same public identity, whose peer ID is the one in the published address, so the address is valid on any node. Backbone links can't use it: a swarm keeps one live connection per peer ID, so links between nodes that share one would replace each other. Each node therefore also has its own backbone identity. The member list names members by backbone peer ID, which also authenticates the backbone: a connection from an unlisted peer is closed, and mesh protocols are refused from non-members. The public identity is never used on the backbone, and the relay runs no Kademlia or gossipsub under it, because several hosts sharing one peer ID confuse protocols that key on peer ID.
+- **The backbone is a second swarm in the same Endpoint (Decision 2).** A swarm has one identity, so the Endpoint engine owns a second `SwarmCore` under the backbone identity, with its own QUIC transport on its own port (UDP `19877` by default). It attaches to the Endpoint's `SharedPoll` in a host token space, as mDNS does ([ADR 0013](0013-swarm-owned-shared-poll.md)), so there is still one wait loop and no extra thread, and its deadlines and redials join the wait budget. Its connections are allocated in the `MESH_IPV4`/`MESH_IPV6` connection namespaces, so the relay agent can tell the two swarms' connections apart; `MeshSwarm` routes the agent's calls to the right swarm. The engine keeps a link to every member, redialing with backoff from 1 s doubling to 30 s.
+- **Single-hop forwarding (Decision 5).** With no local reservation for the destination, the entry node finds the holding node in its directory and opens `/minip2p/relay-mesh/forward/1.0.0` to it with `Forward { source, destination, limit }`. The holding node checks its local reservations only, opens STOP to the destination with `source` and `limit`, and replies with one Circuit Relay v2 status. After `OK` both nodes splice bytes as for a local circuit. The destination sees an ordinary STOP from the relay peer ID. A holding node never forwards again, so there are no loops and no path state beyond one hop.
+
+## Rejected alternatives
+
+- **One swarm whose backbone transport holds its own key.** The swarm's Identify would advertise the public key on connections authenticated with a backbone key, and other code assumes one local identity per swarm.
+- **Two processes per region, a relay plus a backbone sidecar.** Every forwarded byte would cross IPC.
+- **Per-region relay keys, with clients learning each peer's region, as DERP does.** That needs client changes, and published addresses would name a region.
+- **Multi-hop forwarding or a shared reservation store.** A full-mesh member list makes one hop enough, and pushing each node's own reservations needs no database.
+
+## Consequences
+
+- Every node holds the public identity's private key, so a breach of any node exposes it for the whole mesh. Keep the key in a secret store readable only by the relay instances.
+- **Rotating the shared public key changes every published address,** on every node at once. It is the relay's peer ID, so there is no way to rotate it without republishing the address. Backbone keys can be rotated one node at a time by updating the member list.
+- Each node enforces its own limits; there are no mesh-wide quotas. The entry node decides the circuit limit, and the holding node enforces it.
+- Nodes need synced clocks: reservation expiries cross the backbone as UNIX seconds, and derived WebTransport certhashes must match across nodes.
+- Membership is static: changing it means restarting nodes with the new list.
