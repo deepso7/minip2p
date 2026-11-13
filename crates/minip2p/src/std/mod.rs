@@ -62,6 +62,8 @@ use crate::CircuitLimits;
 use crate::GossipsubConfig;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubError;
+#[cfg(all(feature = "relay-server", feature = "quic"))]
+use crate::RelayMeshConfig;
 #[cfg(feature = "relay")]
 use crate::ReservationInfo;
 use crate::engine::Engine;
@@ -581,6 +583,19 @@ impl Endpoint {
         self.engine.core.transport().local_addresses()
     }
 
+    /// Returns the relay-mesh backbone's listen addresses, with this node's
+    /// backbone peer id: what the other members list for it. Empty unless
+    /// built with [`EndpointBuilder::relay_mesh`].
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    pub fn relay_mesh_addresses(&self) -> Vec<PeerAddr> {
+        self.engine
+            .relay_server
+            .as_ref()
+            .and_then(|relay_server| relay_server.backbone.as_ref())
+            .map(|backbone| backbone.listen_addrs())
+            .unwrap_or_default()
+    }
+
     /// Registers an application protocol for inbound and outbound negotiation.
     ///
     /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are rejected with
@@ -892,7 +907,7 @@ impl Endpoint {
     fn block(&mut self, deadline: WaitDeadline) -> Result<bool, Error> {
         let now = self.now();
         let mut budget = deadline.remaining().unwrap_or(MAX_IDLE_WAIT);
-        if let Some(next) = self.engine.core.next_deadline(now) {
+        if let Some(next) = self.engine.swarm_deadline(now) {
             budget = budget.min(Duration::from_millis(next.millis_until(now)));
         }
         if let Some(next) = self.engine.driver_deadline(now) {
@@ -1144,6 +1159,11 @@ impl Endpoint {
         // The failure is queued as an event too, and drained below.
         #[cfg(feature = "mdns")]
         drop(self.shutdown());
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        {
+            let now = self.now();
+            self.engine.shutdown_backbone(now);
+        }
         let drain_by = std::time::Instant::now() + timeout;
         loop {
             report.errors.extend(self.disconnect_established());
@@ -1179,6 +1199,11 @@ impl Endpoint {
             // reservation closing, say) are returned.
             for event in polled {
                 self.engine.ingest(event, now);
+            }
+            // A relay mesh's backbone closes alongside, and its timers are
+            // in the drain's sleep budget, so it is polled here too.
+            if let Err(error) = self.engine.drive_backbone(now) {
+                report.errors.push(error);
             }
             self.engine.settle(now);
             report.events.extend(self.engine.events.drain(..));
@@ -1228,6 +1253,19 @@ impl Drop for Endpoint {
     fn drop(&mut self) {
         // Drop cannot surface disconnect failures; transports own final cleanup.
         drop(self.disconnect_established());
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        if let Some(backbone) = self
+            .engine
+            .relay_server
+            .as_mut()
+            .and_then(|relay_server| relay_server.backbone.as_mut())
+        {
+            // Best effort, like the public swarm's: one poll sends the
+            // closes before the sockets go.
+            let now = self.clock.now();
+            backbone.shutdown(now);
+            drop(backbone.core.poll(now));
+        }
     }
 }
 
@@ -1270,6 +1308,8 @@ pub struct EndpointBuilder {
     relay_server_config: Option<RelayServerConfig>,
     #[cfg(feature = "relay-server")]
     relay_server_announce_addrs: Vec<Multiaddr>,
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    relay_mesh: Option<RelayMeshConfig>,
     #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
     /// Capability intent for Endpoint setup, which applies the defaults; the
@@ -1304,6 +1344,8 @@ impl Default for EndpointBuilder {
             relay_server_config: None,
             #[cfg(feature = "relay-server")]
             relay_server_announce_addrs: Vec::new(),
+            #[cfg(all(feature = "relay-server", feature = "quic"))]
+            relay_mesh: None,
             #[cfg(feature = "relay")]
             circuit_limits: CircuitLimits::default(),
             capabilities: Capabilities::default(),
@@ -1596,6 +1638,53 @@ impl EndpointBuilder {
         Ok(self)
     }
 
+    /// Makes this relay one node of a relay mesh: several relays that share
+    /// this endpoint's identity, each serving the peers reserved on any of
+    /// them by forwarding circuits over a backbone (see
+    /// [`minip2p_relay_server::mesh`]).
+    ///
+    /// The backbone is a second swarm under
+    /// [`RelayMeshConfig::identity`], over its own QUIC transport bound to
+    /// [`RelayMeshConfig::listen`]. It shares this endpoint's wait, and its
+    /// traffic never reaches the application: [`Endpoint::wait`] reports
+    /// only member links coming up and going down, as
+    /// [`EndpointEvent::RelayMeshMemberUp`] and
+    /// [`EndpointEvent::RelayMeshMemberDown`]. Every member is dialed from
+    /// the first drive and redialed with backoff (1 s doubling to 30 s)
+    /// while its link is down; a backbone connection from a peer not in
+    /// [`RelayMeshConfig::members`] is closed. Nodes need synced clocks:
+    /// reservation expiries cross the backbone as UNIX seconds.
+    ///
+    /// Needs [`relay_server`](Self::relay_server) or
+    /// [`relay_server_config`](Self::relay_server_config), and replaces that
+    /// config's [`mesh`](RelayServerConfig::mesh) with the members'.
+    /// Checked at bind ([`BindError::Options`]): the backbone identity must
+    /// differ from the endpoint's, and every listen and member address must
+    /// be `/ip4|ip6/<ip>/udp/<port>/quic-v1`. A backbone socket that cannot
+    /// be bound is [`BindError::RelayMesh`].
+    ///
+    /// ```no_run
+    /// use minip2p::{Ed25519Keypair, Endpoint, PeerAddr, RelayMeshConfig};
+    ///
+    /// # let (public_key, backbone_key) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
+    /// // Every node's backbone address and backbone peer id; each node skips its own.
+    /// let members: Vec<PeerAddr> = vec![
+    ///     "/ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse()?,
+    /// ];
+    /// let endpoint = Endpoint::builder()
+    ///     .identity(public_key) // the same on every node
+    ///     .relay_server()
+    ///     .relay_mesh(RelayMeshConfig::new(backbone_key, members))
+    ///     .listen_on("/ip4/0.0.0.0/udp/19876/quic-v1")?
+    ///     .bind()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    pub fn relay_mesh(mut self, config: RelayMeshConfig) -> Self {
+        self.relay_mesh = Some(config);
+        self
+    }
+
     /// Adds a relay, in preference order; each call adds one.
     ///
     /// A relay is a path, not a mode: connects still race direct candidates
@@ -1778,6 +1867,10 @@ impl EndpointBuilder {
         if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
             return Err(EndpointOptionsError::RelayAnnounceWithoutServer.into());
         }
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        if let Some(mesh) = &self.relay_mesh {
+            self.validate_relay_mesh(mesh)?;
+        }
         #[cfg(feature = "quic")]
         if self.ca_webtransport_certificate()
             && !self.listen_addrs.iter().any(Multiaddr::is_webtransport)
@@ -1792,6 +1885,38 @@ impl EndpointBuilder {
             self.ca_webtransport_certificate(),
         )
         .map_err(|error| BindError::RelayServerAnnounce(Box::new(error)))?;
+        Ok(())
+    }
+
+    /// The relay-mesh checks [`Self::relay_mesh`] documents.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    fn validate_relay_mesh(&self, mesh: &RelayMeshConfig) -> Result<(), EndpointOptionsError> {
+        if self.relay_server_config.is_none() {
+            return Err(EndpointOptionsError::RelayMeshWithoutServer);
+        }
+        if self.keypair.as_ref() == Some(&mesh.identity) {
+            return Err(EndpointOptionsError::RelayMeshPublicIdentity);
+        }
+        let backbone_shape = |address: &Multiaddr| {
+            address.is_quic_transport()
+                && matches!(
+                    address.protocols().first(),
+                    Some(Protocol::Ip4(_) | Protocol::Ip6(_))
+                )
+        };
+        if let Some(addr) = mesh.listen.iter().find(|address| !backbone_shape(address)) {
+            return Err(EndpointOptionsError::UnsupportedListenShape {
+                addr: addr.clone(),
+                expected: "a relay-mesh backbone `/ip4|ip6/<ip>/udp/<port>/quic-v1` address",
+            });
+        }
+        if let Some(addr) = mesh
+            .members
+            .iter()
+            .find(|member| !backbone_shape(member.transport()))
+        {
+            return Err(EndpointOptionsError::RelayMeshMember { addr: addr.clone() });
+        }
         Ok(())
     }
 
@@ -1818,6 +1943,18 @@ impl EndpointBuilder {
         let mut capabilities = std::mem::take(&mut self.capabilities);
         #[cfg(feature = "relay-server")]
         if let Some(config) = self.relay_server_config.take() {
+            // A mesh node's agent learns the members' backbone peer ids.
+            #[cfg(feature = "quic")]
+            let config = match &self.relay_mesh {
+                Some(mesh) => RelayServerConfig {
+                    mesh: Some(minip2p_relay_server::mesh::MeshConfig {
+                        members: mesh.member_ids().collect(),
+                        ..config.mesh.unwrap_or_default()
+                    }),
+                    ..config
+                },
+                None => config,
+            };
             capabilities.relay_server = Some(setup::RelayServerSetup {
                 config,
                 announce_addrs: std::mem::take(&mut self.relay_server_announce_addrs),
@@ -2157,6 +2294,11 @@ fn build_endpoint(
 ) -> Result<Endpoint, BindError> {
     #[cfg(feature = "relay-server")]
     let ca_webtransport_certificate = options.ca_webtransport_certificate();
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    let relay_mesh = options
+        .relay_mesh
+        .clone()
+        .map(|mesh| (mesh, options.agent_version.clone(), options.timeouts));
     let mut builder = SwarmBuilder::new(&keypair)
         .agent_version(options.agent_version)
         .simultaneous_dial_window_ms(
@@ -2214,6 +2356,13 @@ fn build_endpoint(
         #[cfg(feature = "mdns")]
         mdns_sockets,
     )?;
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    if let Some((mesh, agent_version, timeouts)) = relay_mesh {
+        let relay_server = engine.relay_server.as_mut().ok_or(BindError::Invariant {
+            reason: "a validated relay mesh has no relay server",
+        })?;
+        relay_server.backbone = Some(bind_backbone(mesh, agent_version, timeouts, &mut poll)?);
+    }
     // Relay and AutoNAT server addresses may name a host; the endpoint
     // resolves those off the driver, like Connection-attempt candidates.
     #[cfg(feature = "autonat")]
@@ -2232,6 +2381,41 @@ fn build_endpoint(
         #[cfg(all(test, feature = "quic"))]
         raw_events: std::collections::VecDeque::new(),
     })
+}
+
+/// Binds a relay mesh's backbone: a swarm under the backbone identity, over
+/// QUIC in the mesh connection namespaces (so the relay agent tells its
+/// connections apart), listening and attached to the endpoint's poll as a
+/// host source: its readiness wakes the wait, and each batch polls it.
+#[cfg(all(feature = "relay-server", feature = "quic"))]
+fn bind_backbone(
+    mesh: RelayMeshConfig,
+    agent_version: String,
+    timeouts: SwarmTimeouts,
+    poll: &mut SharedPoll,
+) -> Result<crate::relay_mesh::Backbone, BindError> {
+    let config = QuicNodeConfig::new(mesh.identity.clone())
+        .with_namespaces(minip2p_quic::QuicNamespaces::MESH);
+    let mut transport = QuicTransport::bind(config, &mesh.listen).map_err(BindError::RelayMesh)?;
+    poll.attach_host_source(&mut transport)
+        .map_err(|error| BindError::readiness_poll("attaching the relay-mesh backbone", &error))?;
+    let mut core = SwarmBuilder::new(&mesh.identity)
+        .agent_version(agent_version)
+        .timeouts(timeouts)
+        .build_core(transport, StdEntropy::new())?;
+    minip2p_relay_server::mesh::register_backbone_roles(&mut core)?;
+    core.listen_on_bound_addrs().map_err(|error| match error {
+        Error::Transport(error) => BindError::Listen(error),
+        _ => BindError::Invariant {
+            reason: "listening on the backbone's bound addresses failed outside the transport",
+        },
+    })?;
+    let own = mesh.identity.peer_id();
+    let members = mesh
+        .members
+        .into_iter()
+        .filter(|member| *member.peer_id() != own);
+    Ok(crate::relay_mesh::Backbone::new(core, members))
 }
 
 /// Raw swarm access for the crate's own tests, bypassing the engine.
@@ -4606,6 +4790,70 @@ mod tests {
         endpoint
             .add_protocol(PROTOCOL)
             .expect("application ids must be accepted");
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_mesh_is_checked_before_any_socket_opens() {
+        let public = Ed25519Keypair::generate();
+        let quic: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let member = |transport: &str| {
+            PeerAddr::new(
+                transport.parse().unwrap(),
+                Ed25519Keypair::generate().peer_id(),
+            )
+            .unwrap()
+        };
+        let mesh = |identity: &Ed25519Keypair, members| RelayMeshConfig {
+            identity: identity.clone(),
+            listen: vec![quic.clone()],
+            members,
+        };
+        let bind = |builder: EndpointBuilder| match builder
+            .identity(public.clone())
+            .listen_on_multiaddr(&quic)
+            .unwrap()
+            .bind()
+        {
+            Err(BindError::Options(error)) => error,
+            Err(other) => panic!("expected an options error, got {other:?}"),
+            Ok(_) => panic!("bound despite an invalid relay mesh"),
+        };
+        let backbone = Ed25519Keypair::generate();
+
+        let error = bind(Endpoint::builder().relay_mesh(mesh(&backbone, Vec::new())));
+        assert_eq!(error, EndpointOptionsError::RelayMeshWithoutServer);
+        let error = bind(
+            Endpoint::builder()
+                .relay_server()
+                .relay_mesh(mesh(&public, Vec::new())),
+        );
+        assert_eq!(error, EndpointOptionsError::RelayMeshPublicIdentity);
+        // Backbone transports take `/ip4|ip6` QUIC only: no names, no TCP.
+        for transport in [
+            "/dns4/relay.example/udp/19877/quic-v1",
+            "/ip4/127.0.0.1/tcp/19877",
+        ] {
+            let bad = member(transport);
+            let error = bind(
+                Endpoint::builder()
+                    .relay_server()
+                    .relay_mesh(mesh(&backbone, vec![bad.clone()])),
+            );
+            assert_eq!(error, EndpointOptionsError::RelayMeshMember { addr: bad });
+        }
+        let error = bind(
+            Endpoint::builder()
+                .relay_server()
+                .relay_mesh(RelayMeshConfig {
+                    listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap()],
+                    ..mesh(&backbone, Vec::new())
+                }),
+        );
+        assert!(matches!(
+            error,
+            EndpointOptionsError::UnsupportedListenShape { .. }
+        ));
     }
 
     #[cfg(all(feature = "relay-server", feature = "tcp"))]

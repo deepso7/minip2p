@@ -17,7 +17,9 @@
 //!    outcome.
 //! 2. Ingest one bounded batch of swarm events: one transport poll, or two
 //!    around the mDNS tick when the mDNS carrier shares the transport's
-//!    stack (mDNS can put bytes into the shared sockets).
+//!    stack (mDNS can put bytes into the shared sockets). A relay-mesh node
+//!    then polls its backbone swarm once, whose events reach only the relay
+//!    agent.
 //! 3. One capability pass: relay-server, NAT, Gossipsub, Discovery.
 //! 4. Expand the NAT dials the batch parked on a name, so their lookups run
 //!    before the caller sleeps, and route what expansion settled at once.
@@ -609,6 +611,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.ingest_transport(now)?;
         #[cfg(feature = "mdns")]
         self.tick_mdns(now)?;
+        self.drive_backbone(now)?;
         self.capability_pass(now, names);
         self.expand_parked(now, names);
         self.settle(now);
@@ -635,6 +638,34 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             self.ingest(event, now);
         }
         Ok(())
+    }
+
+    /// One poll of a relay-mesh node's backbone swarm, fed to the relay
+    /// agent, after redialing the members that are due; nothing without a
+    /// mesh.
+    #[cfg_attr(
+        not(all(feature = "relay-server", feature = "quic")),
+        expect(unused_variables, reason = "only a relay mesh has a backbone")
+    )]
+    pub(crate) fn drive_backbone(&mut self, now: Now) -> Result<(), DriverError> {
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        if let Some(relay_server) = self.relay_server.as_mut() {
+            relay_server.drive_backbone(&mut self.core, now)?;
+        }
+        Ok(())
+    }
+
+    /// Stops a relay-mesh node's redials and disconnects its members, for
+    /// a closing endpoint.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    pub(crate) fn shutdown_backbone(&mut self, now: Now) {
+        if let Some(backbone) = self
+            .relay_server
+            .as_mut()
+            .and_then(|relay_server| relay_server.backbone.as_mut())
+        {
+            backbone.shutdown(now);
+        }
     }
 
     /// Ticks mDNS, polls a shared transport again, and feeds mDNS
@@ -819,6 +850,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                     .drain(..)
                     .map(EndpointEvent::RelayServer),
             );
+            #[cfg(feature = "quic")]
+            self.events.extend(relay_server.mesh_events.drain(..));
         }
         #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {
@@ -946,7 +979,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             #[cfg(feature = "relay-server")]
             self.relay_server
                 .as_ref()
-                .and_then(|relay_server| relay_server.agent.next_deadline(now)),
+                .and_then(|relay_server| relay_server.next_deadline(now)),
             #[cfg(feature = "autonat")]
             self.nat.as_ref().and_then(|nat| nat.next_deadline(now)),
             #[cfg(feature = "pubsub")]
@@ -965,13 +998,28 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         .min()
     }
 
+    /// When a swarm next has due work: the public swarm, or a relay-mesh
+    /// node's backbone swarm, whose QUIC handshakes, retransmissions and
+    /// keepalives must run with no public traffic to wake the endpoint.
+    pub(crate) fn swarm_deadline(&self, now: Now) -> Option<Deadline> {
+        let public = self.core.next_deadline(now);
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        let public = Deadline::earliest_opt(
+            public,
+            self.relay_server
+                .as_ref()
+                .and_then(|relay_server| relay_server.backbone_swarm_deadline(now)),
+        );
+        public
+    }
+
     /// When the engine next needs a batch: immediately while events wait to
     /// be pulled, else the earliest swarm, attempt, or driver timer.
     pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if !self.events.is_empty() {
             return Some(Deadline::IMMEDIATE);
         }
-        Deadline::earliest_opt(self.core.next_deadline(now), self.driver_deadline(now))
+        Deadline::earliest_opt(self.swarm_deadline(now), self.driver_deadline(now))
     }
 }
 

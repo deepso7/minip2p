@@ -3,14 +3,28 @@
 //! host's time sample and needs only `alloc`. The agent runs its commands on
 //! the swarm itself (`SwarmCore` implements `RelaySwarm`), so the driver only
 //! routes events and ticks and collects what the agent emits.
+//!
+//! A relay-mesh node (std with QUIC) also owns its [`Backbone`] here: the
+//! agent then runs over a `MeshSwarm` of the public and backbone swarms, and
+//! the driver polls the backbone each batch and feeds its events to the
+//! agent too.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use minip2p_core::platform::{EntropySource, Now};
+use minip2p_core::platform::{Deadline, EntropySource, Now};
+#[cfg(feature = "quic")]
+use minip2p_relay_server::mesh::MeshSwarm;
 use minip2p_relay_server::{RelayServerAgent, RelayServerEvent};
+#[cfg(feature = "quic")]
+use minip2p_swarm::DriverError;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::Transport;
+
+#[cfg(feature = "quic")]
+use crate::EndpointEvent;
+#[cfg(feature = "quic")]
+use crate::relay_mesh::Backbone;
 
 /// Synchronous relay-server runtime control failure.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +43,13 @@ pub(crate) struct RelayServerDriver {
     /// The transport address revision the listener addresses were last
     /// taken at.
     pub(crate) listeners_revision: Option<u64>,
+    /// A relay-mesh node's backbone swarm.
+    #[cfg(feature = "quic")]
+    pub(crate) backbone: Option<Backbone>,
+    /// Member links that came up or went down, queued after the agent's
+    /// events.
+    #[cfg(feature = "quic")]
+    pub(crate) mesh_events: Vec<EndpointEvent>,
 }
 
 impl RelayServerDriver {
@@ -37,10 +58,15 @@ impl RelayServerDriver {
             agent,
             events: VecDeque::new(),
             listeners_revision: None,
+            #[cfg(feature = "quic")]
+            backbone: None,
+            #[cfg(feature = "quic")]
+            mesh_events: Vec::new(),
         }
     }
 
     /// Feeds one swarm event to the agent; returns whether it claimed it.
+    /// A mesh node's backbone events come through here too.
     pub(crate) fn ingest<T: Transport, E: EntropySource>(
         &mut self,
         event: &SwarmEvent,
@@ -61,6 +87,17 @@ impl RelayServerDriver {
         };
         // The first event at this time sample runs the agent's deadline sweep
         // before dispatch, preserving deadline-first ordering for the batch.
+        #[cfg(feature = "quic")]
+        let claimed = match self.backbone.as_mut() {
+            Some(backbone) => self.agent.handle_event(
+                &mut MeshSwarm::new(swarm, &mut backbone.core),
+                event,
+                is_circuit,
+                now,
+            ),
+            None => self.agent.handle_event(swarm, event, is_circuit, now),
+        };
+        #[cfg(not(feature = "quic"))]
         let claimed = self.agent.handle_event(swarm, event, is_circuit, now);
         self.collect_agent_events();
         claimed
@@ -77,9 +114,63 @@ impl RelayServerDriver {
             .next_deadline(now)
             .is_some_and(|due| due.is_expired_at(now))
         {
+            #[cfg(feature = "quic")]
+            match self.backbone.as_mut() {
+                Some(backbone) => self
+                    .agent
+                    .handle_tick(&mut MeshSwarm::new(swarm, &mut backbone.core), now),
+                None => self.agent.handle_tick(swarm, now),
+            }
+            #[cfg(not(feature = "quic"))]
             self.agent.handle_tick(swarm, now);
             self.collect_agent_events();
         }
+    }
+
+    /// A mesh node's backbone batch: redials the members that are due, then
+    /// feeds one backbone poll's events to the link bookkeeping and the
+    /// agent. Nothing on the backbone reaches the application but member
+    /// links coming up and going down.
+    #[cfg(feature = "quic")]
+    pub(crate) fn drive_backbone<T: Transport, E: EntropySource>(
+        &mut self,
+        swarm: &mut SwarmCore<T, E>,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        let Some(backbone) = self.backbone.as_mut() else {
+            return Ok(());
+        };
+        backbone.redial(now);
+        for event in backbone.core.poll(now)? {
+            if let Some(backbone) = self.backbone.as_mut()
+                && let Some(change) = backbone.observe(&event, now)
+            {
+                self.mesh_events.push(change);
+            }
+            self.ingest(&event, swarm, now);
+        }
+        Ok(())
+    }
+
+    /// When the agent's timers or a mesh member's redial are next due. The
+    /// backbone swarm's own timers are [`Self::backbone_swarm_deadline`].
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
+        let agent = self.agent.next_deadline(now);
+        #[cfg(feature = "quic")]
+        let agent = Deadline::earliest_opt(
+            agent,
+            self.backbone.as_ref().and_then(Backbone::redial_deadline),
+        );
+        agent
+    }
+
+    /// When a mesh node's backbone swarm next has due work (a QUIC
+    /// retransmission or keepalive, say), scheduled like the public swarm's.
+    #[cfg(feature = "quic")]
+    pub(crate) fn backbone_swarm_deadline(&self, now: Now) -> Option<Deadline> {
+        self.backbone
+            .as_ref()
+            .and_then(|backbone| backbone.core.next_deadline(now))
     }
 
     /// Moves the events the agent queued (including outside an ingest or
