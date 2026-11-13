@@ -99,6 +99,10 @@ pub enum RelayServerRuntimeErrorKind {
     ResetStream,
     /// An agent invariant failed.
     InternalInvariant,
+    /// A relay-mesh peer was refused or broke a mesh protocol: a backbone
+    /// connection from a non-member, or a malformed or over-cap directory or
+    /// forward stream.
+    Mesh,
 }
 
 /// Why the relay denied a RESERVE. Local diagnostics only: the requester
@@ -184,6 +188,10 @@ pub enum RelayServerEvent {
         source_peer_id: PeerId,
         /// Reserved STOP peer.
         destination_peer_id: PeerId,
+        /// For a circuit forwarded across a relay mesh, the other node's
+        /// backbone peer id: the holding node on the entry node, the entry
+        /// node on the holding node.
+        via: Option<PeerId>,
     },
     /// Exactly-once circuit terminal event with accepted-byte totals.
     CircuitClosed {
@@ -195,6 +203,9 @@ pub enum RelayServerEvent {
         bytes: CircuitByteCounts,
         /// Stable terminal reason.
         reason: CircuitCloseReason,
+        /// The other mesh node's backbone peer id, as in
+        /// [`CircuitOpened`](Self::CircuitOpened).
+        via: Option<PeerId>,
     },
     /// A host address refresh was rejected while `source` was healthy, or
     /// with a different error while it was already failing. The source's

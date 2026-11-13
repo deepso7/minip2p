@@ -22,7 +22,8 @@ pub struct RelaySwarmError(#[from] pub DriverError);
 /// The swarm is passed into every
 /// [`RelayServerAgent`](crate::RelayServerAgent) call that can issue a
 /// command and never stored; each command runs inline and its result is
-/// applied before the call returns. Implemented for [`SwarmCore`].
+/// applied before the call returns. Implemented for [`SwarmCore`], and for
+/// a mesh node's two swarms by [`MeshSwarm`](crate::mesh::MeshSwarm).
 pub trait RelaySwarm {
     /// The remote address of the connection `conn_id`, while the swarm holds
     /// it. Its first IP is the connection's admission key (ADR 0018).
@@ -73,6 +74,16 @@ pub trait RelaySwarm {
         &mut self,
         peer: &PeerId,
         stream: StreamKey,
+        now_ms: u64,
+    ) -> Result<(), RelaySwarmError>;
+
+    /// Closes `peer`'s connection `conn_id`. A mesh node closes backbone
+    /// connections from peers that are not members; a connection already
+    /// gone counts as closed.
+    fn close_connection(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
         now_ms: u64,
     ) -> Result<(), RelaySwarmError>;
 }
@@ -150,6 +161,23 @@ impl<T: Transport, E: EntropySource> RelaySwarm for SwarmCore<T, E> {
         match SwarmCore::reset_stream(self, peer, stream.conn_id, stream.stream_id, now_ms) {
             // A stream that is gone (or whose connection is) is already reset.
             Ok(()) | Err(DriverError::Swarm(SwarmError::StreamNotFound { .. })) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Closes `peer`'s connection: the swarm keeps one per peer, so that is
+    /// `conn_id` unless it is already gone.
+    fn close_connection(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        if SwarmCore::connection_remote_addr(self, conn_id).is_none() {
+            return Ok(());
+        }
+        match SwarmCore::disconnect(self, peer, now_ms) {
+            Ok(()) | Err(DriverError::Swarm(SwarmError::NotConnected { .. })) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }

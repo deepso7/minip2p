@@ -57,6 +57,10 @@ pub enum Call {
         peer: PeerId,
         stream: StreamKey,
     },
+    CloseConnection {
+        peer: PeerId,
+        conn_id: ConnectionId,
+    },
 }
 
 /// The scripted swarm every relay-server test runs against: connection
@@ -69,7 +73,8 @@ pub struct FakeSwarm {
     /// Each live connection's remote address.
     pub remote_addrs: BTreeMap<ConnectionId, Multiaddr>,
     calls: Vec<Call>,
-    next_stream: u64,
+    /// Opened streams take ids above this.
+    pub next_stream: u64,
     /// The stream the next open returns, whatever connection it is on.
     pub next_open: Option<StreamKey>,
     /// Refuse every stream open.
@@ -229,6 +234,19 @@ impl RelaySwarm for FakeSwarm {
         self.calls.push(Call::Reset {
             peer: peer.clone(),
             stream,
+        });
+        Ok(())
+    }
+
+    fn close_connection(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        _now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        self.calls.push(Call::CloseConnection {
+            peer: peer.clone(),
+            conn_id,
         });
         Ok(())
     }

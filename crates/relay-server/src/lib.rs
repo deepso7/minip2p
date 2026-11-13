@@ -28,6 +28,11 @@
 //! [`minip2p_transport::ConnectionId`] identity is retained throughout; the
 //! service relies on Swarm's single live connection per peer while still
 //! rejecting stale events from replaced connections.
+//!
+//! With [`RelayServerConfig::mesh`] set, the agent is one node of a relay
+//! mesh serving a shared relay identity: it publishes its reservations to
+//! the other members and forwards CONNECTs for peers reserved elsewhere over
+//! a backbone swarm. See [`mesh`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]

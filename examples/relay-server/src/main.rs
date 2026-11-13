@@ -363,6 +363,7 @@ fn print_event(event: RelayServerEvent) {
         RelayServerEvent::CircuitOpened {
             source_peer_id,
             destination_peer_id,
+            ..
         } => println!(
             "[relay] circuit opened source={source_peer_id} destination={destination_peer_id}"
         ),
@@ -371,6 +372,7 @@ fn print_event(event: RelayServerEvent) {
             destination_peer_id,
             bytes,
             reason,
+            ..
         } => println!(
             "[relay] circuit closed source={source_peer_id} destination={destination_peer_id} source_to_destination_bytes={} destination_to_source_bytes={} cause={reason:?}",
             bytes.source_to_destination, bytes.destination_to_source
