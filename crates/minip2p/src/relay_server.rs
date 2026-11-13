@@ -140,7 +140,15 @@ impl RelayServerDriver {
         let Some(backbone) = self.backbone.as_mut() else {
             return Ok(());
         };
-        backbone.redial(now);
+        self.events.extend(
+            backbone
+                .redial(now)
+                .into_iter()
+                .map(RelayServerEvent::Error),
+        );
+        let Some(backbone) = self.backbone.as_mut() else {
+            return Ok(());
+        };
         for event in backbone.core.poll(now)? {
             if let Some(backbone) = self.backbone.as_mut()
                 && let Some(change) = backbone.observe(&event, now)

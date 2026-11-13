@@ -19,6 +19,7 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::ConnectionId;
 
 use crate::EndpointEvent;
+use minip2p_relay_server::{RelayServerRuntimeError, RelayServerRuntimeErrorKind};
 
 /// The backbone's default UDP port, on every listen address of
 /// [`RelayMeshConfig::new`].
@@ -100,12 +101,25 @@ impl Backbone {
         }
     }
 
-    /// Dials every member whose redial is due.
-    pub(crate) fn redial(&mut self, now: Now) {
+    /// Dials every member whose redial is due, returning the dials the
+    /// transport refused at once: no `DialFailed` follows for those.
+    pub(crate) fn redial(&mut self, now: Now) -> Vec<RelayServerRuntimeError> {
+        let mut refused = Vec::new();
         for addr in self.links.due(now) {
-            let dialed = self.core.dial(&addr).ok();
+            let dialed = match self.core.dial(&addr) {
+                Ok(conn_id) => Some(conn_id),
+                Err(error) => {
+                    refused.push(RelayServerRuntimeError {
+                        kind: RelayServerRuntimeErrorKind::Mesh,
+                        peer_id: Some(addr.peer_id().clone()),
+                        detail: format!("dialing mesh member at {}: {error}", addr.transport()),
+                    });
+                    None
+                }
+            };
             self.links.dialed(addr.peer_id(), dialed, now);
         }
+        refused
     }
 
     /// Follows member links through one backbone event, returning the
@@ -144,7 +158,10 @@ impl Backbone {
 struct Links(BTreeMap<PeerId, Link>);
 
 struct Link {
-    addr: PeerAddr,
+    /// The member's addresses, in the order given; dials rotate through
+    /// them, moving on after each failure.
+    addrs: Vec<PeerAddr>,
+    next: usize,
     /// The member's backbone connection is established.
     up: bool,
     /// Our dial to it, until it establishes or fails.
@@ -155,23 +172,25 @@ struct Link {
 }
 
 impl Links {
-    /// Every member starts due, so the first batch dials them all.
+    /// Every member starts due, so the first batch dials them all. A
+    /// member listed under several addresses gets one link over all of them.
     fn new(members: impl IntoIterator<Item = PeerAddr>) -> Self {
-        Self(
-            members
-                .into_iter()
-                .map(|addr| {
-                    let link = Link {
-                        addr: addr.clone(),
-                        up: false,
-                        dial: None,
-                        redial_at: Some(Deadline::IMMEDIATE),
-                        backoff_ms: MIN_REDIAL_BACKOFF_MS,
-                    };
-                    (addr.peer_id().clone(), link)
+        let mut links = BTreeMap::new();
+        for addr in members {
+            links
+                .entry(addr.peer_id().clone())
+                .or_insert_with(|| Link {
+                    addrs: Vec::new(),
+                    next: 0,
+                    up: false,
+                    dial: None,
+                    redial_at: Some(Deadline::IMMEDIATE),
+                    backoff_ms: MIN_REDIAL_BACKOFF_MS,
                 })
-                .collect(),
-        )
+                .addrs
+                .push(addr);
+        }
+        Self(links)
     }
 
     fn awaiting_redial(link: &Link) -> bool {
@@ -184,7 +203,7 @@ impl Links {
             .values()
             .filter(|link| Self::awaiting_redial(link))
             .filter(|link| link.redial_at.is_some_and(|at| at.is_expired_at(now)))
-            .map(|link| link.addr.clone())
+            .filter_map(|link| link.addrs.get(link.next).cloned())
             .collect()
     }
 
@@ -195,7 +214,7 @@ impl Links {
             link.redial_at = None;
             link.dial = dial;
             if dial.is_none() {
-                link.schedule(now);
+                link.failed(now);
             }
         }
     }
@@ -238,7 +257,7 @@ impl Links {
                     .find(|link| link.dial == Some(*conn_id))?;
                 link.dial = None;
                 if !link.up {
-                    link.schedule(now);
+                    link.failed(now);
                 }
                 None
             }
@@ -256,6 +275,12 @@ impl Links {
 }
 
 impl Link {
+    /// A dial failed: the next one tries the member's next address.
+    fn failed(&mut self, now: Now) {
+        self.next = (self.next + 1) % self.addrs.len().max(1);
+        self.schedule(now);
+    }
+
     /// Schedules the next dial after the current backoff, then doubles it.
     fn schedule(&mut self, now: Now) {
         self.redial_at = Some(now.deadline_after(self.backoff_ms));
@@ -282,6 +307,22 @@ mod tests {
 
     fn at(ms: u64) -> Now {
         Now::from_millis(ms)
+    }
+
+    #[test]
+    fn failed_dials_rotate_through_a_members_addresses() {
+        let v4 = member();
+        let v6 = PeerAddr::new(
+            "/ip6/::1/udp/19877/quic-v1".parse().expect("address"),
+            v4.peer_id().clone(),
+        )
+        .expect("peer address");
+        let mut links = Links::new([v4.clone(), v6.clone()]);
+        assert_eq!(links.due(at(0)), vec![v4.clone()]);
+        links.dialed(v4.peer_id(), None, at(0));
+        assert_eq!(links.due(at(1_000)), vec![v6]);
+        links.dialed(v4.peer_id(), None, at(1_000));
+        assert_eq!(links.due(at(3_000)), vec![v4]);
     }
 
     #[test]
