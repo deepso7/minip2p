@@ -34,7 +34,7 @@ Certbot renews about 30 days before expiry. To test the whole path:
 
 ```bash
 sudo certbot renew --cert-name relay.minip2p.com --force-renewal
-minip2p-relay service logs   # expect "certificate reloaded" within a minute
+minip2p-relay service logs   # expect a new "certificate reloaded" line with a later not_after within a minute
 ```
 
 The full setup, including the hook's contents, is in the [WebTransport CA certificates plan](../../docs/plans/webtransport-ca-certificates.md#ops-relayminip2pcom) and [Stable browser addresses](../../docs/md/docs/rust/webtransport-certificates.mdx).
