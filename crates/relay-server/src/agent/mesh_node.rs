@@ -539,7 +539,7 @@ impl RelayServerAgent {
             .claims(destination, now_unix)
             .into_iter()
             .map(|claim| {
-                let link = mesh.links.get(&claim.member).map(|link| link.conn_id);
+                let link = mesh.links.get(claim.member).map(|link| link.conn_id);
                 (claim.member.clone(), link)
             })
             .filter(|tried| !resolution.tried.contains(tried))
