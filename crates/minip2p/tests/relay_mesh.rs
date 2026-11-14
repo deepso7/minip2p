@@ -270,9 +270,10 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
         b"hello back from alice".to_vec(),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut answered = false;
-    let mut received = None;
-    while received.is_none() {
+    // Stream data arrives in chunks: each side collects until the whole
+    // message is in.
+    let (mut at_alice, mut received) = (Vec::new(), Vec::new());
+    while received.len() < reply.len() {
         assert!(Instant::now() < deadline, "payload did not cross the mesh");
         if let Some(event) = bob.next_event(Duration::from_millis(20)).unwrap() {
             match event {
@@ -283,7 +284,7 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
                 } if stream_id == stream => bob.send_stream(conn, stream, hello.clone()).unwrap(),
                 EndpointEvent::StreamData {
                     stream_id, data, ..
-                } if stream_id == stream => received = Some(data),
+                } if stream_id == stream => received.extend_from_slice(&data),
                 _ => {}
             }
         }
@@ -295,15 +296,17 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
         }) = alice.next_event(Duration::from_millis(20)).unwrap()
             && peer_id == bob_peer
         {
-            assert_eq!(&data[..], &hello[..]);
-            assert!(!answered);
-            alice
-                .send_stream(conn_id, stream_id, reply.clone())
-                .unwrap();
-            answered = true;
+            at_alice.extend_from_slice(&data);
+            assert!(at_alice.len() <= hello.len(), "Bob sent only hello");
+            if at_alice.len() == hello.len() {
+                assert_eq!(at_alice, hello);
+                alice
+                    .send_stream(conn_id, stream_id, reply.clone())
+                    .unwrap();
+            }
         }
     }
-    assert_eq!(received.as_deref(), Some(reply.as_slice()));
+    assert_eq!(received, reply);
 
     // Both nodes report the circuit as crossing the backbone.
     for (node, other) in [(&b, &a), (&a, &b)] {

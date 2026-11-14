@@ -86,9 +86,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Backbone identity**: A Mesh node's own key for the Backbone. The member list names each node by its backbone peer ID, which is also how a node recognizes the other members. _Avoid_: mesh key (that is the file holding it)
 
-**Backbone**: The QUIC links between Mesh nodes, authenticated with Backbone identities and carried by a second swarm in the relay's Endpoint on its own port (UDP `19877` by default). Each pair of members keeps one link, redialed with backoff when lost.
+**Backbone**: The links between Mesh nodes, authenticated with Backbone identities, over which nodes share their Directory and forward circuits.
 
-**Directory**: A Mesh node's view of which peers hold reservations on which other node, built from the snapshot and updates each member pushes on its directory stream. A member's entries go when its stream or link does. _Avoid_: registry, shared reservation store
+**Directory**: A Mesh node's view of which peers hold reservations on which other node, as each member reports them. _Avoid_: registry, shared reservation store
 
 **Entry node**: The Mesh node a dialer's HOP CONNECT reaches. It applies the dialer's admission checks and, with no local reservation for the destination, forwards the circuit to the Holding node it finds in its Directory.
 

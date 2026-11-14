@@ -1169,7 +1169,7 @@ impl Endpoint {
             }
             // Out of time or failed: hand over what the swarm already queued
             // (a disconnect's close failure, say) without polling again.
-            let (polled, last, now) = if std::time::Instant::now() >= drain_by {
+            let (polled, mut last, now) = if std::time::Instant::now() >= drain_by {
                 (self.engine.core.take_buffered_events(), true, self.now())
             } else {
                 let harvested = if self.close_drain_busy() {
@@ -1202,8 +1202,11 @@ impl Endpoint {
             }
             // A relay mesh's backbone closes alongside, and its timers are
             // in the drain's sleep budget, so it is polled here too.
+            // A failure there ends the drain, as a public swarm's does.
             if let Err(error) = self.engine.drive_backbone(now) {
                 report.errors.push(error);
+                report.outcome = CloseOutcome::Failed;
+                last = true;
             }
             self.engine.settle(now);
             report.events.extend(self.engine.events.drain(..));

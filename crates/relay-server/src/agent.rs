@@ -2328,6 +2328,11 @@ impl RelayServerAgent {
                     renewed,
                     expires_unix_secs,
                 });
+            // A CONNECT waiting on a member's snapshot can use the new
+            // local reservation now, rather than time out on the wait.
+            if self.mesh.is_some() {
+                self.resolve_waiting(io);
+            }
         }
         self.complete_hop(key);
     }

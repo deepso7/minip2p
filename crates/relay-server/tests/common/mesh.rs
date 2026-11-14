@@ -249,13 +249,25 @@ impl Mesh {
         node.establish(client, stream.conn_id);
         node.hop_ready(client, stream, now);
         node.data(client, stream, &frame(reserve_request()), now);
+        // A CONNECT waiting on it can be answered in the same step.
         let events = node.events();
         assert!(
-            matches!(events[..], [RelayServerEvent::ReservationAccepted { .. }]),
+            matches!(
+                events[..],
+                [RelayServerEvent::ReservationAccepted { .. }, ..]
+            ),
             "{events:?}"
         );
         self.pump(now);
-        self.calls(i);
+        // Only the RESERVE exchange is dropped; a waiting CONNECT's answer
+        // stays for the test to read.
+        self.client_calls[i].retain(|call| match call {
+            Call::Send { stream: on, .. }
+            | Call::Close { stream: on, .. }
+            | Call::Reset { stream: on, .. }
+            | Call::Ack { stream: on, .. } => *on != stream,
+            _ => true,
+        });
     }
 
     /// `client`, connected to node `i` over `stream.conn_id`, sends CONNECT

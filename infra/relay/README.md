@@ -65,11 +65,11 @@ Give every node an Elastic IP, Mumbai included: the current instance has an auto
     --type SecureString --value file:///var/lib/minip2p-relay/identity.key
   ```
 
-  Each new node fetches the key into a file only root can read, imports it on its first install (below), and deletes the copy:
+  Each new node fetches the key into a file only root can read, imports it on its first install (below), and deletes the copy. The stored value keeps the file's trailing newline and `--output text` adds another, which `--import-key` rejects, so the fetch strips whitespace and keeps only the 64 hex characters:
 
   ```bash
   sudo sh -c 'umask 077; aws ssm get-parameter --region ap-south-1 --name /minip2p/relay/identity-key \
-    --with-decryption --query Parameter.Value --output text > /root/identity.key'
+    --with-decryption --query Parameter.Value --output text | tr -d "[:space:]" > /root/identity.key'
   ```
 
 - **Backbone keys.** Each node creates its own at `/var/lib/minip2p-relay/mesh.key` on its first start with `--mesh`, and prints its backbone address as `[relay] mesh listening=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/<backbone peer ID>`. Put the node's Elastic IP in place of `0.0.0.0` to get its member entry, `/ip4/<elastic ip>/udp/19877/quic-v1/p2p/<backbone peer ID>`. The full list of entries is the member list, the same on every node.
@@ -78,7 +78,7 @@ A breach of any node exposes the public identity for the whole mesh, and replaci
 
 ### Security groups
 
-Each node's group opens UDP `19877` only to the other members' Elastic IPs. The public ports (TCP and UDP `19876`) stay as they are. Once DNS-01 is in place (below), TCP `80` can close.
+Each node's group opens UDP `19877` only to the other members' Elastic IPs. The public ports (TCP and UDP `19876`) stay as they are. Once every node renews over DNS-01 (below), TCP `80` can close.
 
 ### DNS
 
@@ -99,6 +99,15 @@ sudo certbot certonly --dns-route53 -d relay.minip2p.com --key-type ecdsa \
   --cert-name relay.minip2p.com \
   --deploy-hook /usr/local/sbin/minip2p-relay-cert-hook
 ```
+
+Mumbai already holds this certificate, issued over HTTP-01, and `certonly` can keep it without saving the new method. Switch its renewal instead (Certbot 2.3 or newer):
+
+```bash
+sudo certbot reconfigure --cert-name relay.minip2p.com --dns-route53 \
+  --deploy-hook /usr/local/sbin/minip2p-relay-cert-hook
+```
+
+On every node, check that `/etc/letsencrypt/renewal/relay.minip2p.com.conf` says `authenticator = dns-route53` and that `sudo certbot renew --cert-name relay.minip2p.com --dry-run` passes before closing TCP `80`.
 
 The instance role needs, as in the [plugin's policy](https://certbot-dns-route53.readthedocs.io/en/stable/#credentials), `route53:ListHostedZones` and `route53:GetChange` on resource `*`, and `route53:ChangeResourceRecordSets` on the `relay.minip2p.com` zone only, limited to the challenge record with the condition `ForAllValues:StringEquals` `route53:ChangeResourceRecordSetsNormalizedRecordNames` = `_acme-challenge.relay.minip2p.com`. The deploy hook and live reload stay as in [Certificate](#certificate); set up the hook and `/etc/minip2p-relay/tls` on each new node as described there. Three nodes stay under Let's Encrypt's limit of 5 duplicate certificates per week, but the forced-renewal test counts against it, so test one node at a time.
 

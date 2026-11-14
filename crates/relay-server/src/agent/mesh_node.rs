@@ -283,7 +283,6 @@ impl RelayServerAgent {
             return true;
         };
         link.live = true;
-        link.backoff_ms = MIN_REOPEN_BACKOFF_MS;
         let mut snapshot = Vec::new();
         for (peer, record) in &self.reservations {
             snapshot.extend_from_slice(
@@ -345,7 +344,9 @@ impl RelayServerAgent {
             .swarm
             .send_stream(member, stream, data.into(), io.now_ms())
         {
-            Ok(()) => {}
+            // Nothing is left queued, so the snapshot is in the transport:
+            // the next lost stream reopens from the shortest backoff.
+            Ok(()) => link.backoff_ms = MIN_REOPEN_BACKOFF_MS,
             Err(RelaySwarmError(DriverError::Full { unsent, .. })) => {
                 link.blocked = true;
                 link.backlog = unsent.to_vec();

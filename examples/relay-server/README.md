@@ -93,7 +93,7 @@ minip2p-relay --key var/relay.ed25519 \
 
 At startup the relay prints `[relay] mesh listening=/ip4/…/udp/19877/quic-v1/p2p/<backbone peer ID>`: that line, with a wildcard IP replaced by the node's public one, is the node's entry in the member list. It logs `[relay] mesh member=<backbone peer ID> up` and `down` as links come and go, and circuits forwarded across the backbone get ` via=<backbone peer ID>` (the other node) on their `circuit opened` and `circuit closed` lines. Without `--mesh-key` the relay runs and logs exactly as a standalone relay.
 
-Nodes need synced clocks (NTP), and the backbone port open only to the other members. `service install --mesh` adds `--mesh-key /var/lib/minip2p-relay/mesh.key` to the unit, so the service creates the backbone key next to the identity on first start; `--mesh-listen` and `--mesh-member` imply `--mesh` and pass through. `service uninstall` keeps both keys. To change the member list, run `service install` again with the new list.
+Nodes need synced clocks (NTP), and the backbone port open only to the other members. `service install --mesh` adds `--mesh-key /var/lib/minip2p-relay/mesh.key` to the unit, so the service creates the backbone key next to the identity on first start; `--mesh-listen` and `--mesh-member` imply `--mesh` and pass through. `service uninstall` keeps both keys. To change the member list, run `service install` again with the new list. It writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off.
 
 ## Browsers with a stable address
 

@@ -547,13 +547,28 @@ fn a_waiting_connect_that_turns_local_respects_the_destinations_ip_cap() {
     mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
     assert_eq!(mesh.hop_status(C, bob_stream()).0, None);
     mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(1));
-
-    mesh.release_directory(B, C, at(2));
     assert_eq!(
         mesh.hop_status(C, bob_stream()).0,
         Some(Status::ResourceLimitExceeded)
     );
     mesh.nodes[C].assert_indexes_consistent();
+}
+
+#[test]
+fn a_waiting_connect_uses_a_local_reservation_made_during_the_wait() {
+    for dialer in DIALERS {
+        let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
+        let bob = Bob::dial(&mut mesh, C, dialer, at(1));
+        bob.assert_waiting(&mut mesh);
+
+        // B never syncs; Alice reserves on C itself.
+        mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(2));
+        let stop = opened(&mesh.calls(C)).expect("a STOP to Alice");
+        mesh.nodes[C].stop_ready(&alice(), stop, at(2));
+        mesh.nodes[C].stop_status(&alice(), stop, Status::Ok, at(2));
+        mesh.pump(at(2));
+        bob.assert_opened(&mut mesh, at(2));
+    }
 }
 
 #[test]

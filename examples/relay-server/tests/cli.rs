@@ -251,17 +251,24 @@ fn two_mesh_nodes_report_each_other_up() {
     let dir = tempfile::tempdir().unwrap();
     let public = dir.path().join("identity.key");
     write_key(&public, &minip2p::Ed25519Keypair::generate());
-    let nodes: Vec<_> = (0..2)
-        .map(|index| {
+    // Ports no socket holds once the probes drop, so each node can list
+    // the other. Both probes stay open until both ports are picked, so the
+    // two differ.
+    let probes: Vec<_> = (0..2)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = probes
+        .iter()
+        .map(|probe| probe.local_addr().unwrap().port())
+        .collect();
+    drop(probes);
+    let nodes: Vec<_> = ports
+        .into_iter()
+        .enumerate()
+        .map(|(index, port)| {
             let key = dir.path().join(format!("mesh-{index}.key"));
             let keypair = minip2p::Ed25519Keypair::generate();
             write_key(&key, &keypair);
-            // A port no socket holds now, so each node can list the other.
-            let port = std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
             let member = format!(
                 "/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{}",
                 keypair.peer_id()
