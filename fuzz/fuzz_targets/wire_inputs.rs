@@ -28,6 +28,7 @@ use minip2p_relay::{
     FrameDecode as RelayFrame, HopConnect, HopMessage, HopReservation, HopResponder, StopInitiator,
     StopMessage, StopResponder,
 };
+use minip2p_relay_server::mesh;
 use minip2p_secure_mux::noise::{
     NoiseConfig, NoiseExtensions, NoiseHandshakePayload, NoiseOutput, NoiseRole, NoiseSession,
 };
@@ -76,7 +77,33 @@ fuzz_target!(|data: &[u8]| {
     if let DcutrFrame::Complete { payload, .. } = minip2p_dcutr::decode_frame(data) {
         let _ = HolePunch::decode(payload);
     }
+    fuzz_relay_mesh(data);
 });
+
+/// Decodes both relay-mesh frames, and feeds the input to a directory stream
+/// as one read and as two, so frames split across reads take the same path.
+fn fuzz_relay_mesh(data: &[u8]) {
+    let _ = mesh::decode_mesh_frame(data, mesh::DirectoryMessage::decode);
+    let _ = mesh::decode_mesh_frame(data, mesh::ForwardMessage::decode);
+
+    let member = fuzz_peer_id();
+    let split = data.first().map_or(0, |b| usize::from(*b)).min(data.len());
+    let (head, tail) = data.split_at(split);
+    let mut whole = mesh::Directory::new(4);
+    whole.stream_opened(member.clone(), 0u8);
+    let whole_input = whole.stream_data(&member, &0, data);
+    let mut parts = mesh::Directory::new(4);
+    parts.stream_opened(member.clone(), 0u8);
+    let first = parts.stream_data(&member, &0, head);
+    let parts_input = match first {
+        mesh::DirectoryInput::Reset(_) => first,
+        _ => parts.stream_data(&member, &0, tail),
+    };
+    let reset = |input: &mesh::DirectoryInput| matches!(input, mesh::DirectoryInput::Reset(_));
+    assert_eq!(reset(&whole_input), reset(&parts_input));
+    assert_eq!(whole.entry_count(&member), parts.entry_count(&member));
+    assert_eq!(whole.is_synced(&member), parts.is_synced(&member));
+}
 
 /// Exercises the relay-side incremental framing and terminal-action boundary.
 fn fuzz_relay_server_machines(data: &[u8]) {

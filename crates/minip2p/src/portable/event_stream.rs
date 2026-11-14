@@ -227,6 +227,23 @@ pub enum EndpointEvent {
     /// address sources, and runtime errors.
     #[cfg(feature = "relay-server")]
     RelayServer(minip2p_relay_server::RelayServerEvent),
+    /// A relay-mesh member's backbone link came up
+    /// ([`EndpointBuilder::relay_mesh`](crate::EndpointBuilder::relay_mesh)):
+    /// this node now exchanges reservations and forwards circuits with it.
+    /// Queued after the batch's [`Self::RelayServer`] events.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    RelayMeshMemberUp {
+        /// The member's backbone peer id.
+        peer_id: PeerId,
+    },
+    /// A relay-mesh member's backbone link went down. Its reservations are
+    /// forgotten, and the endpoint redials it with backoff (1 s doubling to
+    /// 30 s) until [`Self::RelayMeshMemberUp`].
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    RelayMeshMemberDown {
+        /// The member's backbone peer id.
+        peer_id: PeerId,
+    },
 }
 
 impl EndpointEvent {

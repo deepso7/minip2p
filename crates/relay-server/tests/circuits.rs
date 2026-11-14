@@ -115,6 +115,7 @@ fn admitted_connect_opens_stop_on_the_reserved_exact_connection() {
                 RelayServerEvent::CircuitOpened {
                     ref source_peer_id,
                     ref destination_peer_id,
+                    ..
                 },
                 RelayServerEvent::CircuitClosed {
                     bytes,

@@ -1,5 +1,6 @@
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
+use minip2p_transport::ConnectionNamespace;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Resource and flow-control limits for the synchronous QUIC adapter.
@@ -240,6 +241,8 @@ pub struct QuicNodeConfig {
     pub(crate) limits: QuicLimits,
     /// What WebTransport-serving sockets present to `h3` clients.
     pub(crate) webtransport_certificates: WebTransportCertificates,
+    /// Where each socket allocates its connection ids.
+    pub(crate) namespaces: QuicNamespaces,
 }
 
 impl QuicNodeConfig {
@@ -253,6 +256,7 @@ impl QuicNodeConfig {
             keypair,
             limits: QuicLimits::default(),
             webtransport_certificates: WebTransportCertificates::default(),
+            namespaces: QuicNamespaces::default(),
         }
     }
 
@@ -292,8 +296,73 @@ impl QuicNodeConfig {
         &self.webtransport_certificates
     }
 
+    /// Replaces the default [`QuicNamespaces::QUIC`], so this transport's
+    /// connection ids stay apart from another QUIC transport's in the same
+    /// host — a mesh relay's backbone uses [`QuicNamespaces::MESH`].
+    pub fn with_namespaces(mut self, namespaces: QuicNamespaces) -> Self {
+        self.namespaces = namespaces;
+        self
+    }
+
+    /// Returns the namespaces this transport allocates connection ids in.
+    pub fn namespaces(&self) -> QuicNamespaces {
+        self.namespaces
+    }
+
     /// Returns the Ed25519 host keypair.
     pub(crate) fn keypair(&self) -> &Ed25519Keypair {
         &self.keypair
+    }
+}
+
+/// The [`ConnectionNamespace`]s a [`QuicTransport`](crate::QuicTransport)
+/// allocates connection ids in, one per IP family.
+///
+/// The default, [`QUIC`](Self::QUIC), suits a host with one QUIC transport.
+/// A host running two side by side gives the second its own pair, so a router
+/// can tell their connections apart by id alone.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QuicNamespaces {
+    ipv4: ConnectionNamespace,
+    ipv6: ConnectionNamespace,
+}
+
+impl QuicNamespaces {
+    /// [`QUIC_IPV4`](ConnectionNamespace::QUIC_IPV4) and
+    /// [`QUIC_IPV6`](ConnectionNamespace::QUIC_IPV6): the default.
+    pub const QUIC: Self = Self {
+        ipv4: ConnectionNamespace::QUIC_IPV4,
+        ipv6: ConnectionNamespace::QUIC_IPV6,
+    };
+    /// [`MESH_IPV4`](ConnectionNamespace::MESH_IPV4) and
+    /// [`MESH_IPV6`](ConnectionNamespace::MESH_IPV6): a mesh relay's backbone.
+    pub const MESH: Self = Self {
+        ipv4: ConnectionNamespace::MESH_IPV4,
+        ipv6: ConnectionNamespace::MESH_IPV6,
+    };
+
+    /// Creates a pair, or `None` if both families would share one namespace:
+    /// a namespace takes exactly one allocator, or ids would repeat.
+    pub const fn new(ipv4: ConnectionNamespace, ipv6: ConnectionNamespace) -> Option<Self> {
+        if ipv4.get() == ipv6.get() {
+            return None;
+        }
+        Some(Self { ipv4, ipv6 })
+    }
+
+    /// The namespace for connections over the IPv4 socket.
+    pub const fn ipv4(self) -> ConnectionNamespace {
+        self.ipv4
+    }
+
+    /// The namespace for connections over the IPv6 socket.
+    pub const fn ipv6(self) -> ConnectionNamespace {
+        self.ipv6
+    }
+}
+
+impl Default for QuicNamespaces {
+    fn default() -> Self {
+        Self::QUIC
     }
 }

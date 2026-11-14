@@ -36,7 +36,7 @@ On a Linux systemd host with standard administration tools under `/usr/bin` and 
 sudo minip2p-relay service install --hostname relay.example.com
 ```
 
-The command keeps the identity under `/var/lib/minip2p-relay`. Run `minip2p-relay service status` or `minip2p-relay service logs` to inspect it.
+The command keeps the identity under `/var/lib/minip2p-relay` (and, with `--mesh`, the backbone key: see [Relay mesh](#relay-mesh)). Run `minip2p-relay service status` or `minip2p-relay service logs` to inspect it.
 
 The executable expands the same builder when composing all four listeners:
 
@@ -74,6 +74,26 @@ cargo run -p minip2p-relay-server-example -- \
 The key file is created owner-only on Unix and never overwritten. Configuration and address errors are reported before transport binding where possible. Run with `--help` for capacity (overall, per peer, and per IPv4 address or IPv6 /64), duration, byte, pending-control, timeout, and fixed peer/IP token-bucket flags, plus `--max-rate-limit-entries` for the keys each token-bucket map tracks. A rate flag accepts `CAPACITY/REFILL_MS` or `off`. Zero circuit duration/bytes mean unlimited; zero capacities deny new work.
 
 Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. TCP, QUIC-v1 and WebTransport shapes are accepted. Without `--webtransport-cert`, a WebTransport one must carry its `/certhash` (copy it from the `webtransport=` line); with it, a WebTransport one must not. Wildcards, circuit addresses, other shapes, and conflicting `/p2p` identities are rejected.
+
+## Relay mesh
+
+Several relays can serve one relay address from different regions, behind geo DNS ([plan](../../docs/plans/relay-mesh.md), [ADR 0027](../../docs/adr/0027-relay-mesh-two-identities-and-single-hop-forwarding.md)). Every node runs with the same `--key`, so the peer ID in the address is valid wherever a client lands, and links to the other nodes over a QUIC backbone under a backbone key of its own. A node that gets a CONNECT for a peer reserved on another node forwards the circuit there. Clients need no changes.
+
+```bash
+minip2p-relay --key var/relay.ed25519 \
+  --announce /dns/relay.example.com/udp/19876/quic-v1 \
+  --mesh-key var/mesh.ed25519 \
+  --mesh-member /ip4/198.51.100.7/udp/19877/quic-v1/p2p/12D3KooW… \
+  --mesh-member /ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooW…
+```
+
+- `--mesh-key PATH` turns the mesh on. The backbone key is loaded or created like `--key`, with the same owner-only checks, and must differ from it. The mesh needs a persistent `--key`, since the other nodes load the same one.
+- `--mesh-listen HOST:PORT` replaces the default backbone binds, UDP `19877` on `0.0.0.0` and `[::]` (falling back to the available family). Repeat it for both families.
+- `--mesh-member PEER_ADDR` names one member by its backbone address and backbone peer ID, `/ip4|ip6/<ip>/udp/<port>/quic-v1/p2p/<backbone peer ID>`. Repeat it for every node. A node skips its own entry, so every node can take the same list. A backbone connection from a peer that isn't listed is closed.
+
+At startup the relay prints `[relay] mesh listening=/ip4/…/udp/19877/quic-v1/p2p/<backbone peer ID>`: that line, with a wildcard IP replaced by the node's public one, is the node's entry in the member list. It logs `[relay] mesh member=<backbone peer ID> up` and `down` as links come and go, and circuits forwarded across the backbone get ` via=<backbone peer ID>` (the other node) on their `circuit opened` and `circuit closed` lines. Without `--mesh-key` the relay runs and logs exactly as a standalone relay.
+
+Nodes need synced clocks (NTP), and the backbone port open only to the other members. `service install --mesh` adds `--mesh-key /var/lib/minip2p-relay/mesh.key` to the unit, so the service creates the backbone key next to the identity on first start; `--mesh-listen` and `--mesh-member` imply `--mesh` and pass through. `service uninstall` keeps both keys. To change the member list, run `service install` again with the new list. It writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off.
 
 ## Browsers with a stable address
 

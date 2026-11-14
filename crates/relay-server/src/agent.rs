@@ -19,6 +19,7 @@ use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::address::normalize_addrs;
 use crate::limiter::TokenBuckets;
+use crate::mesh::{DirectoryMessage, ForwardMessage};
 use crate::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
     RelayServerAddrSource, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
@@ -166,32 +167,152 @@ struct ReservationRecord {
     conn_id: ConnectionId,
     /// The admission key it counts against, fixed when first admitted.
     ip: Option<IpKey>,
+    /// Expiry in UTC UNIX seconds, as mesh nodes publish it; counted from
+    /// zero when the host supplies no UNIX time.
+    expires_unix: u64,
 }
 
+/// An inbound control stream that can ask for a circuit: a client's HOP
+/// stream, or a mesh member's forward stream.
 struct HopWorker {
+    /// The stream's swarm peer: the client, or the entry member.
     peer_id: PeerId,
-    responder: HopResponder,
+    responder: Responder,
     request_known: bool,
     is_circuit: bool,
 }
 
+enum Responder {
+    Hop(HopResponder),
+    /// A forward stream from an entry member: the request bytes read so
+    /// far, then the forwarded CONNECT's source once it decoded.
+    Forward {
+        request: Vec<u8>,
+        source: Option<PeerId>,
+    },
+}
+
 struct PendingCircuit {
+    /// The dialer and the reserved peer, as the circuit's events name them.
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
+    /// The source leg's swarm peer: the dialer, or on a holding node the
+    /// entry member that forwarded the CONNECT.
+    source_leg_peer: PeerId,
     source_ip: Option<IpKey>,
     destination_ip: Option<IpKey>,
-    destination_conn_id: ConnectionId,
-    /// The STOP stream while the relay still owns it: `None` once its
-    /// connection or negotiation is gone.
-    stop_stream: Option<StreamKey>,
-    /// The STOP exchange, from the stream's `StreamReady` on.
-    stop: Option<StopInitiator>,
+    /// The destination leg's connection; `None` while resolving.
+    destination_conn_id: Option<ConnectionId>,
+    /// The destination stream (STOP or forward) while the relay still owns
+    /// it: `None` while resolving, or once its connection or negotiation is
+    /// gone.
+    destination_stream: Option<StreamKey>,
+    destination: PendingDestination,
+    /// The circuit's limit: the config's for a local CONNECT, the entry
+    /// node's for a forwarded one.
+    limit: Limit,
+    /// Entry-node CONNECT resolution across the mesh.
+    resolution: Resolution,
     source_pipelined: Vec<u8>,
     destination_pipelined: Vec<u8>,
     /// The source half-closed while the circuit waited on STOP. The
     /// destination cannot: a STOP stream that half-closes before its STATUS
     /// fails the circuit, and the STATUS commits it in the same call.
     source_eof: bool,
+}
+
+impl PendingCircuit {
+    /// The destination leg's swarm peer: the reserved peer, or the holding
+    /// member a forward goes to.
+    fn destination_leg_peer(&self) -> &PeerId {
+        match &self.destination {
+            PendingDestination::Forward { member, .. } => member,
+            _ => &self.destination_peer_id,
+        }
+    }
+
+    /// What the dialer hears when the CONNECT's control deadline passes: a
+    /// pending leg failed to connect, while a resolving one answers the
+    /// last claim's refusal, or `NO_RESERVATION` if no claim was found.
+    fn timeout_status(&self) -> Status {
+        match self.destination {
+            PendingDestination::Resolving => {
+                self.resolution.last_status.unwrap_or(Status::NoReservation)
+            }
+            _ => Status::ConnectionFailed,
+        }
+    }
+
+    /// Whether the destination stream finished negotiating.
+    fn destination_ready(&self) -> bool {
+        matches!(
+            self.destination,
+            PendingDestination::Stop(Some(_)) | PendingDestination::Forward { reply: Some(_), .. }
+        )
+    }
+}
+
+/// Where a CONNECT's destination leg goes.
+enum Route {
+    /// STOP to the local reservation on `conn_id`.
+    Stop {
+        conn_id: ConnectionId,
+        stream: StreamKey,
+    },
+    /// A forward to the holding `member`.
+    Forward { member: PeerId, stream: StreamKey },
+    /// No leg yet: wait for an unsynced member's directory.
+    Wait,
+}
+
+impl PendingCircuit {
+    /// Points the destination side at `route`. The caller keeps the
+    /// destination indexes in step.
+    fn route(&mut self, route: Route) {
+        let (conn_id, stream, destination) = match route {
+            Route::Stop { conn_id, stream } => {
+                (Some(conn_id), Some(stream), PendingDestination::Stop(None))
+            }
+            Route::Forward { member, stream } => (
+                Some(stream.conn_id),
+                Some(stream),
+                PendingDestination::Forward {
+                    member,
+                    reply: None,
+                },
+            ),
+            Route::Wait => (None, None, PendingDestination::Resolving),
+        };
+        self.destination_conn_id = conn_id;
+        self.destination_stream = stream;
+        self.destination = destination;
+    }
+}
+
+/// What a pending circuit's destination side is waiting on.
+enum PendingDestination {
+    /// No leg yet: an entry node waits for an unsynced member's directory.
+    Resolving,
+    /// STOP to the local reservation; the exchange from the stream's
+    /// `StreamReady` on.
+    Stop(Option<StopInitiator>),
+    /// A forward to the holding `member`; its reply bytes read so far from
+    /// the stream's `StreamReady` on.
+    Forward {
+        member: PeerId,
+        reply: Option<Vec<u8>>,
+    },
+}
+
+/// An entry node's progress through a CONNECT's remote claims.
+#[derive(Default)]
+struct Resolution {
+    /// Members already tried, each with the link it was tried over, so a
+    /// failed claim is not tried again on the same link. A member whose
+    /// link was replaced since can be tried again on the new one.
+    tried: Vec<(PeerId, Option<ConnectionId>)>,
+    /// The last refusal a claim produced, answered when none is left.
+    last_status: Option<Status>,
 }
 
 /// A STOP stream the relay gave up before it closed: its circuit failed or
@@ -208,10 +329,17 @@ struct RetiredStop {
 struct Circuit {
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
+    /// Each leg's swarm peer; a leg on the backbone has the member's.
+    source_leg_peer: PeerId,
+    destination_leg_peer: PeerId,
+    /// The other mesh node's backbone peer, for a circuit that crosses it.
+    via: Option<PeerId>,
     source_ip: Option<IpKey>,
     destination_ip: Option<IpKey>,
     source_stream: StreamKey,
     destination_stream: StreamKey,
+    /// Duration and byte limits it enforces; zero or absent is unlimited.
+    limit: Limit,
     bytes: CircuitByteCounts,
     to_destination: Forward,
     to_source: Forward,
@@ -238,12 +366,12 @@ impl Circuit {
     fn target(&mut self, direction: CircuitDirection) -> (&PeerId, StreamKey, &mut Forward) {
         match direction {
             CircuitDirection::SourceToDestination => (
-                &self.destination_peer_id,
+                &self.destination_leg_peer,
                 self.destination_stream,
                 &mut self.to_destination,
             ),
             CircuitDirection::DestinationToSource => (
-                &self.source_peer_id,
+                &self.source_leg_peer,
                 self.source_stream,
                 &mut self.to_source,
             ),
@@ -491,6 +619,8 @@ fn failed_negotiation(event: &SwarmEvent) -> Option<(StreamKey, &str)> {
     }
 }
 
+mod mesh_node;
+
 /// Whole-service deterministic relay policy and forwarding state.
 ///
 /// Lookups by connection, peer, stream, and due time go through indexes
@@ -538,6 +668,8 @@ pub struct RelayServerAgent {
     /// Pending plus committed circuits and committed reservations per
     /// admission key, a circuit whose ends share a key counted once.
     ip_tally: IpTally,
+    /// Relay-mesh state, when the config makes this agent a mesh node.
+    mesh: Option<mesh_node::MeshNode>,
 }
 
 impl RelayServerAgent {
@@ -574,6 +706,7 @@ impl RelayServerAgent {
                 config.max_rate_limit_entries,
             ),
             ip_tally: IpTally::default(),
+            mesh: config.mesh.as_ref().map(mesh_node::MeshNode::new),
             config,
             accepting: true,
             explicit_addrs: None,
@@ -735,7 +868,11 @@ impl RelayServerAgent {
         self.tick_before_event(io);
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                self.on_connection_established(io, peer_id.clone(), *conn_id, is_circuit);
+                if self.is_backbone(*conn_id) {
+                    self.on_backbone_established(io, peer_id.clone(), *conn_id);
+                } else {
+                    self.on_connection_established(io, peer_id.clone(), *conn_id, is_circuit);
+                }
                 false
             }
             SwarmEvent::ConnectionClosed {
@@ -745,7 +882,11 @@ impl RelayServerAgent {
                 false
             }
             SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
-                self.on_connection_replaced(io, peer_id, *old, *new, is_circuit);
+                if self.is_backbone(*new) {
+                    self.on_backbone_replaced(io, peer_id, *old, *new);
+                } else {
+                    self.on_connection_replaced(io, peer_id, *old, *new, is_circuit);
+                }
                 false
             }
             SwarmEvent::StreamReady {
@@ -764,6 +905,8 @@ impl RelayServerAgent {
                 } else if protocol_id == HOP_PROTOCOL_ID {
                     self.on_hop_ready(io, peer_id.clone(), key, is_circuit);
                     true
+                } else if self.mesh.is_some() {
+                    self.on_mesh_stream_ready(io, peer_id, key, protocol_id)
                 } else {
                     false
                 }
@@ -799,7 +942,11 @@ impl RelayServerAgent {
                         data,
                     );
                     true
-                } else if self.hop_workers.contains_key(&key) {
+                } else if let Some(worker) = self.hop_workers.get(&key) {
+                    if matches!(worker.responder, Responder::Forward { .. }) {
+                        self.on_forward_request_data(io, key, data);
+                        return true;
+                    }
                     // Payload coalesced with CONNECT stays in the responder
                     // until the decision, unacknowledged.
                     let held = self.hop_bridge_len(key);
@@ -820,6 +967,9 @@ impl RelayServerAgent {
                             CircuitDirection::DestinationToSource,
                             data.clone(),
                         );
+                    } else if self.is_pending_forward(source_stream) {
+                        let bridged = self.on_forward_reply(io, source_stream, data);
+                        io.ack(key, data.len().saturating_sub(bridged));
                     } else {
                         let bridged = if self.feed_stop(source_stream, |stop| stop.on_data(data)) {
                             self.drain_stop(io, source_stream)
@@ -832,6 +982,8 @@ impl RelayServerAgent {
                 } else if self.retired_stops.contains_key(&key) {
                     io.ack(key, data.len());
                     true
+                } else if self.mesh.is_some() {
+                    self.on_directory_data(io, key, data)
                 } else {
                     false
                 }
@@ -863,6 +1015,12 @@ impl RelayServerAgent {
                     }
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
+                    && self.is_pending_forward(source_stream)
+                {
+                    // A holding node ends a forward only after its STATUS.
+                    self.forward_refused(io, source_stream, Status::ConnectionFailed);
+                    true
+                } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.feed_stop(source_stream, StopInitiator::on_remote_write_closed)
                 {
                     self.drain_stop(io, source_stream);
@@ -874,6 +1032,7 @@ impl RelayServerAgent {
                 } else {
                     self.rejected_hop_streams.contains_key(&key)
                         || self.retired_stops.contains_key(&key)
+                        || (self.mesh.is_some() && self.on_directory_ended(io, key, false))
                 }
             }
             // Resumes a circuit direction paused on this leg. Other relay
@@ -894,6 +1053,8 @@ impl RelayServerAgent {
                     self.resume_forward(io, key, CircuitDirection::DestinationToSource);
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
                     self.resume_forward(io, source_stream, CircuitDirection::SourceToDestination);
+                } else if self.mesh.is_some() {
+                    self.resume_directory(io, key);
                 }
                 claimed
             }
@@ -926,6 +1087,15 @@ impl RelayServerAgent {
                     self.circuit_leg_closed(io, source_stream, CircuitLeg::Destination);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
+                    && self.is_pending_forward(source_stream)
+                    && self
+                        .pending_circuits
+                        .get(&source_stream)
+                        .is_some_and(PendingCircuit::destination_ready)
+                {
+                    self.forward_refused(io, source_stream, Status::ConnectionFailed);
+                    true
+                } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.feed_stop(source_stream, StopInitiator::on_remote_reset)
                 {
                     self.drain_stop(io, source_stream);
@@ -942,7 +1112,9 @@ impl RelayServerAgent {
                     true
                 } else {
                     let owned = self.remove_hop_worker(key).is_some();
-                    owned || self.rejected_hop_streams.remove(&key).is_some()
+                    owned
+                        || self.rejected_hop_streams.remove(&key).is_some()
+                        || (self.mesh.is_some() && self.on_directory_ended(io, key, true))
                 };
                 // The stream is gone: a STOP stream retired above, or
                 // earlier, needs no more claiming.
@@ -963,9 +1135,10 @@ impl RelayServerAgent {
             self.close_circuit(io, key, CircuitCloseReason::DurationLimit);
         }
         for key in self.hop_deadlines.due(now_ms) {
-            if self.pending_circuits.contains_key(&key) {
+            if let Some(circuit) = self.pending_circuits.get(&key) {
+                let status = circuit.timeout_status();
                 self.hop_deadlines.remove(&key);
-                self.fail_pending_connect(io, key, Status::ConnectionFailed);
+                self.fail_pending_connect(io, key, status);
                 continue;
             }
             if let Some(worker) = self.remove_hop_worker(key) {
@@ -980,10 +1153,14 @@ impl RelayServerAgent {
             }
         }
         for key in self.stop_deadlines.due(now_ms) {
-            self.fail_pending_connect(io, key, Status::ConnectionFailed);
+            let status = self
+                .pending_circuits
+                .get(&key)
+                .map_or(Status::ConnectionFailed, PendingCircuit::timeout_status);
+            self.fail_pending_connect(io, key, status);
         }
         for peer_id in self.reservation_deadlines.due(now_ms) {
-            self.remove_reservation(&peer_id);
+            self.remove_reservation(io, &peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id,
                 reason: ReservationCloseReason::Expired,
@@ -991,6 +1168,7 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now_ms);
         self.circuit_limiters.sweep(now_ms);
+        self.reopen_due_directories(io);
     }
 
     /// Resets a relay stream the peer stopped; returns whether we own it.
@@ -1026,6 +1204,7 @@ impl RelayServerAgent {
             || self.pending_circuits.contains_key(&key)
             || self.rejected_hop_streams.contains_key(&key)
             || self.retired_stops.contains_key(&key)
+            || self.owns_directory_stream(key)
     }
 
     /// Sweeps deadlines before the first event in a driver batch.
@@ -1059,18 +1238,44 @@ impl RelayServerAgent {
             return true;
         }
         let Some(source_stream) = self.stop_to_source.get(&key).copied() else {
-            return false;
+            return self.mesh.is_some() && self.on_directory_ready(io, key);
         };
-        let limit = self.circuit_limit();
-        if let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
-            && circuit.stop.is_none()
-        {
-            // The initiator's first output is the STOP CONNECT request.
-            circuit.stop = Some(StopInitiator::new(
-                circuit.source_peer_id.clone(),
-                Some(limit),
-            ));
-            self.drain_stop(io, source_stream);
+        let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
+            return true;
+        };
+        match &mut circuit.destination {
+            PendingDestination::Stop(stop @ None) => {
+                // The initiator's first output is the STOP CONNECT request.
+                *stop = Some(StopInitiator::new(
+                    circuit.source_peer_id.clone(),
+                    Some(circuit.limit.clone()),
+                ));
+                self.drain_stop(io, source_stream);
+            }
+            PendingDestination::Forward {
+                member,
+                reply: reply @ None,
+            } => {
+                *reply = Some(Vec::new());
+                let request = ForwardMessage::Forward {
+                    source: circuit.source_peer_id.clone(),
+                    destination: circuit.destination_peer_id.clone(),
+                    limit: circuit.limit.clone(),
+                };
+                let member = member.clone();
+                if let Err(error) =
+                    io.swarm
+                        .send_stream(&member, key, request.encode_frame().into(), io.now_ms())
+                {
+                    self.runtime_error(
+                        RelayServerRuntimeErrorKind::SendStream,
+                        Some(member),
+                        control_send_failure(error),
+                    );
+                    self.forward_refused(io, source_stream, Status::ConnectionFailed);
+                }
+            }
+            _ => {}
         }
         true
     }
@@ -1084,21 +1289,26 @@ impl RelayServerAgent {
             return true;
         }
         let Some(source_stream) = self.stop_to_source.get(&key).copied() else {
-            return false;
+            return self.mesh.is_some() && self.on_directory_ended(io, key, true);
         };
         if let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
-            && circuit.stop.is_none()
+            && !circuit.destination_ready()
         {
             // The stream is gone: nothing to reset or claim.
-            circuit.stop_stream = None;
+            circuit.destination_stream = None;
             self.stop_to_source.remove(&key);
-            let peer_id = circuit.destination_peer_id.clone();
+            let peer_id = circuit.destination_leg_peer().clone();
+            let forward = matches!(circuit.destination, PendingDestination::Forward { .. });
             self.runtime_error(
                 RelayServerRuntimeErrorKind::OpenStream,
                 Some(peer_id),
                 detail.into(),
             );
-            self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
+            if forward {
+                self.forward_refused(io, source_stream, Status::ConnectionFailed);
+            } else {
+                self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
+            }
         }
         true
     }
@@ -1125,7 +1335,8 @@ impl RelayServerAgent {
         .into_iter()
         .flatten()
         .min();
-        [reservation, hop, stop, circuit, limiter]
+        let mesh = self.mesh.as_ref().and_then(|mesh| mesh.reopen.earliest());
+        [reservation, hop, stop, circuit, limiter, mesh]
             .into_iter()
             .flatten()
             .min()
@@ -1141,6 +1352,7 @@ impl RelayServerAgent {
             || self.stop_to_source.contains_key(&stream)
             || self.retired_stops.contains_key(&stream)
             || self.circuits.contains_key(&stream)
+            || self.owns_directory_stream(stream)
     }
 
     /// The exact connection owning `peer_id`'s committed reservation.
@@ -1199,11 +1411,21 @@ impl RelayServerAgent {
             && reservation.conn_id == old
         {
             reservation.conn_id = new;
+            let expires_unix = reservation.expires_unix;
+            self.publish(
+                io,
+                &DirectoryMessage::Present {
+                    peer: peer_id.clone(),
+                    expires_unix,
+                },
+            );
         }
         self.on_connection_closed(io, peer_id, old);
     }
 
     fn on_connection_closed(&mut self, io: &mut Io<'_>, peer_id: &PeerId, conn_id: ConnectionId) {
+        // A member's entries go before its pending forwards look again.
+        let link_lost = self.is_backbone(conn_id) && self.on_backbone_closed(peer_id, conn_id);
         // Circuits are keyed by their source stream, so source legs are a
         // range; destination legs come through `stop_to_source`, keyed by
         // the destination stream. Collected by circuit so they close in
@@ -1237,13 +1459,21 @@ impl RelayServerAgent {
         for (source_stream, source_closed) in pending {
             if source_closed {
                 self.abort_pending_connect(io, source_stream);
+            } else if self.is_pending_forward(source_stream) {
+                // The forward went with its link: try the next claim.
+                if let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
+                    && let Some(stream) = circuit.destination_stream.take()
+                {
+                    self.stop_to_source.remove(&stream);
+                }
+                self.forward_refused(io, source_stream, Status::ConnectionFailed);
             } else {
                 // The STOP stream went with its connection: nothing to reset.
                 if let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
-                    && let Some(stop_stream) = circuit.stop_stream.take()
+                    && let Some(stop_stream) = circuit.destination_stream.take()
                 {
                     self.stop_to_source.remove(&stop_stream);
-                    if circuit.stop.is_none() {
+                    if !circuit.destination_ready() {
                         let peer_id = circuit.destination_peer_id.clone();
                         self.runtime_error(
                             RelayServerRuntimeErrorKind::OpenStream,
@@ -1263,7 +1493,7 @@ impl RelayServerAgent {
             .get(peer_id)
             .is_some_and(|reservation| reservation.conn_id == conn_id)
         {
-            self.remove_reservation(peer_id);
+            self.remove_reservation(io, peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id: peer_id.clone(),
                 reason: ReservationCloseReason::ConnectionClosed,
@@ -1293,6 +1523,9 @@ impl RelayServerAgent {
             .collect();
         for stream in retired {
             self.retired_stops.remove(&stream);
+        }
+        if link_lost {
+            self.resolve_waiting(io, None);
         }
     }
 
@@ -1330,7 +1563,7 @@ impl RelayServerAgent {
         }
         let worker = HopWorker {
             peer_id: peer_id.clone(),
-            responder: HopResponder::new(),
+            responder: Responder::Hop(HopResponder::new()),
             request_known: false,
             is_circuit,
         };
@@ -1353,11 +1586,16 @@ impl RelayServerAgent {
         key: StreamKey,
         input: impl FnOnce(&mut HopResponder) -> Result<(), RelayError>,
     ) -> bool {
-        let Some(worker) = self.hop_workers.get_mut(&key) else {
+        let Some(HopWorker {
+            peer_id,
+            responder: Responder::Hop(responder),
+            ..
+        }) = self.hop_workers.get_mut(&key)
+        else {
             return false;
         };
-        let peer_id = worker.peer_id.clone();
-        let result = input(&mut worker.responder);
+        let peer_id = peer_id.clone();
+        let result = input(responder);
         if let Err(error) = result {
             self.runtime_error(
                 RelayServerRuntimeErrorKind::InternalInvariant,
@@ -1379,7 +1617,10 @@ impl RelayServerAgent {
         let Some(stop) = self
             .pending_circuits
             .get_mut(&source_stream)
-            .and_then(|circuit| circuit.stop.as_mut())
+            .and_then(|circuit| match &mut circuit.destination {
+                PendingDestination::Stop(stop) => stop.as_mut(),
+                _ => None,
+            })
         else {
             return false;
         };
@@ -1392,7 +1633,10 @@ impl RelayServerAgent {
     /// the responder produced after the reply (its FIN) takes effect.
     fn drain_hop(&mut self, io: &mut Io<'_>, key: StreamKey) {
         while let Some(worker) = self.hop_workers.get_mut(&key) {
-            let Some(output) = worker.responder.poll_output() else {
+            let Responder::Hop(responder) = &mut worker.responder else {
+                break;
+            };
+            let Some(output) = responder.poll_output() else {
                 break;
             };
             let peer_id = worker.peer_id.clone();
@@ -1410,7 +1654,7 @@ impl RelayServerAgent {
                 }) => {
                     worker.request_known = true;
                     if worker.is_circuit {
-                        self.deny_connect(key, destination_peer_id, Status::PermissionDenied);
+                        self.deny_connect(io, key, destination_peer_id, Status::PermissionDenied);
                     } else {
                         self.decide_connect(io, key, destination_peer_id);
                     }
@@ -1445,11 +1689,14 @@ impl RelayServerAgent {
         let mut bridged = 0;
         let mut accepted = false;
         while let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
-            let Some(output) = circuit.stop.as_mut().and_then(StopInitiator::poll_output) else {
+            let PendingDestination::Stop(Some(stop)) = &mut circuit.destination else {
+                break;
+            };
+            let Some(output) = stop.poll_output() else {
                 break;
             };
             let peer_id = circuit.destination_peer_id.clone();
-            let stream = circuit.stop_stream;
+            let stream = circuit.destination_stream;
             match output {
                 StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted) => accepted = true,
                 StopInitiatorOutput::Outcome(outcome) => {
@@ -1499,48 +1746,76 @@ impl RelayServerAgent {
         bridged
     }
 
-    /// The destination accepted STOP: answers the source's CONNECT and, once
-    /// the transport takes that success, commits the circuit.
+    /// The destination accepted STOP, or the holding member accepted the
+    /// forward: answers the source's CONNECT (a HOP STATUS, or on a holding
+    /// node the forward's `OK`) and, once the transport takes that success,
+    /// commits the circuit.
     fn accept_pending_circuit(&mut self, io: &mut Io<'_>, source_stream: StreamKey) {
-        if !self.pending_circuits.contains_key(&source_stream) {
+        let Some(circuit) = self.pending_circuits.get(&source_stream) else {
             return;
-        }
+        };
         self.stop_deadlines.remove(&source_stream);
-        let limit = self.circuit_limit();
-        if !self.feed_hop(source_stream, |hop| hop.accept_connect(Some(limit))) {
-            self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
-            return;
-        }
+        let limit = circuit.limit.clone();
         let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
             self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
             return;
         };
-        let Some(HopResponderOutput::Outbound(reply)) = worker.responder.poll_output() else {
-            self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
-            return;
-        };
         let peer_id = worker.peer_id.clone();
-        // Payload coalesced with CONNECT follows the reply; it precedes
-        // everything buffered since.
-        let mut held = Vec::new();
-        while let Some(output) = worker.responder.poll_output() {
-            if let HopResponderOutput::BridgeData(data) = output {
-                held.extend_from_slice(&data);
+        // The success reply, and payload a HOP responder held behind CONNECT.
+        let accepted = match &mut worker.responder {
+            Responder::Forward { .. } => Ok((
+                ForwardMessage::Status(Status::Ok).encode_frame(),
+                Vec::new(),
+            )),
+            Responder::Hop(responder) => match responder.accept_connect(Some(limit)) {
+                Err(error) => Err(Some(format!(
+                    "HOP responder rejected routed input: {error}"
+                ))),
+                Ok(()) => match responder.poll_output() {
+                    Some(HopResponderOutput::Outbound(reply)) => {
+                        let mut held = Vec::new();
+                        while let Some(output) = responder.poll_output() {
+                            if let HopResponderOutput::BridgeData(data) = output {
+                                held.extend_from_slice(&data);
+                            }
+                        }
+                        Ok((reply, held))
+                    }
+                    _ => Err(None),
+                },
+            },
+        };
+        let reply = match accepted {
+            Ok((reply, held)) => {
+                // Payload coalesced with CONNECT follows the reply; it
+                // precedes everything buffered since.
+                if !held.is_empty()
+                    && let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
+                {
+                    let later = core::mem::replace(&mut circuit.source_pipelined, held);
+                    if !self.append_pending_payload(
+                        io,
+                        source_stream,
+                        CircuitDirection::SourceToDestination,
+                        &later,
+                    ) {
+                        return;
+                    }
+                }
+                reply
             }
-        }
-        if !held.is_empty()
-            && let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
-        {
-            let later = core::mem::replace(&mut circuit.source_pipelined, held);
-            if !self.append_pending_payload(
-                io,
-                source_stream,
-                CircuitDirection::SourceToDestination,
-                &later,
-            ) {
+            Err(detail) => {
+                if let Some(detail) = detail {
+                    self.runtime_error(
+                        RelayServerRuntimeErrorKind::InternalInvariant,
+                        Some(peer_id),
+                        detail,
+                    );
+                }
+                self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
                 return;
             }
-        }
+        };
         match io
             .swarm
             .send_stream(&peer_id, source_stream, reply.into(), io.now_ms())
@@ -1575,16 +1850,26 @@ impl RelayServerAgent {
         let Some(pending) = self.remove_pending_circuit(source_stream) else {
             return;
         };
-        let Some(destination_stream) = pending.stop_stream else {
+        let Some(destination_stream) = pending.destination_stream else {
             return;
         };
-        if self.config.max_circuit_duration_secs != 0 {
+        if let Some(duration_secs) = pending.limit.duration.filter(|secs| *secs != 0) {
             self.circuit_deadlines.set(
                 source_stream,
                 io.now_ms()
-                    .saturating_add(self.config.max_circuit_duration_secs.saturating_mul(1_000)),
+                    .saturating_add(u64::from(duration_secs).saturating_mul(1_000)),
             );
         }
+        let destination_leg_peer = pending.destination_leg_peer().clone();
+        // A forwarded circuit has one leg on the backbone, so one leg peer
+        // is a member's rather than an endpoint's.
+        let via = if pending.source_leg_peer != pending.source_peer_id {
+            Some(pending.source_leg_peer.clone())
+        } else if destination_leg_peer != pending.destination_peer_id {
+            Some(destination_leg_peer.clone())
+        } else {
+            None
+        };
         self.hold_circuit(
             &pending.source_peer_id,
             &pending.destination_peer_id,
@@ -1594,10 +1879,14 @@ impl RelayServerAgent {
         let mut circuit = Circuit {
             source_peer_id: pending.source_peer_id.clone(),
             destination_peer_id: pending.destination_peer_id.clone(),
+            source_leg_peer: pending.source_leg_peer,
+            destination_leg_peer,
+            via: via.clone(),
             source_ip: pending.source_ip,
             destination_ip: pending.destination_ip,
             source_stream,
             destination_stream,
+            limit: pending.limit,
             bytes: CircuitByteCounts::default(),
             to_destination: Forward::default(),
             to_source: Forward::default(),
@@ -1615,6 +1904,7 @@ impl RelayServerAgent {
         self.events.push_back(RelayServerEvent::CircuitOpened {
             source_peer_id: pending.source_peer_id,
             destination_peer_id: pending.destination_peer_id,
+            via,
         });
         self.pump_forward(io, source_stream, CircuitDirection::SourceToDestination);
         self.pump_forward(io, source_stream, CircuitDirection::DestinationToSource);
@@ -1622,9 +1912,14 @@ impl RelayServerAgent {
 
     /// Payload the HOP worker on `stream` holds behind its CONNECT.
     fn hop_bridge_len(&self, stream: StreamKey) -> usize {
-        self.hop_workers
+        match self
+            .hop_workers
             .get(&stream)
-            .map_or(0, |worker| worker.responder.pending_bridge_len())
+            .map(|worker| &worker.responder)
+        {
+            Some(Responder::Hop(responder)) => responder.pending_bridge_len(),
+            _ => 0,
+        }
     }
 
     /// Releases the credit of a dropped pending circuit's buffered payload,
@@ -1638,8 +1933,8 @@ impl RelayServerAgent {
     ) {
         let held = self.hop_bridge_len(source_stream);
         io.ack(source_stream, circuit.source_pipelined.len() + held);
-        if let Some(stop_stream) = circuit.stop_stream {
-            io.ack(stop_stream, circuit.destination_pipelined.len());
+        if let Some(stream) = circuit.destination_stream {
+            io.ack(stream, circuit.destination_pipelined.len());
         }
     }
 
@@ -1811,7 +2106,11 @@ impl RelayServerAgent {
         *total = total.saturating_add(accepted as u64);
         let total = *total;
         io.ack(origin, accepted);
-        if self.config.max_circuit_bytes != 0 && total > self.config.max_circuit_bytes {
+        if circuit
+            .limit
+            .data
+            .is_some_and(|limit| limit != 0 && total > limit)
+        {
             self.close_circuit(
                 io,
                 source_stream,
@@ -1850,12 +2149,12 @@ impl RelayServerAgent {
             _ => (true, true),
         };
         if reset_source {
-            self.reset(io, circuit.source_peer_id.clone(), circuit.source_stream);
+            self.reset(io, circuit.source_leg_peer.clone(), circuit.source_stream);
         }
         if reset_destination {
             self.reset(
                 io,
-                circuit.destination_peer_id.clone(),
+                circuit.destination_leg_peer.clone(),
                 circuit.destination_stream,
             );
         }
@@ -1874,6 +2173,7 @@ impl RelayServerAgent {
             destination_peer_id: circuit.destination_peer_id,
             bytes: circuit.bytes,
             reason,
+            via: circuit.via,
         });
     }
 
@@ -1985,7 +2285,10 @@ impl RelayServerAgent {
         let Some(worker) = self.hop_workers.get_mut(&key) else {
             return;
         };
-        let Some(HopResponderOutput::Outbound(data)) = worker.responder.poll_output() else {
+        let Responder::Hop(responder) = &mut worker.responder else {
+            return;
+        };
+        let Some(HopResponderOutput::Outbound(data)) = responder.poll_output() else {
             self.runtime_error(
                 RelayServerRuntimeErrorKind::InternalInvariant,
                 Some(peer_id),
@@ -2005,13 +2308,34 @@ impl RelayServerAgent {
             .get(&key.conn_id)
             .is_some_and(|connection| connection.peer_id == peer_id)
         {
-            self.insert_reservation(peer_id.clone(), key.conn_id, ip, deadline_ms);
+            let expires_unix = now
+                .unix_seconds
+                .unwrap_or(0)
+                .saturating_add(self.config.reservation_duration_secs);
+            self.insert_reservation(
+                io,
+                peer_id.clone(),
+                ReservationRecord {
+                    conn_id: key.conn_id,
+                    ip,
+                    expires_unix,
+                },
+                deadline_ms,
+            );
+            // A CONNECT to this peer waiting on a member's snapshot can use
+            // the new local reservation now, rather than time out on the
+            // wait. A peer with no circuit (the usual renewal) has none.
+            let waiting_for = (self.mesh.is_some() && self.peer_circuit_count(&peer_id) > 0)
+                .then(|| peer_id.clone());
             self.events
                 .push_back(RelayServerEvent::ReservationAccepted {
                     peer_id,
                     renewed,
                     expires_unix_secs,
                 });
+            if let Some(peer_id) = waiting_for {
+                self.resolve_waiting(io, Some(&peer_id));
+            }
         }
         self.complete_hop(key);
     }
@@ -2093,7 +2417,8 @@ impl RelayServerAgent {
 
     /// Decides a CONNECT and, when admitted, opens STOP on the destination's
     /// exact reserved connection. The circuit then waits for that stream's
-    /// `StreamReady`.
+    /// `StreamReady`. A mesh node with no local reservation resolves the
+    /// CONNECT across the mesh instead.
     fn decide_connect(&mut self, io: &mut Io<'_>, key: StreamKey, destination_peer_id: PeerId) {
         let Some(source_peer_id) = self
             .hop_workers
@@ -2103,12 +2428,12 @@ impl RelayServerAgent {
             return;
         };
         let now_ms = io.now_ms();
-        let destination_conn = self
+        let destination_conn = self.live_reservation(&destination_peer_id);
+        let source_ip = self.connection_ip(key.conn_id);
+        let destination_ip = self
             .reservations
             .get(&destination_peer_id)
-            .map(|reservation| reservation.conn_id);
-        let source_ip = self.connection_ip(key.conn_id);
-        let destination_ip = destination_conn.and_then(|conn_id| self.connection_ip(conn_id));
+            .and_then(|reservation| self.connection_ip(reservation.conn_id));
         let max_per_ip = self.config.max_circuits_per_ip;
         let status = if !self.accepting
             || self
@@ -2126,20 +2451,10 @@ impl RelayServerAgent {
                     >= self.config.max_circuits_per_peer)
             || circuit_ip_keys(source_ip.as_ref(), destination_ip.as_ref())
                 .any(|ip| self.ip_tally.is_full(Some(ip), Held::Circuits, max_per_ip))
-            || self
-                .pending_circuits
-                .len()
-                .saturating_add(self.circuits.len())
-                >= self.config.max_circuits
+            || self.circuit_count() >= self.config.max_circuits
         {
             Some(Status::ResourceLimitExceeded)
-        } else if destination_conn.is_none()
-            || destination_conn.is_some_and(|conn_id| {
-                self.connections
-                    .get(&conn_id)
-                    .is_none_or(|connection| connection.peer_id != destination_peer_id)
-            })
-        {
+        } else if destination_conn.is_none() && self.mesh.is_none() {
             Some(Status::NoReservation)
         } else if destination_conn.is_some_and(|conn_id| {
             self.pending_stop_count(conn_id) >= self.config.max_pending_stop_requests_per_connection
@@ -2149,62 +2464,116 @@ impl RelayServerAgent {
             None
         };
         if let Some(status) = status {
-            self.deny_connect(key, destination_peer_id, status);
+            self.deny_connect(io, key, destination_peer_id, status);
             return;
         }
-        // Admitted: only now does the request cost a token.
+        let mut pending = PendingCircuit {
+            source_leg_peer: source_peer_id.clone(),
+            source_peer_id,
+            destination_peer_id,
+            source_ip,
+            destination_ip,
+            destination_conn_id: None,
+            destination_stream: None,
+            destination: PendingDestination::Resolving,
+            limit: self.circuit_limit(),
+            resolution: Resolution::default(),
+            source_pipelined: Vec::new(),
+            destination_pipelined: Vec::new(),
+            source_eof: false,
+        };
+        // A mesh node routes even a local reservation through resolution, so
+        // a local STOP that fails to open falls through to remote claims.
+        if let Some(conn_id) = destination_conn.filter(|_| self.mesh.is_none()) {
+            // Admitted: only now does the request cost a token.
+            self.consume_circuit_token(&pending, now_ms);
+            match self.open_stop(io, &pending.destination_peer_id, conn_id) {
+                Ok(stream) => pending.route(Route::Stop { conn_id, stream }),
+                Err(status) => {
+                    let destination = pending.destination_peer_id;
+                    self.deny_connect(io, key, destination, status);
+                    return;
+                }
+            }
+        } else {
+            // A mesh node: the CONNECT is admitted once some claim is worth
+            // trying or some member's directory is still syncing.
+            let mut resolution = Resolution::default();
+            match self.route(io, &pending.destination_peer_id.clone(), &mut resolution) {
+                Ok(route) => {
+                    // Only a local STOP holds the destination's IP; a stale
+                    // local reservation's must not ride along to a forward.
+                    if !matches!(route, Route::Stop { .. }) {
+                        pending.destination_ip = None;
+                    }
+                    pending.route(route);
+                    pending.resolution = resolution;
+                    self.consume_circuit_token(&pending, now_ms);
+                }
+                Err(status) => {
+                    let destination = pending.destination_peer_id;
+                    self.deny_connect(io, key, destination, status);
+                    return;
+                }
+            }
+        }
+        self.insert_pending_circuit(
+            key,
+            pending,
+            now_ms.saturating_add(self.config.control_stream_timeout_ms),
+        );
+    }
+
+    fn consume_circuit_token(&mut self, pending: &PendingCircuit, now_ms: u64) {
         self.circuit_limiters
-            .consume(&source_peer_id, source_ip.clone(), now_ms);
-        let destination_conn_id = destination_conn.expect("checked above");
+            .consume(&pending.source_peer_id, pending.source_ip.clone(), now_ms);
+    }
+
+    /// The connection holding `peer_id`'s live local reservation: committed,
+    /// on a connection the agent still knows as that peer's.
+    fn live_reservation(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        let conn_id = self.reservations.get(peer_id)?.conn_id;
+        self.connections
+            .get(&conn_id)
+            .is_some_and(|connection| connection.peer_id == *peer_id)
+            .then_some(conn_id)
+    }
+
+    /// Opens STOP to `destination` on its reservation's exact connection, or
+    /// returns the status the CONNECT is refused with.
+    fn open_stop(
+        &mut self,
+        io: &mut Io<'_>,
+        destination: &PeerId,
+        conn_id: ConnectionId,
+    ) -> Result<StreamKey, Status> {
         // The swarm may be ahead of the events delivered so far.
-        let opened = if io
-            .swarm
-            .connection_remote_addr(destination_conn_id)
-            .is_none()
-        {
+        let opened = if io.swarm.connection_remote_addr(conn_id).is_none() {
             Err(format!(
-                "expected destination connection {destination_conn_id} is no longer active"
+                "expected destination connection {conn_id} is no longer active"
             ))
         } else {
             io.swarm
-                .open_stream(&destination_peer_id, STOP_PROTOCOL_ID, now_ms)
+                .open_stream(destination, STOP_PROTOCOL_ID, io.now_ms())
                 .map_err(|error| error.to_string())
         };
-        let stop_stream = match opened {
-            Ok(stream) if stream.conn_id == destination_conn_id => stream,
+        match opened {
+            Ok(stream) if stream.conn_id == conn_id => Ok(stream),
             // Opens are peer-scoped: this one landed on a connection that
             // replaced the reservation's.
             Ok(stream) => {
-                self.retire_stop(io, destination_peer_id.clone(), stream, false);
-                self.deny_connect(key, destination_peer_id, Status::NoReservation);
-                return;
+                self.retire_stop(io, destination.clone(), stream, false);
+                Err(Status::NoReservation)
             }
             Err(detail) => {
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::OpenStream,
-                    Some(destination_peer_id.clone()),
+                    Some(destination.clone()),
                     detail,
                 );
-                self.deny_connect(key, destination_peer_id, Status::ConnectionFailed);
-                return;
+                Err(Status::ConnectionFailed)
             }
-        };
-        self.insert_pending_circuit(
-            key,
-            PendingCircuit {
-                source_peer_id,
-                destination_peer_id,
-                source_ip,
-                destination_ip,
-                destination_conn_id,
-                stop_stream: Some(stop_stream),
-                stop: None,
-                source_pipelined: Vec::new(),
-                destination_pipelined: Vec::new(),
-                source_eof: false,
-            },
-            now_ms.saturating_add(self.config.control_stream_timeout_ms),
-        );
+        }
     }
 
     fn peer_circuit_count(&self, peer_id: &PeerId) -> usize {
@@ -2219,20 +2588,42 @@ impl RelayServerAgent {
             .count()
     }
 
-    fn deny_connect(&mut self, key: StreamKey, destination_peer_id: PeerId, status: Status) {
-        let Some(source_peer_id) = self
-            .hop_workers
-            .get(&key)
-            .map(|worker| worker.peer_id.clone())
-        else {
+    /// Refuses a CONNECT with `status`: a HOP STATUS to the dialer, or on a
+    /// holding node a forward STATUS to the entry member.
+    fn deny_connect(
+        &mut self,
+        io: &mut Io<'_>,
+        key: StreamKey,
+        destination_peer_id: PeerId,
+        status: Status,
+    ) {
+        let Some(worker) = self.hop_workers.get(&key) else {
+            return;
+        };
+        let leg_peer = worker.peer_id.clone();
+        let Responder::Forward { source, .. } = &worker.responder else {
+            self.events.push_back(RelayServerEvent::CircuitDenied {
+                source_peer_id: leg_peer,
+                destination_peer_id,
+                status,
+            });
+            self.feed_hop(key, |hop| hop.reject(status));
             return;
         };
         self.events.push_back(RelayServerEvent::CircuitDenied {
-            source_peer_id,
+            source_peer_id: source.clone().unwrap_or_else(|| leg_peer.clone()),
             destination_peer_id,
             status,
         });
-        self.feed_hop(key, |hop| hop.reject(status));
+        self.complete_hop(key);
+        let reply = ForwardMessage::Status(status).encode_frame();
+        match io
+            .swarm
+            .send_stream(&leg_peer, key, reply.into(), io.now_ms())
+        {
+            Ok(()) => self.close(io, leg_peer, key),
+            Err(error) => self.abort_hop_reply(io, leg_peer, key, error),
+        }
     }
 
     /// Fails a pending circuit, answering its CONNECT with `status`.
@@ -2240,7 +2631,7 @@ impl RelayServerAgent {
         let Some(destination_peer_id) = self.drop_pending_circuit(io, source_stream) else {
             return;
         };
-        self.deny_connect(source_stream, destination_peer_id, status);
+        self.deny_connect(io, source_stream, destination_peer_id, status);
         self.drain_hop(io, source_stream);
     }
 
@@ -2251,7 +2642,7 @@ impl RelayServerAgent {
     }
 
     /// Removes a pending circuit, releases its buffered payload's credit, and
-    /// retires its STOP stream. Returns its destination peer.
+    /// retires its STOP or forward stream. Returns its destination peer.
     fn drop_pending_circuit(
         &mut self,
         io: &mut Io<'_>,
@@ -2259,13 +2650,13 @@ impl RelayServerAgent {
     ) -> Option<PeerId> {
         let circuit = self.remove_pending_circuit(source_stream)?;
         self.release_pipelined(io, source_stream, &circuit);
-        if let Some(stop_stream) = circuit.stop_stream {
-            self.stop_to_source.remove(&stop_stream);
+        if let Some(stream) = circuit.destination_stream {
+            self.stop_to_source.remove(&stream);
             self.retire_stop(
                 io,
-                circuit.destination_peer_id.clone(),
-                stop_stream,
-                circuit.stop.is_some(),
+                circuit.destination_leg_peer().clone(),
+                stream,
+                circuit.destination_ready(),
             );
         }
         Some(circuit.destination_peer_id)
@@ -2338,29 +2729,40 @@ impl RelayServerAgent {
 
     // Inserts and removals that keep the indexes in step with their maps.
 
+    /// Commits or renews `peer_id`'s reservation and publishes it to the
+    /// mesh.
     fn insert_reservation(
         &mut self,
+        io: &mut Io<'_>,
         peer_id: PeerId,
-        conn_id: ConnectionId,
-        ip: Option<IpKey>,
+        record: ReservationRecord,
         deadline_ms: u64,
     ) {
         self.reservation_deadlines.set(peer_id.clone(), deadline_ms);
-        self.ip_tally.add(ip.as_ref(), Held::Reservations);
-        if let Some(replaced) = self
-            .reservations
-            .insert(peer_id, ReservationRecord { conn_id, ip })
-        {
+        self.ip_tally.add(record.ip.as_ref(), Held::Reservations);
+        let present = DirectoryMessage::Present {
+            peer: peer_id.clone(),
+            expires_unix: record.expires_unix,
+        };
+        if let Some(replaced) = self.reservations.insert(peer_id, record) {
             self.ip_tally
                 .remove(replaced.ip.as_ref(), Held::Reservations);
         }
+        self.publish(io, &present);
     }
 
-    fn remove_reservation(&mut self, peer_id: &PeerId) {
+    /// Ends `peer_id`'s reservation, if any, and publishes that to the mesh.
+    fn remove_reservation(&mut self, io: &mut Io<'_>, peer_id: &PeerId) {
         self.reservation_deadlines.remove(peer_id);
         if let Some(removed) = self.reservations.remove(peer_id) {
             self.ip_tally
                 .remove(removed.ip.as_ref(), Held::Reservations);
+            self.publish(
+                io,
+                &DirectoryMessage::Gone {
+                    peer: peer_id.clone(),
+                },
+            );
         }
     }
 
@@ -2381,10 +2783,11 @@ impl RelayServerAgent {
             circuit.source_ip.as_ref(),
             circuit.destination_ip.as_ref(),
         );
-        self.pending_by_destination
-            .insert((circuit.destination_conn_id, source_stream));
-        if let Some(stop_stream) = circuit.stop_stream {
-            self.stop_to_source.insert(stop_stream, source_stream);
+        if let Some(conn_id) = circuit.destination_conn_id {
+            self.pending_by_destination.insert((conn_id, source_stream));
+        }
+        if let Some(stream) = circuit.destination_stream {
+            self.stop_to_source.insert(stream, source_stream);
         }
         self.stop_deadlines.set(source_stream, stop_deadline_ms);
         self.pending_circuits.insert(source_stream, circuit);
@@ -2393,8 +2796,10 @@ impl RelayServerAgent {
     fn remove_pending_circuit(&mut self, source_stream: StreamKey) -> Option<PendingCircuit> {
         let circuit = self.pending_circuits.remove(&source_stream)?;
         self.stop_deadlines.remove(&source_stream);
-        self.pending_by_destination
-            .remove(&(circuit.destination_conn_id, source_stream));
+        if let Some(conn_id) = circuit.destination_conn_id {
+            self.pending_by_destination
+                .remove(&(conn_id, source_stream));
+        }
         self.release_circuit(
             &circuit.source_peer_id,
             &circuit.destination_peer_id,
@@ -2428,8 +2833,20 @@ impl RelayServerAgent {
         for peer in circuit_endpoints(source, destination) {
             *self.peer_circuits.entry(peer.clone()).or_default() += 1;
         }
+        self.hold_circuit_ips(source_ip, destination_ip);
+    }
+
+    /// Counts one more circuit against each admission key, one shared by
+    /// both ends once.
+    fn hold_circuit_ips(&mut self, source_ip: Option<&IpKey>, destination_ip: Option<&IpKey>) {
         for ip in circuit_ip_keys(source_ip, destination_ip) {
             self.ip_tally.add(Some(ip), Held::Circuits);
+        }
+    }
+
+    fn release_circuit_ips(&mut self, source_ip: Option<&IpKey>, destination_ip: Option<&IpKey>) {
+        for ip in circuit_ip_keys(source_ip, destination_ip) {
+            self.ip_tally.remove(Some(ip), Held::Circuits);
         }
     }
 
@@ -2440,9 +2857,7 @@ impl RelayServerAgent {
         source_ip: Option<&IpKey>,
         destination_ip: Option<&IpKey>,
     ) {
-        for ip in circuit_ip_keys(source_ip, destination_ip) {
-            self.ip_tally.remove(Some(ip), Held::Circuits);
-        }
+        self.release_circuit_ips(source_ip, destination_ip);
         for peer in circuit_endpoints(source, destination) {
             if let Some(count) = self.peer_circuits.get_mut(peer) {
                 *count -= 1;
@@ -2473,9 +2888,12 @@ impl RelayServerAgent {
         assert_deadlines(&self.hop_deadlines, self.hop_workers.keys().collect());
         assert_deadlines(&self.stop_deadlines, self.pending_circuits.keys().collect());
         assert_deadlines(&self.circuit_deadlines, self.circuits.keys().collect());
-        if self.config.max_circuit_duration_secs != 0 {
-            assert_eq!(self.circuit_deadlines.by_key.len(), self.circuits.len());
-        }
+        let timed = self
+            .circuits
+            .values()
+            .filter(|circuit| circuit.limit.duration.is_some_and(|secs| secs != 0))
+            .count();
+        assert_eq!(self.circuit_deadlines.by_key.len(), timed);
         // Every reservation is on the timer.
         assert_deadlines(
             &self.reservation_deadlines,
@@ -2489,13 +2907,13 @@ impl RelayServerAgent {
         let pending_by_destination: BTreeSet<_> = self
             .pending_circuits
             .iter()
-            .map(|(key, circuit)| (circuit.destination_conn_id, *key))
+            .filter_map(|(key, circuit)| Some((circuit.destination_conn_id?, *key)))
             .collect();
         assert_eq!(pending_by_destination, self.pending_by_destination);
         let stop_to_source: BTreeMap<_, _> = self
             .pending_circuits
             .iter()
-            .filter_map(|(key, circuit)| circuit.stop_stream.map(|stop| (stop, *key)))
+            .filter_map(|(key, circuit)| circuit.destination_stream.map(|stream| (stream, *key)))
             .chain(
                 self.circuits
                     .iter()

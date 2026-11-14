@@ -37,6 +37,14 @@ impl ConnectionNamespace {
     pub const TCP_IPV6: Self = Self(4);
     /// WebTransport client sessions (a browser's dials).
     pub const WEBTRANSPORT: Self = Self(5);
+    /// Relay-mesh backbone QUIC over IPv4.
+    ///
+    /// A mesh relay runs a second QUIC transport for its backbone links next
+    /// to its public one; this namespace keeps the backbone's ids apart from
+    /// [`QUIC_IPV4`](Self::QUIC_IPV4), so one relay agent can serve both.
+    pub const MESH_IPV4: Self = Self(6);
+    /// Relay-mesh backbone QUIC over IPv6. See [`MESH_IPV4`](Self::MESH_IPV4).
+    pub const MESH_IPV6: Self = Self(7);
     /// Relay circuits.
     ///
     /// Deliberately `0x80`, so every circuit id has the top bit of its `u64`
@@ -68,6 +76,8 @@ impl ConnectionNamespace {
             3 => Some("tcp/ip4"),
             4 => Some("tcp/ip6"),
             5 => Some("webtransport"),
+            6 => Some("mesh/ip4"),
+            7 => Some("mesh/ip6"),
             0x80 => Some("circuit"),
             _ => None,
         }
@@ -301,6 +311,9 @@ mod tests {
             ConnectionNamespace::QUIC_IPV6,
             ConnectionNamespace::TCP_IPV4,
             ConnectionNamespace::TCP_IPV6,
+            ConnectionNamespace::WEBTRANSPORT,
+            ConnectionNamespace::MESH_IPV4,
+            ConnectionNamespace::MESH_IPV6,
             ConnectionNamespace::CIRCUIT,
         ];
 
@@ -342,6 +355,9 @@ mod tests {
             ConnectionNamespace::QUIC_IPV6,
             ConnectionNamespace::TCP_IPV4,
             ConnectionNamespace::TCP_IPV6,
+            ConnectionNamespace::WEBTRANSPORT,
+            ConnectionNamespace::MESH_IPV4,
+            ConnectionNamespace::MESH_IPV6,
         ] {
             // Assert the packing itself, not just `is_circuit()`: hosts and
             // wire logs may still read the top bit directly.
@@ -385,6 +401,9 @@ mod tests {
 
         let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 3).expect("in range");
         assert_eq!(format!("{circuit}"), "circuit#3");
+
+        let mesh = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV6, 3).expect("in range");
+        assert_eq!(format!("{mesh}"), "mesh/ip6#3");
 
         // Unregistered tags stay printable.
         let custom = ConnectionId::namespaced(ConnectionNamespace::new(9), 3).expect("in range");

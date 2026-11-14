@@ -60,7 +60,7 @@ curl -fsSL https://minip2p.com/install/relay.sh | sh
 sudo minip2p-relay service restart
 ```
 
-`sudo minip2p-relay service uninstall` removes the unit but preserves the identity in `/var/lib/minip2p-relay`.
+`sudo minip2p-relay service uninstall` removes the unit but preserves the identity (and a relay mesh's backbone key) in `/var/lib/minip2p-relay`.
 
 ### Serve browsers
 
@@ -71,6 +71,46 @@ Add `--webtransport` to `service install` or the foreground command to serve bro
 ```
 
 The address survives restarts with the same key, but goes stale within about 26 days, so browsers must keep getting the current one from the logs. For one permanent `/dns/relay.example.com/…/webtransport` address, give the relay a CA-signed certificate: see [Stable browser addresses](/docs/rust/webtransport-certificates).
+
+### Serve one address from several regions
+
+Several relay servers can serve one relay address as a relay mesh. Geo DNS sends each client to the nearest node. Every node runs with the same identity, so the peer ID in the address is valid on any of them. When a client asks a node for a circuit to a peer reserved on another node, the first node forwards the circuit to the second over a QUIC backbone. Clients need no changes.
+
+Each node also has a backbone key of its own, which the other nodes use to recognize it. Install the first node with `--mesh`. The service then creates the backbone key at `/var/lib/minip2p-relay/mesh.key` and listens for the backbone on UDP port `19877`:
+
+```bash
+sudo minip2p-relay service install --hostname relay.example.com --mesh
+minip2p-relay service logs
+```
+
+The logs show the node's backbone address:
+
+```text
+[relay] mesh listening=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/12D3KooW...
+```
+
+Replace the wildcard IP with the node's public IP to get its entry in the member list. Copy `/var/lib/minip2p-relay/identity.key` to every other node and import it on that node's first install, also with `--mesh` and no members, so they all share the peer ID and each creates its backbone key:
+
+```bash
+sudo minip2p-relay service install --hostname relay.example.com --import-key ./identity.key --mesh
+```
+
+Once every node's entry is known, reinstall every node with the full member list, including the node's own entry, which it skips. The identity is already in place, so leave out `--import-key`:
+
+```bash
+sudo minip2p-relay service install \
+  --hostname relay.example.com \
+  --mesh-member /ip4/198.51.100.7/udp/19877/quic-v1/p2p/12D3KooW... \
+  --mesh-member /ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooW...
+```
+
+Run it again the same way to change the list later. Each `service install` writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off. A node closes backbone connections from peers that aren't on its list.
+
+Allow UDP port `19877` only from the other nodes' IP addresses. Keep the nodes' clocks synced with NTP. Each node logs `[relay] mesh member=12D3KooW... up` when its link to that member comes up and `down` when the link drops. Circuits forwarded across the backbone show the other node's backbone peer ID as `via=` in their `circuit opened` and `circuit closed` lines.
+
+Each node applies its own reservation, circuit, and rate limits. Mesh-wide limits are not supported. Every node holds the shared identity key, so a breach of any node exposes it, and replacing the key changes every published address.
+
+In the foreground, `--mesh-key PATH` enables the mesh, `--mesh-listen HOST:PORT` replaces the default backbone listeners, and `--mesh-member` adds one member. Repeat `--mesh-listen` and `--mesh-member` as needed.
 
 ### Run it in the foreground
 
