@@ -1525,7 +1525,7 @@ impl RelayServerAgent {
             self.retired_stops.remove(&stream);
         }
         if link_lost {
-            self.resolve_waiting(io);
+            self.resolve_waiting(io, None);
         }
     }
 
@@ -2322,16 +2322,19 @@ impl RelayServerAgent {
                 },
                 deadline_ms,
             );
+            // A CONNECT to this peer waiting on a member's snapshot can use
+            // the new local reservation now, rather than time out on the
+            // wait. A peer with no circuit (the usual renewal) has none.
+            let waiting_for = (self.mesh.is_some() && self.peer_circuit_count(&peer_id) > 0)
+                .then(|| peer_id.clone());
             self.events
                 .push_back(RelayServerEvent::ReservationAccepted {
                     peer_id,
                     renewed,
                     expires_unix_secs,
                 });
-            // A CONNECT waiting on a member's snapshot can use the new
-            // local reservation now, rather than time out on the wait.
-            if self.mesh.is_some() {
-                self.resolve_waiting(io);
+            if let Some(peer_id) = waiting_for {
+                self.resolve_waiting(io, Some(&peer_id));
             }
         }
         self.complete_hop(key);

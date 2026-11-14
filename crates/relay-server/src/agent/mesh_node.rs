@@ -456,7 +456,7 @@ impl RelayServerAgent {
         io.ack(stream, data.len());
         match mesh.directory.stream_data(&member, &stream, data) {
             DirectoryInput::Ignored | DirectoryInput::Applied => {}
-            DirectoryInput::Synced => self.resolve_waiting(io),
+            DirectoryInput::Synced => self.resolve_waiting(io, None),
             DirectoryInput::Reset(reason) => {
                 mesh.receiving.remove(&stream);
                 self.rejected_hop_streams.insert(stream, member.clone());
@@ -630,13 +630,17 @@ impl RelayServerAgent {
         }
     }
 
-    /// Re-routes every CONNECT waiting on a member's directory, after a
-    /// member synced or a link dropped.
-    pub(super) fn resolve_waiting(&mut self, io: &mut Io<'_>) {
+    /// Re-routes the CONNECTs waiting on a member's directory, after a
+    /// member synced or a link dropped (`None`: all of them), or after
+    /// `Some(destination)` reserved here (only those to it).
+    pub(super) fn resolve_waiting(&mut self, io: &mut Io<'_>, destination: Option<&PeerId>) {
         let waiting: Vec<StreamKey> = self
             .pending_circuits
             .iter()
-            .filter(|(_, circuit)| matches!(circuit.destination, PendingDestination::Resolving))
+            .filter(|(_, circuit)| {
+                matches!(circuit.destination, PendingDestination::Resolving)
+                    && destination.is_none_or(|peer| circuit.destination_peer_id == *peer)
+            })
             .map(|(stream, _)| *stream)
             .collect();
         for source_stream in waiting {
