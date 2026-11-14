@@ -7,13 +7,13 @@ use minip2p_core::platform::Deadline;
 use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, PeerAddr, PeerId};
 use minip2p_nat::{ConnectLegs, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
-use minip2p_relay_server::mesh::{DIRECTORY_PROTOCOL_ID, FORWARD_PROTOCOL_ID};
+use minip2p_relay_server::mesh::{DIRECTORY_PROTOCOL_ID, DirectoryMessage, FORWARD_PROTOCOL_ID};
 use minip2p_relay_server::{
     CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit, RelayServerConfig,
     RelayServerEvent, Status, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, ConnectionNamespace};
+use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
 
 use common::mesh::{Mesh, link, member};
 use common::nat_client::{
@@ -462,6 +462,51 @@ fn a_replaced_link_keeps_connects_waiting_for_the_new_snapshot() {
     let calls = mesh.nodes[C].calls();
     assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
     assert_eq!(mesh.nodes[C].circuit_count(), 1);
+}
+
+#[test]
+fn a_forward_lost_to_a_replaced_link_retries_the_member_on_the_new_link() {
+    let mut mesh = mesh(defaults());
+    mesh.reserve(B, &alice(), key(ALICE_CONN, 1), at(0));
+    mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
+    assert_eq!(forward_opens(&mesh, C, B), 1);
+
+    // The forward is in flight when C's link to B is replaced.
+    let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
+    let node = &mut mesh.nodes[C];
+    node.replace(&member(B), link(B), new_link, false, 2);
+    node.calls();
+    // B's snapshot arrives on the new link, still claiming Alice.
+    let directory = StreamKey {
+        conn_id: new_link,
+        stream_id: StreamId::new(7),
+    };
+    node.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: member(B),
+            conn_id: directory.conn_id,
+            stream_id: directory.stream_id,
+            protocol_id: DIRECTORY_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        false,
+        at(2),
+    );
+    let mut snapshot = DirectoryMessage::Present {
+        peer: alice(),
+        expires_unix: u64::MAX,
+    }
+    .encode_frame();
+    snapshot.extend(DirectoryMessage::Synced.encode_frame());
+    node.data(&member(B), directory, &snapshot, at(2));
+
+    let calls = node.calls();
+    let retried = calls.iter().any(|call| {
+        matches!(call, Call::Open { protocol_id, opened: Some(stream), .. }
+            if protocol_id == FORWARD_PROTOCOL_ID && stream.conn_id == new_link)
+    });
+    assert!(retried, "{calls:?}");
+    assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
 }
 
 #[test]

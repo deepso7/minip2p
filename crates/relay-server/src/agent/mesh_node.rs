@@ -534,15 +534,18 @@ impl RelayServerAgent {
             return Err(resolution.last_status.unwrap_or(Status::NoReservation));
         };
         let now_unix = io.now.unix_seconds.unwrap_or(0);
-        let claims: Vec<PeerId> = mesh
+        let claims: Vec<(PeerId, Option<ConnectionId>)> = mesh
             .directory
             .claims(destination, now_unix)
             .into_iter()
-            .map(|claim| claim.member.clone())
-            .filter(|member| !resolution.tried.contains(member))
+            .map(|claim| {
+                let link = mesh.links.get(&claim.member).map(|link| link.conn_id);
+                (claim.member.clone(), link)
+            })
+            .filter(|tried| !resolution.tried.contains(tried))
             .collect();
-        for member in claims {
-            resolution.tried.push(member.clone());
+        for (member, link) in claims {
+            resolution.tried.push((member.clone(), link));
             match io
                 .swarm
                 .open_stream(&member, FORWARD_PROTOCOL_ID, io.now_ms())

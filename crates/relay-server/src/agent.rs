@@ -307,8 +307,10 @@ enum PendingDestination {
 /// An entry node's progress through a CONNECT's remote claims.
 #[derive(Default)]
 struct Resolution {
-    /// Members already tried, so a failed claim is not tried again.
-    tried: Vec<PeerId>,
+    /// Members already tried, each with the link it was tried over, so a
+    /// failed claim is not tried again on the same link. A member whose
+    /// link was replaced since can be tried again on the new one.
+    tried: Vec<(PeerId, Option<ConnectionId>)>,
     /// The last refusal a claim produced, answered when none is left.
     last_status: Option<Status>,
 }
