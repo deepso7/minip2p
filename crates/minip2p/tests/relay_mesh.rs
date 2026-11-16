@@ -319,7 +319,7 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
                     via: Some(via),
                 }) if source_peer_id == &bob_peer
                     && destination_peer_id == &alice_peer
-                    && via == other.backbone.peer_id()
+                    && **via == *other.backbone.peer_id()
             )
         });
     }
@@ -377,7 +377,7 @@ fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
         matches!(
             event,
             EndpointEvent::RelayServer(RelayServerEvent::CircuitOpened { via: Some(via), .. })
-                if via == a.backbone.peer_id()
+                if **via == *a.backbone.peer_id()
         )
     });
 }

@@ -418,7 +418,7 @@ fn print_event(event: RelayServerEvent) {
             via,
         } => println!(
             "[relay] circuit opened source={source_peer_id} destination={destination_peer_id}{}",
-            via_field(via.as_ref())
+            via_field(via.as_deref())
         ),
         RelayServerEvent::CircuitClosed {
             source_peer_id,
@@ -430,7 +430,7 @@ fn print_event(event: RelayServerEvent) {
             "[relay] circuit closed source={source_peer_id} destination={destination_peer_id} source_to_destination_bytes={} destination_to_source_bytes={} cause={reason:?}{}",
             bytes.source_to_destination,
             bytes.destination_to_source,
-            via_field(via.as_ref())
+            via_field(via.as_deref())
         ),
         RelayServerEvent::AddrsRejected { source, error } => {
             eprintln!("[relay] {source:?} addresses rejected, keeping the previous ones: {error}")

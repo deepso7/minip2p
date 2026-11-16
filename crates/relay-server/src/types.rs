@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use minip2p_core::PeerId;
@@ -190,8 +191,9 @@ pub enum RelayServerEvent {
         destination_peer_id: PeerId,
         /// For a circuit forwarded across a relay mesh, the other node's
         /// backbone peer id: the holding node on the entry node, the entry
-        /// node on the holding node.
-        via: Option<PeerId>,
+        /// node on the holding node. Boxed so the events of circuits off
+        /// the mesh, and every other event, stay small.
+        via: Option<Box<PeerId>>,
     },
     /// Exactly-once circuit terminal event with accepted-byte totals.
     CircuitClosed {
@@ -205,7 +207,7 @@ pub enum RelayServerEvent {
         reason: CircuitCloseReason,
         /// The other mesh node's backbone peer id, as in
         /// [`CircuitOpened`](Self::CircuitOpened).
-        via: Option<PeerId>,
+        via: Option<Box<PeerId>>,
     },
     /// A host address refresh was rejected while `source` was healthy, or
     /// with a different error while it was already failing. The source's

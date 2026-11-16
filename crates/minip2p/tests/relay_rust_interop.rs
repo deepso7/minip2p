@@ -97,7 +97,7 @@ fn run_client(relays: &mut [Endpoint], args: &[&str]) -> Observed {
     let mut observed = Observed::default();
     let mut observe = |event| match event {
         RelayServerEvent::ReservationAccepted { .. } => observed.reserved = true,
-        RelayServerEvent::CircuitOpened { via, .. } => observed.opened.push(via),
+        RelayServerEvent::CircuitOpened { via, .. } => observed.opened.push(via.map(|via| *via)),
         RelayServerEvent::CircuitClosed { bytes, .. } => {
             observed.bidirectional |=
                 bytes.source_to_destination > 0 && bytes.destination_to_source > 0;

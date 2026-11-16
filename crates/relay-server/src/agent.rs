@@ -197,9 +197,6 @@ struct PendingCircuit {
     /// The dialer and the reserved peer, as the circuit's events name them.
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
-    /// The source leg's swarm peer: the dialer, or on a holding node the
-    /// entry member that forwarded the CONNECT.
-    source_leg_peer: PeerId,
     source_ip: Option<IpKey>,
     destination_ip: Option<IpKey>,
     /// The destination leg's connection; `None` while resolving.
@@ -209,11 +206,9 @@ struct PendingCircuit {
     /// gone.
     destination_stream: Option<StreamKey>,
     destination: PendingDestination,
-    /// The circuit's limit: the config's for a local CONNECT, the entry
-    /// node's for a forwarded one.
-    limit: Limit,
-    /// Entry-node CONNECT resolution across the mesh.
-    resolution: Resolution,
+    /// Mesh-only state, boxed so a node without a mesh carries one word
+    /// for it: `None` there.
+    mesh: Option<Box<PendingMesh>>,
     source_pipelined: Vec<u8>,
     destination_pipelined: Vec<u8>,
     /// The source half-closed while the circuit waited on STOP. The
@@ -222,12 +217,31 @@ struct PendingCircuit {
     source_eof: bool,
 }
 
+/// A pending circuit's state on a mesh node.
+struct PendingMesh {
+    /// On a holding node, the entry member that forwarded the CONNECT: the
+    /// source leg's swarm peer. `None` for a CONNECT from the dialer.
+    forwarded_by: Option<PeerId>,
+    /// The circuit's limit: the config's for a local CONNECT, the entry
+    /// node's for a forwarded one.
+    limit: Limit,
+    /// Entry-node CONNECT resolution across the mesh.
+    resolution: Resolution,
+}
+
 impl PendingCircuit {
+    /// The circuit's limit; `config_limit` unless the mesh state sets one.
+    fn limit(&self, config_limit: impl FnOnce() -> Limit) -> Limit {
+        self.mesh
+            .as_ref()
+            .map_or_else(config_limit, |mesh| mesh.limit.clone())
+    }
+
     /// The destination leg's swarm peer: the reserved peer, or the holding
     /// member a forward goes to.
     fn destination_leg_peer(&self) -> &PeerId {
         match &self.destination {
-            PendingDestination::Forward { member, .. } => member,
+            PendingDestination::Forward(forward) => &forward.member,
             _ => &self.destination_peer_id,
         }
     }
@@ -237,19 +251,22 @@ impl PendingCircuit {
     /// last claim's refusal, or `NO_RESERVATION` if no claim was found.
     fn timeout_status(&self) -> Status {
         match self.destination {
-            PendingDestination::Resolving => {
-                self.resolution.last_status.unwrap_or(Status::NoReservation)
-            }
+            PendingDestination::Resolving => self
+                .mesh
+                .as_ref()
+                .and_then(|mesh| mesh.resolution.last_status)
+                .unwrap_or(Status::NoReservation),
             _ => Status::ConnectionFailed,
         }
     }
 
     /// Whether the destination stream finished negotiating.
     fn destination_ready(&self) -> bool {
-        matches!(
-            self.destination,
-            PendingDestination::Stop(Some(_)) | PendingDestination::Forward { reply: Some(_), .. }
-        )
+        match &self.destination {
+            PendingDestination::Resolving => false,
+            PendingDestination::Stop(stop) => stop.is_some(),
+            PendingDestination::Forward(forward) => forward.reply.is_some(),
+        }
     }
 }
 
@@ -267,26 +284,57 @@ enum Route {
 }
 
 impl PendingCircuit {
+    /// A CONNECT admitted onto `route`, with no payload buffered yet.
+    fn new(
+        source_peer_id: PeerId,
+        destination_peer_id: PeerId,
+        source_ip: Option<IpKey>,
+        destination_ip: Option<IpKey>,
+        route: Route,
+        mesh: Option<Box<PendingMesh>>,
+    ) -> Self {
+        let (destination_conn_id, destination_stream, destination) = Self::destination(route);
+        Self {
+            source_peer_id,
+            destination_peer_id,
+            source_ip,
+            destination_ip,
+            destination_conn_id,
+            destination_stream,
+            destination,
+            mesh,
+            source_pipelined: Vec::new(),
+            destination_pipelined: Vec::new(),
+            source_eof: false,
+        }
+    }
+
     /// Points the destination side at `route`. The caller keeps the
     /// destination indexes in step.
     fn route(&mut self, route: Route) {
-        let (conn_id, stream, destination) = match route {
+        (
+            self.destination_conn_id,
+            self.destination_stream,
+            self.destination,
+        ) = Self::destination(route);
+    }
+
+    /// The destination connection, stream and state `route` starts with.
+    fn destination(route: Route) -> (Option<ConnectionId>, Option<StreamKey>, PendingDestination) {
+        match route {
             Route::Stop { conn_id, stream } => {
                 (Some(conn_id), Some(stream), PendingDestination::Stop(None))
             }
             Route::Forward { member, stream } => (
                 Some(stream.conn_id),
                 Some(stream),
-                PendingDestination::Forward {
+                PendingDestination::Forward(Box::new(ForwardLeg {
                     member,
                     reply: None,
-                },
+                })),
             ),
             Route::Wait => (None, None, PendingDestination::Resolving),
-        };
-        self.destination_conn_id = conn_id;
-        self.destination_stream = stream;
-        self.destination = destination;
+        }
     }
 }
 
@@ -297,12 +345,16 @@ enum PendingDestination {
     /// STOP to the local reservation; the exchange from the stream's
     /// `StreamReady` on.
     Stop(Option<StopInitiator>),
-    /// A forward to the holding `member`; its reply bytes read so far from
-    /// the stream's `StreamReady` on.
-    Forward {
-        member: PeerId,
-        reply: Option<Vec<u8>>,
-    },
+    /// A forward to a holding member, boxed so a mesh-less node's pending
+    /// circuits stay as small as a STOP needs.
+    Forward(Box<ForwardLeg>),
+}
+
+/// A pending circuit's forward to the holding member.
+struct ForwardLeg {
+    member: PeerId,
+    /// The reply bytes read so far, from the stream's `StreamReady` on.
+    reply: Option<Vec<u8>>,
 }
 
 /// An entry node's progress through a CONNECT's remote claims.
@@ -330,23 +382,65 @@ struct RetiredStop {
 struct Circuit {
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
-    /// Each leg's swarm peer; a leg on the backbone has the member's.
-    source_leg_peer: PeerId,
-    destination_leg_peer: PeerId,
-    /// The other mesh node's backbone peer, for a circuit that crosses it.
-    via: Option<PeerId>,
+    /// The backbone leg of a circuit that crosses the mesh, boxed so any
+    /// other circuit carries one word for it: `None` there, where both legs'
+    /// swarm peers are the endpoints and the limit is the config's.
+    backbone: Option<Box<Backbone>>,
     source_ip: Option<IpKey>,
     destination_ip: Option<IpKey>,
     source_stream: StreamKey,
     destination_stream: StreamKey,
-    /// Duration and byte limits it enforces; zero or absent is unlimited.
-    limit: Limit,
     bytes: CircuitByteCounts,
     to_destination: Forward,
     to_source: Forward,
 }
 
+/// How a circuit crosses the mesh backbone.
+struct Backbone {
+    /// The other mesh node's backbone peer.
+    via: PeerId,
+    /// The leg whose swarm peer is `via` rather than an endpoint.
+    leg: CircuitLeg,
+    /// Duration and byte limits the circuit enforces: the config's on the
+    /// entry node, the entry node's on the holding node. Zero or absent is
+    /// unlimited.
+    limit: Limit,
+}
+
+impl Backbone {
+    /// `leg`'s swarm peer: `via` if `leg` is the backbone leg, else its
+    /// `endpoint`. Takes fields, so callers can hold other borrows.
+    fn peer_or<'a>(
+        backbone: &'a Option<Box<Self>>,
+        leg: CircuitLeg,
+        endpoint: &'a PeerId,
+    ) -> &'a PeerId {
+        match backbone {
+            Some(backbone) if backbone.leg == leg => &backbone.via,
+            _ => endpoint,
+        }
+    }
+}
+
 impl Circuit {
+    /// The swarm peer `leg`'s stream is on: the endpoint, or for the
+    /// backbone leg the other mesh node.
+    fn leg_peer(&self, leg: CircuitLeg) -> &PeerId {
+        let endpoint = match leg {
+            CircuitLeg::Source => &self.source_peer_id,
+            CircuitLeg::Destination => &self.destination_peer_id,
+        };
+        Backbone::peer_or(&self.backbone, leg, endpoint)
+    }
+
+    /// The per-direction byte limit, zero for unlimited; `config_bytes`
+    /// unless the circuit crosses the backbone.
+    fn data_limit(&self, config_bytes: u64) -> u64 {
+        self.backbone
+            .as_ref()
+            .map_or(config_bytes, |backbone| backbone.limit.data.unwrap_or(0))
+    }
+
     fn forward(&mut self, direction: CircuitDirection) -> &mut Forward {
         match direction {
             CircuitDirection::SourceToDestination => &mut self.to_destination,
@@ -365,18 +459,28 @@ impl Circuit {
     /// The leg a direction writes to, with its peer and its queue, borrowed
     /// together so a send needs no copy of the peer.
     fn target(&mut self, direction: CircuitDirection) -> (&PeerId, StreamKey, &mut Forward) {
-        match direction {
+        let (endpoint, stream, forward) = match direction {
             CircuitDirection::SourceToDestination => (
-                &self.destination_leg_peer,
+                &self.destination_peer_id,
                 self.destination_stream,
                 &mut self.to_destination,
             ),
             CircuitDirection::DestinationToSource => (
-                &self.source_leg_peer,
+                &self.source_peer_id,
                 self.source_stream,
                 &mut self.to_source,
             ),
-        }
+        };
+        let peer = Backbone::peer_or(&self.backbone, target_leg(direction), endpoint);
+        (peer, stream, forward)
+    }
+}
+
+/// The limit a circuit admitted here enforces.
+fn circuit_limit(config: &RelayServerConfig) -> Limit {
+    Limit {
+        duration: Some(config.max_circuit_duration_secs as u32),
+        data: Some(config.max_circuit_bytes),
     }
 }
 
@@ -1261,26 +1365,24 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return true;
         };
+        let limit = circuit.limit(|| circuit_limit(&self.config));
         match &mut circuit.destination {
             PendingDestination::Stop(stop @ None) => {
                 // The initiator's first output is the STOP CONNECT request.
                 *stop = Some(StopInitiator::new(
                     circuit.source_peer_id.clone(),
-                    Some(circuit.limit.clone()),
+                    Some(limit),
                 ));
                 self.drain_stop(io, source_stream);
             }
-            PendingDestination::Forward {
-                member,
-                reply: reply @ None,
-            } => {
-                *reply = Some(Vec::new());
+            PendingDestination::Forward(forward) if forward.reply.is_none() => {
+                forward.reply = Some(Vec::new());
                 let request = ForwardMessage::Forward {
                     source: circuit.source_peer_id.clone(),
                     destination: circuit.destination_peer_id.clone(),
-                    limit: circuit.limit.clone(),
+                    limit,
                 };
-                let member = member.clone();
+                let member = forward.member.clone();
                 if let Err(error) =
                     io.swarm
                         .send_stream(&member, key, request.encode_frame().into(), io.now_ms())
@@ -1316,7 +1418,7 @@ impl RelayServerAgent {
             circuit.destination_stream = None;
             self.stop_to_source.remove(&key);
             let peer_id = circuit.destination_leg_peer().clone();
-            let forward = matches!(circuit.destination, PendingDestination::Forward { .. });
+            let forward = matches!(circuit.destination, PendingDestination::Forward(_));
             self.runtime_error(
                 RelayServerRuntimeErrorKind::OpenStream,
                 Some(peer_id),
@@ -1773,7 +1875,7 @@ impl RelayServerAgent {
             return;
         };
         self.stop_deadlines.remove(&source_stream);
-        let limit = circuit.limit.clone();
+        let limit = circuit.limit(|| circuit_limit(&self.config));
         let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
             self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
             return;
@@ -1853,13 +1955,6 @@ impl RelayServerAgent {
         }
     }
 
-    fn circuit_limit(&self) -> Limit {
-        Limit {
-            duration: Some(self.config.max_circuit_duration_secs as u32),
-            data: Some(self.config.max_circuit_bytes),
-        }
-    }
-
     /// Commits a pending circuit whose HOP success the source took, then
     /// forwards both sides' pipelined payload and the source's half-close.
     /// Both directions are queued before either sends, so a close the first
@@ -1871,23 +1966,27 @@ impl RelayServerAgent {
         let Some(destination_stream) = pending.destination_stream else {
             return;
         };
-        if let Some(duration_secs) = pending.limit.duration.filter(|secs| *secs != 0) {
+        // Only a circuit across the backbone keeps its own leg peer and
+        // limit; any other's are its endpoints and the config's.
+        let backbone = if let Some(via) = pending
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.forwarded_by.clone())
+        {
+            Some((via, CircuitLeg::Source))
+        } else if let PendingDestination::Forward(forward) = &pending.destination {
+            Some((forward.member.clone(), CircuitLeg::Destination))
+        } else {
+            None
+        };
+        let limit = pending.limit(|| circuit_limit(&self.config));
+        if let Some(duration_secs) = limit.duration.filter(|secs| *secs != 0) {
             self.circuit_deadlines.set(
                 source_stream,
                 io.now_ms()
                     .saturating_add(u64::from(duration_secs).saturating_mul(1_000)),
             );
         }
-        let destination_leg_peer = pending.destination_leg_peer().clone();
-        // A forwarded circuit has one leg on the backbone, so one leg peer
-        // is a member's rather than an endpoint's.
-        let via = if pending.source_leg_peer != pending.source_peer_id {
-            Some(pending.source_leg_peer.clone())
-        } else if destination_leg_peer != pending.destination_peer_id {
-            Some(destination_leg_peer.clone())
-        } else {
-            None
-        };
         self.hold_circuit(
             &pending.source_peer_id,
             &pending.destination_peer_id,
@@ -1897,14 +1996,11 @@ impl RelayServerAgent {
         let mut circuit = Circuit {
             source_peer_id: pending.source_peer_id.clone(),
             destination_peer_id: pending.destination_peer_id.clone(),
-            source_leg_peer: pending.source_leg_peer,
-            destination_leg_peer,
-            via: via.clone(),
+            backbone: backbone.map(|(via, leg)| Box::new(Backbone { via, leg, limit })),
             source_ip: pending.source_ip,
             destination_ip: pending.destination_ip,
             source_stream,
             destination_stream,
-            limit: pending.limit,
             bytes: CircuitByteCounts::default(),
             to_destination: Forward::default(),
             to_source: Forward::default(),
@@ -1918,6 +2014,10 @@ impl RelayServerAgent {
         if !pending.destination_pipelined.is_empty() {
             circuit.to_source.push(pending.destination_pipelined.into());
         }
+        let via = circuit
+            .backbone
+            .as_ref()
+            .map(|backbone| Box::new(backbone.via.clone()));
         self.circuits.insert(source_stream, circuit);
         self.events.push_back(RelayServerEvent::CircuitOpened {
             source_peer_id: pending.source_peer_id,
@@ -2124,11 +2224,8 @@ impl RelayServerAgent {
         *total = total.saturating_add(accepted as u64);
         let total = *total;
         io.ack(origin, accepted);
-        if circuit
-            .limit
-            .data
-            .is_some_and(|limit| limit != 0 && total > limit)
-        {
+        let limit = circuit.data_limit(self.config.max_circuit_bytes);
+        if limit != 0 && total > limit {
             self.close_circuit(
                 io,
                 source_stream,
@@ -2167,14 +2264,12 @@ impl RelayServerAgent {
             _ => (true, true),
         };
         if reset_source {
-            self.reset(io, circuit.source_leg_peer.clone(), circuit.source_stream);
+            let peer = circuit.leg_peer(CircuitLeg::Source).clone();
+            self.reset(io, peer, circuit.source_stream);
         }
         if reset_destination {
-            self.reset(
-                io,
-                circuit.destination_leg_peer.clone(),
-                circuit.destination_stream,
-            );
+            let peer = circuit.leg_peer(CircuitLeg::Destination).clone();
+            self.reset(io, peer, circuit.destination_stream);
         }
         // Bytes still queued were never forwarded; release the origins'
         // credit for them (a no-op on a leg reset above).
@@ -2191,7 +2286,7 @@ impl RelayServerAgent {
             destination_peer_id: circuit.destination_peer_id,
             bytes: circuit.bytes,
             reason,
-            via: circuit.via,
+            via: circuit.backbone.map(|backbone| Box::new(backbone.via)),
         });
     }
 
@@ -2387,7 +2482,7 @@ impl RelayServerAgent {
             advertised.push(Protocol::P2p(self.local_peer_id.clone()));
             addrs.push(advertised.to_bytes());
         }
-        let limit = self.circuit_limit();
+        let limit = circuit_limit(&self.config);
         loop {
             let reservation = Reservation {
                 expire: expires_unix_secs,
@@ -2446,12 +2541,21 @@ impl RelayServerAgent {
             return;
         };
         let now_ms = io.now_ms();
-        let destination_conn = self.live_reservation(&destination_peer_id);
-        let source_ip = self.connection_ip(key.conn_id);
-        let destination_ip = self
+        // One lookup each for the reservation and its connection: the
+        // connection's IP counts even when the reservation is stale, while
+        // only a live one (see `live_reservation`) is a destination.
+        let reserved = self
             .reservations
             .get(&destination_peer_id)
-            .and_then(|reservation| self.connection_ip(reservation.conn_id));
+            .and_then(|reservation| {
+                let connection = self.connections.get(&reservation.conn_id)?;
+                Some((reservation.conn_id, connection))
+            });
+        let destination_ip = reserved.and_then(|(_, connection)| connection.ip.clone());
+        let destination_conn = reserved
+            .filter(|(_, connection)| connection.peer_id == destination_peer_id)
+            .map(|(conn_id, _)| conn_id);
+        let source_ip = self.connection_ip(key.conn_id);
         let max_per_ip = self.config.max_circuits_per_ip;
         let status = if !self.accepting
             || self
@@ -2485,66 +2589,56 @@ impl RelayServerAgent {
             self.deny_connect(io, key, destination_peer_id, status);
             return;
         }
-        let mut pending = PendingCircuit {
-            source_leg_peer: source_peer_id.clone(),
+        // A mesh node routes even a local reservation through resolution, so
+        // a local STOP that fails to open falls through to remote claims.
+        let routed = match destination_conn.filter(|_| self.mesh.is_none()) {
+            Some(conn_id) => {
+                // Admitted: only now does the request cost a token.
+                self.circuit_limiters
+                    .consume(&source_peer_id, source_ip.clone(), now_ms);
+                self.open_stop(io, &destination_peer_id, conn_id)
+                    .map(|stream| (Route::Stop { conn_id, stream }, None))
+            }
+            None => {
+                // A mesh node: the CONNECT is admitted once some claim is
+                // worth trying or some member's directory is still syncing.
+                let mut resolution = Resolution::default();
+                self.route(io, &destination_peer_id, &mut resolution)
+                    .map(|route| {
+                        self.circuit_limiters
+                            .consume(&source_peer_id, source_ip.clone(), now_ms);
+                        let mesh = PendingMesh {
+                            forwarded_by: None,
+                            limit: circuit_limit(&self.config),
+                            resolution,
+                        };
+                        (route, Some(Box::new(mesh)))
+                    })
+            }
+        };
+        let (route, mesh) = match routed {
+            Ok(routed) => routed,
+            Err(status) => {
+                self.deny_connect(io, key, destination_peer_id, status);
+                return;
+            }
+        };
+        // Only a local STOP holds the destination's IP; a stale local
+        // reservation's must not ride along to a forward.
+        let destination_ip = destination_ip.filter(|_| matches!(route, Route::Stop { .. }));
+        let pending = PendingCircuit::new(
             source_peer_id,
             destination_peer_id,
             source_ip,
             destination_ip,
-            destination_conn_id: None,
-            destination_stream: None,
-            destination: PendingDestination::Resolving,
-            limit: self.circuit_limit(),
-            resolution: Resolution::default(),
-            source_pipelined: Vec::new(),
-            destination_pipelined: Vec::new(),
-            source_eof: false,
-        };
-        // A mesh node routes even a local reservation through resolution, so
-        // a local STOP that fails to open falls through to remote claims.
-        if let Some(conn_id) = destination_conn.filter(|_| self.mesh.is_none()) {
-            // Admitted: only now does the request cost a token.
-            self.consume_circuit_token(&pending, now_ms);
-            match self.open_stop(io, &pending.destination_peer_id, conn_id) {
-                Ok(stream) => pending.route(Route::Stop { conn_id, stream }),
-                Err(status) => {
-                    let destination = pending.destination_peer_id;
-                    self.deny_connect(io, key, destination, status);
-                    return;
-                }
-            }
-        } else {
-            // A mesh node: the CONNECT is admitted once some claim is worth
-            // trying or some member's directory is still syncing.
-            let mut resolution = Resolution::default();
-            match self.route(io, &pending.destination_peer_id.clone(), &mut resolution) {
-                Ok(route) => {
-                    // Only a local STOP holds the destination's IP; a stale
-                    // local reservation's must not ride along to a forward.
-                    if !matches!(route, Route::Stop { .. }) {
-                        pending.destination_ip = None;
-                    }
-                    pending.route(route);
-                    pending.resolution = resolution;
-                    self.consume_circuit_token(&pending, now_ms);
-                }
-                Err(status) => {
-                    let destination = pending.destination_peer_id;
-                    self.deny_connect(io, key, destination, status);
-                    return;
-                }
-            }
-        }
+            route,
+            mesh,
+        );
         self.insert_pending_circuit(
             key,
             pending,
             now_ms.saturating_add(self.config.control_stream_timeout_ms),
         );
-    }
-
-    fn consume_circuit_token(&mut self, pending: &PendingCircuit, now_ms: u64) {
-        self.circuit_limiters
-            .consume(&pending.source_peer_id, pending.source_ip.clone(), now_ms);
     }
 
     /// The connection holding `peer_id`'s live local reservation: committed,
@@ -2908,7 +3002,15 @@ impl RelayServerAgent {
         let timed = self
             .circuits
             .values()
-            .filter(|circuit| circuit.limit.duration.is_some_and(|secs| secs != 0))
+            .filter(|circuit| {
+                circuit
+                    .backbone
+                    .as_ref()
+                    .map_or(self.config.max_circuit_duration_secs as u32, |backbone| {
+                        backbone.limit.duration.unwrap_or(0)
+                    })
+                    != 0
+            })
             .count();
         assert_eq!(self.circuit_deadlines.by_key.len(), timed);
         // Every reservation is on the timer.

@@ -571,7 +571,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
         assert!(
             mesh.nodes[node].events().iter().any(|event| matches!(
                 event,
-                RelayServerEvent::CircuitOpened { via: Some(v), .. } if *v == via
+                RelayServerEvent::CircuitOpened { via: Some(v), .. } if **v == via
             )),
             "node {node} opens the circuit via the other"
         );

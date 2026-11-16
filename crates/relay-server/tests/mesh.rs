@@ -60,7 +60,7 @@ fn opened_events(events: &[RelayServerEvent]) -> Vec<Option<PeerId>> {
     events
         .iter()
         .filter_map(|event| match event {
-            RelayServerEvent::CircuitOpened { via, .. } => Some(via.clone()),
+            RelayServerEvent::CircuitOpened { via, .. } => Some(via.as_deref().cloned()),
             _ => None,
         })
         .collect()
