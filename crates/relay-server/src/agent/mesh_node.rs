@@ -99,6 +99,7 @@ impl RelayServerAgent {
 
     /// A backbone connection came up: a member's starts a directory sync,
     /// anyone else's is closed.
+    #[inline(never)]
     pub(super) fn on_backbone_established(
         &mut self,
         io: &mut Io<'_>,
@@ -153,6 +154,7 @@ impl RelayServerAgent {
     /// member stays connected and unsynced throughout, so CONNECTs waiting
     /// on it, or falling back from a forward on the old link, keep waiting
     /// for the new link's snapshot instead of failing.
+    #[inline(never)]
     pub(super) fn on_backbone_replaced(
         &mut self,
         io: &mut Io<'_>,
@@ -299,10 +301,18 @@ impl RelayServerAgent {
     }
 
     /// Sends the message `message` builds to every member whose directory
-    /// stream is live. It is built only then, and kept out of line, so the
-    /// reservation paths of a relay outside a mesh stay as lean as before.
-    #[inline(never)]
+    /// stream is live. A relay outside a mesh pays one inline branch: the
+    /// message is built only when there is a member to send it to, out of
+    /// line.
+    #[inline(always)]
     pub(super) fn publish(&mut self, io: &mut Io<'_>, message: impl FnOnce() -> DirectoryMessage) {
+        if self.mesh.is_some() {
+            self.publish_to_members(io, message);
+        }
+    }
+
+    #[inline(never)]
+    fn publish_to_members(&mut self, io: &mut Io<'_>, message: impl FnOnce() -> DirectoryMessage) {
         let Some(mesh) = &self.mesh else {
             return;
         };
@@ -391,6 +401,7 @@ impl RelayServerAgent {
     /// An inbound mesh stream finished negotiating. Directory and forward
     /// streams from a member's current link are taken; from anyone else they
     /// are reset. Returns whether the stream is the relay's.
+    #[inline(never)]
     pub(super) fn on_mesh_stream_ready(
         &mut self,
         io: &mut Io<'_>,

@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
@@ -676,7 +677,8 @@ pub struct RelayServerAgent {
     /// admission key, a circuit whose ends share a key counted once.
     ip_tally: IpTally,
     /// Relay-mesh state, when the config makes this agent a mesh node.
-    mesh: Option<mesh_node::MeshNode>,
+    /// Boxed so an agent outside a mesh stays as small as before.
+    mesh: Option<Box<mesh_node::MeshNode>>,
 }
 
 impl RelayServerAgent {
@@ -713,7 +715,10 @@ impl RelayServerAgent {
                 config.max_rate_limit_entries,
             ),
             ip_tally: IpTally::default(),
-            mesh: config.mesh.as_ref().map(mesh_node::MeshNode::new),
+            mesh: config
+                .mesh
+                .as_ref()
+                .map(|mesh| Box::new(mesh_node::MeshNode::new(mesh))),
             config,
             accepting: true,
             explicit_addrs: None,
@@ -949,14 +954,18 @@ impl RelayServerAgent {
                         data,
                     );
                     true
-                } else if let Some(worker) = self.hop_workers.get(&key) {
-                    if matches!(worker.responder, Responder::Forward { .. }) {
-                        self.on_forward_request_data(io, key, data);
-                        return true;
-                    }
+                } else if self.hop_workers.contains_key(&key) {
+                    // `contains_key` rather than `get`: a lookup that also
+                    // yields the worker slowed every unowned stream's miss.
+                    let held = match self.hop_workers.get(&key).map(|worker| &worker.responder) {
+                        Some(Responder::Hop(responder)) => responder.pending_bridge_len(),
+                        _ => {
+                            self.on_forward_request_data(io, key, data);
+                            return true;
+                        }
+                    };
                     // Payload coalesced with CONNECT stays in the responder
                     // until the decision, unacknowledged.
-                    let held = self.hop_bridge_len(key);
                     if self.feed_hop(key, |hop| hop.on_data(data)) {
                         self.drain_hop(io, key);
                     }
