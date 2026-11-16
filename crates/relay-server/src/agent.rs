@@ -1355,17 +1355,15 @@ impl RelayServerAgent {
         .into_iter()
         .flatten()
         .min();
-        let earliest = [reservation, hop, stop, circuit, limiter]
+        let mut earliest = [reservation, hop, stop, circuit, limiter]
             .into_iter()
             .flatten()
             .min();
         // Folded in separately so a relay outside a mesh pays one branch.
-        let reopen = self.mesh.as_ref().and_then(|mesh| mesh.reopen.earliest());
-        match (earliest, reopen) {
-            (Some(earliest), Some(reopen)) => Some(earliest.min(reopen)),
-            (earliest, reopen) => earliest.or(reopen),
+        if let Some(mesh) = &self.mesh {
+            earliest = earliest.into_iter().chain(mesh.reopen.earliest()).min();
         }
-        .map(Deadline::from_millis)
+        earliest.map(Deadline::from_millis)
     }
 
     /// Whether the stream is owned by a HOP worker, STOP worker, or circuit,
@@ -2774,6 +2772,8 @@ impl RelayServerAgent {
     }
 
     /// Ends `peer_id`'s reservation, if any, and publishes that to the mesh.
+    /// Inlined, as it was before the mesh, into the expiry sweep's loop.
+    #[inline(always)]
     fn remove_reservation(&mut self, io: &mut Io<'_>, peer_id: &PeerId) {
         self.reservation_deadlines.remove(peer_id);
         if let Some(removed) = self.reservations.remove(peer_id) {
