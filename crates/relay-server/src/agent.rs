@@ -528,6 +528,13 @@ impl<K: Ord + Clone> Deadlines<K> {
     /// Owners due at or before `now_ms`, in key order so a sweep handles
     /// them in the same order however their deadlines fall.
     fn due(&self, now_ms: u64) -> Vec<K> {
+        // The common idle case, without building an iterator.
+        if self
+            .earliest()
+            .is_none_or(|deadline_ms| deadline_ms > now_ms)
+        {
+            return Vec::new();
+        }
         let mut due: Vec<K> = self
             .iter()
             .take_while(|(deadline_ms, _)| *deadline_ms <= now_ms)
@@ -1159,7 +1166,9 @@ impl RelayServerAgent {
                 .map_or(Status::ConnectionFailed, PendingCircuit::timeout_status);
             self.fail_pending_connect(io, key, status);
         }
-        for peer_id in self.reservation_deadlines.due(now_ms) {
+        let expired = self.reservation_deadlines.due(now_ms);
+        self.events.reserve(expired.len());
+        for peer_id in expired {
             self.remove_reservation(io, &peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id,
@@ -1168,7 +1177,9 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now_ms);
         self.circuit_limiters.sweep(now_ms);
-        self.reopen_due_directories(io);
+        if self.mesh.is_some() {
+            self.reopen_due_directories(io);
+        }
     }
 
     /// Resets a relay stream the peer stopped; returns whether we own it.
@@ -1335,12 +1346,17 @@ impl RelayServerAgent {
         .into_iter()
         .flatten()
         .min();
-        let mesh = self.mesh.as_ref().and_then(|mesh| mesh.reopen.earliest());
-        [reservation, hop, stop, circuit, limiter, mesh]
+        let earliest = [reservation, hop, stop, circuit, limiter]
             .into_iter()
             .flatten()
-            .min()
-            .map(Deadline::from_millis)
+            .min();
+        // Folded in separately so a relay outside a mesh pays one branch.
+        let reopen = self.mesh.as_ref().and_then(|mesh| mesh.reopen.earliest());
+        match (earliest, reopen) {
+            (Some(earliest), Some(reopen)) => Some(earliest.min(reopen)),
+            (earliest, reopen) => earliest.or(reopen),
+        }
+        .map(Deadline::from_millis)
     }
 
     /// Whether the stream is owned by a HOP worker, STOP worker, or circuit,
@@ -1412,13 +1428,10 @@ impl RelayServerAgent {
         {
             reservation.conn_id = new;
             let expires_unix = reservation.expires_unix;
-            self.publish(
-                io,
-                &DirectoryMessage::Present {
-                    peer: peer_id.clone(),
-                    expires_unix,
-                },
-            );
+            self.publish(io, || DirectoryMessage::Present {
+                peer: peer_id.clone(),
+                expires_unix,
+            });
         }
         self.on_connection_closed(io, peer_id, old);
     }
@@ -2738,17 +2751,17 @@ impl RelayServerAgent {
         record: ReservationRecord,
         deadline_ms: u64,
     ) {
-        self.reservation_deadlines.set(peer_id.clone(), deadline_ms);
         self.ip_tally.add(record.ip.as_ref(), Held::Reservations);
-        let present = DirectoryMessage::Present {
-            peer: peer_id.clone(),
-            expires_unix: record.expires_unix,
-        };
-        if let Some(replaced) = self.reservations.insert(peer_id, record) {
+        let expires_unix = record.expires_unix;
+        if let Some(replaced) = self.reservations.insert(peer_id.clone(), record) {
             self.ip_tally
                 .remove(replaced.ip.as_ref(), Held::Reservations);
         }
-        self.publish(io, &present);
+        self.publish(io, || DirectoryMessage::Present {
+            peer: peer_id.clone(),
+            expires_unix,
+        });
+        self.reservation_deadlines.set(peer_id, deadline_ms);
     }
 
     /// Ends `peer_id`'s reservation, if any, and publishes that to the mesh.
@@ -2757,12 +2770,9 @@ impl RelayServerAgent {
         if let Some(removed) = self.reservations.remove(peer_id) {
             self.ip_tally
                 .remove(removed.ip.as_ref(), Held::Reservations);
-            self.publish(
-                io,
-                &DirectoryMessage::Gone {
-                    peer: peer_id.clone(),
-                },
-            );
+            self.publish(io, || DirectoryMessage::Gone {
+                peer: peer_id.clone(),
+            });
         }
     }
 

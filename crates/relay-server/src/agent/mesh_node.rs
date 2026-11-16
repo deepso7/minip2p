@@ -298,8 +298,11 @@ impl RelayServerAgent {
         true
     }
 
-    /// Sends `message` to every member whose directory stream is live.
-    pub(super) fn publish(&mut self, io: &mut Io<'_>, message: &DirectoryMessage) {
+    /// Sends the message `message` builds to every member whose directory
+    /// stream is live. It is built only then, and kept out of line, so the
+    /// reservation paths of a relay outside a mesh stay as lean as before.
+    #[inline(never)]
+    pub(super) fn publish(&mut self, io: &mut Io<'_>, message: impl FnOnce() -> DirectoryMessage) {
         let Some(mesh) = &self.mesh else {
             return;
         };
@@ -312,7 +315,7 @@ impl RelayServerAgent {
         if members.is_empty() {
             return;
         }
-        let frame = message.encode_frame();
+        let frame = message().encode_frame();
         for member in members {
             self.send_directory(io, &member, frame.clone());
         }
