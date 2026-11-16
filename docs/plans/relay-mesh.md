@@ -118,7 +118,7 @@ The research for this plan found the committed forwarding path already generic: 
 - The `is_circuit` check that refuses CONNECT over relayed connections doesn't apply to backbone connections, which are direct.
 - **Each circuit stores its effective limit.** Today `commit_circuit` schedules the duration deadline from the agent's config, and `forward_accepted` checks bytes against the same config (`agent.rs:1574`, `1791-1824`). A forwarded circuit on the holding node must enforce `Forward.limit` instead (Decision 7), so `PendingCircuit` and `Circuit` carry their `Limit`, set from config for local circuits and from the message for forwarded ones, and the duration deadline and byte check read it. Zero still means unlimited.
 - A pending CONNECT can wait on a member's `Synced` or on the next claim (Decision 4), so it needs a state for "resolving" besides "STOP pending" and "forward pending", under the same control deadline.
-- `CircuitOpened` and `CircuitClosed` gain `via: Option<PeerId>`, the other node's backbone peer ID, so logs show which circuits crossed the backbone.
+- `CircuitOpened` and `CircuitClosed` gain `via: Option<Box<PeerId>>`, the other node's backbone peer ID, so logs show which circuits crossed the backbone.
 
 The directory, the codec and the `MeshSwarm` adapter live in a new `mesh` module of `crates/relay-server`. They are `no_std + alloc` with caller-supplied time, like the rest of the crate.
 

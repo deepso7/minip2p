@@ -2,6 +2,7 @@
 //! and receiving, CONNECT resolution across members, and the forward
 //! protocol on both the entry and the holding node.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::ToString;
@@ -13,8 +14,8 @@ use minip2p_swarm::DriverError;
 use minip2p_transport::ConnectionId;
 
 use super::{
-    Connection, Deadlines, Held, HopWorker, Io, PendingCircuit, PendingDestination, Resolution,
-    Responder, Route, control_send_failure,
+    Connection, Deadlines, Held, HopWorker, Io, PendingCircuit, PendingDestination, PendingMesh,
+    Resolution, Responder, Route, control_send_failure,
 };
 use crate::mesh::{
     DIRECTORY_PROTOCOL_ID, Directory, DirectoryInput, DirectoryMessage, FORWARD_PROTOCOL_ID,
@@ -602,7 +603,12 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
-        let mut resolution = core::mem::take(&mut circuit.resolution);
+        // Only a mesh node resolves, and its CONNECTs carry mesh state.
+        let mut resolution = circuit
+            .mesh
+            .as_mut()
+            .map(|mesh| core::mem::take(&mut mesh.resolution))
+            .unwrap_or_default();
         let routed = self.route(io, &destination, &mut resolution);
         if ip_changes && matches!(routed, Ok(Route::Stop { .. })) {
             self.release_circuit_ips(source_ip.as_ref(), held_ip.as_ref());
@@ -611,7 +617,9 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
-        circuit.resolution = resolution;
+        if let Some(mesh) = &mut circuit.mesh {
+            mesh.resolution = resolution;
+        }
         match routed {
             Ok(Route::Wait) => {}
             Ok(route) => {
@@ -651,9 +659,7 @@ impl RelayServerAgent {
     pub(super) fn is_pending_forward(&self, source_stream: StreamKey) -> bool {
         self.pending_circuits
             .get(&source_stream)
-            .is_some_and(|circuit| {
-                matches!(circuit.destination, PendingDestination::Forward { .. })
-            })
+            .is_some_and(|circuit| matches!(circuit.destination, PendingDestination::Forward(_)))
     }
 
     /// A forward did not open a circuit. `NO_RESERVATION` and
@@ -673,7 +679,9 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
-        circuit.resolution.last_status = Some(status);
+        if let Some(mesh) = &mut circuit.mesh {
+            mesh.resolution.last_status = Some(status);
+        }
         let member = circuit.destination_leg_peer().clone();
         let ready = circuit.destination_ready();
         let stream = circuit.destination_stream.take();
@@ -703,10 +711,10 @@ impl RelayServerAgent {
             return 0;
         };
         let member = circuit.destination_leg_peer().clone();
-        let PendingDestination::Forward {
-            reply: Some(reply), ..
-        } = &mut circuit.destination
-        else {
+        let PendingDestination::Forward(forward) = &mut circuit.destination else {
+            return 0;
+        };
+        let Some(reply) = &mut forward.reply else {
             return 0;
         };
         reply.extend_from_slice(data);
@@ -864,25 +872,22 @@ impl RelayServerAgent {
                 return;
             }
         };
-        let mut pending = PendingCircuit {
-            source_peer_id: source,
-            destination_peer_id: destination,
-            source_leg_peer: member,
-            source_ip: None,
-            destination_ip,
-            destination_conn_id: None,
-            destination_stream: None,
-            destination: PendingDestination::Resolving,
+        let mesh = PendingMesh {
+            forwarded_by: Some(member),
             limit,
             resolution: Resolution::default(),
-            source_pipelined: Vec::new(),
-            destination_pipelined: Vec::new(),
-            source_eof: false,
         };
-        pending.route(Route::Stop {
-            conn_id,
-            stream: stop,
-        });
+        let pending = PendingCircuit::new(
+            source,
+            destination,
+            None,
+            destination_ip,
+            Route::Stop {
+                conn_id,
+                stream: stop,
+            },
+            Some(Box::new(mesh)),
+        );
         self.insert_pending_circuit(
             stream,
             pending,
