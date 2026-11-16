@@ -1186,9 +1186,7 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now_ms);
         self.circuit_limiters.sweep(now_ms);
-        if self.mesh.is_some() {
-            self.reopen_due_directories(io);
-        }
+        self.reopen_due_directories(io);
     }
 
     /// Resets a relay stream the peer stopped; returns whether we own it.

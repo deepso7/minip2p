@@ -99,6 +99,8 @@ impl RelayServerAgent {
 
     /// A backbone connection came up: a member's starts a directory sync,
     /// anyone else's is closed.
+    ///
+    /// Out of line: inlined into `dispatch`, it slowed every relay's events.
     #[inline(never)]
     pub(super) fn on_backbone_established(
         &mut self,
@@ -154,6 +156,8 @@ impl RelayServerAgent {
     /// member stays connected and unsynced throughout, so CONNECTs waiting
     /// on it, or falling back from a forward on the old link, keep waiting
     /// for the new link's snapshot instead of failing.
+    ///
+    /// Out of line: inlined into `dispatch`, it slowed every relay's events.
     #[inline(never)]
     pub(super) fn on_backbone_replaced(
         &mut self,
@@ -401,6 +405,8 @@ impl RelayServerAgent {
     /// An inbound mesh stream finished negotiating. Directory and forward
     /// streams from a member's current link are taken; from anyone else they
     /// are reset. Returns whether the stream is the relay's.
+    ///
+    /// Out of line: inlined into `dispatch`, it slowed every relay's events.
     #[inline(never)]
     pub(super) fn on_mesh_stream_ready(
         &mut self,
