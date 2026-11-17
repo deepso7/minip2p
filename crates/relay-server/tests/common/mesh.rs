@@ -79,8 +79,18 @@ impl Mesh {
             }
         }
         mesh.pump(at(0));
-        for node in &mut mesh.nodes {
-            assert_eq!(node.events(), [], "a clean start");
+        // A clean start: each member whose directory arrived synced empty.
+        for (i, node) in mesh.nodes.iter_mut().enumerate() {
+            let events = node.events();
+            let synced = (0..count).filter(|&j| j != i && !mesh.held.contains(&(j, i)));
+            assert_eq!(events.len(), synced.clone().count(), "{events:?}");
+            for j in synced {
+                let event = RelayServerEvent::MeshMemberSynced {
+                    member: member(j),
+                    entries: 0,
+                };
+                assert!(events.contains(&event), "{events:?}");
+            }
         }
         mesh
     }

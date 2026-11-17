@@ -247,7 +247,7 @@ fn write_key(path: &std::path::Path, keypair: &minip2p::Ed25519Keypair) {
 
 #[cfg(unix)]
 #[test]
-fn two_mesh_nodes_report_each_other_up() {
+fn two_mesh_nodes_report_each_other_up_and_synced() {
     let dir = tempfile::tempdir().unwrap();
     let public = dir.path().join("identity.key");
     write_key(&public, &minip2p::Ed25519Keypair::generate());
@@ -310,7 +310,8 @@ fn two_mesh_nodes_report_each_other_up() {
 
     let mut listening = [false; 2];
     let mut up = [false; 2];
-    while !(listening.iter().all(|&seen| seen) && up.iter().all(|&seen| seen)) {
+    let mut synced = [false; 2];
+    while ![listening, up, synced].iter().flatten().all(|&seen| seen) {
         let Ok((index, line)) = receiver.recv_timeout(Duration::from_secs(20)) else {
             break;
         };
@@ -318,6 +319,7 @@ fn two_mesh_nodes_report_each_other_up() {
         listening[index] |= line == format!("[relay] mesh listening={own}");
         let other_peer = other.rsplit('/').next().unwrap();
         up[index] |= line == format!("[relay] mesh member={other_peer} up");
+        synced[index] |= line == format!("[relay] mesh member={other_peer} synced entries=0");
     }
     for mut relay in relays {
         relay.kill().unwrap();
@@ -329,4 +331,8 @@ fn two_mesh_nodes_report_each_other_up() {
         "each node prints its backbone address"
     );
     assert_eq!(up, [true; 2], "each node reports the other member up");
+    assert_eq!(
+        synced, [true; 2],
+        "each node reports the other's empty directory synced"
+    );
 }

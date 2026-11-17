@@ -438,6 +438,9 @@ fn print_event(event: RelayServerEvent) {
         RelayServerEvent::AddrsRestored { source } => {
             println!("[relay] {source:?} addresses accepted again")
         }
+        RelayServerEvent::MeshMemberSynced { member, entries } => {
+            println!("[relay] mesh member={member} synced entries={entries}")
+        }
         RelayServerEvent::Error(error) => eprintln!(
             "[relay] operational error kind={:?} peer={} detail={} action=check transport reachability and configured limits",
             error.kind,

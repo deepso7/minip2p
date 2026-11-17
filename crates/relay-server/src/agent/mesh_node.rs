@@ -22,7 +22,8 @@ use crate::mesh::{
     FORWARD_PROTOCOL_ID, ForwardMessage, MeshConfig, decode_mesh_frame, is_backbone_connection,
 };
 use crate::{
-    CircuitDirection, RelayServerAgent, RelayServerRuntimeErrorKind, RelaySwarmError, StreamKey,
+    CircuitDirection, RelayServerAgent, RelayServerEvent, RelayServerRuntimeErrorKind,
+    RelaySwarmError, StreamKey,
 };
 
 /// Most directory bytes queued behind a full stream. Past it the stream is
@@ -473,7 +474,12 @@ impl RelayServerAgent {
         io.ack(stream, data.len());
         match mesh.directory.stream_data(&member, &stream, data) {
             DirectoryInput::Ignored | DirectoryInput::Applied => {}
-            DirectoryInput::Synced => self.resolve_waiting(io, None),
+            DirectoryInput::Synced => {
+                let entries = mesh.directory.entry_count(&member);
+                self.events
+                    .push_back(RelayServerEvent::MeshMemberSynced { member, entries });
+                self.resolve_waiting(io, None);
+            }
             DirectoryInput::Reset(reason) => {
                 mesh.receiving.remove(&stream);
                 self.rejected_hop_streams.insert(stream, member.clone());

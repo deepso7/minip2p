@@ -510,6 +510,29 @@ fn a_forward_lost_to_a_replaced_link_retries_the_member_on_the_new_link() {
 }
 
 #[test]
+fn a_snapshot_reports_the_members_directory_size_when_synced() {
+    let mut mesh = mesh(defaults());
+    mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(0));
+    mesh.reserve(A, &bob(), key(BOB_CONN, 2), at(0));
+    mesh.reset_directory(A, B, at(10));
+    mesh.nodes[A].handle_tick(at(1_010));
+    mesh.pump(at(1_010));
+
+    let synced: Vec<_> = mesh.nodes[B]
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, RelayServerEvent::MeshMemberSynced { .. }))
+        .collect();
+    assert_eq!(
+        synced,
+        [RelayServerEvent::MeshMemberSynced {
+            member: member(A),
+            entries: 2,
+        }]
+    );
+}
+
+#[test]
 fn a_connect_during_a_snapshot_waits_for_synced() {
     for dialer in DIALERS {
         let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
