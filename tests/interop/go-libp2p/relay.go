@@ -150,7 +150,11 @@ func waitForHop(ctx context.Context, identified coreevent.Subscription, relay pe
 func pingOnce(ctx context.Context, node host.Host, target peer.ID) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	result := <-ping.Ping(ctx, node, target)
+	result, ok := <-ping.Ping(ctx, node, target)
+	if !ok {
+		// ping closes the channel without a result once ctx is done.
+		return fmt.Errorf("ping %s: no result: %w", target, ctx.Err())
+	}
 	return result.Error
 }
 

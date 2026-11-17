@@ -90,7 +90,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Directory**: A Mesh node's view of which peers hold reservations on which other node, as each member reports them. _Avoid_: registry, shared reservation store
 
-**Entry node**: The Mesh node a dialer's HOP CONNECT reaches. It applies the dialer's admission checks and, with no usable local reservation for the destination, forwards the circuit to a Holding node it finds in its Directory, trying the next claim if that one refuses.
+**Entry node**: The Mesh node a dialer's HOP CONNECT reaches. It answers the dialer, forwarding the circuit to a Holding node when the destination isn't reserved on it.
 
 **Holding node**: The Mesh node where the destination holds its reservation. It opens STOP to the destination for a forwarded circuit and never forwards it again (single hop).
 
