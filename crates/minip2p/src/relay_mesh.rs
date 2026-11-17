@@ -19,16 +19,12 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::ConnectionId;
 
 use crate::EndpointEvent;
+use minip2p_relay_server::mesh::Backoff;
 use minip2p_relay_server::{RelayServerRuntimeError, RelayServerRuntimeErrorKind};
 
 /// The backbone's default UDP port, on every listen address of
 /// [`RelayMeshConfig::new`].
 pub const DEFAULT_RELAY_MESH_PORT: u16 = 19_877;
-
-/// First redial delay after a member's link is lost or its dial fails.
-const MIN_REDIAL_BACKOFF_MS: u64 = 1_000;
-/// The redial delay doubles per failed dial up to this.
-const MAX_REDIAL_BACKOFF_MS: u64 = 30_000;
 
 /// Makes a relay Endpoint one node of a relay mesh, through
 /// [`EndpointBuilder::relay_mesh`](crate::EndpointBuilder::relay_mesh).
@@ -168,7 +164,8 @@ struct Link {
     dial: Option<ConnectionId>,
     /// When to dial again, while the link is down and no dial is out.
     redial_at: Option<Deadline>,
-    backoff_ms: u64,
+    /// Redial delay after the link is lost or a dial fails.
+    backoff: Backoff,
 }
 
 impl Links {
@@ -185,7 +182,7 @@ impl Links {
                     up: false,
                     dial: None,
                     redial_at: Some(Deadline::IMMEDIATE),
-                    backoff_ms: MIN_REDIAL_BACKOFF_MS,
+                    backoff: Backoff::new(),
                 })
                 .addrs
                 .push(addr);
@@ -227,7 +224,7 @@ impl Links {
                     link.dial = None;
                 }
                 link.redial_at = None;
-                link.backoff_ms = MIN_REDIAL_BACKOFF_MS;
+                link.backoff.reset();
                 let was_up = std::mem::replace(&mut link.up, true);
                 (!was_up).then(|| EndpointEvent::RelayMeshMemberUp {
                     peer_id: peer_id.clone(),
@@ -283,8 +280,7 @@ impl Link {
 
     /// Schedules the next dial after the current backoff, then doubles it.
     fn schedule(&mut self, now: Now) {
-        self.redial_at = Some(now.deadline_after(self.backoff_ms));
-        self.backoff_ms = (self.backoff_ms * 2).min(MAX_REDIAL_BACKOFF_MS);
+        self.redial_at = Some(now.deadline_after(self.backoff.next_delay_ms()));
     }
 }
 

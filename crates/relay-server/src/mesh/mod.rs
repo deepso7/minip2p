@@ -23,10 +23,12 @@ use minip2p_core::PeerId;
 use minip2p_swarm::{EntropySource, SwarmCore, SwarmError};
 use minip2p_transport::{ConnectionId, ConnectionNamespace, Transport};
 
+mod backoff;
 mod codec;
 mod directory;
 mod swarm;
 
+pub use backoff::Backoff;
 pub use codec::{
     DIRECTORY_PROTOCOL_ID, DirectoryMessage, FORWARD_PROTOCOL_ID, ForwardMessage,
     MAX_MESH_MESSAGE_SIZE, MeshMessageError, decode_mesh_frame,

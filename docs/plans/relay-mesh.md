@@ -82,7 +82,7 @@ The agent needs a hook at each change. Today `ReservationAccepted` and `Reservat
 
 Clients can't be relied on to retry. When a connected relay refuses a HOP CONNECT, minip2p's connect attempt retires every remaining address for that relay peer ID and fails if no other relay is configured (`crates/nat/src/attempt.rs:1289-1338`). Every region shares one peer ID, so to the client the whole mesh is one relay: any `NO_RESERVATION` the mesh gets wrong fails a connection that could have worked. The entry node therefore settles transient states itself, within the CONNECT's existing control deadline (`control_stream_timeout_ms`):
 
-1. **Local reservation:** use it. It is known to be live.
+1. **Local reservation:** use it. It is known to be live. If its STOP stream can't even be opened (the swarm already lost the connection, and the agent hasn't heard yet), it isn't, so fall through to the remote claims.
 2. **Remote claims:** order them by latest `expires_unix` (a new reservation gets now + the reservation lifetime, so the newest commit comes first), ties by lower backbone peer ID. Forward to the first. If it answers `NO_RESERVATION` or `CONNECTION_FAILED`, or the backbone link fails, try the next claim.
 3. **No claim left, but some member is connected and not yet synced:** hold the CONNECT until that member's `Synced` arrives or its link drops, then look again from step 1.
 4. **Otherwise,** or when the control deadline passes, answer the last status seen, or `NO_RESERVATION` if no claim was ever found.

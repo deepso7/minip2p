@@ -18,18 +18,12 @@ use super::{
     Resolution, Responder, Route, control_send_failure,
 };
 use crate::mesh::{
-    DIRECTORY_PROTOCOL_ID, Directory, DirectoryInput, DirectoryMessage, FORWARD_PROTOCOL_ID,
-    ForwardMessage, MeshConfig, decode_mesh_frame, is_backbone_connection,
+    Backoff, DIRECTORY_PROTOCOL_ID, Directory, DirectoryInput, DirectoryMessage,
+    FORWARD_PROTOCOL_ID, ForwardMessage, MeshConfig, decode_mesh_frame, is_backbone_connection,
 };
 use crate::{
     CircuitDirection, RelayServerAgent, RelayServerRuntimeErrorKind, RelaySwarmError, StreamKey,
 };
-
-/// First delay before a directory stream that ended on a live link reopens;
-/// it doubles per reopen up to [`MAX_REOPEN_BACKOFF_MS`], and resets once a
-/// snapshot is out.
-const MIN_REOPEN_BACKOFF_MS: u64 = 1_000;
-const MAX_REOPEN_BACKOFF_MS: u64 = 30_000;
 
 /// Most directory bytes queued behind a full stream. Past it the stream is
 /// reset and reopened, so the member resyncs from a fresh snapshot.
@@ -73,7 +67,9 @@ struct Link {
     /// Bytes a full stream has not taken yet, resent on its writable.
     backlog: Vec<u8>,
     blocked: bool,
-    backoff_ms: u64,
+    /// Delay before a directory stream that ended on a live link reopens;
+    /// reset once a snapshot is in the transport.
+    backoff: Backoff,
 }
 
 impl RelayServerAgent {
@@ -135,7 +131,7 @@ impl RelayServerAgent {
                 live: false,
                 backlog: Vec::new(),
                 blocked: false,
-                backoff_ms: MIN_REOPEN_BACKOFF_MS,
+                backoff: Backoff::new(),
             },
         );
         mesh.reopen.remove(&peer);
@@ -230,9 +226,9 @@ impl RelayServerAgent {
         if let Some(mesh) = &mut self.mesh
             && let Some(link) = mesh.links.get_mut(member)
         {
+            let delay_ms = link.backoff.next_delay_ms();
             mesh.reopen
-                .set(member.clone(), io.now_ms().saturating_add(link.backoff_ms));
-            link.backoff_ms = link.backoff_ms.saturating_mul(2).min(MAX_REOPEN_BACKOFF_MS);
+                .set(member.clone(), io.now_ms().saturating_add(delay_ms));
         }
     }
 
@@ -364,7 +360,7 @@ impl RelayServerAgent {
         {
             // Nothing is left queued, so the snapshot is in the transport:
             // the next lost stream reopens from the shortest backoff.
-            Ok(()) => link.backoff_ms = MIN_REOPEN_BACKOFF_MS,
+            Ok(()) => link.backoff.reset(),
             Err(RelaySwarmError(DriverError::Full { unsent, .. })) => {
                 link.blocked = true;
                 link.backlog = unsent.to_vec();
