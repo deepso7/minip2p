@@ -578,6 +578,49 @@ fn a_waiting_connect_that_turns_local_respects_the_destinations_ip_cap() {
 }
 
 #[test]
+fn a_waiting_connect_uses_a_new_claim_from_a_synced_member() {
+    for dialer in DIALERS {
+        let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
+        let bob = Bob::dial(&mut mesh, C, dialer, at(1));
+        bob.assert_waiting(&mut mesh);
+
+        // B never syncs; Alice reserves on A, which C already synced with.
+        mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(2));
+        assert_eq!(forward_opens(&mesh, C, A), 1);
+        mesh.answer_stop(A, &alice(), Status::Ok, at(2));
+        bob.assert_opened(&mut mesh, at(2));
+    }
+}
+
+#[test]
+fn a_waiting_connect_uses_a_reservation_moved_to_a_replacement_connection() {
+    for dialer in DIALERS {
+        let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
+        mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(0));
+        // C's swarm already replaced Alice's connection; the agent hasn't
+        // heard, so her STOP fails to open and the CONNECT waits on B.
+        mesh.nodes[C].swarm.forget(&alice());
+        let bob = Bob::dial(&mut mesh, C, dialer, at(1));
+        bob.assert_waiting(&mut mesh);
+
+        mesh.nodes[C].replace(
+            &alice(),
+            ConnectionId::new(ALICE_CONN),
+            ConnectionId::new(ALICE_CONN_2),
+            false,
+            2,
+        );
+        mesh.pump(at(2));
+        let stop = opened(&mesh.calls(C)).expect("a STOP to Alice");
+        assert_eq!(stop.conn_id, ConnectionId::new(ALICE_CONN_2));
+        mesh.nodes[C].stop_ready(&alice(), stop, at(2));
+        mesh.nodes[C].stop_status(&alice(), stop, Status::Ok, at(2));
+        mesh.pump(at(2));
+        bob.assert_opened(&mut mesh, at(2));
+    }
+}
+
+#[test]
 fn a_waiting_connect_uses_a_local_reservation_made_during_the_wait() {
     for dialer in DIALERS {
         let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);

@@ -1529,18 +1529,25 @@ impl RelayServerAgent {
         is_circuit: bool,
     ) {
         self.on_connection_established(io, peer_id.clone(), new, is_circuit);
+        let mut moved = false;
         if !is_circuit
             && let Some(reservation) = self.reservations.get_mut(peer_id)
             && reservation.conn_id == old
         {
             reservation.conn_id = new;
             let expires_unix = reservation.expires_unix;
+            moved = true;
             self.publish(io, || DirectoryMessage::Present {
                 peer: peer_id.clone(),
                 expires_unix,
             });
         }
         self.on_connection_closed(io, peer_id, old);
+        // A CONNECT to the peer that waits on a member's snapshot (its STOP
+        // failed to open on `old`) can use the moved reservation now.
+        if moved && self.mesh.is_some() && self.peer_circuit_count(peer_id) > 0 {
+            self.resolve_waiting(io, Some(peer_id));
+        }
     }
 
     fn on_connection_closed(&mut self, io: &mut Io<'_>, peer_id: &PeerId, conn_id: ConnectionId) {

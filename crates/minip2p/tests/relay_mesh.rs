@@ -446,7 +446,15 @@ fn a_backbone_connection_from_a_non_member_is_closed() {
     // The stranger lists A, but A does not list it.
     let c = Relay::spawn(bind_relay(&public, &stranger, 0, vec![a.backbone.clone()]));
 
+    // A never counts the stranger as a member, before or after refusing it.
+    let no_member_up = |event: &EndpointEvent| {
+        assert!(
+            !matches!(event, EndpointEvent::RelayMeshMemberUp { .. }),
+            "a non-member came up as a member"
+        );
+    };
     a.expect("non-member refused", Duration::from_secs(20), |event| {
+        no_member_up(event);
         matches!(
             event,
             EndpointEvent::RelayServer(RelayServerEvent::Error(error))
@@ -457,13 +465,7 @@ fn a_backbone_connection_from_a_non_member_is_closed() {
     c.expect("closed by A", Duration::from_secs(20), |event| {
         matches!(event, EndpointEvent::RelayMeshMemberDown { peer_id } if peer_id == a.backbone.peer_id())
     });
-    // A never counted the stranger as a member.
-    assert!(
-        !a.events
-            .try_iter()
-            .any(|event| matches!(event, EndpointEvent::RelayMeshMemberUp { .. })),
-        "a non-member came up as a member"
-    );
+    a.events.try_iter().for_each(|event| no_member_up(&event));
 }
 
 #[test]

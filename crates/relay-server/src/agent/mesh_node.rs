@@ -473,7 +473,9 @@ impl RelayServerAgent {
         };
         io.ack(stream, data.len());
         match mesh.directory.stream_data(&member, &stream, data) {
-            DirectoryInput::Ignored | DirectoryInput::Applied => {}
+            DirectoryInput::Ignored => {}
+            // A new claim can serve a CONNECT waiting on another member.
+            DirectoryInput::Applied => self.resolve_waiting(io, None),
             DirectoryInput::Synced => {
                 let entries = mesh.directory.entry_count(&member);
                 self.events
