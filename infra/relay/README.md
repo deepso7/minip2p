@@ -151,7 +151,7 @@ The instance role needs, as in the [plugin's policy](https://certbot-dns-route53
 
    A node closes backbone connections from peers not on its list, so links come up once both ends have it.
 
-4. **Check the links,** then **switch DNS.** Every node's logs should show `[relay] mesh member=<id> up` for every other member. Then replace the single records with the latency records (DNS step 4).
+4. **Check the links,** then **switch DNS.** Every node's logs should show `[relay] mesh member=<id> up`, then `[relay] mesh member=<id> synced entries=<n>`, for every other member; until a member is synced, the node holds CONNECTs that could route to it. Then replace the single records with the latency records (DNS step 4).
 5. **Verify live.** From a client in each region, connect to a peer reserved from another region through `relay.minip2p.com`. The entry node logs `circuit opened … via=<holding node's backbone id>`.
 
 `[relay] mesh member=<id> down` means a backbone link dropped; the node redials it with backoff. Health checks can't see a backbone partition, so alert on that line. While a link is down, the two nodes answer `NO_RESERVATION` for each other's peers.

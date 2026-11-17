@@ -225,6 +225,17 @@ pub enum RelayServerEvent {
         /// Address source that accepted a refresh again.
         source: RelayServerAddrSource,
     },
+    /// A relay-mesh member's directory snapshot completed on its current
+    /// directory stream: CONNECTs can now route to peers it holds. Queued
+    /// once per stream, so again after the member's link or stream is
+    /// replaced and it resyncs. Only mesh nodes queue it.
+    MeshMemberSynced {
+        /// The member's backbone peer id.
+        member: PeerId,
+        /// How many reserved peers this node's directory holds for the
+        /// member once the snapshot completed.
+        entries: usize,
+    },
     /// Asynchronous diagnostic that does not replace stable lifecycle events.
     Error(RelayServerRuntimeError),
 }

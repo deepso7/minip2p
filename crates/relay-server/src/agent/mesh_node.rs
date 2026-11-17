@@ -22,7 +22,8 @@ use crate::mesh::{
     ForwardMessage, MeshConfig, decode_mesh_frame, is_backbone_connection,
 };
 use crate::{
-    CircuitDirection, RelayServerAgent, RelayServerRuntimeErrorKind, RelaySwarmError, StreamKey,
+    CircuitDirection, RelayServerAgent, RelayServerEvent, RelayServerRuntimeErrorKind,
+    RelaySwarmError, StreamKey,
 };
 
 /// First delay before a directory stream that ended on a live link reopens;
@@ -477,7 +478,12 @@ impl RelayServerAgent {
         io.ack(stream, data.len());
         match mesh.directory.stream_data(&member, &stream, data) {
             DirectoryInput::Ignored | DirectoryInput::Applied => {}
-            DirectoryInput::Synced => self.resolve_waiting(io, None),
+            DirectoryInput::Synced => {
+                let entries = mesh.directory.entry_count(&member);
+                self.events
+                    .push_back(RelayServerEvent::MeshMemberSynced { member, entries });
+                self.resolve_waiting(io, None);
+            }
             DirectoryInput::Reset(reason) => {
                 mesh.receiving.remove(&stream);
                 self.rejected_hop_streams.insert(stream, member.clone());

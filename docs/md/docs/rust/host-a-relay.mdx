@@ -106,7 +106,7 @@ sudo minip2p-relay service install \
 
 Run it again the same way to change the list later. Each `service install` writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off. A node closes backbone connections from peers that aren't on its list.
 
-Allow UDP port `19877` only from the other nodes' IP addresses. Keep the nodes' clocks synced with NTP. Each node logs `[relay] mesh member=12D3KooW... up` when its link to that member comes up and `down` when the link drops. Circuits forwarded across the backbone show the other node's backbone peer ID as `via=` in their `circuit opened` and `circuit closed` lines.
+Allow UDP port `19877` only from the other nodes' IP addresses. Keep the nodes' clocks synced with NTP. Each node logs `[relay] mesh member=12D3KooW... up` when its link to that member comes up and `down` when the link drops, and `[relay] mesh member=12D3KooW... synced entries=3` once it has that member's full directory: the number of reservations the member holds. Circuits forwarded across the backbone show the other node's backbone peer ID as `via=` in their `circuit opened` and `circuit closed` lines.
 
 Each node applies its own reservation, circuit, and rate limits. Mesh-wide limits are not supported. Every node holds the shared identity key, so a breach of any node exposes it, and replacing the key changes every published address.
 

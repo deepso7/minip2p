@@ -326,6 +326,20 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
 }
 
 #[test]
+fn each_node_reports_the_others_directory_size_once_synced() {
+    let (a, b) = meshed_pair();
+    for (node, other) in [(&a, &b), (&b, &a)] {
+        node.expect("member synced", Duration::from_secs(10), |event| {
+            matches!(
+                event,
+                EndpointEvent::RelayServer(RelayServerEvent::MeshMemberSynced { member, entries: 0 })
+                    if member == other.backbone.peer_id()
+            )
+        });
+    }
+}
+
+#[test]
 fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
     let (a, b) = meshed_pair();
     // Loopback is not global unicast: both sides must opt in to punch it.

@@ -1,6 +1,6 @@
 # Plan: relay mesh — one relay address served from several regions
 
-> **Status:** Implemented in the PR stack below (PRs 1–5; decisions recorded in [ADR 0027](../adr/0027-relay-mesh-two-identities-and-single-hop-forwarding.md)). The Ops steps (PR 6) are a runbook in [infra/relay/README.md](../../infra/relay/README.md), not yet carried out. Deviations: the relay binary doesn't log directory size per member (the Endpoint doesn't expose it), and the go-libp2p relay-client interop mode wasn't added; the mesh interop runs against rust-libp2p only. Review history: reviewed with gpt-6.1-sol (high). Round 1: 8 findings (1 blocker: clients don't retry a refused CONNECT, so the relay must settle transient directory states itself). Round 2: that blocker still open (a stale holding node at capacity blocked fallback), plus 1 nit. Round 3: approved. Every finding was checked against the code and fixed.
+> **Status:** Implemented in the PR stack below (PRs 1–5; decisions recorded in [ADR 0027](../adr/0027-relay-mesh-two-identities-and-single-hop-forwarding.md)). The Ops steps (PR 6) are a runbook in [infra/relay/README.md](../../infra/relay/README.md), not yet carried out. Deviation: the go-libp2p relay-client interop mode wasn't added; the mesh interop runs against rust-libp2p only. Review history: reviewed with gpt-6.1-sol (high). Round 1: 8 findings (1 blocker: clients don't retry a refused CONNECT, so the relay must settle transient directory states itself). Round 2: that blocker still open (a stale holding node at capacity blocked fallback), plus 1 nit. Round 3: approved. Every finding was checked against the code and fixed.
 
 ## Goal
 
@@ -132,7 +132,7 @@ The directory, the codec and the `MeshSwarm` adapter live in a new `mesh` module
 ### 8. Endpoint and relay binary
 
 - **Endpoint:** `EndpointBuilder::relay_mesh(RelayMeshConfig { identity, listen, members })`, valid only with `relay_server`. `members` is a list of `PeerAddr`s (backbone addresses with backbone peer IDs). The node skips its own backbone peer ID if it appears, so every node can use the same list. New `EndpointEvent` variants report a member link coming up or going down.
-- **Relay binary:** `--mesh-key <path>`, `--mesh-listen <addr>` (repeatable, default `0.0.0.0:19877` and `[::]:19877`), and `--mesh-member <peer addr>` (repeatable). The backbone key is created on first run like the public key, with the same permission checks. `service install` passes the flags through and stores the backbone key next to the identity (`/var/lib/minip2p-relay/mesh.key`). Logs: `[relay] mesh member=<id> up|down` and the directory size per member.
+- **Relay binary:** `--mesh-key <path>`, `--mesh-listen <addr>` (repeatable, default `0.0.0.0:19877` and `[::]:19877`), and `--mesh-member <peer addr>` (repeatable). The backbone key is created on first run like the public key, with the same permission checks. `service install` passes the flags through and stores the backbone key next to the identity (`/var/lib/minip2p-relay/mesh.key`). Logs: `[relay] mesh member=<id> up|down` and the directory size per member (`[relay] mesh member=<id> synced entries=<n>`, once per completed snapshot).
 
 ## Ops: `relay.minip2p.com` as a mesh
 
