@@ -1,15 +1,10 @@
 # unified-testing transport app
 
-The minip2p entry in [libp2p/unified-testing](https://github.com/libp2p/unified-testing)'s
-transport interop matrix: dial, handshake, and ping against every other libp2p
-implementation, over `tcp` (Noise, Yamux) and `quic-v1`.
+The minip2p entry in [libp2p/unified-testing](https://github.com/libp2p/unified-testing)'s transport interop matrix: dial, handshake, and ping against every other libp2p implementation, over `tcp` (Noise, Yamux) and `quic-v1`.
 
-It follows the repo's [transport test-app contract](https://github.com/libp2p/unified-testing/blob/master/docs/write-a-transport-test-app.md),
-with one deviation the reference rust-libp2p image also makes: the listener address is
-a Redis **list** (`RPUSH` / `BLPOP` on `<TEST_KEY>_listener_multiaddr`), not a string.
+It follows the repo's [transport test-app contract](https://github.com/libp2p/unified-testing/blob/master/docs/write-a-transport-test-app.md), with one deviation the reference rust-libp2p image also makes: the listener address is a Redis **list** (`RPUSH` / `BLPOP` on `<TEST_KEY>_listener_multiaddr`), not a string.
 
-Standalone crate (own `[workspace]`), so it never touches the workspace lockfile. No
-Redis client dependency: the two commands it needs are a few lines of RESP.
+Standalone crate (own `[workspace]`), so it never touches the workspace lockfile. No Redis client dependency: the two commands it needs are a few lines of RESP.
 
 ## Build
 
@@ -38,11 +33,6 @@ latency:
   unit: ms
 ```
 
-Timing matches rust-libp2p's `interop-tests`: the clock starts before the dial and stops
-at the first ping result. `ping_rtt` comes from a second ping on the already negotiated
-stream, so like rust-libp2p's it covers only the payload echo. It is timed here rather
-than taken from `PingRttMeasured`, whose whole-millisecond `rtt_ms` reads 0 between
-containers.
+Timing matches rust-libp2p's `interop-tests`: the clock starts before the dial and stops at the first ping result. `ping_rtt` comes from a second ping on the already negotiated stream, so like rust-libp2p's it covers only the payload echo. It is timed here rather than taken from `PingRttMeasured`, whose whole-millisecond `rtt_ms` reads 0 between containers.
 
-Set `DEBUG=true` for every endpoint event on stderr. The logging is synchronous, so
-debug runs report slightly higher latencies.
+Set `DEBUG=true` for every endpoint event on stderr. The logging is synchronous, so debug runs report slightly higher latencies.
