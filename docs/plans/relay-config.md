@@ -44,12 +44,12 @@ Non-goals (possible follow-ups, each needs its own case):
 `minip2p-relay --config PATH` reads a TOML file whose fields mirror the flags:
 
 ```toml
-hostname = "relay.example.com"   # derives the /dns announcements, as service install does today
+hostname = "relay.example.com" # derives the /dns announcements, as service install does today
 key = "/var/lib/minip2p-relay/identity.key"
 # quic = ["0.0.0.0:19876"]        # default: automatic IPv4/IPv6, as today
 # announce = ["/dns/…"]           # extra announcements
 
-[webtransport]                    # present = on
+[webtransport] # present = on
 cert = "/etc/minip2p-relay/tls/fullchain.pem"
 key = "/etc/minip2p-relay/tls/privkey.pem"
 
@@ -57,7 +57,7 @@ key = "/etc/minip2p-relay/tls/privkey.pem"
 max_reservations = 1024
 max_circuit_bytes = 1048576
 
-[mesh]                            # present = on
+[mesh] # present = on
 key = "/var/lib/minip2p-relay/mesh.key"
 members = ["/ip4/198.51.100.7/udp/19877/quic-v1/p2p/12D3KooW…"]
 ```
