@@ -1,0 +1,19 @@
+[package]
+name = "minip2p-unified-testing"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Transport test app for libp2p/unified-testing. Standalone (its own
+# workspace) like the other foreign-harness crates in tests/interop. See README.md.
+[workspace]
+
+[[bin]]
+name = "minip2p-unified-testing"
+path = "src/main.rs"
+
+[dependencies]
+minip2p = { package = "minip2p-rs", path = "../../../crates/minip2p", features = [
+  "quic",
+  "tcp",
+] }
