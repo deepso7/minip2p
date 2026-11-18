@@ -79,18 +79,31 @@ fn run_config(path: &std::path::Path) -> Vec<String> {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the relay");
+    let (sender, receiver) = mpsc::channel();
     let stdout = relay.stdout.take().expect("piped stdout");
-    let mut lines = Vec::new();
-    for line in BufReader::new(stdout).lines() {
-        let line = line.expect("relay output");
-        let ready = line.starts_with("[relay] commands on stdin");
-        lines.push(line);
-        if ready {
-            break;
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
         }
-    }
+    });
+    let mut lines = Vec::new();
+    let ready = loop {
+        match receiver.recv_timeout(Duration::from_secs(20)) {
+            Ok(line) => {
+                let ready = line.starts_with("[relay] commands on stdin");
+                lines.push(line);
+                if ready {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
     relay.kill().expect("stop the relay");
     relay.wait().expect("reap the relay");
+    assert!(ready, "relay never became ready: {lines:#?}");
     lines
 }
 
