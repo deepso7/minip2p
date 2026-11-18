@@ -54,7 +54,9 @@ mod webtransport_tests;
 #[cfg(test)]
 mod write_fairness_tests;
 
-pub use config::{CongestionController, QuicLimits, QuicNodeConfig, WebTransportCertificates};
+pub use config::{
+    CongestionController, QuicLimits, QuicNamespaces, QuicNodeConfig, WebTransportCertificates,
+};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{
     ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
@@ -588,6 +590,7 @@ impl QuicTransport {
         let transport_config = Arc::new(transport_config);
         let tally = DatagramTally::register(&node_config.peer_id());
         let max_pending_datagrams = node_config.limits().max_pending_datagrams;
+        let namespaces = node_config.namespaces();
         let sockets = udps
             .into_iter()
             .map(|(requested, udp, quic_v1, webtransport)| {
@@ -596,8 +599,19 @@ impl QuicTransport {
                 let local_addr = udp
                     .local_addr()
                     .map_err(|e| QuicBindError::socket(requested, "read local address", &e))?;
-                let mut socket = Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
-                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))?;
+                let namespace = if local_addr.is_ipv6() {
+                    namespaces.ipv6()
+                } else {
+                    namespaces.ipv4()
+                };
+                let mut socket = Socket::new(
+                    udp,
+                    local_addr,
+                    namespace,
+                    max_pending_datagrams,
+                    tally.clone(),
+                )
+                .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))?;
                 socket.quic_v1 = quic_v1;
                 socket.webtransport = webtransport;
                 Ok(socket)
@@ -2053,6 +2067,35 @@ mod tests {
         let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
         assert_resolve_first(transport.dial(&named).map(drop));
         assert_resolve_first(transport.send_datagram(named.transport(), b"x"));
+    }
+
+    #[test]
+    fn configured_namespaces_stamp_each_family_s_connection_ids() {
+        let config = QuicNodeConfig::generate().with_namespaces(QuicNamespaces::MESH);
+        let mut transport = QuicTransport::dual_stack(config).expect("bind");
+        assert_eq!(
+            transport.namespaces(),
+            vec![
+                ConnectionNamespace::MESH_IPV4,
+                ConnectionNamespace::MESH_IPV6
+            ]
+        );
+        for (addr, namespace) in [
+            ("127.0.0.1:9", ConnectionNamespace::MESH_IPV4),
+            ("[::1]:9", ConnectionNamespace::MESH_IPV6),
+        ] {
+            let id = transport.dial(&target(addr)).expect("dial");
+            assert_eq!(id.namespace(), namespace, "{addr}");
+        }
+
+        // One namespace per allocator: both families can't share one.
+        assert_eq!(
+            QuicNamespaces::new(
+                ConnectionNamespace::MESH_IPV4,
+                ConnectionNamespace::MESH_IPV4
+            ),
+            None
+        );
     }
 
     #[test]

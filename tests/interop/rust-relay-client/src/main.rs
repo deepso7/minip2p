@@ -35,6 +35,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .parse()?;
     let expected_duration: u64 = argument(2, "expected duration")?.parse()?;
     let expected_bytes: u64 = argument(3, "expected byte limit")?.parse()?;
+    // The source dials through this relay address; another node of a relay
+    // mesh serving the same relay peer id, or by default the same relay.
+    let source_relay_addr: Multiaddr = match std::env::args().nth(4) {
+        Some(address) => address.parse()?,
+        None => relay_addr.clone(),
+    };
     macro_rules! verify_limit {
         ($limit:expr, $context:literal) => {{
             let limit = $limit.ok_or(concat!($context, " omitted its advertised Limit"))?;
@@ -46,6 +52,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }};
     }
     let relay_peer = peer_id(&relay_addr).ok_or("relay address must end in /p2p/<peer-id>")?;
+    if peer_id(&source_relay_addr) != Some(relay_peer) {
+        return Err("both relay addresses must name the same relay peer id".into());
+    }
     let mut destination = client()?;
     let destination_peer = *destination.local_peer_id();
 
@@ -87,8 +96,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let destination_addr = relay_addr
-        .clone()
+    let destination_addr = source_relay_addr
         .with(Protocol::P2pCircuit)
         .with(Protocol::P2p(destination_peer));
     let mut source = client()?;

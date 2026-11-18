@@ -1,3 +1,5 @@
+use crate::mesh::MeshConfig;
+
 /// A token bucket replenishing one token per interval.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RateLimit {
@@ -59,6 +61,9 @@ pub struct RelayServerConfig {
     /// refill, so size it for the churn you expect. Zero refuses every
     /// request an enabled limiter sees.
     pub max_rate_limit_entries: usize,
+    /// Makes the agent a relay-mesh node; `None` (the default) is a single
+    /// relay. See [`crate::mesh`].
+    pub mesh: Option<MeshConfig>,
 }
 
 impl Default for RelayServerConfig {
@@ -88,6 +93,7 @@ impl Default for RelayServerConfig {
             circuit_rate_limit_per_peer: per_peer,
             circuit_rate_limit_per_ip: per_ip,
             max_rate_limit_entries: 1_024,
+            mesh: None,
         }
     }
 }

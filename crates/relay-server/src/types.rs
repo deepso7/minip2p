@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use minip2p_core::PeerId;
@@ -99,6 +100,10 @@ pub enum RelayServerRuntimeErrorKind {
     ResetStream,
     /// An agent invariant failed.
     InternalInvariant,
+    /// A relay-mesh peer was refused or broke a mesh protocol: a backbone
+    /// connection from a non-member, or a malformed or over-cap directory or
+    /// forward stream.
+    Mesh,
 }
 
 /// Why the relay denied a RESERVE. Local diagnostics only: the requester
@@ -184,6 +189,11 @@ pub enum RelayServerEvent {
         source_peer_id: PeerId,
         /// Reserved STOP peer.
         destination_peer_id: PeerId,
+        /// For a circuit forwarded across a relay mesh, the other node's
+        /// backbone peer id: the holding node on the entry node, the entry
+        /// node on the holding node. Boxed so the events of circuits off
+        /// the mesh, and every other event, stay small.
+        via: Option<Box<PeerId>>,
     },
     /// Exactly-once circuit terminal event with accepted-byte totals.
     CircuitClosed {
@@ -195,6 +205,9 @@ pub enum RelayServerEvent {
         bytes: CircuitByteCounts,
         /// Stable terminal reason.
         reason: CircuitCloseReason,
+        /// The other mesh node's backbone peer id, as in
+        /// [`CircuitOpened`](Self::CircuitOpened).
+        via: Option<Box<PeerId>>,
     },
     /// A host address refresh was rejected while `source` was healthy, or
     /// with a different error while it was already failing. The source's
@@ -211,6 +224,17 @@ pub enum RelayServerEvent {
     AddrsRestored {
         /// Address source that accepted a refresh again.
         source: RelayServerAddrSource,
+    },
+    /// A relay-mesh member's directory snapshot completed on its current
+    /// directory stream: CONNECTs can now route to peers it holds. Queued
+    /// once per stream, so again after the member's link or stream is
+    /// replaced and it resyncs. Only mesh nodes queue it.
+    MeshMemberSynced {
+        /// The member's backbone peer id.
+        member: PeerId,
+        /// How many reserved peers this node's directory holds for the
+        /// member once the snapshot completed.
+        entries: usize,
     },
     /// Asynchronous diagnostic that does not replace stable lifecycle events.
     Error(RelayServerRuntimeError),

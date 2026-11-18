@@ -24,7 +24,15 @@ Run `just interop-relay-rust` to start a minip2p TCP relay and two independent r
 
 The gate requires a reservation, the relay's Identify HOP advertisement, HOP CONNECT and STOP establishment, and successful ping traffic (bytes accepted in both directions). It configures non-default duration and byte limits and asserts that rust-libp2p decodes the exact values on RESERVE and both circuit legs. Successful reservation proves rust-libp2p accepts minip2p's `voucher: None`. The gate does not assert deliberate minip2p deviations as upstream parity. It is ignored in ordinary tests because it downloads/builds the pinned foreign implementation and owns loopback sockets.
 
-Recorded environment/result: macOS arm64, Rust stable 1.91-compatible toolchain, `just interop-relay-rust`: success (2026-08-20).
+The same recipe runs a second case against a two-node relay mesh: two minip2p relay Endpoints share one public identity and link over a loopback QUIC backbone. The destination reserves on the first node and the source dials through the second, so the unchanged rust-libp2p clients complete CONNECT/STOP and ping across the backbone, and both nodes report the circuit with the other's backbone peer ID in `via`.
+
+Recorded environment/result: macOS arm64, Rust stable 1.91-compatible toolchain, `just interop-relay-rust`: success (2026-08-20). Linux x86_64 (Ubuntu 26.04), Rust 1.99, both cases including the mesh: success (2026-11-13).
+
+## Relay mesh against go-libp2p
+
+Run `just interop-relay-go` (needs Go) to run the same two-node mesh case with go-libp2p v0.48.0's circuit relay v2 client: the harness in `go-libp2p/`, started as `go-libp2p relay <relay-addr> <duration-secs> <byte-limit> [source-relay-addr]`, connects a destination host to the first node, checks its Identify advertises HOP, and reserves; a second host dials the destination's `/p2p-circuit` address through the other node; each pings the other, and both check the duration and byte limits on their circuit leg. The relays then assert the reservation, one circuit per node with the other node's backbone peer ID in `via`, and bytes in both directions. The byte limit is 64 KiB rather than the rust-libp2p gate's 2 KiB: go-libp2p's Noise handshake and Identify use about 2 KiB per direction on the circuit before ping runs.
+
+Recorded environment/result: Linux x86_64 (Ubuntu 26.04), Go 1.26.11, Rust 1.99, `just interop-relay-go`: success (2026-11-18).
 
 ## Still separate
 

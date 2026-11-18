@@ -331,6 +331,29 @@ With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/mes
 
 Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` fails `bind()` with `BindError::Swarm(SwarmError::ReservedProtocol { .. })`, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
 
+## Hosting a relay mesh
+
+With QUIC, a std relay can be one node of a relay mesh: several relays that share one identity (and so one relay address, behind geo DNS), each serving peers reserved on any of them by forwarding circuits to the node that holds the reservation ([`minip2p_relay_server::mesh`](../relay-server/README.md)). Give every node the same `identity` and a backbone key of its own:
+
+```rust,no_run
+use minip2p::{Ed25519Keypair, Endpoint, PeerAddr, RelayMeshConfig};
+
+# let (public_key, backbone_key) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
+// Every node's backbone address and backbone peer id; each node skips its own.
+let members: Vec<PeerAddr> = vec![
+    "/ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse()?,
+];
+let endpoint = Endpoint::builder()
+    .identity(public_key)
+    .relay_server()
+    .relay_mesh(RelayMeshConfig::new(backbone_key, members))
+    .listen_on("/ip4/0.0.0.0/udp/19876/quic-v1")?
+    .bind()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The backbone is a second swarm under the backbone key, on its own QUIC socket (UDP `19877` on every interface by default, `DEFAULT_RELAY_MESH_PORT`), sharing the endpoint's wait; `Endpoint::relay_mesh_addresses` reports where it listens. The endpoint dials every member at start and redials a lost one with backoff (1 s doubling to 30 s); both ends of a pair dial, and the swarm keeps one connection. A backbone connection from a peer that is not a member is closed. Backbone traffic never reaches the application: `wait` reports only `EndpointEvent::RelayMeshMemberUp` and `RelayMeshMemberDown`, queued after the batch's `RelayServer` events, and a circuit that crossed the backbone carries the other node's backbone peer id in `CircuitOpened`/`CircuitClosed`'s `via`. `relay_mesh` without a relay server, a backbone key equal to the endpoint's identity, or a listen or member address that is not `/ip4|ip6/<ip>/udp/<port>/quic-v1` fails `bind` with `BindError::Options`; a backbone socket that cannot be bound is `BindError::RelayMesh`. Nodes need synced clocks (NTP): reservation expiries cross the backbone as UNIX seconds.
+
 ## Benchmarks
 
 `benches/endpoint_e2e.rs` times connection setup, ping, echo, and transfer over QUIC and TCP. `benches/endpoint_idle.rs` measures what an idle endpoint with no peers costs: blocking waits on the endpoint's shared poll per second and process CPU milliseconds per second, for QUIC alone, for QUIC + TCP with the relay server, Gossipsub, and mDNS started, and for the same without mDNS. It needs the `bench` feature, which compiles in the wait counters from `minip2p_transport::bench` and is off by default:

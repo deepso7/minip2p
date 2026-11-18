@@ -137,6 +137,31 @@ pub enum EndpointOptionsError {
          enabled; call EndpointBuilder::relay_server or relay_server_config"
     )]
     RelayAnnounceWithoutServer,
+    /// A relay mesh was configured without enabling the relay server.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    #[error(
+        "a relay mesh was configured, but the relay server is not enabled; call \
+         EndpointBuilder::relay_server or relay_server_config"
+    )]
+    RelayMeshWithoutServer,
+    /// The relay-mesh backbone identity is the endpoint's own: links between
+    /// nodes that share one peer id would replace each other.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    #[error(
+        "the relay-mesh backbone identity must differ from the endpoint's identity, which \
+         every mesh node shares; give each node a backbone key of its own"
+    )]
+    RelayMeshPublicIdentity,
+    /// A relay-mesh member's address is not one the backbone can dial.
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    #[error(
+        "relay-mesh member `{addr}` is not a backbone address; expected \
+         `/ip4|ip6/<ip>/udp/<port>/quic-v1/p2p/<backbone peer id>`"
+    )]
+    RelayMeshMember {
+        /// The rejected member.
+        addr: minip2p_core::PeerAddr,
+    },
 }
 
 /// A failure turning [`EndpointBuilder`](super::EndpointBuilder) options into
@@ -194,6 +219,11 @@ pub enum BindError {
     #[cfg(feature = "quic")]
     #[error("QUIC transport: {0}")]
     Quic(QuicBindError),
+    /// The relay-mesh backbone's QUIC transport could not be built (its
+    /// port in use, say).
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    #[error("relay-mesh backbone QUIC transport: {0}")]
+    RelayMesh(QuicBindError),
     /// A transport could not start listening (a TCP listener's port in use,
     /// say).
     #[error("listen: {0}")]

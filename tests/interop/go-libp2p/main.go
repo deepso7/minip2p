@@ -1,4 +1,6 @@
-// Command go-libp2p is the foreign peer used by minip2p's live TCP interop gate.
+// Command go-libp2p is the foreign peer used by minip2p's live interop gates:
+// a TCP/Noise/Yamux echo peer driven over JSON lines on stdin/stdout, or,
+// with a leading `relay` argument, a circuit relay v2 client (see relay.go).
 package main
 
 import (
@@ -40,6 +42,13 @@ type event struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "relay" {
+		if err := runRelay(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "go-libp2p relay client:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	ctx := context.Background()
 	node, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	if err != nil {

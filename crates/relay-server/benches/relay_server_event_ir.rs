@@ -126,6 +126,15 @@ impl RelaySwarm for BenchSwarm {
         self.counts.resets += 1;
         Ok(())
     }
+
+    fn close_connection(
+        &mut self,
+        _peer: &PeerId,
+        _conn_id: ConnectionId,
+        _now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        Ok(())
+    }
 }
 
 const PEERS: u64 = 128;

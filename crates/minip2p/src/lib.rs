@@ -31,6 +31,8 @@ mod nat;
 mod portable;
 #[cfg(feature = "pubsub")]
 mod pubsub;
+#[cfg(all(feature = "relay-server", feature = "quic"))]
+mod relay_mesh;
 #[cfg(feature = "relay-server")]
 mod relay_server;
 mod setup;
@@ -43,6 +45,8 @@ mod writer;
 pub use portable::*;
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
+#[cfg(all(feature = "relay-server", feature = "quic"))]
+pub use relay_mesh::{DEFAULT_RELAY_MESH_PORT, RelayMeshConfig};
 #[cfg(feature = "relay-server")]
 pub use relay_server::RelayServerControlError;
 #[cfg(feature = "autonat")]

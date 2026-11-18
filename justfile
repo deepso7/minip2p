@@ -61,6 +61,10 @@ interop-go:
 interop-relay-rust:
     cargo test -p minip2p-rs --features relay-server,tcp --test relay_rust_interop -- --ignored --nocapture
 
+# go-libp2p's circuit relay v2 client across a two-node minip2p relay mesh (needs Go).
+interop-relay-go:
+    cargo test -p minip2p-rs --features relay-server,tcp --test relay_go_interop -- --ignored --nocapture
+
 docs:
     cargo doc --workspace --no-deps
     RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps

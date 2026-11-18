@@ -123,8 +123,8 @@ impl Received {
 }
 
 /// A non-blocking UDP socket plus its bounded retry queue, and the state the
-/// transport keeps per socket: connection ids come from the socket's family
-/// namespace, and each socket has its own receive bound, so one family's
+/// transport keeps per socket: connection ids come from the namespace
+/// configured for the socket's family, and each socket has its own receive bound, so one family's
 /// traffic cannot starve the other's.
 pub(crate) struct Socket {
     pub(crate) udp: UdpSocket,
@@ -181,6 +181,7 @@ impl Socket {
     pub(crate) fn new(
         udp: UdpSocket,
         local_addr: SocketAddr,
+        namespace: ConnectionNamespace,
         max_pending: usize,
         tally: DatagramTally,
     ) -> io::Result<Self> {
@@ -189,11 +190,6 @@ impl Socket {
         enable_apple_fast_path(&state);
         let buffers = grow_buffers(&state, &udp);
         tally.record_socket_buffers(buffers);
-        let namespace = if local_addr.is_ipv6() {
-            ConnectionNamespace::QUIC_IPV6
-        } else {
-            ConnectionNamespace::QUIC_IPV4
-        };
         Ok(Self {
             udp,
             state,

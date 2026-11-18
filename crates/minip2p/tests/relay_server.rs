@@ -242,7 +242,7 @@ fn exercise_relay(
 
     let relay_events = pair.finish();
     assert!(relay_events.iter().any(|event| matches!(event, RelayServerEvent::ReservationAccepted { peer_id, .. } if peer_id == &responder_peer)));
-    assert!(relay_events.iter().any(|event| matches!(event, RelayServerEvent::CircuitOpened { source_peer_id, destination_peer_id } if source_peer_id == &initiator_peer && destination_peer_id == &responder_peer)));
+    assert!(relay_events.iter().any(|event| matches!(event, RelayServerEvent::CircuitOpened { source_peer_id, destination_peer_id, via: None } if source_peer_id == &initiator_peer && destination_peer_id == &responder_peer)));
 }
 
 /// Built exactly as the README hosts a relay: `bind()` alone, no `listen()`.

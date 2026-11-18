@@ -1,6 +1,6 @@
 # Plan: relay mesh — one relay address served from several regions
 
-> **Status:** Proposed. Not implemented. Review history: reviewed with gpt-6.1-sol (high). Round 1: 8 findings (1 blocker: clients don't retry a refused CONNECT, so the relay must settle transient directory states itself). Round 2: that blocker still open (a stale holding node at capacity blocked fallback), plus 1 nit. Round 3: approved. Every finding was checked against the code and fixed.
+> **Status:** Implemented in [#548](https://github.com/deepso7/minip2p/pull/548), which combines the PR stack below (PRs 1–5; decisions recorded in [ADR 0027](../adr/0027-relay-mesh-two-identities-and-single-hop-forwarding.md)). The Ops steps (PR 6) are a runbook in [infra/relay/README.md](../../infra/relay/README.md), not yet carried out. The mesh interop runs against both rust-libp2p (`just interop-relay-rust`) and go-libp2p (`just interop-relay-go`). Review history: reviewed with gpt-6.1-sol (high). Round 1: 8 findings (1 blocker: clients don't retry a refused CONNECT, so the relay must settle transient directory states itself). Round 2: that blocker still open (a stale holding node at capacity blocked fallback), plus 1 nit. Round 3: approved. Every finding was checked against the code and fixed.
 
 ## Goal
 
@@ -82,7 +82,7 @@ The agent needs a hook at each change. Today `ReservationAccepted` and `Reservat
 
 Clients can't be relied on to retry. When a connected relay refuses a HOP CONNECT, minip2p's connect attempt retires every remaining address for that relay peer ID and fails if no other relay is configured (`crates/nat/src/attempt.rs:1289-1338`). Every region shares one peer ID, so to the client the whole mesh is one relay: any `NO_RESERVATION` the mesh gets wrong fails a connection that could have worked. The entry node therefore settles transient states itself, within the CONNECT's existing control deadline (`control_stream_timeout_ms`):
 
-1. **Local reservation:** use it. It is known to be live.
+1. **Local reservation:** use it. It is known to be live. If its STOP stream can't even be opened (the swarm already lost the connection, and the agent hasn't heard yet), it isn't, so fall through to the remote claims.
 2. **Remote claims:** order them by latest `expires_unix` (a new reservation gets now + the reservation lifetime, so the newest commit comes first), ties by lower backbone peer ID. Forward to the first. If it answers `NO_RESERVATION` or `CONNECTION_FAILED`, or the backbone link fails, try the next claim.
 3. **No claim left, but some member is connected and not yet synced:** hold the CONNECT until that member's `Synced` arrives or its link drops, then look again from step 1.
 4. **Otherwise,** or when the control deadline passes, answer the last status seen, or `NO_RESERVATION` if no claim was ever found.
@@ -118,7 +118,7 @@ The research for this plan found the committed forwarding path already generic: 
 - The `is_circuit` check that refuses CONNECT over relayed connections doesn't apply to backbone connections, which are direct.
 - **Each circuit stores its effective limit.** Today `commit_circuit` schedules the duration deadline from the agent's config, and `forward_accepted` checks bytes against the same config (`agent.rs:1574`, `1791-1824`). A forwarded circuit on the holding node must enforce `Forward.limit` instead (Decision 7), so `PendingCircuit` and `Circuit` carry their `Limit`, set from config for local circuits and from the message for forwarded ones, and the duration deadline and byte check read it. Zero still means unlimited.
 - A pending CONNECT can wait on a member's `Synced` or on the next claim (Decision 4), so it needs a state for "resolving" besides "STOP pending" and "forward pending", under the same control deadline.
-- `CircuitOpened` and `CircuitClosed` gain `via: Option<PeerId>`, the other node's backbone peer ID, so logs show which circuits crossed the backbone.
+- `CircuitOpened` and `CircuitClosed` gain `via: Option<Box<PeerId>>`, the other node's backbone peer ID, so logs show which circuits crossed the backbone.
 
 The directory, the codec and the `MeshSwarm` adapter live in a new `mesh` module of `crates/relay-server`. They are `no_std + alloc` with caller-supplied time, like the rest of the crate.
 
@@ -132,7 +132,7 @@ The directory, the codec and the `MeshSwarm` adapter live in a new `mesh` module
 ### 8. Endpoint and relay binary
 
 - **Endpoint:** `EndpointBuilder::relay_mesh(RelayMeshConfig { identity, listen, members })`, valid only with `relay_server`. `members` is a list of `PeerAddr`s (backbone addresses with backbone peer IDs). The node skips its own backbone peer ID if it appears, so every node can use the same list. New `EndpointEvent` variants report a member link coming up or going down.
-- **Relay binary:** `--mesh-key <path>`, `--mesh-listen <addr>` (repeatable, default `0.0.0.0:19877` and `[::]:19877`), and `--mesh-member <peer addr>` (repeatable). The backbone key is created on first run like the public key, with the same permission checks. `service install` passes the flags through and stores the backbone key next to the identity (`/var/lib/minip2p-relay/mesh.key`). Logs: `[relay] mesh member=<id> up|down` and the directory size per member.
+- **Relay binary:** `--mesh-key <path>`, `--mesh-listen <addr>` (repeatable, default `0.0.0.0:19877` and `[::]:19877`), and `--mesh-member <peer addr>` (repeatable). The backbone key is created on first run like the public key, with the same permission checks. `service install` passes the flags through and stores the backbone key next to the identity (`/var/lib/minip2p-relay/mesh.key`). Logs: `[relay] mesh member=<id> up|down` and the directory size per member (`[relay] mesh member=<id> synced entries=<n>`, once per completed snapshot).
 
 ## Ops: `relay.minip2p.com` as a mesh
 
