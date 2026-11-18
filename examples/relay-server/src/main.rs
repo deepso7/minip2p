@@ -5,6 +5,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod certificate;
 mod cli;
+mod config;
 mod service;
 
 use std::error::Error;
@@ -84,8 +85,8 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         endpoint.peer_id(),
         options.accepting
     );
-    // What the other mesh nodes list for this one in --mesh-member, with a
-    // wildcard IP replaced by this node's public one.
+    // What the other mesh nodes list for this one in [mesh] members (or
+    // --mesh-member), with a wildcard IP replaced by this node's public one.
     for address in endpoint.relay_mesh_addresses() {
         println!("[relay] mesh listening={address}");
     }

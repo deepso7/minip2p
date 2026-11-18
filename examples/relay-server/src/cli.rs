@@ -1,10 +1,11 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use minip2p::{Multiaddr, PeerAddr, Protocol, RateLimit, RelayServerConfig};
+use minip2p::{Endpoint, Multiaddr, PeerAddr, Protocol, RateLimit, RelayServerConfig};
 
-#[derive(Debug)]
+/// What the relay runs with, from flags or from a `--config` file.
+#[derive(Debug, PartialEq)]
 pub struct Options {
     /// Exact QUIC binds; empty selects automatic IPv4/IPv6 binding.
     pub quic_binds: Vec<SocketAddr>,
@@ -31,7 +32,8 @@ pub struct MeshOptions {
     pub key_path: PathBuf,
     /// Exact backbone binds; empty selects UDP 19877 on IPv4 and IPv6.
     pub listen: Vec<SocketAddr>,
-    /// Every member's backbone address; this node's own entry is skipped.
+    /// Backbone addresses of the members this node dials; its own entry is
+    /// skipped. Members it doesn't list can still dial it.
     pub members: Vec<PeerAddr>,
 }
 
@@ -42,22 +44,40 @@ pub struct CertificatePaths {
     pub key: PathBuf,
 }
 
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            quic_binds: Vec::new(),
+            tcp_binds: Vec::new(),
+            key_path: None,
+            announce_addrs: Vec::new(),
+            accepting: true,
+            webtransport: false,
+            webtransport_certificate: None,
+            webtransport_reload_interval: Duration::from_secs(30),
+            config: RelayServerConfig::default(),
+            mesh: None,
+        }
+    }
+}
+
+/// Parses the relay's flags, or `--config PATH` alone, which reads them all
+/// from a file (see [`crate::config`]).
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
-    let mut options = Options {
-        quic_binds: Vec::new(),
-        tcp_binds: Vec::new(),
-        key_path: None,
-        announce_addrs: Vec::new(),
-        accepting: true,
-        webtransport: false,
-        webtransport_certificate: None,
-        webtransport_reload_interval: Duration::from_secs(30),
-        config: RelayServerConfig::default(),
-        mesh: None,
-    };
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--config") {
+        return match args.as_slice() {
+            [flag, path] if flag == "--config" => crate::config::load(Path::new(path)),
+            _ => Err(
+                "--config PATH excludes every other option; set them in the config file instead"
+                    .into(),
+            ),
+        };
+    }
+    let mut options = Options::default();
     let (mut certificate, mut key) = (None, None);
     let (mut mesh_key, mut mesh_listen, mut mesh_members) = (None, Vec::new(), Vec::new());
-    let mut args = args.into_iter().collect::<Vec<_>>().into_iter();
+    let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
         match flag.as_str() {
@@ -144,15 +164,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         }
     };
     options.webtransport |= options.webtransport_certificate.is_some();
-    if options.quic_binds.len() > 2 {
-        return Err("--quic accepts at most one IPv4 and one IPv6 address".into());
-    }
-    check_mesh(&mesh_listen, &mesh_members)?;
     options.mesh = match mesh_key {
-        // An ephemeral public identity can't be shared with the other nodes.
-        Some(_) if options.key_path.is_none() => {
-            return Err("--mesh-key needs --key: every mesh node loads the same identity".into());
-        }
         Some(key_path) => Some(MeshOptions {
             key_path,
             listen: mesh_listen,
@@ -161,11 +173,60 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         None if mesh_listen.is_empty() && mesh_members.is_empty() => None,
         None => return Err("--mesh-listen and --mesh-member need --mesh-key".into()),
     };
-    options
-        .config
-        .validate()
-        .map_err(|error| error.to_string())?;
+    validate(&options)?;
     Ok(options)
+}
+
+/// The checks flags and config files share, so the relay refuses a bad
+/// setting before it binds anything. Errors name the flag and its field.
+pub(crate) fn validate(options: &Options) -> Result<(), String> {
+    for ipv4 in [true, false] {
+        if options
+            .quic_binds
+            .iter()
+            .filter(|bind| bind.is_ipv4() == ipv4)
+            .count()
+            > 1
+        {
+            return Err("--quic (quic) accepts at most one IPv4 and one IPv6 address".into());
+        }
+    }
+    // The Endpoint checks these too, but only once `service install` has
+    // replaced a working config. The builder call binds nothing.
+    if !options.announce_addrs.is_empty() {
+        Endpoint::builder()
+            .relay_server_announce_addrs(options.announce_addrs.clone())
+            .map_err(|error| format!("invalid --announce (announce): {error}"))?;
+    }
+    let ca_certificate = options.webtransport_certificate.is_some();
+    for address in &options.announce_addrs {
+        if address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::WebTransport))
+            && address.certhashes().next().is_some() == ca_certificate
+        {
+            return Err(if ca_certificate {
+                format!(
+                    "WebTransport announce {address} must not carry a /certhash with a CA certificate"
+                )
+            } else {
+                format!(
+                    "WebTransport announce {address} needs the /certhash from the `webtransport=` log line, or a CA certificate"
+                )
+            });
+        }
+    }
+    if let Some(mesh) = &options.mesh {
+        check_mesh(&mesh.listen, &mesh.members)?;
+        // An ephemeral public identity can't be shared with the other nodes.
+        if options.key_path.is_none() {
+            return Err(
+                "the mesh needs a persistent identity (--key, or key in the config): every mesh node loads the same one"
+                    .into(),
+            );
+        }
+    }
+    options.config.validate().map_err(|error| error.to_string())
 }
 
 fn next_value(flag: &str, args: &mut std::vec::IntoIter<String>) -> Result<String, String> {
@@ -183,19 +244,18 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
         .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}"))
 }
 
-/// Resolves one `HOST:PORT` bind to the single socket address it binds: the
-/// resolver's first answer. One flag is one socket, as before binds became
-/// listen multiaddrs; repeat the flag (or pass IPs) to bind both families.
-/// Checks mesh settings the relay would only reject once bound, so that
-/// `service install` refuses them before replacing a working unit.
-pub(crate) fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<(), String> {
+/// Checks mesh settings the relay would only reject once bound.
+fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<(), String> {
     // The backbone transport binds one socket per family.
     for ipv4 in [true, false] {
         let mut family = listen.iter().filter(|address| address.is_ipv4() == ipv4);
         if let Some(first) = family.next()
             && family.any(|address| address != first)
         {
-            return Err("--mesh-listen accepts at most one IPv4 and one IPv6 address".into());
+            return Err(
+                "--mesh-listen ([mesh] listen) accepts at most one IPv4 and one IPv6 address"
+                    .into(),
+            );
         }
     }
     for member in members {
@@ -208,13 +268,16 @@ pub(crate) fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<
             ]
         ) {
             return Err(format!(
-                "--mesh-member {member} must be /ip4|ip6/IP/udp/PORT/quic-v1/p2p/BACKBONE_ID"
+                "mesh member {member} must be /ip4|ip6/IP/udp/PORT/quic-v1/p2p/BACKBONE_ID"
             ));
         }
     }
     Ok(())
 }
 
+/// Resolves one `HOST:PORT` bind to the single socket address it binds: the
+/// resolver's first answer. One flag is one socket, as before binds became
+/// listen multiaddrs; repeat the flag (or pass IPs) to bind both families.
 pub(crate) fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
     value
         .to_socket_addrs()
@@ -225,7 +288,7 @@ pub(crate) fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{flag} {value:?} resolved to no address"))
 }
 
-fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
+pub(crate) fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
     if value == "off" {
         return Ok(None);
     }
@@ -239,7 +302,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash without --webtransport-cert, and none with it)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--webtransport-cert PATH       CA-signed WebTransport certificate chain (PEM); implies --webtransport\n--webtransport-key PATH        the --webtransport-cert private key (PEM); required with it\n--webtransport-reload-secs N   how often to check both files and serve a renewed certificate (default 30)\n--paused                       start with new admissions paused\n--mesh-key PATH                load/create this node's relay-mesh backbone identity; enables the mesh\n--mesh-listen HOST:PORT        exact backbone UDP bind (repeatable; default 0.0.0.0:19877 and [::]:19877)\n--mesh-member PEER_ADDR        a member's /ip4|ip6/.../udp/PORT/quic-v1/p2p/BACKBONE_ID (repeatable; own entry skipped)\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME [--import-key PATH] [--webtransport] [--webtransport-cert PATH --webtransport-key PATH] [--mesh] [--mesh-listen HOST:PORT]... [--mesh-member PEER_ADDR]...\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay --config PATH\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--config PATH                  read every option below from a TOML file instead (no other flags)\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash without --webtransport-cert, and none with it)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--webtransport-cert PATH       CA-signed WebTransport certificate chain (PEM); implies --webtransport\n--webtransport-key PATH        the --webtransport-cert private key (PEM); required with it\n--webtransport-reload-secs N   how often to check both files and serve a renewed certificate (default 30)\n--paused                       start with new admissions paused\n--mesh-key PATH                load/create this node's relay-mesh backbone identity; enables the mesh\n--mesh-listen HOST:PORT        exact backbone UDP bind (repeatable; default 0.0.0.0:19877 and [::]:19877)\n--mesh-member PEER_ADDR        a member's /ip4|ip6/.../udp/PORT/quic-v1/p2p/BACKBONE_ID (repeatable; own entry skipped)\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install (--hostname HOSTNAME | --config PATH) [--import-key PATH]\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -292,6 +355,45 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
+    }
+
+    #[test]
+    fn rejects_two_quic_binds_in_one_family() {
+        let error = parse([
+            "--quic".into(),
+            "127.0.0.1:4101".into(),
+            "--quic".into(),
+            "127.0.0.2:4101".into(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_wildcard_announce_before_binding() {
+        let error = parse(["--announce".into(), "/ip4/0.0.0.0/tcp/4001".into()]).unwrap_err();
+        assert!(error.contains("invalid --announce"), "{error}");
+    }
+
+    #[test]
+    fn a_hashless_webtransport_announce_needs_a_ca_certificate() {
+        let announce = "/dns/relay.example.com/udp/19876/quic-v1/webtransport";
+        let error = parse([
+            "--webtransport".into(),
+            "--announce".into(),
+            announce.into(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("needs the /certhash"), "{error}");
+        parse([
+            "--webtransport-cert".into(),
+            "c.pem".into(),
+            "--webtransport-key".into(),
+            "k.pem".into(),
+            "--announce".into(),
+            announce.into(),
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -402,7 +504,7 @@ mod tests {
     #[test]
     fn rejects_incomplete_mesh_flags() {
         let error = parse(["--mesh-key".into(), "mesh.key".into()]).unwrap_err();
-        assert!(error.contains("--mesh-key needs --key"), "{error}");
+        assert!(error.contains("persistent identity"), "{error}");
         for flag in ["--mesh-listen", "--mesh-member"] {
             let value = if flag == "--mesh-listen" {
                 "127.0.0.1:4301"

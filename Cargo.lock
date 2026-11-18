@@ -1346,8 +1346,11 @@ dependencies = [
  "minip2p-example-common",
  "minip2p-rs",
  "minip2p-tls",
+ "rustix",
  "rustls-pki-types",
+ "serde",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

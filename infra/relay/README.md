@@ -8,7 +8,7 @@ This directory holds the relay container image (`Dockerfile`, published as `ghcr
 - **DNS:** `A 13.200.143.202` and `AAAA 2406:da1a:515:6cb6:8928:6c77:ed2:2ebe`. The IPv4 address is the instance's auto-assigned public IP, not an Elastic IP: stopping and starting the instance changes it, and the `A` record must follow. A reboot keeps it.
 - **Security groups:** `relay-server-sg` allows TCP and UDP `19876` (relay) and TCP `80` (certbot's HTTP-01 challenge).
 - **Peer ID:** `12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf`, from `/var/lib/minip2p-relay/identity.key`. Losing that file changes the peer ID and breaks every published address, so back it up before replacing the instance.
-- **Service:** the systemd unit `minip2p-relay` from `minip2p-relay service install`, announcing `/dns/relay.minip2p.com/tcp/19876` and `/dns/relay.minip2p.com/udp/19876/quic-v1`, with WebTransport on a Let's Encrypt certificate.
+- **Service:** the systemd unit `minip2p-relay` from `minip2p-relay service install`, announcing `/dns/relay.minip2p.com/tcp/19876` and `/dns/relay.minip2p.com/udp/19876/quic-v1`, with WebTransport on a Let's Encrypt certificate. Its options live in `/etc/minip2p-relay/relay.toml`; change them with `sudoedit` and `sudo minip2p-relay service restart`.
 
 ### Operate it
 
@@ -25,6 +25,26 @@ Upgrade to the latest release:
 curl -fsSL https://minip2p.com/install/relay.sh | sh
 sudo minip2p-relay service restart
 ```
+
+### Move to the config file
+
+Releases before the config file baked every option into the unit's `ExecStart`. After upgrading the binary, reinstall once from a config with the current WebTransport paths. The unit then runs `minip2p-relay --config /etc/minip2p-relay/relay.toml` and never changes again:
+
+```toml
+# relay.toml
+hostname = "relay.minip2p.com"
+
+[webtransport]
+cert = "/etc/minip2p-relay/tls/fullchain.pem"
+key = "/etc/minip2p-relay/tls/privkey.pem"
+```
+
+```bash
+sudo minip2p-relay service install --config relay.toml
+minip2p-relay service logs
+```
+
+The logs must show the same peer ID and `webtransport=/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/p2p/…`. Without that line the `[webtransport]` section is missing or wrong, and browsers can't connect.
 
 ### Certificate
 
@@ -54,7 +74,7 @@ Not carried out yet. These steps turn `relay.minip2p.com` into a relay mesh: sev
 | `eu-central-1` (Frankfurt) | new                                      |
 | `us-east-1`                | new                                      |
 
-Give every node an Elastic IP, Mumbai included: the current instance has an auto-assigned IPv4 address that changes on stop/start, and the member list and DNS records need fixed addresses. Attach Mumbai's before any DNS change, and update its `A` record to it. Keep NTP running on every node (Ubuntu's default `systemd-timesyncd` is enough): reservation expiries cross the backbone as UNIX seconds.
+Give every node an Elastic IP, Mumbai included: the current instance has an auto-assigned IPv4 address that changes on stop/start, and member entries and DNS records need fixed addresses. Attach Mumbai's before any DNS change, and update its `A` record to it. Keep NTP running on every node (Ubuntu's default `systemd-timesyncd` is enough): reservation expiries cross the backbone as UNIX seconds.
 
 ### Keys
 
@@ -72,7 +92,7 @@ Give every node an Elastic IP, Mumbai included: the current instance has an auto
     --with-decryption --query Parameter.Value --output text | tr -d "[:space:]" > /root/identity.key'
   ```
 
-- **Backbone keys.** Each node creates its own at `/var/lib/minip2p-relay/mesh.key` on its first start with `--mesh`, and prints its backbone address as `[relay] mesh listening=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/<backbone peer ID>`. Put the node's Elastic IP in place of `0.0.0.0` to get its member entry, `/ip4/<elastic ip>/udp/19877/quic-v1/p2p/<backbone peer ID>`. The full list of entries is the member list, the same on every node.
+- **Backbone keys.** `service install` with a `[mesh]` section creates each node's own at `/var/lib/minip2p-relay/mesh.key`, and prints its backbone address as `mesh_member_candidate=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/<backbone peer ID>`. Put the node's Elastic IP in place of `0.0.0.0` to get its member entry, `/ip4/<elastic ip>/udp/19877/quic-v1/p2p/<backbone peer ID>`. The shared identity signs each backbone key, so nodes accept each other without a member list to check against.
 
 A breach of any node exposes the public identity for the whole mesh, and replacing it changes every published address: no SSH open to the world, and nothing but the relay role can read the parameter.
 
@@ -113,45 +133,48 @@ The instance role needs, as in the [plugin's policy](https://certbot-dns-route53
 
 ### Rollout
 
-1. **Mumbai alone.** Upgrade it to the mesh release and reinstall its service with a backbone key and no members. It behaves as today:
+Mumbai's `relay.toml` lists no members:
+
+```toml
+hostname = "relay.minip2p.com"
+
+[webtransport]
+cert = "/etc/minip2p-relay/tls/fullchain.pem"
+key = "/etc/minip2p-relay/tls/privkey.pem"
+
+[mesh]
+members = []
+```
+
+1. **Mumbai alone.** Upgrade it to the mesh release and install it from that config. It behaves as today:
 
    ```bash
-   sudo minip2p-relay service install --hostname relay.minip2p.com \
-     --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
-     --webtransport-key /etc/minip2p-relay/tls/privkey.pem \
-     --mesh
+   sudo minip2p-relay service install --config relay.toml
    minip2p-relay service logs
    ```
 
-   Note its `mesh listening=` line and build its member entry.
+   Install prints `mesh_member_candidate=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/<backbone id>` (and an `/ip6/::` line). Put the Elastic IP in place of `0.0.0.0` to get its member entry, and check it against the `mesh listening=` log line.
 
-2. **New regions.** On each new node: attach its Elastic IP, install the relay, fetch the identity key from SSM, and set up its certificate. Then install with the imported identity and a backbone key, still without members:
+2. **New regions, one at a time.** On each new node: attach its Elastic IP, install the relay, fetch the identity key from SSM, and set up its certificate. Its `relay.toml` is Mumbai's with `members` listing every node already running:
 
-   ```bash
-   sudo minip2p-relay service install --hostname relay.minip2p.com \
-     --import-key /root/identity.key \
-     --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
-     --webtransport-key /etc/minip2p-relay/tls/privkey.pem \
-     --mesh
-   sudo rm /root/identity.key
+   ```toml
+   [mesh]
+   members = [
+     "/ip4/<mumbai eip>/udp/19877/quic-v1/p2p/<mumbai backbone id>",
+     # "/ip4/<frankfurt eip>/udp/19877/quic-v1/p2p/<frankfurt backbone id>",  # for the next node
+   ]
    ```
 
-   Check that its `[relay] peer=` line shows `12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf`, and build its member entry from its `mesh listening=` line.
-
-3. **Member list.** With every node's entry known, rerun `service install` on every node, Mumbai included, with the same flags as before minus `--import-key`, plus the full list. Every node takes the same list and skips its own entry:
+   Open UDP `19877` between the new node and every running one, then install with the imported identity:
 
    ```bash
-   sudo minip2p-relay service install --hostname relay.minip2p.com \
-     --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
-     --webtransport-key /etc/minip2p-relay/tls/privkey.pem \
-     --mesh-member /ip4/<mumbai eip>/udp/19877/quic-v1/p2p/<mumbai backbone id> \
-     --mesh-member /ip4/<frankfurt eip>/udp/19877/quic-v1/p2p/<frankfurt backbone id> \
-     --mesh-member /ip4/<us eip>/udp/19877/quic-v1/p2p/<us backbone id>
+   sudo minip2p-relay service install --config relay.toml --import-key /root/identity.key \
+     && sudo rm /root/identity.key
    ```
 
-   A node closes backbone connections from peers not on its list, so links come up once both ends have it.
+   Check that its `[relay] peer=` line shows `12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf`, and build its member entry from its `mesh_member_candidate=` line for the next node's list. The running nodes need no config change or restart: they accept the new node because the shared identity signed its backbone key.
 
-4. **Check the links,** then **switch DNS.** Every node's logs should show `[relay] mesh member=<id> up`, then `[relay] mesh member=<id> synced entries=<n>`, for every other member; until a member is synced, the node holds CONNECTs that could route to it. Then replace the single records with the latency records (DNS step 4).
-5. **Verify live.** From a client in each region, connect to a peer reserved from another region through `relay.minip2p.com`. The entry node logs `circuit opened … via=<holding node's backbone id>`.
+3. **Check the links,** then **switch DNS.** Every node's logs should show `[relay] mesh member=<id> up`, then `[relay] mesh member=<id> synced entries=<n>`, for every other member; until a member is synced, the node holds CONNECTs that could route to it. Then replace the single records with the latency records (DNS step 4).
+4. **Verify live.** From a client in each region, connect to a peer reserved from another region through `relay.minip2p.com`. The entry node logs `circuit opened … via=<holding node's backbone id>`.
 
-`[relay] mesh member=<id> down` means a backbone link dropped; the node redials it with backoff. Health checks can't see a backbone partition, so alert on that line. While a link is down, the two nodes answer `NO_RESERVATION` for each other's peers.
+`[relay] mesh member=<id> down` means a backbone link dropped; the node that lists the other redials it with backoff. Health checks can't see a backbone partition, so alert on that line. While a link is down, the two nodes answer `NO_RESERVATION` for each other's peers.

@@ -27,6 +27,12 @@ minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = [
 minip2p-example-common = { path = "../common" }
 minip2p-tls = { path = "../../crates/tls" }
 rustls-pki-types = "1.15.1"
+serde = { workspace = true, features = ["derive", "std"] }
+toml = { version = "0.9.12", default-features = false, features = [
+  "parse",
+  "serde",
+  "std",
+] }
 
 # Release binaries are static musl, whose allocator roughly halves relayed
 # throughput; mimalloc brings it back to the glibc build's.
@@ -35,3 +41,6 @@ mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.5", features = ["process"] }
