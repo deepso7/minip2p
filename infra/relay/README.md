@@ -158,8 +158,8 @@ members = []
 2. **New regions.** On each new node: attach its Elastic IP, install the relay, fetch the identity key from SSM, and set up its certificate. Then install with the imported identity:
 
    ```bash
-   sudo minip2p-relay service install --config relay.toml --import-key /root/identity.key
-   sudo rm /root/identity.key
+   sudo minip2p-relay service install --config relay.toml --import-key /root/identity.key \
+     && sudo rm /root/identity.key
    ```
 
    Check that its `[relay] peer=` line shows `12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf`, and build its member entry from its `mesh_member_candidate=` line.

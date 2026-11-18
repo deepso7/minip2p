@@ -85,7 +85,7 @@ In CA certificate mode the relay serves a certificate for your domain instead. B
     sudo minip2p-relay service install --config relay.toml
     ```
 
-    On a relay that is already installed, add the `[webtransport]` section to `/etc/minip2p-relay/relay.toml` instead and run `sudo minip2p-relay service restart`.
+    On a relay already installed with `--config`, set `cert` and `key` in `/etc/minip2p-relay/relay.toml`'s `[webtransport]` section instead (add the section if it is missing; a second `[webtransport]` table is an error) and run `sudo minip2p-relay service restart`. A unit installed by an earlier release still passes its options as flags and ignores the file: rerun `service install --config` with all its settings once.
 
     `minip2p-relay service logs` shows the address and the leaf's expiry:
 

@@ -70,6 +70,7 @@ fn service_install_rejects_an_invalid_hostname_before_touching_the_host() {
 
 /// Runs `minip2p-relay --config PATH` until it is ready and returns its
 /// output lines.
+#[cfg(unix)]
 fn run_config(path: &std::path::Path) -> Vec<String> {
     let mut relay = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
         .arg("--config")

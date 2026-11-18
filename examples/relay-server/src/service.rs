@@ -126,14 +126,15 @@ fn prepare_config(source: Source<'_>, existing: Option<&str>) -> Result<Prepared
     let text = fill_key_paths(text)?;
     let file = config::File::parse(&text)?;
     // The CLI's default is an ephemeral key, and another path would bypass
-    // `--import-key`'s refusal to replace the service identity.
-    if file.key.as_deref() != Some(Path::new(IDENTITY_PATH)) {
+    // `--import-key`'s refusal to replace the service identity. The exact
+    // spelling matters: `Path` equality ignores a trailing slash, `open` does not.
+    if file.key.as_deref().map(Path::as_os_str) != Some(OsStr::new(IDENTITY_PATH)) {
         return Err(format!(
             "key must be {IDENTITY_PATH:?}, the service identity; use --import-key to install another key there"
         ));
     }
     if let Some(mesh) = &file.mesh
-        && mesh.key.as_deref() != Some(Path::new(MESH_KEY_PATH))
+        && mesh.key.as_deref().map(Path::as_os_str) != Some(OsStr::new(MESH_KEY_PATH))
     {
         return Err(format!(
             "[mesh] key must be {MESH_KEY_PATH:?}, the service's backbone key"
@@ -772,6 +773,12 @@ WantedBy=multi-user.target\n"
     #[test]
     fn a_config_install_requires_the_service_key_paths() {
         let error = prepare_config(Source::File("key = \"/root/identity.key\""), None).unwrap_err();
+        assert!(error.contains("use --import-key"), "{error}");
+        let error = prepare_config(
+            Source::File("key = \"/var/lib/minip2p-relay/identity.key/\""),
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("use --import-key"), "{error}");
         let error = prepare_config(
             Source::File("[mesh]\nkey = \"/var/lib/minip2p-relay/identity.key\""),
