@@ -147,6 +147,8 @@ else
   echo "release: regenerating lockfiles"
   cargo metadata --format-version 1 >/dev/null
   cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
+  # Its Dockerfile builds with --locked, so the pinned minip2p versions must follow the bump.
+  cargo metadata --manifest-path tests/interop/unified-testing/Cargo.toml --format-version 1 >/dev/null
   pnpm install --lockfile-only --ignore-scripts
 
   # wasm-bindgen's import shim names hash the crate version, so the committed
