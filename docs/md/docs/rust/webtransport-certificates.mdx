@@ -11,7 +11,7 @@ With `--webtransport` alone, the relay serves self-signed certificates derived f
 
 In CA certificate mode the relay serves a certificate for your domain instead. Browsers check it like any HTTPS page, the address carries no Certhash, and it never changes.
 
-|  | Self-signed (`--webtransport`) | CA certificate (`--webtransport-cert`) |
+|  | Self-signed (`[webtransport]`, `--webtransport`) | CA certificate (`[webtransport] cert`, `--webtransport-cert`) |
 | --- | --- | --- |
 | Address | IP plus certhashes; stale within about 26 days | `/dns/<domain>/…/webtransport/p2p/…`; permanent |
 | Renewal | Automatic, in-process, every 13 days | certbot renews; the relay reloads the files live |
@@ -71,13 +71,21 @@ In CA certificate mode the relay serves a certificate for your domain instead. B
   </Step>
   <Step title="Install the service with the certificate">
 
-    The unit adds `--webtransport` and announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+    Write a `relay.toml` with the certificate. With a CA certificate, `hostname` also announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+
+    ```toml
+    hostname = "relay.example.com"
+
+    [webtransport]
+    cert = "/etc/minip2p-relay/tls/fullchain.pem"
+    key = "/etc/minip2p-relay/tls/privkey.pem"
+    ```
 
     ```bash
-    sudo minip2p-relay service install --hostname relay.example.com \
-      --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
-      --webtransport-key /etc/minip2p-relay/tls/privkey.pem
+    sudo minip2p-relay service install --config relay.toml
     ```
+
+    On a relay that is already installed, add the `[webtransport]` section to `/etc/minip2p-relay/relay.toml` instead and run `sudo minip2p-relay service restart`.
 
     `minip2p-relay service logs` shows the address and the leaf's expiry:
 
@@ -106,7 +114,7 @@ Hardcode the `webtransport=` address in the page. [`@minip2p/web`](/docs/typescr
 /dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…
 ```
 
-On a relay run in the foreground, pass the same files with `--webtransport-cert PATH --webtransport-key PATH` (they imply `--webtransport`) and announce the address yourself with `--announce /dns/relay.example.com/udp/19876/quic-v1/webtransport`.
+On a relay run in the foreground, pass the same config with `--config relay.toml`, or the files with `--webtransport-cert PATH --webtransport-key PATH` (they imply `--webtransport`) and announce the address yourself with `--announce /dns/relay.example.com/udp/19876/quic-v1/webtransport`.
 
 ## How auto-renewal works
 

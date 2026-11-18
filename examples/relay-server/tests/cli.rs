@@ -30,7 +30,7 @@ fn operator_help_points_to_service_installation() {
     assert!(stdout.starts_with("usage: minip2p-relay "), "{stdout}");
     assert!(stdout.contains("IPv6 port 19876"), "{stdout}");
     assert!(
-        stdout.contains("minip2p-relay service install --hostname HOSTNAME"),
+        stdout.contains("minip2p-relay service install (--hostname HOSTNAME | --config PATH)"),
         "{stdout}"
     );
 }
@@ -46,7 +46,7 @@ fn service_install_help_describes_the_host_setup() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--hostname <HOSTNAME>"), "{stdout}");
     assert!(stdout.contains("--import-key <PATH>"), "{stdout}");
-    assert!(stdout.contains("--webtransport-cert <PATH>"), "{stdout}");
+    assert!(stdout.contains("--config <FILE>"), "{stdout}");
     assert!(
         stdout.contains("Install and start a systemd service"),
         "{stdout}"
@@ -64,8 +64,106 @@ fn service_install_rejects_an_invalid_hostname_before_touching_the_host() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("invalid --hostname"), "{stderr}");
+    assert!(stderr.contains("invalid hostname"), "{stderr}");
     assert!(stderr.contains("not a hostname"), "{stderr}");
+}
+
+/// Runs `minip2p-relay --config PATH` until it is ready and returns its
+/// output lines.
+fn run_config(path: &std::path::Path) -> Vec<String> {
+    let mut relay = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
+        .arg("--config")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the relay");
+    let stdout = relay.stdout.take().expect("piped stdout");
+    let mut lines = Vec::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.expect("relay output");
+        let ready = line.starts_with("[relay] commands on stdin");
+        lines.push(line);
+        if ready {
+            break;
+        }
+    }
+    relay.kill().expect("stop the relay");
+    relay.wait().expect("reap the relay");
+    lines
+}
+
+// Persistent keys need unix file permissions.
+#[cfg(unix)]
+#[test]
+fn a_config_file_runs_the_relay_with_a_persistent_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("relay.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "key = {:?}\nquic = [\"127.0.0.1:0\"]\ntcp = [\"127.0.0.1:0\"]\npaused = true\n\n[webtransport]\n\n[mesh]\nkey = {:?}\nlisten = [\"127.0.0.1:0\"]\n",
+            dir.path().join("identity.key"),
+            dir.path().join("mesh.key"),
+        ),
+    )
+    .unwrap();
+    let peer = |lines: &[String]| {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("[relay] peer=")?.split(' ').next())
+            .unwrap()
+            .to_owned()
+    };
+
+    let first = run_config(&config);
+    assert!(
+        first.iter().any(|line| line.ends_with("persisted=created")),
+        "{first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|line| line.starts_with("[relay] mesh listening=/ip4/127.0.0.1/udp/")),
+        "{first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|line| line.starts_with("[relay] webtransport=")),
+        "{first:?}"
+    );
+    assert!(
+        first.iter().any(|line| line.ends_with("accepting=false")),
+        "{first:?}"
+    );
+    let second = run_config(&config);
+    assert_eq!(peer(&first), peer(&second));
+}
+
+#[test]
+fn a_config_file_excludes_other_flags_and_unknown_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("relay.toml");
+    std::fs::write(&config, "hostnme = \"relay.example.com\"\n").unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        String::from_utf8(output.stderr).unwrap()
+    };
+
+    let stderr = run(&["--paused"]);
+    assert!(
+        stderr.contains("--config PATH excludes every other option"),
+        "{stderr}"
+    );
+    let stderr = run(&[]);
+    assert!(stderr.contains("unknown field `hostnme`"), "{stderr}");
 }
 
 #[test]
