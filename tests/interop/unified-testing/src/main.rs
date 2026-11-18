@@ -1,15 +1,20 @@
-//! Transport test app for <https://github.com/libp2p/unified-testing>.
+//! Transport test app for libp2p's two interop harnesses:
+//! <https://github.com/libp2p/test-plans> (`transport-interop`) and
+//! <https://github.com/libp2p/unified-testing> (`transport`).
 //!
-//! Contract: `docs/write-a-transport-test-app.md` in that repo. Settings come
-//! from env vars; the listener publishes its multiaddr to Redis under
-//! `<TEST_KEY>_listener_multiaddr` and serves pings until Docker stops it; the
-//! dialer reads that address, connects, and pings twice: the first ping ends
-//! `handshake_plus_one_rtt`, the second (on the negotiated stream) is
-//! `ping_rtt`. It prints the latency YAML on stdout; everything else goes to
-//! stderr.
+//! Both run this image with settings in the environment, have the listener
+//! publish its multiaddr to Redis and serve pings until the runner stops the
+//! container, and have the dialer read that address, connect, and ping twice:
+//! the first ping ends `handshake_plus_one_rtt`, the second (on the negotiated
+//! stream) is `ping_rtt`. One result line goes to stdout; everything else goes
+//! to stderr. The address is a Redis *list* (`RPUSH` / `BLPOP`) in both, which
+//! is what the reference rust-libp2p image does -- unified-testing's own doc
+//! says `GET`, but test-plans' spec, the older of the two, says
+//! `RPUSH`/`BLPOP`.
 //!
-//! The Redis key is a list (RPUSH / BLPOP), not a string: that is what the
-//! reference rust-libp2p image does, whatever the doc says.
+//! [`Harness`] holds what they disagree on: the names of the settings, the
+//! Redis key, and whether the result is JSON or YAML. It is picked from
+//! whichever dialer flag the runner set, so neither harness needs configuring.
 
 use std::env;
 use std::error::Error;
