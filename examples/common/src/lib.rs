@@ -80,10 +80,10 @@ pub fn load_keypair(
     };
 
     if path.exists() {
-        let raw = read_secret(path)?;
-        let secret = decode_secret(raw.strip_suffix('\n').unwrap_or(&raw))
-            .map_err(|e| format!("invalid key file {}: {e}", path.display()))?;
-        let keypair = Ed25519Keypair::from_secret_key_bytes(secret);
+        #[cfg(unix)]
+        let keypair = read_keypair_owned_by(path, rustix::process::geteuid().as_raw())?;
+        #[cfg(not(unix))]
+        let keypair = decode_keypair(&read_secret(path)?, path)?;
         println!(
             "[{role}] peer={} identity={} persisted=loaded",
             keypair.peer_id(),
@@ -102,12 +102,35 @@ pub fn load_keypair(
     Ok(keypair)
 }
 
+/// Reads an existing key file that `owner_uid` owns with mode 0600, as
+/// [`load_keypair`] requires of the running uid's keys. `minip2p-relay
+/// service install` reads the service user's backbone key with it.
+#[cfg(unix)]
+pub fn read_keypair_owned_by(
+    path: &FsPath,
+    owner_uid: u32,
+) -> Result<Ed25519Keypair, Box<dyn Error>> {
+    decode_keypair(&read_secret(path, owner_uid)?, path)
+}
+
+/// The key file contents [`load_keypair`] writes and reads back: the
+/// secret's 64 hex characters and a newline.
+pub fn encode_key_file(keypair: &Ed25519Keypair) -> String {
+    format!("{}\n", encode_hex(&keypair.secret_key_bytes()))
+}
+
+fn decode_keypair(raw: &str, path: &FsPath) -> Result<Ed25519Keypair, Box<dyn Error>> {
+    let secret = decode_secret(raw.strip_suffix('\n').unwrap_or(raw))
+        .map_err(|e| format!("invalid key file {}: {e}", path.display()))?;
+    Ok(Ed25519Keypair::from_secret_key_bytes(secret))
+}
+
 /// Opens and validates an existing key before reading at most one encoded
 /// secret plus its optional newline. Non-blocking open avoids hanging on a
 /// FIFO substituted for the requested path; metadata from the opened handle
 /// prevents a pathname replacement from bypassing the checks.
 #[cfg(unix)]
-fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
+fn read_secret(path: &FsPath, expected_uid: u32) -> Result<String, Box<dyn Error>> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let path_metadata = fs::symlink_metadata(path)
@@ -128,10 +151,9 @@ fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
         return Err(format!("refusing key file {}: not a regular file", path.display()).into());
     }
 
-    let expected_uid = rustix::process::geteuid().as_raw();
     if metadata.uid() != expected_uid {
         return Err(format!(
-            "refusing key file {}: owned by uid {}, expected process uid {expected_uid}",
+            "refusing key file {}: owned by uid {}, expected uid {expected_uid}",
             path.display(),
             metadata.uid()
         )

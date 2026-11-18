@@ -36,7 +36,7 @@ Install and start the relay under systemd with your public hostname:
 sudo minip2p-relay service install --hostname relay.example.com
 ```
 
-The command creates a dedicated system user, stores the identity at `/var/lib/minip2p-relay/identity.key`, installs the systemd unit, and starts it. It will not replace an existing identity. To keep an identity from a manual installation, import it on the first run:
+The command creates a dedicated system user, stores the identity at `/var/lib/minip2p-relay/identity.key`, writes the relay's settings to `/etc/minip2p-relay/relay.toml`, installs a systemd unit that runs `minip2p-relay --config /etc/minip2p-relay/relay.toml`, and starts it. It will not replace an existing identity. To keep an identity from a manual installation, import it on the first run:
 
 ```bash
 sudo minip2p-relay service install \
@@ -45,6 +45,45 @@ sudo minip2p-relay service install \
 ```
 
 Replace `relay.example.com` with your hostname. Give it `A` and `AAAA` records when the server has both address families. Allow inbound TCP and UDP port `19876` in the host firewall and cloud security group. If you manage DNS through Cloudflare, keep these records in DNS-only mode. Cloudflare Tunnel and the standard Cloudflare proxy do not forward arbitrary libp2p TCP and QUIC traffic.
+
+### Change settings
+
+Every relay option lives in `/etc/minip2p-relay/relay.toml`, so a change is an edit and a restart:
+
+```bash
+sudoedit /etc/minip2p-relay/relay.toml
+sudo minip2p-relay service restart
+```
+
+Fields mirror the foreground flags. The file lists only what you changed; anything left out keeps the release's default, and an unknown field stops the relay with an error:
+
+```toml
+hostname = "relay.example.com"          # announces /dns/relay.example.com on port 19876
+key = "/var/lib/minip2p-relay/identity.key"
+# quic = ["0.0.0.0:19876"]              # --quic; default: IPv4 and IPv6 on 19876
+# announce = ["/dns/…"]                 # --announce, after the hostname's
+# paused = true                         # --paused
+
+[webtransport]                          # present = serve browsers
+# cert = "/etc/minip2p-relay/tls/fullchain.pem"   # a CA-signed certificate
+# key = "/etc/minip2p-relay/tls/privkey.pem"
+# reload_secs = 30
+
+[limits]                                # each --max-…/--…-rate flag, without dashes
+max_reservations = 1024
+max_circuit_bytes = 1048576
+reservation_peer_rate = "3/250"         # CAPACITY/REFILL_MS or "off"
+```
+
+`hostname` announces `/dns/<hostname>/tcp/19876` and `/dns/<hostname>/udp/19876/quic-v1`, plus `/dns/<hostname>/udp/19876/quic-v1/webtransport` with a CA certificate. It needs the default ports: with `quic` or `tcp` binds, list `announce` addresses instead.
+
+To install a file you wrote, pass it instead of `--hostname`; it replaces the installed one. The service fills in its own key paths, and refuses a file naming other ones, so the identity stays at `/var/lib/minip2p-relay/identity.key` (use `--import-key` to bring one):
+
+```bash
+sudo minip2p-relay service install --config relay.toml
+```
+
+`service install --hostname` on a host that already has a config keeps it, and refuses if it names another hostname.
 
 Check the service or follow its logs:
 
@@ -60,11 +99,11 @@ curl -fsSL https://minip2p.com/install/relay.sh | sh
 sudo minip2p-relay service restart
 ```
 
-`sudo minip2p-relay service uninstall` removes the unit but preserves the identity (and a relay mesh's backbone key) in `/var/lib/minip2p-relay`.
+`sudo minip2p-relay service uninstall` removes the unit but preserves the config, the identity, and a relay mesh's backbone key.
 
 ### Serve browsers
 
-Add `--webtransport` to `service install` or the foreground command to serve browsers on the QUIC port. The relay serves self-signed certificates derived from its key, rotating each 13-day Certificate period, and logs the address a browser dials, Certhash included:
+Add a `[webtransport]` section to the config (or `--webtransport` to the foreground command) to serve browsers on the QUIC port. The relay serves self-signed certificates derived from its key, rotating each 13-day Certificate period, and logs the address a browser dials, Certhash included:
 
 ```text
 [relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/12D3KooW…
@@ -76,41 +115,55 @@ The address survives restarts with the same key, but goes stale within about 26 
 
 Several relay servers can serve one relay address as a relay mesh. Geo DNS sends each client to the nearest node. Every node runs with the same identity, so the peer ID in the address is valid on any of them. When a client asks a node for a circuit to a peer reserved on another node, the first node forwards the circuit to the second over a QUIC backbone. Clients need no changes.
 
-Each node also has a backbone key of its own, which the other nodes use to recognize it. Install the first node with `--mesh`. The service then creates the backbone key at `/var/lib/minip2p-relay/mesh.key` and listens for the backbone on UDP port `19877`:
+Each node also has a backbone key of its own, which the other nodes use to recognize it. Turn the mesh on with a `[mesh]` section:
 
-```bash
-sudo minip2p-relay service install --hostname relay.example.com --mesh
-minip2p-relay service logs
+```toml
+hostname = "relay.example.com"
+
+[mesh]
+# listen = ["0.0.0.0:19877"]   # --mesh-listen; default: IPv4 and IPv6 on 19877
+members = []                   # --mesh-member: every node's backbone address
 ```
 
-The logs show the node's backbone address:
+Install the first node with it. `service install` creates the backbone key at `/var/lib/minip2p-relay/mesh.key` and prints the node's member entry before starting the relay:
+
+```bash
+sudo minip2p-relay service install --config relay.toml
+```
 
 ```text
-[relay] mesh listening=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/12D3KooW...
+mesh_member_candidate=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/12D3KooW...
+mesh_member_candidate=/ip6/::/udp/19877/quic-v1/p2p/12D3KooW...
 ```
 
-Replace the wildcard IP with the node's public IP to get its entry in the member list. Copy `/var/lib/minip2p-relay/identity.key` to every other node and import it on that node's first install, also with `--mesh` and no members, so they all share the peer ID and each creates its backbone key:
+Replace the wildcard IP with the node's public IP to get its entry in the member list, and check it against the `[relay] mesh listening=` line in `minip2p-relay service logs`, which shows what actually bound. Copy `/var/lib/minip2p-relay/identity.key` to every other node and import it on that node's install, so they all share the peer ID:
 
 ```bash
-sudo minip2p-relay service install --hostname relay.example.com --import-key ./identity.key --mesh
+sudo minip2p-relay service install --config relay.toml --import-key ./identity.key
 ```
 
-Once every node's entry is known, reinstall every node with the full member list, including the node's own entry, which it skips. The identity is already in place, so leave out `--import-key`:
+Once every node's entry is known, list them all in `members` on every node, including the node's own entry, which it skips, and restart:
+
+```toml
+[mesh]
+members = [
+  "/ip4/198.51.100.7/udp/19877/quic-v1/p2p/12D3KooW...",
+  "/ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooW...",
+]
+```
 
 ```bash
-sudo minip2p-relay service install \
-  --hostname relay.example.com \
-  --mesh-member /ip4/198.51.100.7/udp/19877/quic-v1/p2p/12D3KooW... \
-  --mesh-member /ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooW...
+sudoedit /etc/minip2p-relay/relay.toml
+sudo minip2p-relay service restart
 ```
 
-Run it again the same way to change the list later. Each `service install` writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off, and any `--mesh-listen` flags, or the backbone moves back to UDP `19877` while the other members still dial the old port. A node closes backbone connections from peers that aren't on its list.
+Change the list the same way later. A node closes backbone connections from peers that aren't on its list.
 
 Allow UDP port `19877` only from the other nodes' IP addresses. Keep the nodes' clocks synced with NTP. Each node logs `[relay] mesh member=12D3KooW... up` when its link to that member comes up and `down` when the link drops, and `[relay] mesh member=12D3KooW... synced entries=3` once it has that member's full directory: the number of reservations the member holds. Circuits forwarded across the backbone show the other node's backbone peer ID as `via=` in their `circuit opened` and `circuit closed` lines.
 
 Each node applies its own reservation, circuit, and rate limits. Mesh-wide limits are not supported. Every node holds the shared identity key, so a breach of any node exposes it, and replacing the key changes every published address.
 
-In the foreground, `--mesh-key PATH` enables the mesh, `--mesh-listen HOST:PORT` replaces the default backbone listeners, and `--mesh-member` adds one member. Repeat `--mesh-listen` and `--mesh-member` as needed.
+In the foreground, `--mesh-key PATH` enables the mesh, `--mesh-listen HOST:PORT` replaces the default backbone listeners, and `--mesh-member` adds one member. Repeat `--mesh-listen` and `--mesh-member` as needed. A foreground `--config` with `[mesh]` needs `key = "PATH"` in that section, so the backbone key persists.
 
 ### Run it in the foreground
 

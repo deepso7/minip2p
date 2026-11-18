@@ -36,7 +36,41 @@ On a Linux systemd host with standard administration tools under `/usr/bin` and 
 sudo minip2p-relay service install --hostname relay.example.com
 ```
 
-The command keeps the identity under `/var/lib/minip2p-relay` (and, with `--mesh`, the backbone key: see [Relay mesh](#relay-mesh)). Run `minip2p-relay service status` or `minip2p-relay service logs` to inspect it.
+The command keeps the identity under `/var/lib/minip2p-relay` (and, with `[mesh]`, the backbone key: see [Relay mesh](#relay-mesh)), writes the relay's options to `/etc/minip2p-relay/relay.toml` (root:minip2p-relay, 0640), and installs a unit that runs `minip2p-relay --config /etc/minip2p-relay/relay.toml`. Run `minip2p-relay service status` or `minip2p-relay service logs` to inspect it.
+
+## Config file
+
+`minip2p-relay --config PATH` reads every option from a TOML file whose fields mirror the flags, and takes no other flag. Change an installed relay by editing its file and restarting it:
+
+```bash
+sudoedit /etc/minip2p-relay/relay.toml && sudo minip2p-relay service restart
+```
+
+```toml
+hostname = "relay.example.com" # announces /dns/<hostname>/tcp/19876 and /udp/19876/quic-v1
+key = "/var/lib/minip2p-relay/identity.key" # --key
+# quic = ["0.0.0.0:4101"]       # --quic (tcp = [...] for --tcp); not with hostname
+# announce = ["/dns4/relay.example.com/tcp/4001"]   # --announce, after hostname's
+paused = false # --paused
+
+[webtransport] # present = --webtransport
+cert = "/etc/minip2p-relay/tls/fullchain.pem" # --webtransport-cert
+key = "/etc/minip2p-relay/tls/privkey.pem" # --webtransport-key
+reload_secs = 30 # --webtransport-reload-secs
+
+[limits] # each limit flag without its dashes
+max_circuits = 1024 # --max-circuits
+circuit_ip_rate = "off" # --circuit-ip-rate
+
+[mesh] # present = the mesh is on
+key = "/var/lib/minip2p-relay/mesh.key" # --mesh-key
+listen = ["0.0.0.0:19877"] # --mesh-listen
+members = [] # --mesh-member: "/ip4/<ip>/udp/19877/quic-v1/p2p/<backbone id>"
+```
+
+Omitted fields keep the binary's defaults; an unknown field is an error. `hostname` needs the default ports, so it can't be combined with `quic` or `tcp` (list `announce` addresses instead), and announces the hashless WebTransport address `/dns/<hostname>/udp/19876/quic-v1/webtransport` only with a CA certificate. `[mesh]` needs its `key`, so the backbone key is never ephemeral.
+
+`service install (--hostname HOSTNAME | --config FILE) [--import-key PATH]` writes that file. `--hostname` writes a minimal one when none exists, keeps an existing one naming the same hostname, and refuses one naming another. `--config` checks `FILE` and installs it, replacing the existing one. Either way the installed file names the service's keys, `key = "/var/lib/minip2p-relay/identity.key"` and `[mesh] key = "/var/lib/minip2p-relay/mesh.key"`: install adds them when absent and refuses other paths, so a copied config can't bypass `--import-key`. Certificate paths must be absolute. With `[mesh]`, install creates the backbone key if it is missing (service-owned, 0600, never replaced), refuses a backbone listen port of `0`, and prints `mesh_member_candidate=` lines before starting the relay.
 
 The executable expands the same builder when composing all four listeners:
 
@@ -93,7 +127,14 @@ minip2p-relay --key var/relay.ed25519 \
 
 At startup the relay prints `[relay] mesh listening=/ip4/…/udp/19877/quic-v1/p2p/<backbone peer ID>`: that line, with a wildcard IP replaced by the node's public one, is the node's entry in the member list. It logs `[relay] mesh member=<backbone peer ID> up` and `down` as links come and go, `[relay] mesh member=<backbone peer ID> synced entries=<n>` when that member's directory snapshot completes (`n` is how many of its reservations this node knows about), and circuits forwarded across the backbone get ` via=<backbone peer ID>` (the other node) on their `circuit opened` and `circuit closed` lines. Without `--mesh-key` the relay runs and logs exactly as a standalone relay.
 
-Nodes need synced clocks (NTP), and the backbone port open only to the other members. `service install --mesh` adds `--mesh-key /var/lib/minip2p-relay/mesh.key` to the unit, so the service creates the backbone key next to the identity on first start; `--mesh-listen` and `--mesh-member` imply `--mesh` and pass through. `service uninstall` keeps both keys. To change the member list, run `service install` again with the new list. It writes the unit afresh, so repeat any `--webtransport` or `--webtransport-cert`/`--webtransport-key` flags the node already uses, or browser access turns off, and any `--mesh-listen` flags, or the backbone moves back to UDP `19877` while the other members still dial the old port.
+Nodes need synced clocks (NTP), and the backbone port open only to the other members. In the config file the mesh is the `[mesh]` section (see [Config file](#config-file)). `service install` with a `[mesh]` section creates the backbone key at `/var/lib/minip2p-relay/mesh.key` and prints this node's entry before the relay first starts, one per backbone bind (the defaults when `listen` is empty):
+
+```text
+mesh_member_candidate=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/12D3KooW…
+mesh_member_candidate=/ip6/::/udp/19877/quic-v1/p2p/12D3KooW…
+```
+
+Replace a wildcard IP with the node's public one, and confirm the entry against the `mesh listening=` startup log, which shows what actually bound (automatic binds can fall back to one family). To change the member list, edit `members` in `/etc/minip2p-relay/relay.toml` and run `service restart`. `service uninstall` keeps the config and both keys.
 
 ## Browsers with a stable address
 
@@ -137,14 +178,21 @@ On a systemd host with certbot, for `relay.example.com` (also on the docs site a
      --deploy-hook /usr/local/sbin/minip2p-relay-cert-hook
    ```
 
-5. Install the service with the certificate. The unit adds `--webtransport` and announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+5. Install the service with the certificate. With a CA certificate, `hostname` also announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+
+   ```toml
+   # relay.toml
+   hostname = "relay.example.com"
+   
+   [webtransport]
+   cert = "/etc/minip2p-relay/tls/fullchain.pem"
+   key = "/etc/minip2p-relay/tls/privkey.pem"
+   ```
 
    ```bash
-   sudo minip2p-relay service install --hostname relay.example.com \
-     --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
-     --webtransport-key /etc/minip2p-relay/tls/privkey.pem
+   sudo minip2p-relay service install --config relay.toml
    ```
 
 6. Check renewal end to end once: run `sudo certbot renew --cert-name relay.example.com --force-renewal`, then confirm within a minute that `minip2p-relay service logs` shows `[relay] webtransport certificate reloaded not_after=…` with the new date. The relay keeps running, with its reservations and circuits.
 
-Use `service install --webtransport` without a certificate to serve browsers with the rotating self-signed certificates instead. The unit then announces no WebTransport address: an announced certhash would go stale within 26 days, and explicit announces replace listener addresses in reservation replies. Browsers must get the current `webtransport=` address from the logs.
+Use an empty `[webtransport]` section to serve browsers with the rotating self-signed certificates instead. `hostname` then announces no WebTransport address: an announced certhash would go stale within 26 days, and explicit announces replace listener addresses in reservation replies. Browsers must get the current `webtransport=` address from the logs.
