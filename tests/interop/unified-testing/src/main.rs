@@ -24,6 +24,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 /// Matches the framework's own per-test timeout ballpark.
 const TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+#[derive(Debug)]
 struct Config {
     is_dialer: bool,
     redis_addr: String,
@@ -50,7 +51,13 @@ fn run() -> Result<()> {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let var = |name: &str| env::var(name).map_err(|_| format!("{name} is not set"));
+        Self::parse(|name| env::var(name).ok())
+    }
+
+    /// Settings come from `lookup` rather than the process environment so the
+    /// contract can be exercised without one.
+    fn parse(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let var = |name: &str| lookup(name).ok_or_else(|| format!("{name} is not set"));
         let transport = var("TRANSPORT")?;
         if transport == "tcp" {
             // Standalone transports (quic-v1) get neither variable.
@@ -68,7 +75,7 @@ impl Config {
             redis_addr: var("REDIS_ADDR")?,
             redis_key: format!("{}_listener_multiaddr", var("TEST_KEY")?),
             transport,
-            debug: env::var("DEBUG").is_ok_and(|v| v == "true"),
+            debug: lookup("DEBUG").is_some_and(|v| v == "true"),
         })
     }
 
@@ -259,5 +266,76 @@ impl Redis {
             return Err("redis closed the connection".into());
         }
         Ok(line.trim_end_matches("\r\n").to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a lookup over `(name, value)` pairs, as the harness env would.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    const UNIFIED_TCP: &[(&str, &str)] = &[
+        ("IS_DIALER", "true"),
+        ("REDIS_ADDR", "redis:6379"),
+        ("TEST_KEY", "deadbeef"),
+        ("TRANSPORT", "tcp"),
+        ("SECURE_CHANNEL", "noise"),
+        ("MUXER", "yamux"),
+    ];
+
+    #[test]
+    fn unified_testing_tcp_settings_are_read() {
+        let config = Config::parse(env(UNIFIED_TCP)).expect("parses");
+        assert!(config.is_dialer);
+        assert_eq!(config.redis_addr, "redis:6379");
+        assert_eq!(config.redis_key, "deadbeef_listener_multiaddr");
+        assert_eq!(config.transport, "tcp");
+        assert!(!config.debug);
+    }
+
+    #[test]
+    fn quic_needs_no_secure_channel_or_muxer() {
+        let config = Config::parse(env(&[
+            ("IS_DIALER", "false"),
+            ("REDIS_ADDR", "redis:6379"),
+            ("TEST_KEY", "k"),
+            ("TRANSPORT", "quic-v1"),
+        ]))
+        .expect("parses");
+        assert!(!config.is_dialer);
+        assert_eq!(config.bind_addr(), "/ip4/0.0.0.0/udp/0/quic-v1");
+    }
+
+    #[test]
+    fn an_unsupported_muxer_is_refused_rather_than_silently_dialled() {
+        let err = Config::parse(env(&[
+            ("IS_DIALER", "true"),
+            ("REDIS_ADDR", "redis:6379"),
+            ("TEST_KEY", "k"),
+            ("TRANSPORT", "tcp"),
+            ("SECURE_CHANNEL", "noise"),
+            ("MUXER", "mplex"),
+        ]))
+        .expect_err("mplex is not supported");
+        assert!(err.to_string().contains("MUXER=mplex"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_setting_names_itself() {
+        let err = Config::parse(env(&[("TRANSPORT", "quic-v1")])).expect_err("incomplete");
+        assert!(err.to_string().contains("IS_DIALER"), "{err}");
     }
 }
