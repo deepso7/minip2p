@@ -22,8 +22,6 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::Transport;
 
 #[cfg(feature = "quic")]
-use crate::EndpointEvent;
-#[cfg(feature = "quic")]
 use crate::relay_mesh::Backbone;
 
 /// Synchronous relay-server runtime control failure.
@@ -46,10 +44,6 @@ pub(crate) struct RelayServerDriver {
     /// A relay-mesh node's backbone swarm.
     #[cfg(feature = "quic")]
     pub(crate) backbone: Option<Backbone>,
-    /// Member links that came up or went down, queued after the agent's
-    /// events.
-    #[cfg(feature = "quic")]
-    pub(crate) mesh_events: Vec<EndpointEvent>,
 }
 
 impl RelayServerDriver {
@@ -60,8 +54,6 @@ impl RelayServerDriver {
             listeners_revision: None,
             #[cfg(feature = "quic")]
             backbone: None,
-            #[cfg(feature = "quic")]
-            mesh_events: Vec::new(),
         }
     }
 
@@ -129,8 +121,8 @@ impl RelayServerDriver {
 
     /// A mesh node's backbone batch: redials the members that are due, then
     /// feeds one backbone poll's events to the link bookkeeping and the
-    /// agent. Nothing on the backbone reaches the application but member
-    /// links coming up and going down.
+    /// agent. Nothing on the backbone reaches the application but the
+    /// agent's own mesh events.
     #[cfg(feature = "quic")]
     pub(crate) fn drive_backbone<T: Transport, E: EntropySource>(
         &mut self,
@@ -150,10 +142,8 @@ impl RelayServerDriver {
             return Ok(());
         };
         for event in backbone.core.poll(now)? {
-            if let Some(backbone) = self.backbone.as_mut()
-                && let Some(change) = backbone.observe(&event, now)
-            {
-                self.mesh_events.push(change);
+            if let Some(backbone) = self.backbone.as_mut() {
+                backbone.observe(&event, now);
             }
             self.ingest(&event, swarm, now);
         }
@@ -183,8 +173,15 @@ impl RelayServerDriver {
 
     /// Moves the events the agent queued (including outside an ingest or
     /// tick, such as an address refresh's `AddrsRejected`) into the
-    /// driver's queue.
+    /// driver's queue, and the backbone connections it verified to the
+    /// member links.
     pub(crate) fn collect_agent_events(&mut self) {
+        #[cfg(feature = "quic")]
+        if let Some(backbone) = self.backbone.as_mut() {
+            for (peer, conn_id) in self.agent.take_verified_links() {
+                backbone.verified(&peer, conn_id);
+            }
+        }
         while let Some(event) = self.agent.poll_event() {
             self.events.push_back(event);
         }

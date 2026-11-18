@@ -4,6 +4,16 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Relay-mesh membership is signed, not listed
+
+The public identity now vouches for each node's backbone key ([ADR 0028](docs/adr/0028-relay-mesh-identity-signed-membership.md)), so a mesh has no allowlist and a new node joins by listing the existing ones, with no change on them. The mesh wire gains `/minip2p/relay-mesh/member/1.0.0`, so every node of a mesh must upgrade together.
+
+- **`mesh::MeshConfig` drops `members`** and gains `public_key` and `proof`; build it with `MeshConfig::new(&public_identity, &backbone_peer_id)`, which signs the proof. `Default` is gone. `RelayServerAgent::new` refuses a `public_key` that isn't the agent's own identity (`RelayServerConfigErrorKind::NotOwnIdentity`).
+- **`RelaySwarm` gains `connection_peer`**: implement it on a custom swarm by returning the peer whose current connection `conn_id` is (`SwarmCore::connection_peer`).
+- **`RelayServerEvent` gains `MeshMemberUp`, `MeshMemberDown` and `MeshPeerRejected { peer_id, reason: MeshRejectionReason }`**: add arms if you match it exhaustively.
+- **`EndpointEvent::RelayMeshMemberUp` and `RelayMeshMemberDown` are removed**: match `EndpointEvent::RelayServer(RelayServerEvent::MeshMemberUp { member })` and `MeshMemberDown { member }` instead. They now report members that dialed in unlisted too.
+- **`RelayMeshConfig::members` lists the members to dial**, not an allowlist: a node accepts any member that proves itself, and only a node that lists the other redials a dropped link.
+
 ### The AutoNAT server treats IPv4-mapped IPv6 as IPv4
 
 `AutoNatServer` now matches an IPv4-mapped IPv6 address (`/ip6/::ffff:a.b.c.d`) to the IPv4 address it maps, on either the observed address or a candidate, so a request a dual-stack listener used to refuse with `E_DIAL_REFUSED` is forwarded; no migration is needed.

@@ -20,12 +20,13 @@ use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::address::normalize_addrs;
 use crate::limiter::TokenBuckets;
-use crate::mesh::{DirectoryMessage, ForwardMessage};
+use crate::mesh::{DirectoryMessage, ForwardMessage, MEMBER_PROTOCOL_ID};
 use crate::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
     RelayServerAddrSource, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
-    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelaySwarm,
-    RelaySwarmError, ReservationCloseReason, ReservationDenialReason, StreamKey,
+    RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
+    RelayServerRuntimeErrorKind, RelaySwarm, RelaySwarmError, ReservationCloseReason,
+    ReservationDenialReason, StreamKey,
 };
 
 /// The key per-IP admission limits share: an IPv4 address (IPv4-mapped
@@ -806,6 +807,14 @@ impl RelayServerAgent {
         config: RelayServerConfig,
     ) -> Result<Self, RelayServerConfigError> {
         config.validate()?;
+        if let Some(mesh) = &config.mesh
+            && PeerId::from_public_key(&mesh.public_key) != local_peer_id
+        {
+            return Err(RelayServerConfigError {
+                field: "mesh.public_key",
+                reason: RelayServerConfigErrorKind::NotOwnIdentity,
+            });
+        }
         Ok(Self {
             local_peer_id,
             reservation_limiters: AdmissionLimiters::new(
@@ -1017,7 +1026,12 @@ impl RelayServerAgent {
                     stream_id: *stream_id,
                 };
                 if *initiated_locally {
-                    self.on_stop_ready(io, key)
+                    if self.mesh.is_some() && protocol_id == MEMBER_PROTOCOL_ID {
+                        self.on_member_ready(io, peer_id, key);
+                        true
+                    } else {
+                        self.on_stop_ready(io, key)
+                    }
                 } else if protocol_id == HOP_PROTOCOL_ID {
                     self.on_hop_ready(io, peer_id.clone(), key, is_circuit);
                     true
@@ -1103,7 +1117,7 @@ impl RelayServerAgent {
                     io.ack(key, data.len());
                     true
                 } else if self.mesh.is_some() {
-                    self.on_directory_data(io, key, data)
+                    self.on_member_data(io, key, data) || self.on_directory_data(io, key, data)
                 } else {
                     false
                 }
@@ -1152,7 +1166,9 @@ impl RelayServerAgent {
                 } else {
                     self.rejected_hop_streams.contains_key(&key)
                         || self.retired_stops.contains_key(&key)
-                        || (self.mesh.is_some() && self.on_directory_ended(io, key, false))
+                        || (self.mesh.is_some()
+                            && (self.on_member_eof(io, key)
+                                || self.on_directory_ended(io, key, false)))
                 }
             }
             // Resumes a circuit direction paused on this leg. Other relay
@@ -1234,7 +1250,9 @@ impl RelayServerAgent {
                     let owned = self.remove_hop_worker(key).is_some();
                     owned
                         || self.rejected_hop_streams.remove(&key).is_some()
-                        || (self.mesh.is_some() && self.on_directory_ended(io, key, true))
+                        || (self.mesh.is_some()
+                            && (self.drop_member_stream(key)
+                                || self.on_directory_ended(io, key, true)))
                 };
                 // The stream is gone: a STOP stream retired above, or
                 // earlier, needs no more claiming.
@@ -1290,7 +1308,10 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now_ms);
         self.circuit_limiters.sweep(now_ms);
-        self.reopen_due_directories(io);
+        if self.mesh.is_some() {
+            self.expire_proofs(io);
+            self.reopen_due_directories(io);
+        }
     }
 
     /// Resets a relay stream the peer stopped; returns whether we own it.
@@ -1326,7 +1347,7 @@ impl RelayServerAgent {
             || self.pending_circuits.contains_key(&key)
             || self.rejected_hop_streams.contains_key(&key)
             || self.retired_stops.contains_key(&key)
-            || self.owns_directory_stream(key)
+            || self.owns_mesh_stream(key)
     }
 
     /// Sweeps deadlines before the first event in a driver batch.
@@ -1409,7 +1430,8 @@ impl RelayServerAgent {
             return true;
         }
         let Some(source_stream) = self.stop_to_source.get(&key).copied() else {
-            return self.mesh.is_some() && self.on_directory_ended(io, key, true);
+            return self.mesh.is_some()
+                && (self.drop_member_stream(key) || self.on_directory_ended(io, key, true));
         };
         if let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
             && !circuit.destination_ready()
@@ -1461,7 +1483,14 @@ impl RelayServerAgent {
             .min();
         // Folded in separately so a relay outside a mesh pays one branch.
         if let Some(mesh) = &self.mesh {
-            earliest = earliest.into_iter().chain(mesh.reopen.earliest()).min();
+            earliest = [
+                earliest,
+                mesh.reopen.earliest(),
+                mesh.proof_deadlines.earliest(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
         }
         earliest.map(Deadline::from_millis)
     }
@@ -1475,7 +1504,7 @@ impl RelayServerAgent {
             || self.stop_to_source.contains_key(&stream)
             || self.retired_stops.contains_key(&stream)
             || self.circuits.contains_key(&stream)
-            || self.owns_directory_stream(stream)
+            || self.owns_mesh_stream(stream)
     }
 
     /// The exact connection owning `peer_id`'s committed reservation.
@@ -3088,6 +3117,9 @@ impl RelayServerAgent {
             ip_tally.add(reservation.ip.as_ref(), Held::Reservations);
         }
         assert_eq!(ip_tally, self.ip_tally);
+        if let Some(mesh) = &self.mesh {
+            mesh.assert_consistent();
+        }
     }
 
     fn runtime_error(

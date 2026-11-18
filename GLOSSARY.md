@@ -78,15 +78,17 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### Relay mesh
 
-**Relay mesh**: Several relay servers that serve one relay address together, from different regions behind geo DNS (ADR 0027). Each node forwards a CONNECT for a peer reserved on another node to that node. Membership is a static list. _Avoid_: relay cluster, federation
+**Relay mesh**: Several relay servers that serve one relay address together, from different regions behind geo DNS (ADR 0027). Each node forwards a CONNECT for a peer reserved on another node to that node. Any node that proves the Public identity vouches for its Backbone identity is a member (ADR 0028); there is no member list. _Avoid_: relay cluster, federation
 
 **Mesh node**: One relay process in a Relay mesh, running under the shared Public identity and its own Backbone identity. _Avoid_: region (a region hosts a node)
 
 **Public identity**: The key every Mesh node shares, whose peer ID is the relay peer ID in the published address. Clients see only it, and it is never used on the Backbone. Replacing it changes every published address.
 
-**Backbone identity**: A Mesh node's own key for the Backbone. The member list names each node by its backbone peer ID, which is also how a node recognizes the other members. _Avoid_: mesh key (that is the file holding it)
+**Backbone identity**: A Mesh node's own key for the Backbone. Other nodes dial a node at its backbone peer ID, and recognize it by its Member proof. _Avoid_: mesh key (that is the file holding it)
 
-**Backbone**: The links between Mesh nodes, authenticated with Backbone identities, over which nodes share their Directory and forward circuits.
+**Member proof**: The Public identity's signature over a Mesh node's backbone peer ID, which the node sends on every new Backbone connection. A connection becomes a member link only once both sides' proofs check out. _Avoid_: membership token
+
+**Backbone**: The links between Mesh nodes, authenticated with Backbone identities and Member proofs, over which nodes share their Directory and forward circuits. A link forms when either node lists the other.
 
 **Directory**: A Mesh node's view of which peers hold reservations on which other node, as each member reports them. _Avoid_: registry, shared reservation store
 

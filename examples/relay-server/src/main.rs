@@ -183,12 +183,6 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         match endpoint.wait(Duration::from_millis(250))? {
             EndpointWaitOutcome::Event(EndpointEvent::RelayServer(event)) => print_event(event),
-            EndpointWaitOutcome::Event(EndpointEvent::RelayMeshMemberUp { peer_id }) => {
-                println!("[relay] mesh member={peer_id} up")
-            }
-            EndpointWaitOutcome::Event(EndpointEvent::RelayMeshMemberDown { peer_id }) => {
-                println!("[relay] mesh member={peer_id} down")
-            }
             EndpointWaitOutcome::Event(event) => println!("[endpoint] {event:?}"),
             _ => {}
         }
@@ -438,8 +432,15 @@ fn print_event(event: RelayServerEvent) {
         RelayServerEvent::AddrsRestored { source } => {
             println!("[relay] {source:?} addresses accepted again")
         }
+        RelayServerEvent::MeshMemberUp { member } => println!("[relay] mesh member={member} up"),
+        RelayServerEvent::MeshMemberDown { member } => {
+            println!("[relay] mesh member={member} down")
+        }
         RelayServerEvent::MeshMemberSynced { member, entries } => {
             println!("[relay] mesh member={member} synced entries={entries}")
+        }
+        RelayServerEvent::MeshPeerRejected { peer_id, reason } => {
+            eprintln!("[relay] mesh peer={peer_id} rejected: {reason}")
         }
         RelayServerEvent::Error(error) => eprintln!(
             "[relay] operational error kind={:?} peer={} detail={} action=check transport reachability and configured limits",

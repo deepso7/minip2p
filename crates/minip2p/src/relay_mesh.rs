@@ -2,12 +2,14 @@
 //! under the node's own backbone identity, over its own QUIC transport.
 //!
 //! The relay agent drives both swarms through one
-//! [`MeshSwarm`](minip2p_relay_server::mesh::MeshSwarm); this module owns
-//! what the agent leaves to its host: keeping a link to every member up.
-//! Every member is dialed at start, and a member whose link is lost (or
-//! whose dial failed) is redialed after a backoff of 1 s doubling to 30 s,
-//! reset once the link is up. Both ends of a pair dial; the swarm's
-//! simultaneous-dial tiebreak keeps one connection.
+//! [`MeshSwarm`](minip2p_relay_server::mesh::MeshSwarm) and decides who is a
+//! member (ADR 0028); this module owns what the agent leaves to its host:
+//! keeping a link to every member this node lists. A listed member is dialed
+//! at start and, while it has no connection, redialed after a backoff of
+//! 1 s doubling to 30 s, reset once the agent verifies its connection.
+//! Members that dial in are accepted whether listed or not, so a link forms
+//! when either side lists the other; a link that drops is redialed only by
+//! a side that lists the other.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +20,6 @@ use minip2p_quic::QuicTransport;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::ConnectionId;
 
-use crate::EndpointEvent;
 use minip2p_relay_server::mesh::Backoff;
 use minip2p_relay_server::{RelayServerRuntimeError, RelayServerRuntimeErrorKind};
 
@@ -32,7 +33,8 @@ pub const DEFAULT_RELAY_MESH_PORT: u16 = 19_877;
 /// Every node serves the relay under the same public identity (the
 /// Endpoint's), and links to the other members over a backbone under an
 /// identity of its own, so the links between nodes that share a public peer
-/// id don't replace each other.
+/// id don't replace each other. The public identity vouches for each
+/// backbone identity, so membership needs no list (ADR 0028).
 #[derive(Clone, Debug)]
 pub struct RelayMeshConfig {
     /// This node's backbone identity: one per node, never the public one.
@@ -40,10 +42,12 @@ pub struct RelayMeshConfig {
     /// Backbone QUIC listen addresses, `/ip4|ip6/<ip>/udp/<port>/quic-v1`,
     /// at most one per IP family. Members dial these.
     pub listen: Vec<Multiaddr>,
-    /// Every member's backbone address, `/ip4|ip6/<ip>/udp/<port>/quic-v1`
-    /// with its backbone peer id. This node's own entry is skipped, so
-    /// every node can take the same list. A backbone connection from any
-    /// other peer is closed.
+    /// The members this node dials, each a backbone address
+    /// `/ip4|ip6/<ip>/udp/<port>/quic-v1` with its backbone peer id. List
+    /// every existing node when adding one; nodes need not list each other
+    /// both ways. This node's own entry is skipped, so every node can take
+    /// the same list. Members that dial in are accepted whether listed or
+    /// not.
     pub members: Vec<PeerAddr>,
 }
 
@@ -67,34 +71,23 @@ impl RelayMeshConfig {
             members: members.into_iter().collect(),
         }
     }
-
-    /// The members' backbone peer ids, without this node's own.
-    pub(crate) fn member_ids(&self) -> impl Iterator<Item = PeerId> + '_ {
-        let own = self.identity.peer_id();
-        self.members
-            .iter()
-            .map(PeerAddr::peer_id)
-            .filter(move |peer| **peer != own)
-            .cloned()
-    }
 }
 
 /// The backbone swarm.
 pub(crate) type BackboneSwarm = SwarmCore<QuicTransport, StdEntropy>;
 
-/// The backbone swarm and its member links.
+/// The backbone swarm and its listed members' links.
 pub(crate) struct Backbone {
     pub(crate) core: BackboneSwarm,
     links: Links,
 }
 
 impl Backbone {
-    /// `core` is already listening; `members` excludes this node.
+    /// `core` is already listening. An entry for `core`'s own peer id is
+    /// skipped.
     pub(crate) fn new(core: BackboneSwarm, members: impl IntoIterator<Item = PeerAddr>) -> Self {
-        Self {
-            core,
-            links: Links::new(members),
-        }
+        let links = Links::new(core.local_peer_id(), members);
+        Self { core, links }
     }
 
     /// Dials every member whose redial is due, returning the dials the
@@ -118,10 +111,15 @@ impl Backbone {
         refused
     }
 
-    /// Follows member links through one backbone event, returning the
-    /// change to report.
-    pub(crate) fn observe(&mut self, event: &SwarmEvent, now: Now) -> Option<EndpointEvent> {
-        self.links.observe(event, now)
+    /// Follows listed members' connections through one backbone event.
+    pub(crate) fn observe(&mut self, event: &SwarmEvent, now: Now) {
+        self.links.observe(event, now);
+    }
+
+    /// The agent verified `peer`'s connection `conn_id`
+    /// ([`take_verified_links`](minip2p_relay_server::RelayServerAgent::take_verified_links)).
+    pub(crate) fn verified(&mut self, peer: &PeerId, conn_id: ConnectionId) {
+        self.links.verified(peer, conn_id);
     }
 
     /// When the next redial is due; the swarm's own timers are
@@ -150,7 +148,8 @@ impl Backbone {
     }
 }
 
-/// Member link bookkeeping, apart from the swarm so it can be tested alone.
+/// Listed members' link bookkeeping, apart from the swarm so it can be
+/// tested alone.
 struct Links(BTreeMap<PeerId, Link>);
 
 struct Link {
@@ -158,27 +157,32 @@ struct Link {
     /// them, moving on after each failure.
     addrs: Vec<PeerAddr>,
     next: usize,
-    /// The member's backbone connection is established.
+    /// The member's current backbone connection, verified or not, whoever
+    /// dialed it.
+    conn: Option<ConnectionId>,
+    /// The agent verified `conn`.
     up: bool,
     /// Our dial to it, until it establishes or fails.
     dial: Option<ConnectionId>,
-    /// When to dial again, while the link is down and no dial is out.
+    /// When to dial again, while it has no connection and no dial is out.
     redial_at: Option<Deadline>,
-    /// Redial delay after the link is lost or a dial fails.
+    /// Redial delay after a link is lost or an attempt fails.
     backoff: Backoff,
 }
 
 impl Links {
-    /// Every member starts due, so the first batch dials them all. A
-    /// member listed under several addresses gets one link over all of them.
-    fn new(members: impl IntoIterator<Item = PeerAddr>) -> Self {
+    /// Every member but `own` starts due, so the first batch dials them
+    /// all. A member listed under several addresses gets one link over all
+    /// of them.
+    fn new(own: &PeerId, members: impl IntoIterator<Item = PeerAddr>) -> Self {
         let mut links = BTreeMap::new();
-        for addr in members {
+        for addr in members.into_iter().filter(|addr| addr.peer_id() != own) {
             links
                 .entry(addr.peer_id().clone())
                 .or_insert_with(|| Link {
                     addrs: Vec::new(),
                     next: 0,
+                    conn: None,
                     up: false,
                     dial: None,
                     redial_at: Some(Deadline::IMMEDIATE),
@@ -191,7 +195,7 @@ impl Links {
     }
 
     fn awaiting_redial(link: &Link) -> bool {
-        !link.up && link.dial.is_none()
+        link.conn.is_none() && link.dial.is_none()
     }
 
     /// The members to dial now.
@@ -216,49 +220,68 @@ impl Links {
         }
     }
 
-    fn observe(&mut self, event: &SwarmEvent, now: Now) -> Option<EndpointEvent> {
+    fn observe(&mut self, event: &SwarmEvent, now: Now) {
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                let link = self.0.get_mut(peer_id)?;
+            SwarmEvent::ConnectionEstablished { peer_id, conn_id }
+            | SwarmEvent::ConnectionReplaced {
+                peer_id,
+                new: conn_id,
+                ..
+            } => {
+                let Some(link) = self.0.get_mut(peer_id) else {
+                    return;
+                };
                 if link.dial == Some(*conn_id) {
                     link.dial = None;
                 }
+                link.conn = Some(*conn_id);
+                link.up = false;
                 link.redial_at = None;
-                link.backoff.reset();
-                let was_up = std::mem::replace(&mut link.up, true);
-                (!was_up).then(|| EndpointEvent::RelayMeshMemberUp {
-                    peer_id: peer_id.clone(),
-                })
             }
-            SwarmEvent::ConnectionReplaced { peer_id, new, .. } => {
-                let link = self.0.get_mut(peer_id)?;
-                if link.dial == Some(*new) {
-                    link.dial = None;
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
+                let Some(link) = self.0.get_mut(peer_id) else {
+                    return;
+                };
+                if link.conn != Some(*conn_id) {
+                    return;
                 }
-                None
-            }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                let link = self.0.get_mut(peer_id)?;
-                if !std::mem::replace(&mut link.up, false) {
-                    return None;
-                }
-                link.schedule(now);
-                Some(EndpointEvent::RelayMeshMemberDown {
-                    peer_id: peer_id.clone(),
-                })
-            }
-            SwarmEvent::DialFailed { conn_id, .. } => {
-                let link = self
-                    .0
-                    .values_mut()
-                    .find(|link| link.dial == Some(*conn_id))?;
-                link.dial = None;
-                if !link.up {
+                link.conn = None;
+                if std::mem::replace(&mut link.up, false) {
+                    // A link that was up: redial from the reset backoff.
+                    link.schedule(now);
+                } else if link.dial.is_none() {
+                    // Rejected, timed out or dropped before it was
+                    // verified: a failed attempt. With a dial out, its own
+                    // outcome decides.
                     link.failed(now);
                 }
-                None
             }
-            _ => None,
+            SwarmEvent::DialFailed { conn_id, .. } => {
+                let Some(link) = self.0.values_mut().find(|link| link.dial == Some(*conn_id))
+                else {
+                    return;
+                };
+                link.dial = None;
+                // The losing dial of a simultaneous pair leaves the winner
+                // to its proof.
+                if link.conn.is_none() {
+                    link.failed(now);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The agent verified `peer`'s connection `conn_id`: if it is still the
+    /// current one, the link is up and the backoff starts over.
+    fn verified(&mut self, peer: &PeerId, conn_id: ConnectionId) {
+        if let Some(link) = self.0.get_mut(peer)
+            && link.conn == Some(conn_id)
+        {
+            link.up = true;
+            link.backoff.reset();
         }
     }
 
@@ -272,7 +295,7 @@ impl Links {
 }
 
 impl Link {
-    /// A dial failed: the next one tries the member's next address.
+    /// An attempt failed: the next one tries the member's next address.
     fn failed(&mut self, now: Now) {
         self.next = (self.next + 1) % self.addrs.len().max(1);
         self.schedule(now);
@@ -297,12 +320,44 @@ mod tests {
         .expect("peer address")
     }
 
+    fn links(members: impl IntoIterator<Item = PeerAddr>) -> Links {
+        Links::new(&Ed25519Keypair::generate().peer_id(), members)
+    }
+
     fn conn(index: u64) -> ConnectionId {
         ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, index).expect("in range")
     }
 
     fn at(ms: u64) -> Now {
         Now::from_millis(ms)
+    }
+
+    fn established(peer: &PeerId, conn_id: ConnectionId) -> SwarmEvent {
+        SwarmEvent::ConnectionEstablished {
+            peer_id: peer.clone(),
+            conn_id,
+        }
+    }
+
+    fn closed(peer: &PeerId, conn_id: ConnectionId) -> SwarmEvent {
+        SwarmEvent::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id,
+            reason: ConnectionCloseReason::TimedOut,
+        }
+    }
+
+    fn dial_failed(addr: &PeerAddr, conn_id: ConnectionId) -> SwarmEvent {
+        SwarmEvent::DialFailed {
+            conn_id,
+            addr: addr.clone(),
+            reason: "unreachable".into(),
+        }
+    }
+
+    /// How long after `now` the next redial is due.
+    fn redial_in(links: &Links, now: Now) -> Option<u64> {
+        links.next_deadline().map(|due| due.millis_until(now))
     }
 
     #[test]
@@ -313,7 +368,7 @@ mod tests {
             v4.peer_id().clone(),
         )
         .expect("peer address");
-        let mut links = Links::new([v4.clone(), v6.clone()]);
+        let mut links = links([v4.clone(), v6.clone()]);
         assert_eq!(links.due(at(0)), vec![v4.clone()]);
         links.dialed(v4.peer_id(), None, at(0));
         assert_eq!(links.due(at(1_000)), vec![v6]);
@@ -324,7 +379,7 @@ mod tests {
     #[test]
     fn failed_dials_back_off_from_one_second_doubling_to_thirty() {
         let addr = member();
-        let mut links = Links::new([addr.clone()]);
+        let mut links = links([addr.clone()]);
         assert_eq!(links.due(at(0)), vec![addr.clone()], "dialed at start");
 
         let mut now = 0;
@@ -332,14 +387,8 @@ mod tests {
         for index in 0..7 {
             links.dialed(addr.peer_id(), Some(conn(index)), at(now));
             assert_eq!(links.next_deadline(), None, "no redial while a dial is out");
-            let failed = SwarmEvent::DialFailed {
-                conn_id: conn(index),
-                addr: addr.clone(),
-                reason: "unreachable".into(),
-            };
-            assert!(links.observe(&failed, at(now)).is_none());
-            let due = links.next_deadline().expect("redial scheduled");
-            let delay = due.millis_until(at(now));
+            links.observe(&dial_failed(&addr, conn(index)), at(now));
+            let delay = redial_in(&links, at(now)).expect("redial scheduled");
             assert!(links.due(at(now + delay - 1)).is_empty());
             now += delay;
             assert_eq!(links.due(at(now)), vec![addr.clone()]);
@@ -349,48 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_link_reports_down_and_redials_after_one_second() {
-        let addr = member();
-        let peer = addr.peer_id().clone();
-        let mut links = Links::new([addr.clone()]);
-        // Two failures first, so the backoff has grown.
-        for index in 0..2 {
-            links.dialed(&peer, Some(conn(index)), at(0));
-            let failed = SwarmEvent::DialFailed {
-                conn_id: conn(index),
-                addr: addr.clone(),
-                reason: "unreachable".into(),
-            };
-            links.observe(&failed, at(0));
-        }
-
-        // The member dials us: the link is up, and the backoff resets.
-        let up = SwarmEvent::ConnectionEstablished {
-            peer_id: peer.clone(),
-            conn_id: conn(9),
-        };
-        assert!(matches!(
-            links.observe(&up, at(10)),
-            Some(EndpointEvent::RelayMeshMemberUp { peer_id }) if peer_id == peer
-        ));
-        assert_eq!(links.next_deadline(), None);
-
-        let closed = SwarmEvent::ConnectionClosed {
-            peer_id: peer.clone(),
-            conn_id: conn(9),
-            reason: ConnectionCloseReason::TimedOut,
-        };
-        assert!(matches!(
-            links.observe(&closed, at(20)),
-            Some(EndpointEvent::RelayMeshMemberDown { peer_id }) if peer_id == peer
-        ));
-        assert_eq!(links.next_deadline(), Some(at(20).deadline_after(1_000)));
-        // A second close of a link already down reports nothing.
-        assert!(links.observe(&closed, at(30)).is_none());
-    }
-
-    #[test]
-    fn own_backbone_id_is_not_a_member() {
+    fn own_entry_and_unlisted_members_are_not_dialed() {
         let identity = Ed25519Keypair::generate();
         let own = PeerAddr::new(
             "/ip4/127.0.0.1/udp/1/quic-v1".parse().expect("address"),
@@ -398,10 +406,107 @@ mod tests {
         )
         .expect("peer address");
         let other = member();
-        let config = RelayMeshConfig::new(identity, [own, other.clone()]);
+        let mut links = Links::new(&identity.peer_id(), [own, other.clone()]);
+        assert_eq!(links.due(at(0)), vec![other]);
+
+        // An unlisted member that dialed in and dropped is left to redial.
+        let unlisted = Ed25519Keypair::generate().peer_id();
+        links.observe(&established(&unlisted, conn(5)), at(0));
+        links.verified(&unlisted, conn(5));
+        links.observe(&closed(&unlisted, conn(5)), at(10));
+        assert_eq!(links.0.len(), 1);
+    }
+
+    #[test]
+    fn a_verified_link_that_drops_is_redialed_after_one_second() {
+        let addr = member();
+        let peer = addr.peer_id().clone();
+        let mut links = links([addr.clone()]);
+        // Two failures first, so the backoff has grown.
+        for index in 0..2 {
+            links.dialed(&peer, Some(conn(index)), at(0));
+            links.observe(&dial_failed(&addr, conn(index)), at(0));
+        }
+
+        // The member dials us: no redial while it proves itself, and the
+        // backoff resets once the agent verifies it.
+        links.observe(&established(&peer, conn(9)), at(10));
+        assert_eq!(links.next_deadline(), None);
+        links.verified(&peer, conn(9));
+        links.observe(&closed(&peer, conn(9)), at(20));
+        assert_eq!(redial_in(&links, at(20)), Some(1_000));
+        // A stale close changes nothing.
+        links.observe(&closed(&peer, conn(9)), at(30));
+        assert_eq!(redial_in(&links, at(20)), Some(1_000));
+    }
+
+    #[test]
+    fn a_connection_that_closes_unverified_is_a_failed_attempt() {
+        let addr = member();
+        let peer = addr.peer_id().clone();
+        let mut links = links([addr.clone()]);
+        let mut now = 0;
+        let mut delays = Vec::new();
+        for index in 0..3 {
+            links.dialed(&peer, Some(conn(index)), at(now));
+            links.observe(&established(&peer, conn(index)), at(now));
+            // Rejected by either side, or timed out: never verified.
+            links.observe(&closed(&peer, conn(index)), at(now));
+            let delay = redial_in(&links, at(now)).expect("redial scheduled");
+            delays.push(delay);
+            now += delay;
+        }
+        assert_eq!(delays, [1_000, 2_000, 4_000]);
+
+        // A verification for a connection that is no longer current is
+        // ignored.
+        links.dialed(&peer, Some(conn(7)), at(now));
+        links.observe(&established(&peer, conn(7)), at(now));
+        links.observe(
+            &SwarmEvent::ConnectionReplaced {
+                peer_id: peer.clone(),
+                old: conn(7),
+                new: conn(8),
+            },
+            at(now),
+        );
+        links.verified(&peer, conn(7));
+        links.observe(&closed(&peer, conn(8)), at(now));
         assert_eq!(
-            config.member_ids().collect::<Vec<_>>(),
-            vec![other.peer_id().clone()]
+            redial_in(&links, at(now)),
+            Some(8_000),
+            "the replaced-then-failed connection counts as a failure"
+        );
+    }
+
+    #[test]
+    fn a_simultaneous_dial_loser_triggers_no_extra_dial() {
+        let addr = member();
+        let peer = addr.peer_id().clone();
+
+        // Our dial loses to the member's: it reports `DialFailed` while the
+        // winner is mid-proof.
+        let mut links = links([addr.clone()]);
+        links.dialed(&peer, Some(conn(1)), at(0));
+        links.observe(&established(&peer, conn(2)), at(0));
+        links.observe(&dial_failed(&addr, conn(1)), at(0));
+        assert_eq!(links.next_deadline(), None);
+        assert!(links.due(at(60_000)).is_empty());
+
+        // The member's dial loses: established, then closed, while ours is
+        // still handshaking. Ours decides.
+        let mut links = self::links([addr.clone()]);
+        links.dialed(&peer, Some(conn(1)), at(0));
+        links.observe(&established(&peer, conn(2)), at(0));
+        links.observe(&closed(&peer, conn(2)), at(0));
+        assert_eq!(links.next_deadline(), None, "our dial is still out");
+        links.observe(&established(&peer, conn(1)), at(5));
+        links.verified(&peer, conn(1));
+        links.observe(&closed(&peer, conn(1)), at(10));
+        assert_eq!(
+            redial_in(&links, at(10)),
+            Some(1_000),
+            "the loser did not grow the backoff"
         );
     }
 }

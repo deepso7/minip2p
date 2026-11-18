@@ -868,8 +868,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                     .drain(..)
                     .map(EndpointEvent::RelayServer),
             );
-            #[cfg(feature = "quic")]
-            self.events.extend(relay_server.mesh_events.drain(..));
         }
         #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {

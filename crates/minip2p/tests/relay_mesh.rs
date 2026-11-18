@@ -1,6 +1,7 @@
-//! Relay-mesh Endpoints over real loopback transports: two relay nodes that
-//! share one public identity, a client reserved on each, and circuits
-//! forwarded across their backbone.
+//! Relay-mesh Endpoints over real loopback transports: relay nodes that
+//! share one public identity, linked over their backbone by signed
+//! membership (ADR 0028), with clients reserved on them and circuits
+//! forwarded between them.
 //!
 //! Relays are driven on their own threads with long waits, woken only by
 //! readiness and the timers the Endpoint schedules, so a backbone timer
@@ -20,9 +21,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    CloseOutcome, ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    NatConfig, NatEvent, Path, PeerAddr, PeerId, RelayMeshConfig, RelayServerEvent,
-    RelayServerRuntimeErrorKind, ReservationPolicy, WaitHandle,
+    CloseOutcome, ConnectId, ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent,
+    EndpointWaitOutcome, MeshRejectionReason, NatConfig, NatEvent, Path, PeerAddr, PeerId,
+    RelayMeshConfig, RelayServerEvent, ReservationPolicy, WaitHandle,
 };
 
 #[path = "../../../tests/support/endpoint.rs"]
@@ -100,7 +101,13 @@ impl Relay {
 
     fn expect_member_up(&self, member: &PeerId) {
         self.expect("member up", Duration::from_secs(20), |event| {
-            matches!(event, EndpointEvent::RelayMeshMemberUp { peer_id } if peer_id == member)
+            matches!(event, EndpointEvent::RelayServer(RelayServerEvent::MeshMemberUp { member: up }) if up == member)
+        });
+    }
+
+    fn expect_member_down(&self, member: &PeerId) {
+        self.expect("member down", Duration::from_secs(20), |event| {
+            matches!(event, EndpointEvent::RelayServer(RelayServerEvent::MeshMemberDown { member: down }) if down == member)
         });
     }
 
@@ -170,16 +177,13 @@ fn bind_relay(
         .unwrap()
 }
 
-/// Two meshed relays, their backbone link up on both ends. Both take the
-/// same member list, each skipping its own entry.
+/// Two meshed relays, their backbone link up on both ends. A lists
+/// nobody; B, added later, lists A.
 fn meshed_pair() -> (Relay, Relay) {
     let public = Ed25519Keypair::generate();
     let (key_a, key_b) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
-    let port_b = free_udp_port();
-    let b_addr = backbone_addr(port_b, &key_b);
-    let a = Relay::spawn(bind_relay(&public, &key_a, 0, vec![b_addr.clone()]));
-    let members = vec![a.backbone.clone(), b_addr];
-    let b = Relay::spawn(bind_relay(&public, &key_b, port_b, members));
+    let a = Relay::spawn(bind_relay(&public, &key_a, 0, Vec::new()));
+    let b = Relay::spawn(bind_relay(&public, &key_b, 0, vec![a.backbone.clone()]));
     a.expect_member_up(b.backbone.peer_id());
     b.expect_member_up(a.backbone.peer_id());
     (a, b)
@@ -197,6 +201,53 @@ fn client(relay: &PeerAddr, config: NatConfig) -> Endpoint {
         .unwrap();
     endpoint.listen().unwrap();
     endpoint
+}
+
+/// Connects `dialer` to `target` and drives both until the connect
+/// settles, which must be over a relayed path; returns the connection.
+#[expect(
+    clippy::panic,
+    reason = "A failed connect must include the relays' event traces."
+)]
+fn relayed(
+    dialer: &mut Endpoint,
+    target: &mut Endpoint,
+    relays: &[&Relay],
+) -> minip2p::ConnectionId {
+    let target_peer = target.peer_id().clone();
+    let connect_id: ConnectId = dialer.connect(&target_peer).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut trace = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "no relayed path: {trace:#?}");
+        if let Some(event) = dialer.next_event(Duration::from_millis(20)).unwrap() {
+            trace.push(format!("dialer: {event:?}"));
+            if let EndpointEvent::ConnectSettled {
+                connect_id: id,
+                outcome,
+                ..
+            } = event
+                && id == connect_id
+            {
+                match outcome {
+                    ConnectOutcome::Connected {
+                        conn_id,
+                        path: Path::Relayed { .. },
+                    } => return conn_id,
+                    other => panic!(
+                        "expected a relayed connection, got {other:?}\nrelays: {:#?}",
+                        relays
+                            .iter()
+                            .map(|relay| relay.events.try_iter().collect::<Vec<_>>())
+                            .collect::<Vec<_>>()
+                    ),
+                }
+            }
+        }
+        if let Some(event) = target.next_event(Duration::from_millis(20)).unwrap() {
+            trace.push(format!("target: {event:?}"));
+        }
+    }
 }
 
 /// Drives `client` until it holds a reservation on the mesh.
@@ -229,38 +280,7 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
     let mut bob = client(&b.public, no_punch(ReservationPolicy::Never));
     let alice_peer = alice.peer_id().clone();
     let bob_peer = bob.peer_id().clone();
-    let connect_id = bob.connect(&alice_peer).unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut trace = Vec::new();
-    let conn = loop {
-        assert!(Instant::now() < deadline, "no relayed path: {trace:#?}");
-        if let Some(event) = bob.next_event(Duration::from_millis(20)).unwrap() {
-            trace.push(format!("bob: {event:?}"));
-            if let EndpointEvent::ConnectSettled {
-                connect_id: id,
-                outcome,
-                ..
-            } = event
-                && id == connect_id
-            {
-                match outcome {
-                    ConnectOutcome::Connected {
-                        conn_id,
-                        path: Path::Relayed { .. },
-                    } => break conn_id,
-                    other => panic!(
-                        "expected a relayed connection, got {other:?}\nA: {:#?}\nB: {:#?}",
-                        a.events.try_iter().collect::<Vec<_>>(),
-                        b.events.try_iter().collect::<Vec<_>>()
-                    ),
-                }
-            }
-        }
-        if let Some(event) = alice.next_event(Duration::from_millis(20)).unwrap() {
-            trace.push(format!("alice: {event:?}"));
-        }
-    };
+    let conn = relayed(&mut bob, &mut alice, &[&a, &b]);
 
     // Bob speaks first; Alice answers with bytes of her own on the stream.
     let (bob_conn, stream) = bob.open_stream(&alice_peer, ECHO_PROTOCOL).unwrap();
@@ -397,9 +417,10 @@ fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
 }
 
 /// Node A dials B before B is up, so only A's own retransmissions and
-/// redials can bring the link up: B never dials A (its entry for A names a
-/// closed port). No client traffic runs, and both relays sleep on long
-/// waits, so the link comes up only if A schedules its backbone timers.
+/// redials can bring the link up: B lists nobody, so it never dials A, and
+/// leaves the redial to A when the link drops. No client traffic runs, and
+/// both relays sleep on long waits, so the link comes up only if A
+/// schedules its backbone timers.
 #[test]
 fn an_idle_backbone_retransmits_and_redials_on_its_own_timers() {
     let public = Ed25519Keypair::generate();
@@ -414,58 +435,139 @@ fn an_idle_backbone_retransmits_and_redials_on_its_own_timers() {
     // A's first dial is already out when B binds: its handshake reaches B
     // on a retransmission.
     thread::sleep(Duration::from_millis(300));
-    let unreachable_a = backbone_addr(free_udp_port(), &key_a);
-    let bind_b = || {
-        Relay::spawn(bind_relay(
-            &public,
-            &key_b,
-            port_b,
-            vec![unreachable_a.clone()],
-        ))
-    };
+    let bind_b = || Relay::spawn(bind_relay(&public, &key_b, port_b, Vec::new()));
     let b = bind_b();
     a.expect_member_up(&key_b.peer_id());
 
     // B goes away and comes back on the same address: A sees the link
     // drop and redials it after its backoff.
     b.stop();
-    a.expect("member down", Duration::from_secs(20), |event| {
-        matches!(event, EndpointEvent::RelayMeshMemberDown { peer_id } if *peer_id == key_b.peer_id())
-    });
+    a.expect_member_down(&key_b.peer_id());
     let _b = bind_b();
     a.expect_member_up(&key_b.peer_id());
 }
 
 #[test]
-fn a_backbone_connection_from_a_non_member_is_closed() {
-    let public = Ed25519Keypair::generate();
-    let (key_a, stranger) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
-    // A's only member is a node that never runs.
-    let absent = backbone_addr(free_udp_port(), &Ed25519Keypair::generate());
-    let a = Relay::spawn(bind_relay(&public, &key_a, 0, vec![absent]));
-    // The stranger lists A, but A does not list it.
-    let c = Relay::spawn(bind_relay(&public, &stranger, 0, vec![a.backbone.clone()]));
+fn a_node_under_another_public_identity_is_rejected() {
+    let key_a = Ed25519Keypair::generate();
+    let a = Relay::spawn(bind_relay(
+        &Ed25519Keypair::generate(),
+        &key_a,
+        0,
+        Vec::new(),
+    ));
+    // The stranger lists A, but runs under a public identity of its own.
+    let stranger = Ed25519Keypair::generate();
+    let c = Relay::spawn(bind_relay(
+        &Ed25519Keypair::generate(),
+        &stranger,
+        0,
+        vec![a.backbone.clone()],
+    ));
 
-    // A never counts the stranger as a member, before or after refusing it.
-    let no_member_up = |event: &EndpointEvent| {
+    // Whichever side judges the other's proof first refuses it and closes
+    // the connection; neither ever counts the other as a member.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let rejected = |event: &EndpointEvent, other: &PeerId| {
         assert!(
-            !matches!(event, EndpointEvent::RelayMeshMemberUp { .. }),
-            "a non-member came up as a member"
+            !matches!(
+                event,
+                EndpointEvent::RelayServer(RelayServerEvent::MeshMemberUp { .. })
+            ),
+            "a node under another identity came up as a member"
         );
-    };
-    a.expect("non-member refused", Duration::from_secs(20), |event| {
-        no_member_up(event);
         matches!(
             event,
-            EndpointEvent::RelayServer(RelayServerEvent::Error(error))
-                if error.kind == RelayServerRuntimeErrorKind::Mesh
-                    && error.peer_id == Some(stranger.peer_id())
+            EndpointEvent::RelayServer(RelayServerEvent::MeshPeerRejected {
+                peer_id,
+                reason: MeshRejectionReason::InvalidProof,
+            }) if peer_id == other
         )
+    };
+    loop {
+        assert!(Instant::now() < deadline, "neither node rejected the other");
+        let by_a = a
+            .events
+            .recv_timeout(Duration::from_millis(20))
+            .is_ok_and(|event| rejected(&event, &stranger.peer_id()));
+        let by_c = c
+            .events
+            .recv_timeout(Duration::from_millis(20))
+            .is_ok_and(|event| rejected(&event, &key_a.peer_id()));
+        if by_a || by_c {
+            return;
+        }
+    }
+}
+
+/// A lists nobody, B lists A, C lists A and B: every pair links, syncs, and
+/// forwards circuits, with no node listing every other.
+#[test]
+fn a_node_that_lists_the_existing_ones_joins_a_full_mesh() {
+    let public = Ed25519Keypair::generate();
+    let [key_a, key_b, key_c]: [Ed25519Keypair; 3] =
+        std::array::from_fn(|_| Ed25519Keypair::generate());
+    let a = Relay::spawn(bind_relay(&public, &key_a, 0, Vec::new()));
+    let b = Relay::spawn(bind_relay(&public, &key_b, 0, vec![a.backbone.clone()]));
+    let c = Relay::spawn(bind_relay(
+        &public,
+        &key_c,
+        0,
+        vec![a.backbone.clone(), b.backbone.clone()],
+    ));
+    let relays = [&a, &b, &c];
+    for (i, relay) in relays.iter().enumerate() {
+        let mut unsynced: Vec<&PeerId> = relays
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, other)| other.backbone.peer_id())
+            .collect();
+        relay.expect(
+            &format!("node {i} synced with both others"),
+            Duration::from_secs(20),
+            |event| {
+                if let EndpointEvent::RelayServer(RelayServerEvent::MeshMemberSynced {
+                    member,
+                    ..
+                }) = event
+                {
+                    unsynced.retain(|peer| *peer != member);
+                }
+                unsynced.is_empty()
+            },
+        );
+    }
+
+    // One client reserved on each node; each pair of nodes forwards one
+    // circuit, its entry node naming the holding node.
+    let nat = NatConfig {
+        force_relay: true,
+        dcutr: false,
+        reservation_policy: ReservationPolicy::Always,
+        ..NatConfig::default()
+    };
+    let mut clients = relays.map(|relay| {
+        let mut client = client(&relay.public, nat.clone());
+        await_reservation(&mut client, &relay.public);
+        client
     });
-    c.expect("closed by A", Duration::from_secs(20), |event| {
-        matches!(event, EndpointEvent::RelayMeshMemberDown { peer_id } if peer_id == a.backbone.peer_id())
-    });
-    a.events.try_iter().for_each(|event| no_member_up(&event));
+    for (entry, holding) in [(1, 0), (2, 0), (2, 1)] {
+        let [first, second, third] = &mut clients;
+        let (dialer, target) = match (entry, holding) {
+            (1, 0) => (second, first),
+            (2, 0) => (third, first),
+            _ => (third, second),
+        };
+        relayed(dialer, target, &relays);
+        relays[entry].expect("forwarded circuit", Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                EndpointEvent::RelayServer(RelayServerEvent::CircuitOpened { via: Some(via), .. })
+                    if **via == *relays[holding].backbone.peer_id()
+            )
+        });
+    }
 }
 
 #[test]

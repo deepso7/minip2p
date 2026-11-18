@@ -82,9 +82,12 @@ fuzz_target!(|data: &[u8]| {
 
 /// Decodes both relay-mesh frames, and feeds the input to a directory stream
 /// as one read and as two, so frames split across reads take the same path.
+/// Member proofs and accepts go through both readers the same way.
 fn fuzz_relay_mesh(data: &[u8]) {
     let _ = mesh::decode_mesh_frame(data, mesh::DirectoryMessage::decode);
     let _ = mesh::decode_mesh_frame(data, mesh::ForwardMessage::decode);
+    fuzz_member_reader(mesh::MemberReader::proof, data);
+    fuzz_member_reader(mesh::MemberReader::accept, data);
 
     let member = fuzz_peer_id();
     let split = data.first().map_or(0, |b| usize::from(*b)).min(data.len());
@@ -103,6 +106,29 @@ fn fuzz_relay_mesh(data: &[u8]) {
     assert_eq!(reset(&whole_input), reset(&parts_input));
     assert_eq!(whole.entry_count(&member), parts.entry_count(&member));
     assert_eq!(whole.is_synced(&member), parts.is_synced(&member));
+}
+
+/// Reads `data` as one member message whole and split in two: both reads
+/// agree, and a message is whole only at its exact length.
+fn fuzz_member_reader(reader: fn() -> mesh::MemberReader, data: &[u8]) {
+    let mut whole = reader();
+    whole.push(data);
+    let split = data.first().map_or(0, |b| usize::from(*b)).min(data.len());
+    let (head, tail) = data.split_at(split);
+    let mut parts = reader();
+    parts.push(head);
+    parts.push(tail);
+    assert_eq!(whole.finish(), parts.finish());
+    if let Ok(message) = whole.finish() {
+        assert_eq!(message, data);
+    }
+    if let Ok(proof) = whole.finish_proof() {
+        let _ = mesh::verify_member_proof(
+            &PublicKey::new(KeyType::Ed25519, vec![0; 32]),
+            &fuzz_peer_id(),
+            &proof,
+        );
+    }
 }
 
 /// Exercises the relay-side incremental framing and terminal-action boundary.

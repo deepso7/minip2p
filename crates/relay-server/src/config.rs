@@ -105,6 +105,8 @@ pub enum RelayServerConfigErrorKind {
     MustBeNonZero,
     /// A duration cannot be represented by the relay wire's `u32` seconds.
     ExceedsWireU32,
+    /// [`MeshConfig::public_key`] is not the agent's own identity.
+    NotOwnIdentity,
 }
 
 /// An invalid relay configuration field.
@@ -122,6 +124,7 @@ impl core::fmt::Display for RelayServerConfigErrorKind {
         match self {
             Self::MustBeNonZero => f.write_str("must be non-zero"),
             Self::ExceedsWireU32 => f.write_str("exceeds the wire u32 seconds bound"),
+            Self::NotOwnIdentity => f.write_str("is not the relay's own identity"),
         }
     }
 }

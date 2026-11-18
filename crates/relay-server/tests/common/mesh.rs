@@ -10,17 +10,117 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use minip2p_core::PeerId;
 use minip2p_core::platform::Now;
+use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{HopMessage, Status};
-use minip2p_relay_server::mesh::{DIRECTORY_PROTOCOL_ID, MeshConfig, is_backbone_connection};
+use minip2p_relay_server::mesh::{
+    DIRECTORY_PROTOCOL_ID, MEMBER_ACCEPT, MEMBER_PROOF_LEN, MEMBER_PROTOCOL_ID, MeshConfig,
+    is_backbone_connection, sign_member_proof,
+};
 use minip2p_relay_server::{RelayServerConfig, RelayServerEvent, StreamKey};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, ConnectionNamespace};
+use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
 
 use super::{Call, Node, at, connect_request, peer, reserve_request, sends_on};
+
+/// The public identity every node of the mesh shares.
+pub fn relay_identity() -> Ed25519Keypair {
+    Ed25519Keypair::from_secret_key_bytes([7; 32])
+}
+
+/// The relay's peer id on every node.
+pub fn relay_peer() -> PeerId {
+    relay_identity().peer_id()
+}
 
 /// Node `i`'s backbone peer id.
 pub fn member(i: usize) -> PeerId {
     peer(format!("mesh-member-{i}").as_bytes())
+}
+
+/// Node `i`'s member proof under the mesh's public identity.
+pub fn proof(i: usize) -> [u8; MEMBER_PROOF_LEN] {
+    sign_member_proof(&relay_identity(), &member(i))
+}
+
+/// Node `i` of a mesh: a relay under [`relay_identity`] whose backbone peer
+/// id is [`member`]`(i)`.
+pub fn mesh_node(i: usize, mut config: RelayServerConfig) -> Node {
+    config.mesh = Some(MeshConfig::new(&relay_identity(), &member(i)));
+    let mut node = Node::with_identity(relay_peer(), config);
+    node.replace_announce_addrs(vec![super::direct_addr()])
+        .expect("valid announce address");
+    node
+}
+
+/// The member stream `node` opened on `conn_id`, in `calls`.
+pub fn member_open(calls: &[Call], conn_id: ConnectionId) -> Option<StreamKey> {
+    calls.iter().find_map(|call| match call {
+        Call::Open {
+            protocol_id,
+            opened: Some(stream),
+            ..
+        } if protocol_id == MEMBER_PROTOCOL_ID && stream.conn_id == conn_id => Some(*stream),
+        _ => None,
+    })
+}
+
+/// Plays node `from`'s side of the member exchange on `node`'s pending
+/// connection `conn_id`, from `node`'s `calls` since it came up: accepts
+/// `node`'s proof and sends `from`'s own. Returns the commands `node`
+/// issued.
+pub fn verify_by_hand(
+    node: &mut Node,
+    from: usize,
+    conn_id: ConnectionId,
+    calls: &[Call],
+    now: Now,
+) -> Vec<Call> {
+    let outbound = member_open(calls, conn_id).expect("a member open");
+    node.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: member(from),
+            conn_id,
+            stream_id: outbound.stream_id,
+            protocol_id: MEMBER_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        now,
+    );
+    node.data(&member(from), outbound, &[MEMBER_ACCEPT], now);
+    node.half_close(&member(from), outbound, now);
+    let inbound = StreamKey {
+        conn_id,
+        stream_id: StreamId::new(77),
+    };
+    send_member_stream(node, from, inbound, &proof(from), now);
+    node.calls()
+}
+
+/// `from` opens a member stream `stream` on `node`, writes `message` and
+/// half-closes it.
+pub fn send_member_stream(
+    node: &mut Node,
+    from: usize,
+    stream: StreamKey,
+    message: &[u8],
+    now: Now,
+) {
+    node.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: member(from),
+            conn_id: stream.conn_id,
+            stream_id: stream.stream_id,
+            protocol_id: MEMBER_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        false,
+        now,
+    );
+    if !message.is_empty() {
+        node.data(&member(from), stream, message, now);
+    }
+    node.half_close(&member(from), stream, now);
 }
 
 /// The backbone connection, on any node, to node `to`.
@@ -32,7 +132,17 @@ fn link_node(conn_id: ConnectionId) -> usize {
     conn_id.sequence() as usize - 1
 }
 
-/// A mesh of nodes, each a member of every other's list.
+/// Node `i`'s verified links to every other node, in node order.
+fn others_links(i: usize, count: usize) -> Vec<(PeerId, ConnectionId)> {
+    let mut links: Vec<_> = (0..count)
+        .filter(|&j| j != i)
+        .map(|j| (member(j), link(j)))
+        .collect();
+    links.sort();
+    links
+}
+
+/// A mesh of nodes under one public identity, every pair linked.
 pub struct Mesh {
     pub nodes: Vec<Node>,
     /// Client-facing commands each node issued, for the test to read.
@@ -58,9 +168,8 @@ impl Mesh {
         let nodes = configs
             .into_iter()
             .enumerate()
-            .map(|(i, mut config)| {
-                config.mesh = Some(MeshConfig::new((0..count).filter(|j| *j != i).map(member)));
-                let mut node = Node::new(config);
+            .map(|(i, config)| {
+                let mut node = mesh_node(i, config);
                 // Disjoint stream ids, so both ends of a link can open.
                 node.swarm.next_stream = i as u64 * 100_000;
                 node
@@ -79,11 +188,21 @@ impl Mesh {
             }
         }
         mesh.pump(at(0));
-        // A clean start: each member whose directory arrived synced empty.
+        // A clean start: every member verified and up, and each whose
+        // directory arrived synced empty.
         for (i, node) in mesh.nodes.iter_mut().enumerate() {
             let events = node.events();
-            let synced = (0..count).filter(|&j| j != i && !mesh.held.contains(&(j, i)));
-            assert_eq!(events.len(), synced.clone().count(), "{events:?}");
+            let others = (0..count).filter(|&j| j != i);
+            let synced = others.clone().filter(|&j| !mesh.held.contains(&(j, i)));
+            assert_eq!(
+                events.len(),
+                others.clone().count() + synced.clone().count(),
+                "{events:?}"
+            );
+            for j in others {
+                let up = RelayServerEvent::MeshMemberUp { member: member(j) };
+                assert!(events.contains(&up), "{events:?}");
+            }
             for j in synced {
                 let event = RelayServerEvent::MeshMemberSynced {
                     member: member(j),
@@ -91,6 +210,9 @@ impl Mesh {
                 };
                 assert!(events.contains(&event), "{events:?}");
             }
+            let mut verified = node.take_verified_links();
+            verified.sort();
+            assert_eq!(verified, others_links(i, count));
         }
         mesh
     }
