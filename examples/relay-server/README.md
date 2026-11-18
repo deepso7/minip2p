@@ -47,25 +47,25 @@ sudoedit /etc/minip2p-relay/relay.toml && sudo minip2p-relay service restart
 ```
 
 ```toml
-hostname = "relay.example.com"   # announces /dns/<hostname>/tcp/19876 and /udp/19876/quic-v1
-key = "/var/lib/minip2p-relay/identity.key"   # --key
+hostname = "relay.example.com" # announces /dns/<hostname>/tcp/19876 and /udp/19876/quic-v1
+key = "/var/lib/minip2p-relay/identity.key" # --key
 # quic = ["0.0.0.0:4101"]       # --quic (tcp = [...] for --tcp); not with hostname
 # announce = ["/dns4/relay.example.com/tcp/4001"]   # --announce, after hostname's
-paused = false                   # --paused
+paused = false # --paused
 
-[webtransport]                   # present = --webtransport
-cert = "/etc/minip2p-relay/tls/fullchain.pem"   # --webtransport-cert
-key = "/etc/minip2p-relay/tls/privkey.pem"      # --webtransport-key
-reload_secs = 30                 # --webtransport-reload-secs
+[webtransport] # present = --webtransport
+cert = "/etc/minip2p-relay/tls/fullchain.pem" # --webtransport-cert
+key = "/etc/minip2p-relay/tls/privkey.pem" # --webtransport-key
+reload_secs = 30 # --webtransport-reload-secs
 
-[limits]                         # each limit flag without its dashes
-max_circuits = 1024              # --max-circuits
-circuit_ip_rate = "off"          # --circuit-ip-rate
+[limits] # each limit flag without its dashes
+max_circuits = 1024 # --max-circuits
+circuit_ip_rate = "off" # --circuit-ip-rate
 
-[mesh]                           # present = the mesh is on
-key = "/var/lib/minip2p-relay/mesh.key"          # --mesh-key
-listen = ["0.0.0.0:19877"]       # --mesh-listen
-members = []                     # --mesh-member: "/ip4/<ip>/udp/19877/quic-v1/p2p/<backbone id>"
+[mesh] # present = the mesh is on
+key = "/var/lib/minip2p-relay/mesh.key" # --mesh-key
+listen = ["0.0.0.0:19877"] # --mesh-listen
+members = [] # --mesh-member: "/ip4/<ip>/udp/19877/quic-v1/p2p/<backbone id>"
 ```
 
 Omitted fields keep the binary's defaults; an unknown field is an error. `hostname` needs the default ports, so it can't be combined with `quic` or `tcp` (list `announce` addresses instead), and announces the hashless WebTransport address `/dns/<hostname>/udp/19876/quic-v1/webtransport` only with a CA certificate. `[mesh]` needs its `key`, so the backbone key is never ephemeral.
@@ -183,7 +183,7 @@ On a systemd host with certbot, for `relay.example.com` (also on the docs site a
    ```toml
    # relay.toml
    hostname = "relay.example.com"
-
+   
    [webtransport]
    cert = "/etc/minip2p-relay/tls/fullchain.pem"
    key = "/etc/minip2p-relay/tls/privkey.pem"
