@@ -34,6 +34,6 @@ Run `just interop-relay-go` (needs Go) to run the same two-node mesh case with g
 
 Recorded environment/result: Linux x86_64 (Ubuntu 26.04), Go 1.26.11, Rust 1.99, `just interop-relay-go`: success (2026-11-18).
 
-## Still separate
+## Transport matrix (libp2p/unified-testing)
 
-QUIC interoperability needs its own live gate: the upstream interop package does not currently cover QUIC; it covers TCP, WebTransport, and WebRTC Direct.
+`unified-testing/` is minip2p's test app for [libp2p/unified-testing](https://github.com/libp2p/unified-testing)'s transport suite: dial, handshake, and one ping against other libp2p implementations over `tcp` (Noise, Yamux) and `quic-v1`, in both dialer and listener roles. It runs in that repo's Docker harness, not here; see its README to build the image or run it locally.
