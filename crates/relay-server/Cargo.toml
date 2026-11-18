@@ -17,6 +17,7 @@ workspace = true
 default = ["std"]
 std = [
   "minip2p-core/std",
+  "minip2p-identity/std",
   "minip2p-relay/std",
   "minip2p-swarm/std",
   "minip2p-transport/std",
@@ -25,6 +26,9 @@ std = [
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.11.10", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.11.10", default-features = false, features = [
+  "ed25519",
+] }
 minip2p-relay = { path = "../relay", version = "0.11.10", default-features = false }
 minip2p-swarm = { path = "../swarm", version = "0.11.10", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.11.10", default-features = false }

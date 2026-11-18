@@ -139,6 +139,12 @@ impl RelaySwarm for FakeSwarm {
         self.remote_addrs.get(&conn_id)
     }
 
+    fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        self.connections
+            .iter()
+            .find_map(|(peer, conn)| (*conn == conn_id).then_some(peer))
+    }
+
     fn open_stream(
         &mut self,
         peer: &PeerId,
@@ -294,8 +300,13 @@ impl Node {
 
     /// A relay with no address to announce.
     pub fn unannounced(config: RelayServerConfig) -> Self {
+        Self::with_identity(peer(b"relay"), config)
+    }
+
+    /// An unannounced relay whose own peer id is `local`.
+    pub fn with_identity(local: PeerId, config: RelayServerConfig) -> Self {
         Self {
-            agent: RelayServerAgent::new(peer(b"relay"), config).expect("valid config"),
+            agent: RelayServerAgent::new(local, config).expect("valid config"),
             swarm: FakeSwarm::default(),
         }
     }

@@ -15,7 +15,7 @@ use minip2p_relay_server::{
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
 
-use common::mesh::{Mesh, link, member};
+use common::mesh::{Mesh, link, member, verify_by_hand};
 use common::nat_client::{
     CLIENT_RELAY_CONN, ClientSwarm, establish_relay_session, ready_client_hop,
 };
@@ -120,7 +120,7 @@ impl Bob {
             return Self { entry, nat: None };
         };
         // Every node runs as the one relay identity, `common::Node`'s.
-        let relay = peer(b"relay");
+        let relay = common::mesh::relay_peer();
         let relay_addr = PeerAddr::new(
             "/ip4/192.0.2.1/udp/4001/quic-v1"
                 .parse()
@@ -185,7 +185,7 @@ impl Bob {
         agent.handle_event(
             &mut swarm,
             &SwarmEvent::StreamData {
-                peer_id: peer(b"relay"),
+                peer_id: common::mesh::relay_peer(),
                 conn_id: CLIENT_RELAY_CONN,
                 stream_id: bob_stream().stream_id,
                 data: reply.into(),
@@ -475,7 +475,8 @@ fn a_forward_lost_to_a_replaced_link_retries_the_member_on_the_new_link() {
     let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
     let node = &mut mesh.nodes[C];
     node.replace(&member(B), link(B), new_link, false, 2);
-    node.calls();
+    let calls = node.calls();
+    verify_by_hand(node, B, new_link, &calls, at(2));
     // B's snapshot arrives on the new link, still claiming Alice.
     let directory = StreamKey {
         conn_id: new_link,
@@ -840,44 +841,4 @@ fn a_forward_that_times_out_fails_and_leaves_no_state() {
     assert!(!mesh.nodes[A].owns_stream(stop));
     assert!(!mesh.nodes[A].owns_stream(Mesh::remote(B, forward)));
     assert!(!mesh.nodes[B].owns_stream(forward));
-}
-
-#[test]
-fn non_members_are_refused_on_the_backbone_and_on_mesh_protocols() {
-    let mut mesh = mesh(defaults());
-    let stranger = peer(b"mesh-stranger");
-    let node = &mut mesh.nodes[A];
-
-    let backbone = ConnectionId::namespaced(minip2p_transport::ConnectionNamespace::MESH_IPV4, 9)
-        .expect("in range");
-    node.establish(&stranger, backbone);
-    assert_eq!(
-        node.calls(),
-        [Call::CloseConnection {
-            peer: stranger.clone(),
-            conn_id: backbone,
-        }]
-    );
-    assert!(matches!(
-        node.events()[..],
-        [RelayServerEvent::Error(ref error)]
-            if error.kind == minip2p_relay_server::RelayServerRuntimeErrorKind::Mesh
-    ));
-
-    // A mesh protocol over a public connection is not a member's either.
-    let public = key(30, 1);
-    node.establish(&stranger, public.conn_id);
-    assert!(node.handle_event(
-        &SwarmEvent::StreamReady {
-            peer_id: stranger.clone(),
-            conn_id: public.conn_id,
-            stream_id: public.stream_id,
-            protocol_id: FORWARD_PROTOCOL_ID.into(),
-            initiated_locally: false,
-        },
-        false,
-        at(1),
-    ));
-    assert_eq!(resets(&node.calls()), [public]);
-    assert!(node.owns_stream(public), "claimed until it closes");
 }

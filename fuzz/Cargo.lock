@@ -549,6 +549,7 @@ name = "minip2p-relay-server"
 version = "0.11.10"
 dependencies = [
  "minip2p-core",
+ "minip2p-identity",
  "minip2p-relay",
  "minip2p-swarm",
  "minip2p-transport",

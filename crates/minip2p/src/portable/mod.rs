@@ -73,10 +73,11 @@ pub use minip2p_pubsub::{
 };
 #[cfg(feature = "relay-server")]
 pub use minip2p_relay_server::{
-    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
-    RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
-    RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
-    RelayServerRuntimeErrorKind, ReservationCloseReason, ReservationDenialReason, Status,
+    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, MeshRejectionReason,
+    RateLimit, RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind,
+    RelayServerConfig, RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent,
+    RelayServerRuntimeError, RelayServerRuntimeErrorKind, ReservationCloseReason,
+    ReservationDenialReason, Status,
 };
 /// Yamux limits, set per connection through `TcpConfig::yamux` and
 /// `CircuitLimits::yamux`.

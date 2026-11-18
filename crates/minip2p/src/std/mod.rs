@@ -1656,17 +1656,27 @@ impl EndpointBuilder {
     /// [`RelayMeshConfig::identity`], over its own QUIC transport bound to
     /// [`RelayMeshConfig::listen`]. It shares this endpoint's wait, and its
     /// traffic never reaches the application: [`Endpoint::wait`] reports
-    /// only member links coming up and going down, as
-    /// [`EndpointEvent::RelayMeshMemberUp`] and
-    /// [`EndpointEvent::RelayMeshMemberDown`]. Every member is dialed from
-    /// the first drive and redialed with backoff (1 s doubling to 30 s)
-    /// while its link is down; a backbone connection from a peer not in
-    /// [`RelayMeshConfig::members`] is closed. Nodes need synced clocks:
-    /// reservation expiries cross the backbone as UNIX seconds.
+    /// members joining and leaving, and peers refused, as
+    /// [`EndpointEvent::RelayServer`] with
+    /// [`RelayServerEvent::MeshMemberUp`](minip2p_relay_server::RelayServerEvent::MeshMemberUp),
+    /// [`MeshMemberDown`](minip2p_relay_server::RelayServerEvent::MeshMemberDown)
+    /// and
+    /// [`MeshPeerRejected`](minip2p_relay_server::RelayServerEvent::MeshPeerRejected).
+    ///
+    /// There is no allowlist: a backbone peer is a member once it proves
+    /// that this endpoint's identity signed its backbone peer id (ADR 0028),
+    /// so every node must run under the same identity. Each node dials the
+    /// members in [`RelayMeshConfig::members`] from the first drive, and
+    /// redials them with backoff (1 s doubling to 30 s) while their link is
+    /// down, and accepts any member that dials it. A link forms when either
+    /// side lists the other, so a new node that lists every existing node
+    /// joins the mesh without a change on the others. Nodes need synced
+    /// clocks: reservation expiries cross the backbone as UNIX seconds.
     ///
     /// Needs [`relay_server`](Self::relay_server) or
     /// [`relay_server_config`](Self::relay_server_config), and replaces that
-    /// config's [`mesh`](RelayServerConfig::mesh) with the members'.
+    /// config's [`mesh`](RelayServerConfig::mesh) with one signed for this
+    /// node's backbone identity, keeping its directory limit.
     /// Checked at bind ([`BindError::Options`]): the backbone identity must
     /// differ from the endpoint's, and every listen and member address must
     /// be `/ip4|ip6/<ip>/udp/<port>/quic-v1`. A backbone socket that cannot
@@ -1676,7 +1686,7 @@ impl EndpointBuilder {
     /// use minip2p::{Ed25519Keypair, Endpoint, PeerAddr, RelayMeshConfig};
     ///
     /// # let (public_key, backbone_key) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
-    /// // Every node's backbone address and backbone peer id; each node skips its own.
+    /// // The existing nodes' backbone addresses and backbone peer ids; a node skips its own.
     /// let members: Vec<PeerAddr> = vec![
     ///     "/ip4/203.0.113.10/udp/19877/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse()?,
     /// ];
@@ -1944,7 +1954,11 @@ impl EndpointBuilder {
 
     /// Moves the capability intent out for Endpoint setup, which applies
     /// every default; the relay server joins it with its announce addresses.
-    fn take_capabilities(&mut self) -> Capabilities {
+    #[cfg_attr(
+        not(all(feature = "relay-server", feature = "quic")),
+        expect(unused_variables, reason = "only a relay mesh signs with the identity")
+    )]
+    fn take_capabilities(&mut self, keypair: &Ed25519Keypair) -> Capabilities {
         #[cfg_attr(
             not(feature = "relay-server"),
             expect(unused_mut, reason = "only the relay server joins here")
@@ -1952,16 +1966,24 @@ impl EndpointBuilder {
         let mut capabilities = std::mem::take(&mut self.capabilities);
         #[cfg(feature = "relay-server")]
         if let Some(config) = self.relay_server_config.take() {
-            // A mesh node's agent learns the members' backbone peer ids.
+            // A mesh node's agent gets the public key and the proof it
+            // signed for this node's backbone identity.
             #[cfg(feature = "quic")]
             let config = match &self.relay_mesh {
-                Some(mesh) => RelayServerConfig {
-                    mesh: Some(minip2p_relay_server::mesh::MeshConfig {
-                        members: mesh.member_ids().collect(),
-                        ..config.mesh.unwrap_or_default()
-                    }),
-                    ..config
-                },
+                Some(mesh) => {
+                    let mut signed = minip2p_relay_server::mesh::MeshConfig::new(
+                        keypair,
+                        &mesh.identity.peer_id(),
+                    );
+                    if let Some(given) = &config.mesh {
+                        signed.max_directory_entries_per_member =
+                            given.max_directory_entries_per_member;
+                    }
+                    RelayServerConfig {
+                        mesh: Some(signed),
+                        ..config
+                    }
+                }
                 None => config,
             };
             capabilities.relay_server = Some(setup::RelayServerSetup {
@@ -1978,8 +2000,11 @@ impl EndpointBuilder {
     fn prepare(&mut self) -> Result<(Ed25519Keypair, setup::Validated), BindError> {
         self.validate()?;
         let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
-        let capabilities =
-            setup::validate(self.take_capabilities(), STD_PLATFORM, &keypair.peer_id())?;
+        let capabilities = setup::validate(
+            self.take_capabilities(&keypair),
+            STD_PLATFORM,
+            &keypair.peer_id(),
+        )?;
         Ok((keypair, capabilities))
     }
 
@@ -2419,12 +2444,7 @@ fn bind_backbone(
             reason: "listening on the backbone's bound addresses failed outside the transport",
         },
     })?;
-    let own = mesh.identity.peer_id();
-    let members = mesh
-        .members
-        .into_iter()
-        .filter(|member| *member.peer_id() != own);
-    Ok(crate::relay_mesh::Backbone::new(core, members))
+    Ok(crate::relay_mesh::Backbone::new(core, mesh.members))
 }
 
 /// Raw swarm access for the crate's own tests, bypassing the engine.

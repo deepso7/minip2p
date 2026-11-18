@@ -73,6 +73,12 @@ impl RelaySwarm for BenchSwarm {
         self.remote_addrs.get(&conn_id)
     }
 
+    fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        self.connections
+            .iter()
+            .find_map(|(peer, conn)| (*conn == conn_id).then_some(peer))
+    }
+
     fn open_stream(
         &mut self,
         peer: &PeerId,

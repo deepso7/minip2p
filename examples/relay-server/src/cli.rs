@@ -32,7 +32,8 @@ pub struct MeshOptions {
     pub key_path: PathBuf,
     /// Exact backbone binds; empty selects UDP 19877 on IPv4 and IPv6.
     pub listen: Vec<SocketAddr>,
-    /// Every member's backbone address; this node's own entry is skipped.
+    /// Backbone addresses of the members this node dials; its own entry is
+    /// skipped. Members it doesn't list can still dial it.
     pub members: Vec<PeerAddr>,
 }
 

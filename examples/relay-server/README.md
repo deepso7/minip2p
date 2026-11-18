@@ -123,9 +123,9 @@ minip2p-relay --key var/relay.ed25519 \
 
 - `--mesh-key PATH` turns the mesh on. The backbone key is loaded or created like `--key`, with the same owner-only checks, and must differ from it. The mesh needs a persistent `--key`, since the other nodes load the same one.
 - `--mesh-listen HOST:PORT` replaces the default backbone binds, UDP `19877` on `0.0.0.0` and `[::]` (falling back to the available family). Repeat it for both families.
-- `--mesh-member PEER_ADDR` names one member by its backbone address and backbone peer ID, `/ip4|ip6/<ip>/udp/<port>/quic-v1/p2p/<backbone peer ID>`. Repeat it for every node. A node skips its own entry, so every node can take the same list. A backbone connection from a peer that isn't listed is closed.
+- `--mesh-member PEER_ADDR` names one member to dial by its backbone address and backbone peer ID, `/ip4|ip6/<ip>/udp/<port>/quic-v1/p2p/<backbone peer ID>`. Repeat it for every existing node. A node skips its own entry, so every node can take the same list. A node also accepts members it doesn't list: any backbone peer that proves the shared `--key` signed its backbone peer ID is a member ([ADR 0028](../../docs/adr/0028-relay-mesh-identity-signed-membership.md)), so a link forms when either side lists the other.
 
-At startup the relay prints `[relay] mesh listening=/ip4/…/udp/19877/quic-v1/p2p/<backbone peer ID>`: that line, with a wildcard IP replaced by the node's public one, is the node's entry in the member list. It logs `[relay] mesh member=<backbone peer ID> up` and `down` as links come and go, `[relay] mesh member=<backbone peer ID> synced entries=<n>` when that member's directory snapshot completes (`n` is how many of its reservations this node knows about), and circuits forwarded across the backbone get ` via=<backbone peer ID>` (the other node) on their `circuit opened` and `circuit closed` lines. Without `--mesh-key` the relay runs and logs exactly as a standalone relay.
+At startup the relay prints `[relay] mesh listening=/ip4/…/udp/19877/quic-v1/p2p/<backbone peer ID>`: that line, with a wildcard IP replaced by the node's public one, is the node's member entry. It logs `[relay] mesh member=<backbone peer ID> up` and `down` as members join and leave, `[relay] mesh peer=<backbone peer ID> rejected: <reason>` when a backbone peer's proof fails or doesn't come within 5 s (a node under another `--key`, say), `[relay] mesh member=<backbone peer ID> synced entries=<n>` when that member's directory snapshot completes (`n` is how many of its reservations this node knows about), and circuits forwarded across the backbone get ` via=<backbone peer ID>` (the other node) on their `circuit opened` and `circuit closed` lines. Without `--mesh-key` the relay runs and logs exactly as a standalone relay.
 
 Nodes need synced clocks (NTP), and the backbone port open only to the other members. In the config file the mesh is the `[mesh]` section (see [Config file](#config-file)). `service install` with a `[mesh]` section creates the backbone key at `/var/lib/minip2p-relay/mesh.key` and prints this node's entry before the relay first starts, one per backbone bind (the defaults when `listen` is empty):
 
@@ -134,7 +134,7 @@ mesh_member_candidate=/ip4/0.0.0.0/udp/19877/quic-v1/p2p/12D3KooW…
 mesh_member_candidate=/ip6/::/udp/19877/quic-v1/p2p/12D3KooW…
 ```
 
-Replace a wildcard IP with the node's public one, and confirm the entry against the `mesh listening=` startup log, which shows what actually bound (automatic binds can fall back to one family). To change the member list, edit `members` in `/etc/minip2p-relay/relay.toml` and run `service restart`. `service uninstall` keeps the config and both keys.
+Replace a wildcard IP with the node's public one, and confirm the entry against the `mesh listening=` startup log, which shows what actually bound (automatic binds can fall back to one family). A new node lists every existing node's entry in `members` and installs once with `--import-key`; the existing nodes need no change. `service uninstall` keeps the config and both keys.
 
 ## Browsers with a stable address
 

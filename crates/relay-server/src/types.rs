@@ -100,10 +100,36 @@ pub enum RelayServerRuntimeErrorKind {
     ResetStream,
     /// An agent invariant failed.
     InternalInvariant,
-    /// A relay-mesh peer was refused or broke a mesh protocol: a backbone
-    /// connection from a non-member, or a malformed or over-cap directory or
-    /// forward stream.
+    /// A relay-mesh peer broke a mesh protocol: a mesh stream outside a
+    /// member link, or a malformed or over-cap directory or forward stream.
+    /// A failed member proof is [`RelayServerEvent::MeshPeerRejected`]
+    /// instead.
     Mesh,
+}
+
+/// Why a mesh node closed a backbone connection before it became a member
+/// link (ADR 0028).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum MeshRejectionReason {
+    /// The peer's proof is not the public identity's signature for its
+    /// backbone peer id: it runs under a different public identity, or
+    /// none.
+    #[error("member proof does not verify")]
+    InvalidProof,
+    /// The peer's proof was not exactly one signature.
+    #[error("member proof was not {} bytes", crate::mesh::MEMBER_PROOF_LEN)]
+    MalformedProof,
+    /// The peer answered this node's proof with anything but the one accept
+    /// byte.
+    #[error("malformed answer to this node's member proof")]
+    MalformedAccept,
+    /// The peer opened a second member stream on the connection.
+    #[error("second member stream on one connection")]
+    DuplicateProof,
+    /// Both proofs did not complete within
+    /// [`MEMBER_PROOF_TIMEOUT_MS`](crate::mesh::MEMBER_PROOF_TIMEOUT_MS).
+    #[error("member proof timed out")]
+    TimedOut,
 }
 
 /// Why the relay denied a RESERVE. Local diagnostics only: the requester
@@ -235,6 +261,29 @@ pub enum RelayServerEvent {
         /// How many reserved peers this node's directory holds for the
         /// member once the snapshot completed.
         entries: usize,
+    },
+    /// A relay-mesh member joined this node's directory: a backbone
+    /// connection to it passed the member proof both ways. Its link
+    /// replacing an earlier one queues nothing; the member stays in the
+    /// directory, unsynced, while the new link proves itself.
+    MeshMemberUp {
+        /// The member's backbone peer id.
+        member: PeerId,
+    },
+    /// A relay-mesh member left this node's directory: its link closed, or
+    /// the connection replacing it failed or closed before it was verified.
+    /// Its entries are dropped.
+    MeshMemberDown {
+        /// The member's backbone peer id.
+        member: PeerId,
+    },
+    /// This node closed a backbone connection whose member proof failed or
+    /// never came.
+    MeshPeerRejected {
+        /// The peer's backbone peer id.
+        peer_id: PeerId,
+        /// Why it was refused.
+        reason: MeshRejectionReason,
     },
     /// Asynchronous diagnostic that does not replace stable lifecycle events.
     Error(RelayServerRuntimeError),

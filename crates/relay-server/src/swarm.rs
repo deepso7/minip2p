@@ -29,6 +29,14 @@ pub trait RelaySwarm {
     /// it. Its first IP is the connection's admission key (ADR 0018).
     fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr>;
 
+    /// The peer whose current connection `conn_id` is: `None` once the
+    /// swarm replaced or closed it, even when that event has not reached
+    /// the agent yet. A mesh node checks it before every backbone open,
+    /// since [`open_stream`](Self::open_stream) picks the peer's current
+    /// connection, and before it promotes, expires or rejects a pending
+    /// backbone connection.
+    fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId>;
+
     /// Opens an outbound stream on `peer`'s current connection and returns
     /// its exact identity. Negotiation completes later as
     /// `SwarmEvent::StreamReady`, or fails as a `SwarmEvent::Error` naming
@@ -78,8 +86,8 @@ pub trait RelaySwarm {
     ) -> Result<(), RelaySwarmError>;
 
     /// Closes `peer`'s connection `conn_id`. A mesh node closes backbone
-    /// connections from peers that are not members; a connection already
-    /// gone counts as closed.
+    /// connections whose member proof failed or never came; a connection
+    /// already gone counts as closed.
     fn close_connection(
         &mut self,
         peer: &PeerId,
@@ -91,6 +99,10 @@ pub trait RelaySwarm {
 impl<T: Transport, E: EntropySource> RelaySwarm for SwarmCore<T, E> {
     fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
         SwarmCore::connection_remote_addr(self, conn_id)
+    }
+
+    fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        SwarmCore::connection_peer(self, conn_id)
     }
 
     fn open_stream(

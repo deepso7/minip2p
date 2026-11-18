@@ -162,7 +162,9 @@ pub fn mesh(limits: Limits) -> ([Endpoint; 2], [String; 2], [PeerId; 2]) {
     while up != [true; 2] {
         assert!(Instant::now() < deadline, "backbone links never came up");
         for (relay, up) in relays.iter_mut().zip(&mut up) {
-            if let Some(EndpointEvent::RelayMeshMemberUp { .. }) = relay
+            if let Some(EndpointEvent::RelayServer(minip2p::RelayServerEvent::MeshMemberUp {
+                ..
+            })) = relay
                 .next_event(Duration::from_millis(20))
                 .expect("drive the relay")
             {

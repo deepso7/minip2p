@@ -3,12 +3,13 @@
 //! protocol on both the entry and the holding node.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
+use minip2p_identity::PublicKey;
 use minip2p_relay::{Limit, Status};
 use minip2p_swarm::DriverError;
 use minip2p_transport::ConnectionId;
@@ -19,11 +20,13 @@ use super::{
 };
 use crate::mesh::{
     Backoff, DIRECTORY_PROTOCOL_ID, Directory, DirectoryInput, DirectoryMessage,
-    FORWARD_PROTOCOL_ID, ForwardMessage, MeshConfig, decode_mesh_frame, is_backbone_connection,
+    FORWARD_PROTOCOL_ID, ForwardMessage, MEMBER_ACCEPT, MEMBER_PROOF_LEN, MEMBER_PROOF_TIMEOUT_MS,
+    MEMBER_PROTOCOL_ID, MemberReader, MeshConfig, decode_mesh_frame, is_backbone_connection,
+    verify_member_proof,
 };
 use crate::{
-    CircuitDirection, RelayServerAgent, RelayServerEvent, RelayServerRuntimeErrorKind,
-    RelaySwarmError, StreamKey,
+    CircuitDirection, MeshRejectionReason, RelayServerAgent, RelayServerEvent,
+    RelayServerRuntimeErrorKind, RelaySwarmError, StreamKey,
 };
 
 /// Most directory bytes queued behind a full stream. Past it the stream is
@@ -32,10 +35,22 @@ const MAX_DIRECTORY_BACKLOG: usize = 1 << 20;
 
 /// A mesh node's state beside the relay's own.
 pub(super) struct MeshNode {
-    members: BTreeSet<PeerId>,
+    /// The shared public identity, which members' proofs are checked
+    /// against, and this node's own proof.
+    public_key: PublicKey,
+    proof: [u8; MEMBER_PROOF_LEN],
     directory: Directory<StreamKey>,
-    /// Each connected member's backbone link.
+    /// Each verified member's backbone link.
     links: BTreeMap<PeerId, Link>,
+    /// Backbone connections whose member proofs are still out (ADR 0028).
+    /// Not in `links` or the directory, unless one holds the directory entry
+    /// of a member whose link it replaced.
+    pending: BTreeMap<ConnectionId, Pending>,
+    /// Each pending connection's proof deadline.
+    pub(super) proof_deadlines: Deadlines<ConnectionId>,
+    /// Connections verified since the host last took them, replacements
+    /// included: each member's latest.
+    verified: Vec<(PeerId, ConnectionId)>,
     /// Directory streams this node opened, to their member, until they
     /// close. A link's current one is its `stream`.
     publishing: BTreeMap<StreamKey, PeerId>,
@@ -48,13 +63,60 @@ pub(super) struct MeshNode {
 impl MeshNode {
     pub(super) fn new(config: &MeshConfig) -> Self {
         Self {
-            members: config.members.clone(),
+            public_key: config.public_key.clone(),
+            proof: config.proof,
             directory: Directory::new(config.max_directory_entries_per_member),
             links: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            proof_deadlines: Deadlines::new(),
+            verified: Vec::new(),
             publishing: BTreeMap::new(),
             receiving: BTreeMap::new(),
             reopen: Deadlines::new(),
         }
+    }
+
+    /// Forgets `peer`'s link if it is `conn_id`, dropping the member's
+    /// directory entry. Returns whether it was.
+    fn forget_link(&mut self, peer: &PeerId, conn_id: ConnectionId) -> bool {
+        if self
+            .links
+            .get(peer)
+            .is_none_or(|link| link.conn_id != conn_id)
+        {
+            return false;
+        }
+        self.links.remove(peer);
+        self.reopen.remove(peer);
+        self.verified.retain(|(_, verified)| *verified != conn_id);
+        self.directory.member_disconnected(peer);
+        self.publishing
+            .retain(|stream, _| stream.conn_id != conn_id);
+        self.receiving.retain(|stream, _| stream.conn_id != conn_id);
+        true
+    }
+
+    /// Whether `stream` is one of a pending connection's member streams.
+    fn is_member_stream(&self, stream: StreamKey) -> bool {
+        self.pending
+            .get(&stream.conn_id)
+            .is_some_and(|pending| pending.side(stream).is_some())
+    }
+
+    pub(super) fn assert_consistent(&self) {
+        assert!(
+            self.proof_deadlines
+                .by_key
+                .keys()
+                .all(|conn_id| self.pending.contains_key(conn_id)),
+            "a proof deadline without a pending connection"
+        );
+        assert!(
+            self.pending
+                .values()
+                .all(|pending| !self.links.contains_key(&pending.peer) || !pending.holds_entry),
+            "a pending connection holds the entry of a member that has a link"
+        );
     }
 }
 
@@ -73,6 +135,53 @@ struct Link {
     backoff: Backoff,
 }
 
+/// A backbone connection running the member proof exchange.
+struct Pending {
+    peer: PeerId,
+    /// This node's member stream, carrying its proof out and the answer
+    /// back, until the answer's half-close.
+    outbound: Option<(StreamKey, MemberReader)>,
+    /// The peer's member stream, carrying its proof, until its half-close.
+    inbound: Option<(StreamKey, MemberReader)>,
+    /// The peer opened a member stream; a second one is a rejection.
+    inbound_seen: bool,
+    /// The peer accepted this node's proof.
+    accepted: bool,
+    /// The peer's proof checked out.
+    verified: bool,
+    /// The connection replaced the member's link (or a pending connection
+    /// that held this), so the member stays in the directory, unsynced,
+    /// until it is verified or fails.
+    holds_entry: bool,
+}
+
+/// Which of a pending connection's member streams a stream is.
+#[derive(Clone, Copy)]
+enum Side {
+    Outbound,
+    Inbound,
+}
+
+impl Pending {
+    fn side(&self, stream: StreamKey) -> Option<Side> {
+        if self.outbound.as_ref().is_some_and(|(s, _)| *s == stream) {
+            Some(Side::Outbound)
+        } else if self.inbound.as_ref().is_some_and(|(s, _)| *s == stream) {
+            Some(Side::Inbound)
+        } else {
+            None
+        }
+    }
+
+    fn reader(&mut self, side: Side) -> Option<&mut MemberReader> {
+        let slot = match side {
+            Side::Outbound => &mut self.outbound,
+            Side::Inbound => &mut self.inbound,
+        };
+        slot.as_mut().map(|(_, reader)| reader)
+    }
+}
+
 impl RelayServerAgent {
     /// Whether `conn_id` is a backbone connection of this mesh node. Always
     /// false for a single relay, which treats every connection as today.
@@ -80,10 +189,24 @@ impl RelayServerAgent {
         self.mesh.is_some() && is_backbone_connection(conn_id)
     }
 
-    pub(super) fn owns_directory_stream(&self, stream: StreamKey) -> bool {
+    pub(super) fn owns_mesh_stream(&self, stream: StreamKey) -> bool {
         self.mesh.as_ref().is_some_and(|mesh| {
-            mesh.publishing.contains_key(&stream) || mesh.receiving.contains_key(&stream)
+            mesh.publishing.contains_key(&stream)
+                || mesh.receiving.contains_key(&stream)
+                || mesh.is_member_stream(stream)
         })
+    }
+
+    /// The backbone connections verified since the last call, each with its
+    /// peer, replacements included; only each member's latest is kept. The
+    /// Endpoint's member redial bookkeeping reads it; it is not a
+    /// [`RelayServerEvent`] so hosts' matches don't have to handle it.
+    #[doc(hidden)]
+    pub fn take_verified_links(&mut self) -> Vec<(PeerId, ConnectionId)> {
+        self.mesh
+            .as_mut()
+            .map(|mesh| core::mem::take(&mut mesh.verified))
+            .unwrap_or_default()
     }
 
     /// Whether `peer` is a member whose current link is `conn_id`.
@@ -95,8 +218,39 @@ impl RelayServerAgent {
         })
     }
 
-    /// A backbone connection came up: a member's starts a directory sync,
-    /// anyone else's is closed.
+    /// Opens `protocol_id` on `peer`'s backbone connection `conn_id`, and
+    /// only there. `open_stream` takes the peer's current connection, which
+    /// may already be a replacement the agent has not heard of: then nothing
+    /// is opened, and the replacement runs its own proof exchange.
+    fn open_backbone(
+        &mut self,
+        io: &mut Io<'_>,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        protocol_id: &str,
+    ) -> Option<StreamKey> {
+        if io.swarm.connection_peer(conn_id) != Some(peer) {
+            return None;
+        }
+        match io.swarm.open_stream(peer, protocol_id, io.now_ms()) {
+            Ok(stream) if stream.conn_id == conn_id => Some(stream),
+            Ok(stream) => {
+                self.reset(io, peer.clone(), stream);
+                None
+            }
+            Err(error) => {
+                self.runtime_error(
+                    RelayServerRuntimeErrorKind::OpenStream,
+                    Some(peer.clone()),
+                    error.to_string(),
+                );
+                None
+            }
+        }
+    }
+
+    /// A backbone connection came up. It stays pending, outside the
+    /// directory, until both member proofs check out.
     ///
     /// Out of line: inlined into `dispatch`, it slowed every relay's events.
     #[inline(never)]
@@ -106,24 +260,359 @@ impl RelayServerAgent {
         peer: PeerId,
         conn_id: ConnectionId,
     ) {
+        self.start_pending(io, peer, conn_id, false);
+    }
+
+    /// Starts `conn_id`'s proof exchange: arms its deadline and opens this
+    /// node's member stream. `holds_entry` as in [`Pending::holds_entry`].
+    fn start_pending(
+        &mut self,
+        io: &mut Io<'_>,
+        peer: PeerId,
+        conn_id: ConnectionId,
+        holds_entry: bool,
+    ) {
         let Some(mesh) = &mut self.mesh else {
             return;
         };
-        if !mesh.members.contains(&peer) {
-            if let Err(error) = io.swarm.close_connection(&peer, conn_id, io.now_ms()) {
-                self.runtime_error(
-                    RelayServerRuntimeErrorKind::Mesh,
-                    Some(peer.clone()),
-                    error.to_string(),
-                );
+        mesh.pending.insert(
+            conn_id,
+            Pending {
+                peer: peer.clone(),
+                outbound: None,
+                inbound: None,
+                inbound_seen: false,
+                accepted: false,
+                verified: false,
+                holds_entry,
+            },
+        );
+        mesh.proof_deadlines
+            .set(conn_id, io.now_ms().saturating_add(MEMBER_PROOF_TIMEOUT_MS));
+        // A failed open leaves the exchange to its deadline.
+        if let Some(stream) = self.open_backbone(io, &peer, conn_id, MEMBER_PROTOCOL_ID)
+            && let Some(pending) = self
+                .mesh
+                .as_mut()
+                .and_then(|mesh| mesh.pending.get_mut(&conn_id))
+        {
+            pending.outbound = Some((stream, MemberReader::accept()));
+        }
+    }
+
+    /// A member's link, or a pending connection, was replaced. The old one
+    /// goes first and the new one starts its own proof exchange. A member
+    /// whose link (or pending holder) was replaced stays in the directory,
+    /// unsynced, so CONNECTs waiting on it, or falling back from a forward
+    /// on the old link, keep waiting for the new link's snapshot instead of
+    /// failing.
+    ///
+    /// Out of line: inlined into `dispatch`, it slowed every relay's events.
+    #[inline(never)]
+    pub(super) fn on_backbone_replaced(
+        &mut self,
+        io: &mut Io<'_>,
+        peer: &PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
+    ) {
+        let Some(mesh) = &mut self.mesh else {
+            return;
+        };
+        let holds_entry = if let Some(pending) = mesh.pending.remove(&old) {
+            mesh.proof_deadlines.remove(&old);
+            pending.holds_entry
+        } else if mesh.forget_link(peer, old) {
+            mesh.directory.member_connected(peer.clone());
+            true
+        } else {
+            false
+        };
+        self.on_connection_closed(io, peer, old);
+        self.start_pending(io, peer.clone(), new, holds_entry);
+    }
+
+    /// Forgets the backbone connection `conn_id` to `peer`, link or pending.
+    /// Returns whether the member left the directory with it; the caller
+    /// then re-resolves the CONNECTs waiting on it.
+    pub(super) fn on_backbone_closed(&mut self, peer: &PeerId, conn_id: ConnectionId) -> bool {
+        let Some(mesh) = &mut self.mesh else {
+            return false;
+        };
+        if let Some(pending) = mesh.pending.remove(&conn_id) {
+            mesh.proof_deadlines.remove(&conn_id);
+            if !pending.holds_entry {
+                return false;
             }
-            self.runtime_error(
-                RelayServerRuntimeErrorKind::Mesh,
-                Some(peer),
-                "closed a backbone connection from a peer that is not a mesh member".into(),
-            );
+            mesh.directory.member_disconnected(peer);
+        } else if !mesh.forget_link(peer, conn_id) {
+            return false;
+        }
+        self.events.push_back(RelayServerEvent::MeshMemberDown {
+            member: peer.clone(),
+        });
+        true
+    }
+
+    // --- Member proofs ---
+
+    /// This node's member stream finished negotiating: sends the proof and
+    /// half-closes. One whose connection is gone is reset.
+    pub(super) fn on_member_ready(&mut self, io: &mut Io<'_>, peer: &PeerId, stream: StreamKey) {
+        let Some(mesh) = &self.mesh else {
+            return;
+        };
+        if !mesh.is_member_stream(stream) {
+            // Its connection was retired or rejected while it negotiated.
+            self.rejected_hop_streams.insert(stream, peer.clone());
+            self.reset(io, peer.clone(), stream);
             return;
         }
+        let proof = mesh.proof;
+        let sent = io
+            .swarm
+            .send_stream(peer, stream, proof.to_vec().into(), io.now_ms())
+            .and_then(|()| io.swarm.close_stream_write(peer, stream, io.now_ms()));
+        if let Err(error) = sent {
+            // The exchange is left to its deadline.
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::SendStream,
+                Some(peer.clone()),
+                control_send_failure(error),
+            );
+            self.drop_member_stream(stream);
+            self.rejected_hop_streams.insert(stream, peer.clone());
+            self.reset(io, peer.clone(), stream);
+        }
+    }
+
+    /// The peer opened a member stream on `stream.conn_id`. A pending
+    /// connection takes the first; a second rejects the connection.
+    fn on_member_inbound(&mut self, io: &mut Io<'_>, peer: &PeerId, stream: StreamKey) {
+        let pending = self
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.pending.get_mut(&stream.conn_id))
+            .filter(|pending| pending.peer == *peer);
+        match pending {
+            Some(pending) if !pending.inbound_seen => {
+                pending.inbound_seen = true;
+                pending.inbound = Some((stream, MemberReader::proof()));
+            }
+            Some(_) => {
+                self.rejected_hop_streams.insert(stream, peer.clone());
+                self.reset(io, peer.clone(), stream);
+                self.reject(io, stream.conn_id, MeshRejectionReason::DuplicateProof);
+            }
+            // A verified link proves itself once.
+            None => {
+                self.rejected_hop_streams.insert(stream, peer.clone());
+                self.reset(io, peer.clone(), stream);
+            }
+        }
+    }
+
+    /// Bytes on a member stream, kept for the half-close. Returns whether
+    /// the stream is one.
+    pub(super) fn on_member_data(
+        &mut self,
+        io: &mut Io<'_>,
+        stream: StreamKey,
+        data: &[u8],
+    ) -> bool {
+        let Some(pending) = self
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.pending.get_mut(&stream.conn_id))
+        else {
+            return false;
+        };
+        let Some(reader) = pending.side(stream).and_then(|side| pending.reader(side)) else {
+            return false;
+        };
+        reader.push(data);
+        io.ack(stream, data.len());
+        true
+    }
+
+    /// A member stream half-closed: its message is judged. A valid proof is
+    /// answered with the accept byte. Returns whether the stream is one.
+    pub(super) fn on_member_eof(&mut self, io: &mut Io<'_>, stream: StreamKey) -> bool {
+        let Some(mesh) = &mut self.mesh else {
+            return false;
+        };
+        let Some(pending) = mesh.pending.get_mut(&stream.conn_id) else {
+            return false;
+        };
+        let peer = pending.peer.clone();
+        match pending.side(stream) {
+            None => return false,
+            Some(Side::Outbound) => {
+                let accepted = pending
+                    .outbound
+                    .take()
+                    .is_some_and(|(_, reader)| reader.finish() == Ok(&[MEMBER_ACCEPT][..]));
+                if !accepted {
+                    self.reject(io, stream.conn_id, MeshRejectionReason::MalformedAccept);
+                    return true;
+                }
+                pending.accepted = true;
+            }
+            Some(Side::Inbound) => {
+                let proof = pending
+                    .inbound
+                    .take()
+                    .map(|(_, reader)| reader.finish_proof());
+                let Some(Ok(proof)) = proof else {
+                    self.reject(io, stream.conn_id, MeshRejectionReason::MalformedProof);
+                    return true;
+                };
+                if !verify_member_proof(&mesh.public_key, &peer, &proof) {
+                    self.reject(io, stream.conn_id, MeshRejectionReason::InvalidProof);
+                    return true;
+                }
+                let answered = io
+                    .swarm
+                    .send_stream(
+                        &peer,
+                        stream,
+                        Vec::from([MEMBER_ACCEPT]).into(),
+                        io.now_ms(),
+                    )
+                    .and_then(|()| io.swarm.close_stream_write(&peer, stream, io.now_ms()));
+                if let Err(error) = answered {
+                    // The peer's side is left to its deadline.
+                    self.runtime_error(
+                        RelayServerRuntimeErrorKind::SendStream,
+                        Some(peer),
+                        control_send_failure(error),
+                    );
+                    return true;
+                }
+                if let Some(pending) = self
+                    .mesh
+                    .as_mut()
+                    .and_then(|mesh| mesh.pending.get_mut(&stream.conn_id))
+                {
+                    pending.verified = true;
+                }
+            }
+        }
+        self.try_promote(io, stream.conn_id);
+        true
+    }
+
+    /// A member stream closed or failed to negotiate before its half-close:
+    /// dropped, without rejecting the connection; the deadline covers a
+    /// proof that never comes. Returns whether the stream is one.
+    pub(super) fn drop_member_stream(&mut self, stream: StreamKey) -> bool {
+        let Some(pending) = self
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.pending.get_mut(&stream.conn_id))
+        else {
+            return false;
+        };
+        match pending.side(stream) {
+            Some(Side::Outbound) => pending.outbound = None,
+            Some(Side::Inbound) => pending.inbound = None,
+            None => return false,
+        }
+        true
+    }
+
+    /// Makes a pending connection a member link once both proofs checked
+    /// out, unless the swarm already retired it (its queued lifecycle event
+    /// settles it then).
+    fn try_promote(&mut self, io: &mut Io<'_>, conn_id: ConnectionId) {
+        let Some(mesh) = &mut self.mesh else {
+            return;
+        };
+        let Some(pending) = mesh.pending.get(&conn_id) else {
+            return;
+        };
+        if !(pending.accepted && pending.verified)
+            || io.swarm.connection_peer(conn_id) != Some(&pending.peer)
+        {
+            return;
+        }
+        let Some(pending) = mesh.pending.remove(&conn_id) else {
+            return;
+        };
+        mesh.proof_deadlines.remove(&conn_id);
+        self.member_connected(io, pending.peer, conn_id, pending.holds_entry);
+    }
+
+    /// Closes a pending connection whose proof exchange failed, unless the
+    /// swarm already retired it. A member it held the directory entry of
+    /// leaves the directory, and the CONNECTs waiting on it re-resolve.
+    fn reject(&mut self, io: &mut Io<'_>, conn_id: ConnectionId, reason: MeshRejectionReason) {
+        let Some(mesh) = &mut self.mesh else {
+            return;
+        };
+        let Some(peer) = mesh
+            .pending
+            .get(&conn_id)
+            .map(|pending| pending.peer.clone())
+        else {
+            return;
+        };
+        if io.swarm.connection_peer(conn_id) != Some(&peer) {
+            // Its queued `ConnectionReplaced` or `ConnectionClosed` moves or
+            // removes the directory entry.
+            return;
+        }
+        let holds_entry = mesh
+            .pending
+            .remove(&conn_id)
+            .is_some_and(|pending| pending.holds_entry);
+        mesh.proof_deadlines.remove(&conn_id);
+        if holds_entry {
+            mesh.directory.member_disconnected(&peer);
+        }
+        self.events.push_back(RelayServerEvent::MeshPeerRejected {
+            peer_id: peer.clone(),
+            reason,
+        });
+        if let Err(error) = io.swarm.close_connection(&peer, conn_id, io.now_ms()) {
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::Mesh,
+                Some(peer.clone()),
+                error.to_string(),
+            );
+        }
+        if holds_entry {
+            self.events
+                .push_back(RelayServerEvent::MeshMemberDown { member: peer });
+            self.resolve_waiting(io, None);
+        }
+    }
+
+    /// Rejects the pending connections whose proofs are due.
+    pub(super) fn expire_proofs(&mut self, io: &mut Io<'_>) {
+        let Some(mesh) = &mut self.mesh else {
+            return;
+        };
+        for conn_id in mesh.proof_deadlines.due(io.now_ms()) {
+            if let Some(mesh) = &mut self.mesh {
+                mesh.proof_deadlines.remove(&conn_id);
+            }
+            self.reject(io, conn_id, MeshRejectionReason::TimedOut);
+        }
+    }
+
+    /// A verified connection becomes `peer`'s link: the member joins the
+    /// directory (unless it never left it) and a directory sync starts.
+    fn member_connected(
+        &mut self,
+        io: &mut Io<'_>,
+        peer: PeerId,
+        conn_id: ConnectionId,
+        in_directory: bool,
+    ) {
+        let Some(mesh) = &mut self.mesh else {
+            return;
+        };
         mesh.links.insert(
             peer.clone(),
             Link {
@@ -137,6 +626,15 @@ impl RelayServerAgent {
         );
         mesh.reopen.remove(&peer);
         mesh.directory.member_connected(peer.clone());
+        // Only each member's latest counts, so a host that never takes
+        // them holds one per member.
+        mesh.verified.retain(|(member, _)| *member != peer);
+        mesh.verified.push((peer.clone(), conn_id));
+        if !in_directory {
+            self.events.push_back(RelayServerEvent::MeshMemberUp {
+                member: peer.clone(),
+            });
+        }
         // Kept like any connection, so circuits and workers on it end with it.
         self.connections.insert(
             conn_id,
@@ -149,61 +647,19 @@ impl RelayServerAgent {
         self.open_directory(io, peer);
     }
 
-    /// A member's link was replaced. It holds no reservation to move, so
-    /// the old link goes first and the new one starts a fresh sync. The
-    /// member stays connected and unsynced throughout, so CONNECTs waiting
-    /// on it, or falling back from a forward on the old link, keep waiting
-    /// for the new link's snapshot instead of failing.
-    ///
-    /// Out of line: inlined into `dispatch`, it slowed every relay's events.
-    #[inline(never)]
-    pub(super) fn on_backbone_replaced(
-        &mut self,
-        io: &mut Io<'_>,
-        peer: &PeerId,
-        old: ConnectionId,
-        new: ConnectionId,
-    ) {
-        if self.on_backbone_closed(peer, old)
-            && let Some(mesh) = &mut self.mesh
-        {
-            mesh.directory.member_connected(peer.clone());
-        }
-        self.on_connection_closed(io, peer, old);
-        self.on_backbone_established(io, peer.clone(), new);
-    }
-
-    /// Forgets the link `conn_id` to `peer`, dropping the member's entries.
-    /// Returns whether it was the member's current link; the caller then
-    /// re-resolves the CONNECTs waiting on it.
-    pub(super) fn on_backbone_closed(&mut self, peer: &PeerId, conn_id: ConnectionId) -> bool {
-        let Some(mesh) = &mut self.mesh else {
-            return false;
-        };
-        if mesh
-            .links
-            .get(peer)
-            .is_none_or(|link| link.conn_id != conn_id)
-        {
-            return false;
-        }
-        mesh.links.remove(peer);
-        mesh.reopen.remove(peer);
-        mesh.directory.member_disconnected(peer);
-        mesh.publishing
-            .retain(|stream, _| stream.conn_id != conn_id);
-        mesh.receiving.retain(|stream, _| stream.conn_id != conn_id);
-        true
-    }
-
     // --- Directory, sender side ---
 
     fn open_directory(&mut self, io: &mut Io<'_>, member: PeerId) {
-        match io
-            .swarm
-            .open_stream(&member, DIRECTORY_PROTOCOL_ID, io.now_ms())
-        {
-            Ok(stream) => {
+        let Some(conn_id) = self
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.links.get(&member))
+            .map(|link| link.conn_id)
+        else {
+            return;
+        };
+        match self.open_backbone(io, &member, conn_id, DIRECTORY_PROTOCOL_ID) {
+            Some(stream) => {
                 if let Some(mesh) = &mut self.mesh
                     && let Some(link) = mesh.links.get_mut(&member)
                 {
@@ -211,14 +667,8 @@ impl RelayServerAgent {
                     mesh.publishing.insert(stream, member);
                 }
             }
-            Err(error) => {
-                self.runtime_error(
-                    RelayServerRuntimeErrorKind::OpenStream,
-                    Some(member.clone()),
-                    error.to_string(),
-                );
-                self.schedule_reopen(io, &member);
-            }
+            // A retired link goes with its queued lifecycle event.
+            None => self.schedule_reopen(io, &member),
         }
     }
 
@@ -400,9 +850,13 @@ impl RelayServerAgent {
 
     // --- Directory, receiver side, and stream ends ---
 
-    /// An inbound mesh stream finished negotiating. Directory and forward
-    /// streams from a member's current link are taken; from anyone else they
-    /// are reset. Returns whether the stream is the relay's.
+    /// An inbound mesh stream finished negotiating. A member stream joins
+    /// its pending connection's proof exchange. Directory and forward
+    /// streams from a member's current link are taken; on a pending
+    /// connection they are reset quietly (the peer may simply have verified
+    /// first, and reopens its directory stream later), and from anyone else
+    /// they are reset as an error. Returns whether the stream is the
+    /// relay's.
     ///
     /// Out of line: inlined into `dispatch`, it slowed every relay's events.
     #[inline(never)]
@@ -413,8 +867,21 @@ impl RelayServerAgent {
         stream: StreamKey,
         protocol_id: &str,
     ) -> bool {
+        if protocol_id == MEMBER_PROTOCOL_ID {
+            self.on_member_inbound(io, peer, stream);
+            return true;
+        }
         if protocol_id != DIRECTORY_PROTOCOL_ID && protocol_id != FORWARD_PROTOCOL_ID {
             return false;
+        }
+        if self
+            .mesh
+            .as_ref()
+            .is_some_and(|mesh| mesh.pending.contains_key(&stream.conn_id))
+        {
+            self.rejected_hop_streams.insert(stream, peer.clone());
+            self.reset(io, peer.clone(), stream);
+            return true;
         }
         if !self.is_member_link(peer, stream.conn_id) {
             self.rejected_hop_streams.insert(stream, peer.clone());
@@ -572,19 +1039,13 @@ impl RelayServerAgent {
             .collect();
         for (member, link) in claims {
             resolution.tried.push((member.clone(), link));
-            match io
-                .swarm
-                .open_stream(&member, FORWARD_PROTOCOL_ID, io.now_ms())
-            {
-                Ok(stream) => return Ok(Route::Forward { member, stream }),
-                Err(error) => {
-                    self.runtime_error(
-                        RelayServerRuntimeErrorKind::OpenStream,
-                        Some(member),
-                        error.to_string(),
-                    );
-                    resolution.last_status = Some(Status::ConnectionFailed);
-                }
+            // A claim whose link is gone, or replaced under the agent, is a
+            // failed one.
+            let opened = link
+                .and_then(|conn_id| self.open_backbone(io, &member, conn_id, FORWARD_PROTOCOL_ID));
+            match opened {
+                Some(stream) => return Ok(Route::Forward { member, stream }),
+                None => resolution.last_status = Some(Status::ConnectionFailed),
             }
         }
         if self

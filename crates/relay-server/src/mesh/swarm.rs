@@ -4,13 +4,15 @@
 use minip2p_core::{Bytes, Multiaddr, PeerId};
 use minip2p_transport::ConnectionId;
 
-use super::{DIRECTORY_PROTOCOL_ID, FORWARD_PROTOCOL_ID, is_backbone_connection};
+use super::{
+    DIRECTORY_PROTOCOL_ID, FORWARD_PROTOCOL_ID, MEMBER_PROTOCOL_ID, is_backbone_connection,
+};
 use crate::{RelaySwarm, RelaySwarmError, StreamKey};
 
 /// A mesh node's two swarms behind the one [`RelaySwarm`] the agent drives.
 ///
 /// Built per agent call from borrows of both swarms. Opens go to the
-/// backbone for the mesh protocols (directory and forward) and to the public
+/// backbone for the mesh protocols (member, directory and forward) and to the public
 /// swarm otherwise (STOP); every other command goes by its connection's
 /// namespace ([`is_backbone_connection`]). Feed both swarms' events to the
 /// same agent, with `is_circuit = false` for backbone events.
@@ -43,13 +45,24 @@ impl<P: RelaySwarm, B: RelaySwarm> RelaySwarm for MeshSwarm<'_, P, B> {
         }
     }
 
+    fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        if is_backbone_connection(conn_id) {
+            self.backbone.connection_peer(conn_id)
+        } else {
+            self.public.connection_peer(conn_id)
+        }
+    }
+
     fn open_stream(
         &mut self,
         peer: &PeerId,
         protocol_id: &str,
         now_ms: u64,
     ) -> Result<StreamKey, RelaySwarmError> {
-        if protocol_id == DIRECTORY_PROTOCOL_ID || protocol_id == FORWARD_PROTOCOL_ID {
+        if protocol_id == MEMBER_PROTOCOL_ID
+            || protocol_id == DIRECTORY_PROTOCOL_ID
+            || protocol_id == FORWARD_PROTOCOL_ID
+        {
             self.backbone.open_stream(peer, protocol_id, now_ms)
         } else {
             self.public.open_stream(peer, protocol_id, now_ms)

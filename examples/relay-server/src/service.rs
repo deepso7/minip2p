@@ -355,7 +355,7 @@ fn install(source: Source<'_>, import_key: Option<&Path>) -> Result<(), Box<dyn 
             println!("mesh_member_candidate={candidate}");
         }
         println!(
-            "other members list a candidate in [mesh] members, with a wildcard IP replaced by this node's public IP; confirm it against the `[relay] mesh listening=` startup log, which shows what actually bound"
+            "nodes installed later list a candidate in [mesh] members, with a wildcard IP replaced by this node's public IP; confirm it against the `[relay] mesh listening=` startup log, which shows what actually bound"
         );
     }
     run_status(SYSTEMCTL, ["daemon-reload"])?;
