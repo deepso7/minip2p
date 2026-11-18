@@ -63,8 +63,9 @@ impl Harness {
             (Some(_), Some(_)) => {
                 Err("IS_DIALER and is_dialer are both set; cannot tell which harness".into())
             }
-            (None, None) => Err("neither IS_DIALER (unified-testing) nor                                  is_dialer (test-plans) is set"
-                .into()),
+            (None, None) => {
+                Err("neither IS_DIALER (unified-testing) nor is_dialer (test-plans) is set".into())
+            }
         }
     }
 
