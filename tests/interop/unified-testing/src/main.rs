@@ -3,8 +3,10 @@
 //! Contract: `docs/write-a-transport-test-app.md` in that repo. Settings come
 //! from env vars; the listener publishes its multiaddr to Redis under
 //! `<TEST_KEY>_listener_multiaddr` and serves pings until Docker stops it; the
-//! dialer reads that address, connects, pings once, and prints the latency
-//! YAML on stdout. Everything else goes to stderr.
+//! dialer reads that address, connects, and pings twice: the first ping ends
+//! `handshake_plus_one_rtt`, the second (on the negotiated stream) is
+//! `ping_rtt`. It prints the latency YAML on stdout; everything else goes to
+//! stderr.
 //!
 //! The Redis key is a list (RPUSH / BLPOP), not a string: that is what the
 //! reference rust-libp2p image does, whatever the doc says.
@@ -128,7 +130,11 @@ fn dialer(config: &Config) -> Result<()> {
     let deadline = Instant::now() + TEST_TIMEOUT;
     let handshake_start = Instant::now();
     let connect_id = node.connect(target)?;
-    let mut ping_start = None;
+    // Set by the first ping result. The first ping also opens and negotiates
+    // the ping stream, so `ping_rtt` comes from a second ping on that stream:
+    // rust-libp2p's RTT likewise covers only the payload echo.
+    let mut handshake_plus_one_rtt = None;
+    let mut ping_start = Instant::now();
     loop {
         if Instant::now() >= deadline {
             return Err("test timed out".into());
@@ -136,6 +142,8 @@ fn dialer(config: &Config) -> Result<()> {
         let EndpointWaitOutcome::Event(event) = node.wait(deadline)? else {
             continue;
         };
+        // Sampled before logging so DEBUG output does not inflate the numbers.
+        let now = Instant::now();
         config.log(format_args!("{event:?}"));
         match event {
             EndpointEvent::ConnectSettled {
@@ -143,17 +151,19 @@ fn dialer(config: &Config) -> Result<()> {
                 outcome,
                 ..
             } if id == connect_id => match outcome {
-                ConnectOutcome::Connected { .. } => {
-                    ping_start = Some(Instant::now());
-                    node.ping(&peer)?;
-                }
+                ConnectOutcome::Connected { .. } => node.ping(&peer)?,
                 other => return Err(format!("connect failed: {other:?}").into()),
             },
             EndpointEvent::PingRttMeasured { .. } => {
-                let handshake_plus_one_rtt = handshake_start.elapsed();
+                let Some(handshake_plus_one_rtt) = handshake_plus_one_rtt else {
+                    handshake_plus_one_rtt = Some(now - handshake_start);
+                    ping_start = Instant::now();
+                    node.ping(&peer)?;
+                    continue;
+                };
                 // `rtt_ms` is whole milliseconds; container RTTs are below
                 // that, so time the ping here for sub-ms precision.
-                let ping_rtt = ping_start.map_or(Duration::ZERO, |t| t.elapsed());
+                let ping_rtt = now - ping_start;
                 println!("latency:");
                 println!(
                     "  handshake_plus_one_rtt: {:.3}",
