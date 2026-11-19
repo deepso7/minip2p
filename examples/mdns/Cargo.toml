@@ -1,0 +1,23 @@
+[package]
+name = "minip2p-mdns-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Local-link discovery demo: two copies on one LAN find each other over
+# mDNS with no bootstrap address and no configuration. See
+# examples/mdns/README.md.
+[[bin]]
+name = "minip2p-mdns"
+path = "src/main.rs"
+
+[dependencies]
+minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = [
+  "mdns",
+  "tcp",
+] }
+minip2p-example-common = { path = "../common" }

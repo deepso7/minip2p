@@ -60,6 +60,10 @@ check-wasm:
 peer-ping:
     cargo test -p minip2p-peer --test ping
 
+# Local-link discovery between two instances (needs host multicast on UDP 5353).
+mdns-discovery:
+    cargo test -p minip2p-mdns-demo --test discovery -- --ignored --nocapture
+
 # Live foreign-implementation gate: TCP + Noise XX + Yamux in both directions.
 interop-go:
     cargo test -p minip2p-ffi --test go_interop -- --ignored --nocapture

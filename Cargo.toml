@@ -30,6 +30,7 @@ members = [
   "transports/webtransport",
   "examples/chat",
   "examples/common",
+  "examples/mdns",
   "examples/peer",
   "examples/relay-server",
 ]
