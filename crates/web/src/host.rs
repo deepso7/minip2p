@@ -12,16 +12,18 @@
 
 use minip2p::{
     CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
-    EndpointEvent, GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
+    EndpointEvent, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
     PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
 };
+#[cfg(feature = "pubsub")]
+use minip2p_ffi_core::map_gossipsub_error;
 use minip2p_ffi_core::{
     CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, EndpointConfig, EventCarry,
     FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent, PUMP_DRAIN_LIMIT, PathKind,
     Reachability, RelayReservationInfo, UnfinishedConnection, convert_endpoint_event,
     convert_identify, convert_path, convert_reachability, driver_failure_kind, keypair_from_bytes,
-    map_driver_error, map_gossipsub_error, map_write_error, parse_connect_target,
-    parse_direct_peer_addr, parse_peer_id, stream_writer, write_accepted_event,
+    map_driver_error, map_write_error, parse_connect_target, parse_direct_peer_addr, parse_peer_id,
+    stream_writer, write_accepted_event,
 };
 
 use crate::WebEntropy;
@@ -98,11 +100,14 @@ impl<T: Transport> Host<T> {
                     .agent_version
                     .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
             )
-            .gossipsub_config(GossipsubConfig {
-                allow_unsigned: config.allow_unsigned,
-                ..GossipsubConfig::default()
-            })
             .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
+        #[cfg(feature = "pubsub")]
+        {
+            builder = builder.gossipsub_config(minip2p::GossipsubConfig {
+                allow_unsigned: config.allow_unsigned,
+                ..minip2p::GossipsubConfig::default()
+            });
+        }
         // `force_relay` without a relay still submits the config, so the
         // endpoint's validation refuses it rather than dropping the flag.
         if !relays.is_empty() || config.force_relay {
@@ -261,6 +266,7 @@ impl<T: Transport> Host<T> {
     }
 
     /// Subscribes to a pubsub topic.
+    #[cfg(feature = "pubsub")]
     pub fn subscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
             .subscribe(&topic, now)
@@ -268,6 +274,7 @@ impl<T: Transport> Host<T> {
     }
 
     /// Withdraws a pubsub subscription.
+    #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
             .unsubscribe(&topic, now)
@@ -275,6 +282,7 @@ impl<T: Transport> Host<T> {
     }
 
     /// Publishes one pubsub payload.
+    #[cfg(feature = "pubsub")]
     pub fn publish(&mut self, topic: String, data: Vec<u8>, now: Now) -> Result<(), FfiError> {
         if data.len() > minip2p_pubsub::MAX_RPC_SIZE {
             return Err(FfiError::MessageTooLarge);
@@ -282,6 +290,28 @@ impl<T: Transport> Host<T> {
         self.endpoint()?
             .publish(&topic, data, now)
             .map_err(map_gossipsub_error)
+    }
+
+    /// Refuses: this build has no pubsub. The pubsub commands stay so the
+    /// JavaScript surface is the same with or without the feature.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn subscribe(&mut self, _topic: String, _now: Now) -> Result<bool, FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
+    }
+
+    /// Refuses: this build has no pubsub.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn unsubscribe(&mut self, _topic: String, _now: Now) -> Result<bool, FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
+    }
+
+    /// Refuses: this build has no pubsub.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn publish(&mut self, _topic: String, _data: Vec<u8>, _now: Now) -> Result<(), FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
     }
 
     /// Sends an explicit ping; its result arrives as an event.
@@ -572,6 +602,15 @@ fn closed_event(
     }
 }
 
+/// The refusal pubsub commands get from a build without the `pubsub` feature.
+#[cfg(not(feature = "pubsub"))]
+fn pubsub_not_built() -> FfiError {
+    FfiError::NotPermitted {
+        detail: "this build of minip2p-web has no pubsub; build it with the `pubsub` feature"
+            .into(),
+    }
+}
+
 /// Rejects configuration a browser cannot run, each with the reason.
 fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
     let reject = |capability, detail: &str| {
@@ -584,6 +623,13 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
         return reject(
             ConfigCapability::Options,
             "browsers cannot listen; omit listen and configure relays (a browser is reached at its /p2p-circuit address through a relay reservation)",
+        );
+    }
+    #[cfg(not(feature = "pubsub"))]
+    if config.allow_unsigned {
+        return reject(
+            ConfigCapability::Gossipsub,
+            "this build of minip2p-web has no pubsub; omit allowUnsigned, or build it with the `pubsub` feature",
         );
     }
     if config.mdns.is_some() {
@@ -622,6 +668,7 @@ fn map_build_error(error: PortableBuildError) -> FfiError {
                 detail,
             }
         }
+        #[cfg(feature = "pubsub")]
         PortableBuildError::Gossipsub(_) | PortableBuildError::Topic(_) => {
             FfiError::InvalidConfig {
                 capability: ConfigCapability::Gossipsub,

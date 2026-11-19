@@ -16,19 +16,26 @@ crate-type = ["cdylib", "rlib"]
 [lints]
 workspace = true
 
+[features]
+default = ["pubsub"]
+# Gossipsub: `subscribe`, `unsubscribe`, `publish` and their events. Without
+# it those commands refuse with `NotPermitted` (the JavaScript surface stays
+# the same) and the module is smaller; stream- and relay-only apps can build
+# with `--no-default-features`.
+pubsub = ["minip2p/pubsub", "minip2p-ffi-core/pubsub", "dep:minip2p-pubsub"]
+
 [dependencies]
 # The thread-free host core: no std driver, threads, clock or sockets.
 # Relay reservations and circuits come from `relay` (no DCUtR).
 minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false, features = [
   "relay",
-  "pubsub",
 ] }
 minip2p-core = { path = "../core", default-features = false }
 minip2p-ffi-core = { path = "../ffi-core", default-features = false, features = [
   "relay",
   "serde",
 ] }
-minip2p-pubsub = { path = "../pubsub", default-features = false }
+minip2p-pubsub = { path = "../pubsub", default-features = false, optional = true }
 minip2p-webtransport = { path = "../../transports/webtransport", default-features = false }
 getrandom = { workspace = true }
 js-sys = "0.3.105"

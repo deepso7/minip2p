@@ -52,6 +52,7 @@ minip2p-secure-mux|no-default||ci
 minip2p-transport|default|bench|release
 minip2p-quic|default|diagnostics|ci
 minip2p-ffi-core|no-default|serde|release
+minip2p-web|no-default||ci
 EOF
 )
 

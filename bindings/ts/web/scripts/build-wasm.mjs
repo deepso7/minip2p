@@ -4,6 +4,10 @@
 //
 // Needs the `wasm32-unknown-unknown` target and the wasm-bindgen CLI at the
 // version `crates/web` pins (`cargo install wasm-bindgen-cli --version …`).
+//
+// The shipped `.wasm` drops its `name` section (Rust function names, ~62% of
+// the raw bytes and ~24% of the brotli size). Set `MINIP2P_WASM_NAMES=1` to
+// keep it, for readable browser stack traces or `twiggy` profiling.
 
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -32,9 +36,11 @@ const { target_directory: targetDir } = JSON.parse(
     encoding: "utf-8",
   })
 );
+const keepNames = process.env.MINIP2P_WASM_NAMES === "1";
 run("wasm-bindgen", [
   "--target",
   "web",
+  ...(keepNames ? [] : ["--remove-name-section", "--remove-producers-section"]),
   "--out-dir",
   out,
   path.join(

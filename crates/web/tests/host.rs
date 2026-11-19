@@ -160,6 +160,39 @@ fn browser_config_accepts_relays() {
     }
 }
 
+#[cfg(not(feature = "pubsub"))]
+#[test]
+fn without_pubsub_the_pubsub_surface_refuses() {
+    let mut unsigned = config();
+    unsigned.allow_unsigned = true;
+    assert!(matches!(
+        Host::new(vec![1; 32], unsigned, |_| InMemoryTransport::pair(
+            peer(1),
+            peer(2)
+        )
+        .0),
+        Err(FfiError::InvalidConfig {
+            capability: ConfigCapability::Gossipsub,
+            ..
+        })
+    ));
+
+    let (mut a, _b) = pair();
+    let now = Now::from_millis(0);
+    assert!(matches!(
+        a.subscribe("room".into(), now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+    assert!(matches!(
+        a.unsubscribe("room".into(), now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+    assert!(matches!(
+        a.publish("room".into(), vec![1], now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+}
+
 #[test]
 fn a_pumped_host_connects_rings_once_and_reports_its_deadline() {
     let (mut a, mut b) = pair();
@@ -183,8 +216,10 @@ fn a_pumped_host_connects_rings_once_and_reports_its_deadline() {
         vec![peer(2).to_base58()]
     );
     assert!(a.is_peer_ready(peer(2).to_base58()).expect("ready"));
-    // Ping and Identify keep timers, so an idle host still has a deadline.
-    assert!(a.pump(Now::from_millis(40)).next_deadline.is_some());
+    // Gossipsub's heartbeat keeps a timer, so an idle host still has a
+    // deadline; without pubsub nothing is due until I/O arrives.
+    let idle = a.pump(Now::from_millis(40)).next_deadline;
+    assert_eq!(idle.is_some(), cfg!(feature = "pubsub"), "{idle:?}");
 }
 
 #[test]

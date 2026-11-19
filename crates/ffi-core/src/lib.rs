@@ -47,10 +47,9 @@ pub use config::{
 pub use connect::{ConnectTarget, parse_connect_target};
 #[cfg(feature = "driver")]
 pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
-pub use error::{
-    ConfigCapability, FfiError, driver_failure_kind, map_driver_error, map_gossipsub_error,
-    map_topic_error,
-};
+pub use error::{ConfigCapability, FfiError, driver_failure_kind, map_driver_error};
+#[cfg(feature = "pubsub")]
+pub use error::{map_gossipsub_error, map_topic_error};
 #[cfg(any(feature = "driver", feature = "relay"))]
 pub use events::convert_reachability;
 pub use events::{

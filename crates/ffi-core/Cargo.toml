@@ -15,10 +15,8 @@ workspace = true
 [dependencies]
 # The thread-free core needs only the portable endpoint types; the `driver`
 # feature adds the std endpoint and the capabilities it binds.
-minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false, features = [
-  "pubsub",
-] }
-minip2p-pubsub = { path = "../pubsub", default-features = false }
+minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false }
+minip2p-pubsub = { path = "../pubsub", default-features = false, optional = true }
 serde = { workspace = true, features = ["std", "derive"], optional = true }
 thiserror = { workspace = true, features = ["std"] }
 # Must remain paired with crates/ffi, ubrn and @ubjs/core 0.31.0-5.
@@ -37,7 +35,12 @@ driver = [
   "minip2p/mdns",
   "minip2p/relay",
   "minip2p/tcp",
+  "pubsub",
 ]
+# Gossipsub event conversion and error mapping. Without it a thread-free
+# host carries no pubsub; the browser build enables it through its own
+# default `pubsub` feature.
+pubsub = ["minip2p/pubsub", "dep:minip2p-pubsub"]
 # Relay reservations and circuits for the thread-free core (the browser
 # host): NAT event and reachability conversion over `minip2p/relay`.
 relay = ["minip2p/relay"]
