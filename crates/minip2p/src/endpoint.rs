@@ -73,6 +73,8 @@ pub(crate) type EngineOf<P> =
 pub struct Endpoint<P: Platform = crate::StdPlatform> {
     pub(crate) engine: EngineOf<P>,
     pub(crate) platform: P,
+    /// The sample a close took, so the `Drop` after it reuses that time.
+    pub(crate) closed_at: Option<Now>,
 }
 
 /// App-facing minip2p endpoint: one ordered [`EndpointEvent`] stream over
@@ -97,6 +99,8 @@ pub struct Endpoint<P: Platform = crate::StdPlatform> {
 pub struct Endpoint<P: Platform> {
     pub(crate) engine: EngineOf<P>,
     pub(crate) platform: P,
+    /// The sample a close took, so the `Drop` after it reuses that time.
+    pub(crate) closed_at: Option<Now>,
 }
 
 /// Lightweight snapshot of endpoint state, from [`Endpoint::stats`].
@@ -158,7 +162,7 @@ pub struct CloseReport {
     pub events: Vec<EndpointEvent>,
     /// Every transport or swarm failure: each disconnect, and a failed
     /// drive. An mDNS goodbye that could not be sent is an
-    /// [`EndpointEvent::MdnsFailed`] in `events` instead.
+    /// `EndpointEvent::MdnsFailed` in `events` instead.
     pub errors: Vec<DriverError>,
 }
 
@@ -699,11 +703,21 @@ impl<P: Platform> Endpoint<P> {
     /// Consumes the endpoint after tearing it down, reporting what that did.
     ///
     /// On std this is `close_within(DEFAULT_CLOSE_TIMEOUT)`: it disconnects
-    /// established peers and waits up to 500 ms until none remain. On a
-    /// [`Portable`](crate::Portable) platform it is one final drive (see
-    /// `PortableEndpoint`'s close docs): it sends mDNS goodbyes, disconnects
-    /// established peers, drives once, and reports what was still tracked as
-    /// [`CloseOutcome::DeadlineExpired`].
+    /// established peers and waits up to 500 ms until none remain.
+    ///
+    /// On a [`Portable`](crate::Portable) platform it does not wait for
+    /// teardown. At one clock sample it sends mDNS goodbyes, disconnects
+    /// established peers, drives the endpoint once more, and consumes it. The
+    /// [`CloseReport`] carries the final Endpoint events, including
+    /// capability events still queued (Gossipsub events still inside the
+    /// agent too), any a failed [`poll`](Self::poll) left, and those the
+    /// swarm queued even when the final drive fails. Dropping the transport
+    /// releases listeners and in-progress connections as well as established
+    /// ones; the report's `unfinished` lists those abandoned that way, with
+    /// [`CloseOutcome::DeadlineExpired`]. Every established peer is attempted
+    /// even if an earlier step fails. mDNS goodbyes are best effort: one that
+    /// could not be sent is an `EndpointEvent::MdnsFailed` among the events,
+    /// not an error.
     pub fn close(self) -> CloseReport {
         P::close(self)
     }
@@ -732,26 +746,38 @@ impl<P: Platform> Endpoint<P> {
 impl<P: Platform> Drop for Endpoint<P> {
     fn drop(&mut self) {
         // Drop cannot surface disconnect failures; transports own final
-        // cleanup. A closed endpoint has no peers left, so it does not
-        // sample the clock again.
-        if !self.engine.core.connected_peers().is_empty() {
-            let now = self.now();
+        // cleanup. It samples the clock only when there is work, and after a
+        // close it reuses that close's sample.
+        let disconnect = !self.engine.core.connected_peers().is_empty();
+        #[cfg(all(feature = "relay-server", feature = "quic"))]
+        let backbone = self
+            .engine
+            .relay_server
+            .as_ref()
+            .is_some_and(|relay_server| relay_server.backbone.is_some());
+        #[cfg(not(all(feature = "relay-server", feature = "quic")))]
+        let backbone = false;
+        if !disconnect && !backbone {
+            return;
+        }
+        let now = match self.closed_at {
+            Some(now) => now,
+            None => self.now(),
+        };
+        if disconnect {
             drop(self.disconnect_established(now));
         }
         #[cfg(all(feature = "relay-server", feature = "quic"))]
+        if let Some(backbone) = self
+            .engine
+            .relay_server
+            .as_mut()
+            .and_then(|relay_server| relay_server.backbone.as_mut())
         {
-            let now = self.now();
-            if let Some(backbone) = self
-                .engine
-                .relay_server
-                .as_mut()
-                .and_then(|relay_server| relay_server.backbone.as_mut())
-            {
-                // Best effort, like the public swarm's: one poll sends the
-                // closes before the sockets go.
-                backbone.shutdown(now);
-                drop(backbone.core.poll(now));
-            }
+            // Best effort, like the public swarm's: one poll sends the
+            // closes before the sockets go.
+            backbone.shutdown(now);
+            drop(backbone.core.poll(now));
         }
     }
 }

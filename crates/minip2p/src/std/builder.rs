@@ -1183,6 +1183,7 @@ pub(super) fn build_endpoint(
             #[cfg(all(test, feature = "quic"))]
             raw_events: std::collections::VecDeque::new(),
         },
+        closed_at: None,
     })
 }
 

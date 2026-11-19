@@ -170,25 +170,12 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
         self.engine.next_deadline(now)
     }
 
-    /// [`Endpoint::close`] on a portable platform: sends mDNS goodbyes,
-    /// closes established peers, drives the endpoint once more, and
-    /// consumes it: one final drive, then destruction, all at one clock
-    /// sample.
-    ///
-    /// A portable close does not wait for teardown: the [`CloseReport`]
-    /// carries the final Endpoint events, including capability events
-    /// still queued (Gossipsub events still inside the agent too), any a
-    /// failed [`poll`](Endpoint::poll) left, and those the swarm queued even
-    /// when the final drive fails. Dropping the transport releases listeners
-    /// and in-progress connections as well as established ones; the report's
-    /// `unfinished` lists those abandoned that way, with
-    /// [`CloseOutcome::DeadlineExpired`]. Every established peer is
-    /// attempted even if an earlier step fails. mDNS goodbyes are best
-    /// effort: one that could not be sent is an
-    /// [`EndpointEvent::MdnsFailed`] among the events, not an error.
+    /// [`Endpoint::close`] on a portable platform; see its docs.
     pub(crate) fn close_portable(mut self) -> CloseReport {
-        // One sample for the whole teardown, as the caller's `now` was.
+        // One sample for the whole teardown (and the `Drop` after it), as
+        // the caller's `now` was.
         let now = self.now();
+        self.closed_at = Some(now);
         // The failure is queued as an event too.
         #[cfg(feature = "mdns")]
         drop(self.engine.shutdown_mdns(now));
@@ -561,6 +548,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         Ok(Endpoint {
             engine,
             platform: Portable::new(self.clock),
+            closed_at: None,
         })
     }
 
