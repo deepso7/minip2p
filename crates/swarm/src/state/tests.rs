@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::str::FromStr;
 
 use minip2p_identify::IdentifyConfig;

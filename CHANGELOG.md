@@ -6,7 +6,7 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ### `TransportEvent` boxes its `ConnectionEndpoint`
 
-Every received chunk moves through `TransportEvent` as a `StreamData`, and the enum was as large as its per-connection variants. `Connected`, `IncomingConnection` and `PeerIdentityVerified` now carry `endpoint: Box<ConnectionEndpoint>`, and `PeerIdentityVerified` carries `previous_peer_id: Option<Box<PeerId>>`, so `TransportEvent` shrinks from 248 to 56 bytes on 64-bit targets. This only affects code that implements or drives a `Transport` directly: build the events with `Box::new(endpoint)` and `previous.map(Box::new)`; method calls (`endpoint.peer_id()`) auto-deref, and `(*endpoint).clone()` or `*endpoint` gets the value. `SwarmEvent`, `EndpointEvent` and the binding events are unchanged.
+Every received chunk moves through `TransportEvent` as a `StreamData`, and the enum was as large as its per-connection variants. `Connected`, `IncomingConnection` and `PeerIdentityVerified` now carry `endpoint: Box<ConnectionEndpoint>`, and `PeerIdentityVerified` carries `previous_peer_id: Option<Box<PeerId>>`, so `TransportEvent` shrinks from 248 to 56 bytes on 64-bit targets. This only affects code that implements or drives a `Transport` directly: build the events with `Box::new(endpoint)` and `previous.map(Box::new)`; method calls (`endpoint.peer_id()`) auto-deref, and `*endpoint` moves the value out of an owned event (`endpoint.as_ref().clone()` copies it from a borrowed one). `SwarmEvent`, `EndpointEvent` and the binding events are unchanged.
 
 ### `flush`, and close flushes first
 

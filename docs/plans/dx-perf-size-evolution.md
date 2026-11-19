@@ -93,7 +93,7 @@ Each item here is gated on measuring first so we only take on complexity that pa
 
 3. **Zero-alloc `poll(&mut self, now, out: &mut Vec<_>)` (only if benchmarks justify it).**
    - Idle ticks already do not allocate (`Vec::new()` is zero-alloc), and changing `Transport::poll` touches every transport and ~10 test transports. Profile active throughput allocations first (`endpoint_throughput`, `endpoint_ping_load`) before committing to the trait break.
-   - **Results.** Under `endpoint_throughput` and `endpoint_ping_load`, the `Vec`s returned by `poll` account for 1.5–12% of allocations, depending on the benchmark. That is not worth breaking `Transport::poll` across every transport and test transport, so the trait stays as it is. A possible cheap follow-up: when `TransportSet` has a single member, hand that member's `Vec` through instead of copying it into a new one.
+   - **Results.** Counted with temporary allocation counters on the `Vec`s that `TransportSet::poll` and `SwarmCore::poll` return, during `endpoint_throughput` (tcp, quic, relayed), those `Vec`s account for 1.5–12% of all allocations, depending on the case. That is not worth breaking `Transport::poll` across every transport and test transport, so the trait stays as it is. A possible cheap follow-up: when `TransportSet` has a single member, hand that member's `Vec` through instead of copying it into a new one.
 
 ### 5. Internal maintainability (non-breaking)
 
