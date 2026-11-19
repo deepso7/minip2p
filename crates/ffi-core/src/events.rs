@@ -1,9 +1,11 @@
 //! Binding-agnostic event model and upstream event conversion.
 
+#[cfg(feature = "pubsub")]
+use minip2p::GossipsubEvent;
 use minip2p::{
     ConnectFailure, ConnectOutcome, ConnectionCloseReason as UpstreamConnectionCloseReason,
-    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, Path,
-    PingFailure as UpstreamPingFailure, SwarmErrorKind,
+    EndpointEvent, IdentifyMessage, Multiaddr, Path, PingFailure as UpstreamPingFailure,
+    SwarmErrorKind,
 };
 #[cfg(feature = "driver")]
 use minip2p::{DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource};
@@ -921,6 +923,7 @@ pub fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome),
+        #[cfg(feature = "pubsub")]
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
         // NAT comes with the std driver or the portable relay; discovery
         // and mDNS are the std driver's.
@@ -1090,6 +1093,7 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
     })
 }
 
+#[cfg(feature = "pubsub")]
 pub(crate) fn convert_gossipsub(event: GossipsubEvent) -> P2pEvent {
     match event {
         GossipsubEvent::Message {
@@ -1404,6 +1408,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pubsub")]
     #[test]
     fn pubsub_message_conversion_preserves_binary_fields() {
         let remote = peer(5);

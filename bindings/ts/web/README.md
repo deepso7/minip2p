@@ -59,7 +59,7 @@ pnpm test          # unit tests (runs wasm:build first)
 pnpm test:e2e      # Playwright: Chromium and Firefox against native nodes
 ```
 
-`wasm:build` regenerates `wasm/minip2p_web.js` and its `.d.ts`, the checked-in wasm-bindgen glue; commit them, CI fails when they are stale. The `.wasm` is a build output. The e2e suite needs `pnpm build:bindings`, the Node addon (`pnpm --filter @minip2p/node native:build`), the relay-server example (`cargo build -p minip2p-relay-server-example`) and `npx playwright install chromium firefox`.
+`wasm:build` regenerates `wasm/minip2p_web.js` and its `.d.ts`, the checked-in wasm-bindgen glue; commit them, CI fails when they are stale. The `.wasm` is a build output: about 1.4 MB raw, 310 KB with brotli. It ships without its `name` section; set `MINIP2P_WASM_NAMES=1` to keep the Rust function names in stack traces. Sizes, and a smaller build without pubsub, are covered in [`crates/web`](https://github.com/deepso7/minip2p/tree/main/crates/web#building). The e2e suite needs `pnpm build:bindings`, the Node addon (`pnpm --filter @minip2p/node native:build`), the relay-server example (`cargo build -p minip2p-relay-server-example`) and `npx playwright install chromium firefox`.
 
 `src/io.ts` is `JsIo`, the `WebTransportIo` seam the Rust client drives over the browser's `WebTransport`; [`crates/web`](https://github.com/deepso7/minip2p/tree/main/crates/web) is the Rust side.
 

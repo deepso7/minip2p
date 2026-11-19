@@ -195,6 +195,7 @@ pub fn driver_failure_kind(error: &minip2p::DriverError) -> crate::DriverFailure
 /// Maps a Gossipsub refusal: reserved topics to [`FfiError::NotPermitted`],
 /// publish limits to their own variants, topic mistakes to
 /// [`FfiError::InvalidTopic`].
+#[cfg(feature = "pubsub")]
 pub fn map_gossipsub_error(error: minip2p::GossipsubError) -> FfiError {
     match error {
         minip2p::GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
@@ -216,6 +217,7 @@ pub fn map_gossipsub_error(error: minip2p::GossipsubError) -> FfiError {
 }
 
 /// Maps an invalid pubsub topic.
+#[cfg(feature = "pubsub")]
 pub fn map_topic_error(error: minip2p::TopicError) -> FfiError {
     FfiError::InvalidTopic {
         detail: error.to_string(),
