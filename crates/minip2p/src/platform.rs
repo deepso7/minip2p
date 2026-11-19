@@ -69,7 +69,9 @@ pub(crate) mod sealed {
 /// the clock is the host's (a hardware timer on a microcontroller,
 /// `performance.now()` in a browser, a manual clock in a deterministic
 /// simulation), and every endpoint call samples it once. Names are not
-/// resolved: `/dns*` candidates fail as unusable.
+/// resolved: a `/dns*` candidate or relay address goes to the transport as
+/// it is, which dials it if it can (a browser's WebTransport resolves the
+/// host itself) and fails it as a candidate otherwise.
 ///
 /// Built with [`PortableEndpointBuilder`](crate::PortableEndpointBuilder);
 /// [`PortableEndpoint`](crate::PortableEndpoint) names the endpoint type.

@@ -653,9 +653,8 @@ impl RelayLegFixture {
         Self::with_relay(seed, force_relay, "/ip4/192.0.2.50/tcp/4001")
     }
 
-    /// Like [`Self::new`], with the relay at `relay` (which may name a host)
-    /// and NAT dials to named hosts parked for the engine's [`Expander`],
-    /// as on the std Endpoint.
+    /// Like [`Self::new`], with the relay at `relay`, which may name a host:
+    /// NAT dials to named hosts are parked for the engine's [`Expander`].
     fn with_relay(seed: u8, force_relay: bool, relay: &str) -> Self {
         let identity = Ed25519Keypair::from_secret_key_bytes([seed; 32]);
         let relay = PeerAddr::new(
@@ -678,12 +677,11 @@ impl RelayLegFixture {
             relay_timeout_ms: crate::DEFAULT_CONNECT_DEADLINE_MS,
             ..minip2p_nat::NatConfig::default()
         };
-        let mut nat = crate::nat::NatDriver::new(
+        let nat = crate::nat::NatDriver::new(
             minip2p_nat::NatAgent::new(identity.peer_id(), config),
             vec![(*relay.peer_id(), relay.transport().clone())],
             7,
         );
-        nat.park_named_dials();
         endpoint.engine.nat = Some(nat);
         Self {
             endpoint,
@@ -1067,6 +1065,33 @@ fn an_answer_after_the_attempt_deadline_leaves_it_timed_out() {
             } if *connect_id == id
         )),
         "{events:?}"
+    );
+}
+
+/// A portable endpoint hands a named relay to its transport, as it does a
+/// named candidate: a browser's WebTransport dials `/dns` itself. So
+/// `connect(peer_id)` reaches a relay that is not connected yet through the
+/// attempt's own relay leg, without the caller dialing the relay first.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_portable_peer_connect_dials_a_named_relay_itself() {
+    let mut f =
+        RelayLegFixture::with_relay(90, true, "/dns/relay.test/udp/443/quic-v1/webtransport");
+    let now = Now::from_millis(0);
+    let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
+    // Parked for the next batch, which the host is told to run at once.
+    assert_eq!(
+        f.endpoint.at(now).next_deadline(),
+        Some(minip2p_core::platform::Deadline::IMMEDIATE)
+    );
+    let events = f.endpoint.at(now).poll().expect("poll");
+    assert!(
+        RelayLegFixture::terminals(&events, id).is_empty(),
+        "the attempt waits on its relay leg: {events:?}"
+    );
+    assert_eq!(
+        f.dialed(f.relay.peer_id()),
+        ["/dns/relay.test/udp/443/quic-v1/webtransport"]
     );
 }
 

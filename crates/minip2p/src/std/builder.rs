@@ -1181,12 +1181,6 @@ pub(super) fn build_endpoint(
         })?;
         relay_server.backbone = Some(bind_backbone(mesh, agent_version, timeouts, &mut poll)?);
     }
-    // Relay and AutoNAT server addresses may name a host; the endpoint
-    // resolves those off the driver, like Connection-attempt candidates.
-    #[cfg(feature = "autonat")]
-    if let Some(nat) = engine.nat.as_mut() {
-        nat.park_named_dials();
-    }
     Ok(Endpoint {
         engine,
         platform: StdPlatform {

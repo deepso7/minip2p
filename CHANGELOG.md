@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### A portable `connect(peer_id)` dials a named relay itself
+
+A portable endpoint (the browser's, through `@minip2p/web`) refused relay and AutoNAT server addresses that name a host (`/dns/relay.example.com/udp/443/quic-v1/webtransport/p2p/…`) with "named address … must be resolved before dialing", so `connect(peerId)` settled `NoUsableRoute` unless the app had dialed the relay first, and reservations on such a relay never started. The relay leg now hands the named address to the transport, as `connect` already did for a named candidate. Drop the pre-dial: `await endpoint.connect(RELAY); await endpoint.connect(peer)` becomes `await endpoint.connect(peer)`.
+
 ### Stream keys, safe partial writes, and an Endpoint-owned write queue
 
 Endpoint streams are named by one `StreamKey`, a partial write can no longer be dropped by `?`, and the Endpoint holds unsent tails itself, so `StreamWriter` is gone ([ADR 0030](docs/adr/0030-stream-keys-and-an-endpoint-owned-write-queue.md)). The TypeScript SDKs and the binding events are unchanged.
