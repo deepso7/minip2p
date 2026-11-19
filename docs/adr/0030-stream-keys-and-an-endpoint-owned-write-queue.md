@@ -18,5 +18,5 @@ Three things made application streams awkward on the Endpoint ([plan](../plans/d
 
 - `send_stream` changed meaning (it used to be the bare write). Code that matched `Err(Error::Full { unsent, .. })` moves to `try_send_stream` and `SendOutcome::Full`; code that wrapped `StreamWriter` calls `send_stream` and listens for `StreamWriteAccepted` / `StreamWriteAborted`.
 - With the default budget, a single payload over 8 MiB is refused as `TooLarge`; split it or raise the budget. `write_budget(0)` costs nothing beyond an empty map, for callers that use `try_send_stream` only.
-- While a stream has queued bytes, `try_send_stream` on it accepts nothing and returns the whole payload as `Full`, and its Writable is reported as `StreamWriteAccepted` (then passed on to a bare caller still waiting for it), so bytes never reorder.
+- While a stream has queued bytes, `try_send_stream` on it accepts nothing and returns the whole payload as `Full`, and its Writable is reported as `StreamWriteAccepted` (then passed on to a bare caller still waiting for it), so bytes never reorder. Once a write-side close is deferred behind them, `try_send_stream` fails with `SwarmError::WriteClosed` instead: no Writable follows a FIN.
 - `send_stream` is the hottest path; with nothing queued it adds one map lookup and the admission check to the bare write.

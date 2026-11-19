@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, ManualClock,
-    PeerAddr, PortableEndpointBuilder, SendError, SendOutcome, StreamId, StreamKey,
+    ConnectionId, DriverError, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome,
+    ManualClock, PeerAddr, PortableEndpointBuilder, SendError, SendOutcome, StreamId, StreamKey,
+    SwarmError,
 };
 use minip2p_core::platform::{Clock, StdClock, StdEntropy};
 
@@ -101,6 +102,12 @@ fn a_queued_write_completes_on_writable_and_the_fin_waits_for_it() {
         "{closing:?}"
     );
     assert!(!closing.is_retryable() && !closing.is_stream_gone());
+    // No Writable follows the deferred FIN, so a bare write is refused
+    // rather than told to wait for one.
+    assert!(matches!(
+        writer.try_send_stream(stream, vec![3]),
+        Err(DriverError::Swarm(SwarmError::WriteClosed { .. }))
+    ));
 
     let mut settled = Vec::new();
     let mut received = Vec::new();

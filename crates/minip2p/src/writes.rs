@@ -126,10 +126,6 @@ struct Held {
     /// A write-side close requested behind the chunks; the FIN follows once
     /// they have all been accepted.
     close_after: bool,
-    /// A resend failed: the stream is gone. Its own terminal event later in
-    /// the batch reports the abort, or [`WriteQueue::take_failed`] does at
-    /// the batch's end.
-    failed: bool,
 }
 
 impl Held {
@@ -154,7 +150,11 @@ pub(crate) struct WriteQueue {
     streams: BTreeMap<StreamKey, Held>,
     /// Streams whose `try_send_stream` returned Full: their caller holds a
     /// tail and waits for a Writable, which the queue must not swallow.
-    wake: BTreeSet<StreamKey>,
+    pub(crate) wake: BTreeSet<StreamKey>,
+    /// Queued streams whose resend failed: the stream is gone. Its own
+    /// terminal event later in the batch reports the abort, or
+    /// [`WriteQueue::take_failed`] does at the batch's end.
+    failed: Vec<StreamKey>,
 }
 
 impl Default for WriteQueue {
@@ -170,6 +170,7 @@ impl WriteQueue {
             held: 0,
             streams: BTreeMap::new(),
             wake: BTreeSet::new(),
+            failed: Vec::new(),
         }
     }
 
@@ -184,9 +185,18 @@ impl WriteQueue {
     }
 
     /// Records that a bare write to `stream` returned Full, so its caller
-    /// gets a `StreamWritable` even if queued bytes take the next one.
+    /// gets a `StreamWritable` even if queued bytes take the next one. A zero
+    /// budget never queues, so it never takes a Writable and tracks nothing.
     pub(crate) fn want_writable(&mut self, stream: StreamKey) {
-        self.wake.insert(stream);
+        if self.budget > 0 {
+            self.wake.insert(stream);
+        }
+    }
+
+    /// Forgets a waiting bare writer once the write side is closed: no
+    /// Writable follows to clear it.
+    pub(crate) fn unwant_writable(&mut self, stream: StreamKey) {
+        self.wake.remove(&stream);
     }
 
     /// Whether a write-side close is deferred behind the stream's queue.
@@ -253,7 +263,6 @@ impl WriteQueue {
                 peer_id,
                 chunks: VecDeque::new(),
                 close_after: false,
-                failed: false,
             })
             .chunks
             .push_back((tail, counted));
@@ -276,6 +285,7 @@ impl WriteQueue {
     /// were held.
     pub(crate) fn forget(&mut self, stream: StreamKey) -> Option<EndpointEvent> {
         self.wake.remove(&stream);
+        self.failed.retain(|failed| *failed != stream);
         let held = self.streams.remove(&stream)?;
         self.held -= held.counted();
         Some(EndpointEvent::StreamWriteAborted {
@@ -288,16 +298,7 @@ impl WriteQueue {
     /// Aborts every queue whose resend failed with no terminal event for it
     /// in the batch; the engine calls it once a batch is ingested.
     pub(crate) fn take_failed(&mut self) -> Vec<EndpointEvent> {
-        if self.streams.is_empty() {
-            return Vec::new();
-        }
-        let failed: Vec<StreamKey> = self
-            .streams
-            .iter()
-            .filter(|(_, held)| held.failed)
-            .map(|(stream, _)| *stream)
-            .collect();
-        failed
+        core::mem::take(&mut self.failed)
             .into_iter()
             .filter_map(|stream| self.forget(stream))
             .collect()
@@ -390,10 +391,10 @@ impl WriteQueue {
         stream: StreamKey,
         now_ms: u64,
     ) -> Option<EndpointEvent> {
-        let held = self.streams.get_mut(&stream)?;
-        if held.failed {
+        if self.failed.contains(&stream) {
             return None;
         }
+        let held = self.streams.get_mut(&stream)?;
         let peer_id = held.peer_id;
         while let Some((chunk, counted)) = held.chunks.front_mut() {
             let sent = core.send_stream(
@@ -418,7 +419,7 @@ impl WriteQueue {
                 // The stream is gone; its own terminal event says why, and
                 // aborts the queue after it.
                 Err(_) => {
-                    held.failed = true;
+                    self.failed.push(stream);
                     return None;
                 }
             }
@@ -477,5 +478,13 @@ mod tests {
             )),
             Err(SendError::Closing { .. })
         ));
+    }
+
+    #[test]
+    fn a_zero_budget_tracks_no_waiting_writer() {
+        let stream = StreamKey::new(ConnectionId::new(1), StreamId::new(1));
+        let mut queue = WriteQueue::new(0);
+        queue.want_writable(stream);
+        assert!(queue.wake.is_empty());
     }
 }

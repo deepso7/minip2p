@@ -2795,3 +2795,48 @@ fn default_agent_version_matches_package_version() {
         format!("minip2p/{}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn a_half_close_forgets_a_bare_writer_waiting_on_writable() {
+    const PROTOCOL: &str = "/test/half-close-wake/1";
+    let bind = || {
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .protocol(PROTOCOL)
+            .bind()
+            .expect("bind endpoint")
+    };
+    let (mut writer, mut reader) = (bind(), bind());
+    let (writer_peer, reader_peer) = (*writer.peer_id(), *reader.peer_id());
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    let tick = Duration::from_millis(5);
+    writer
+        .connect(reader.listen().expect("listen"))
+        .expect("connect");
+    while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {
+        assert!(std::time::Instant::now() < give_up, "never ready");
+        writer.next_event(tick).expect("drive writer");
+        reader.next_event(tick).expect("drive reader");
+    }
+    let stream = writer.open_stream(&reader_peer, PROTOCOL).expect("open");
+    loop {
+        assert!(std::time::Instant::now() < give_up, "never negotiated");
+        reader.next_event(tick).expect("drive reader");
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) =
+            writer.next_event(tick).expect("drive writer")
+            && ready == stream
+        {
+            break;
+        }
+    }
+    let outcome = writer
+        .try_send_stream(stream, vec![0; 16 * 1024 * 1024])
+        .expect("try send");
+    assert!(!outcome.is_accepted(), "past the stream's send window");
+    // Nothing is queued, so the FIN goes out now and no Writable follows
+    // to clear the waiting writer's marker.
+    writer.close_stream_write(stream).expect("close write");
+    assert!(!writer.is_write_pending(stream));
+    assert!(writer.engine.writes.wake.is_empty());
+}

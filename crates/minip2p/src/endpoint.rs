@@ -529,7 +529,9 @@ impl<P: Platform> Endpoint<P> {
     /// outcome is `#[must_use]`. While [`Self::send_stream`] holds bytes for
     /// the stream this accepts nothing, keeping bytes in order, and its
     /// `StreamWritable` follows [`EndpointEvent::StreamWriteAccepted`] once
-    /// the queue drained.
+    /// the queue drained. After a [`Self::close_stream_write`] deferred
+    /// behind queued bytes it fails with `SwarmError::WriteClosed`, since no
+    /// `StreamWritable` follows a FIN.
     ///
     /// Errors as [`Self::send_stream`]'s driver errors do.
     pub fn try_send_stream(

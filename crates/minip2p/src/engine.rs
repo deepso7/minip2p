@@ -69,7 +69,7 @@ use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, Path, PeerId};
-use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
+use minip2p_swarm::{DriverError, SwarmCore, SwarmError, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamKey, Transport, TransportError};
 
 use crate::connect::{
@@ -281,7 +281,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// Sends what the stream accepts now; see `Endpoint::try_send_stream`.
     /// Behind bytes the write queue holds it accepts nothing, so bytes stay
-    /// in order.
+    /// in order; behind a deferred FIN it fails, since no Writable follows.
     pub(crate) fn try_send_stream(
         &mut self,
         stream: StreamKey,
@@ -289,6 +289,13 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         now: Now,
     ) -> Result<SendOutcome, DriverError> {
         let peer_id = self.stream_peer(stream)?;
+        if self.writes.is_closing(stream) {
+            return Err(SwarmError::WriteClosed {
+                conn_id: stream.conn_id(),
+                stream_id: stream.stream_id(),
+            }
+            .into());
+        }
         if self.writes.is_pending(stream) {
             self.writes.want_writable(stream);
             return Ok(SendOutcome::Full { unsent: data });
@@ -343,7 +350,10 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             stream.conn_id(),
             stream.stream_id(),
             now.monotonic_ms,
-        )
+        )?;
+        // No Writable follows a FIN, so none can clear a waiting bare writer.
+        self.writes.unwant_writable(stream);
+        Ok(())
     }
 
     /// Resets an application stream, aborting what the write queue held.
