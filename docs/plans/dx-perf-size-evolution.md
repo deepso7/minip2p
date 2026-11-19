@@ -1,6 +1,6 @@
 # Plan: DX, performance, and binary-size improvements
 
-> **Status:** PRs 1–4 and 6 landed (#560, #561, #562, #563, #564, #566). PR 5 (boxing cold event variants) is in progress; §3.6 is evaluated and deferred (see its Results).
+> **Status:** Done. PRs 1–6 landed (#560, #561, #562, #563, #564, #566, #568; PR 5 boxed only `TransportEvent`, see §4.1 Results). Follow-ups: relay bridge draining on flush (#565), a Rust-facing detached driver (#567, deferred; see §3.6 Results).
 
 ## Goal
 
