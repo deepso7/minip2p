@@ -154,7 +154,7 @@ pub(crate) struct WriteQueue {
     /// Queued streams whose resend failed: the stream is gone. Its own
     /// terminal event later in the batch reports the abort, or
     /// [`WriteQueue::take_failed`] does at the batch's end.
-    failed: Vec<StreamKey>,
+    failed: BTreeSet<StreamKey>,
 }
 
 impl Default for WriteQueue {
@@ -170,7 +170,7 @@ impl WriteQueue {
             held: 0,
             streams: BTreeMap::new(),
             wake: BTreeSet::new(),
-            failed: Vec::new(),
+            failed: BTreeSet::new(),
         }
     }
 
@@ -285,7 +285,7 @@ impl WriteQueue {
     /// were held.
     pub(crate) fn forget(&mut self, stream: StreamKey) -> Option<EndpointEvent> {
         self.wake.remove(&stream);
-        self.failed.retain(|failed| *failed != stream);
+        self.failed.remove(&stream);
         let held = self.streams.remove(&stream)?;
         self.held -= held.counted();
         Some(EndpointEvent::StreamWriteAborted {
@@ -419,7 +419,7 @@ impl WriteQueue {
                 // The stream is gone; its own terminal event says why, and
                 // aborts the queue after it.
                 Err(_) => {
-                    self.failed.push(stream);
+                    self.failed.insert(stream);
                     return None;
                 }
             }
