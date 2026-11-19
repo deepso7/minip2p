@@ -47,8 +47,10 @@
 //! (`100m_100ms` by default), `MINIP2P_RTT_RUNS` the runs per
 //! point (default 5), and `MINIP2P_RTT_TOTAL_MB` the bytes per timed
 //! transfer (default: 2.5 s or 25 round trips at the link rate, whichever is
-//! longer, and at least 32 MiB). The profile is any `<rate>m_<rtt>ms` or
-//! `<rate>g_<rtt>ms`, such as `100m_300ms`.
+//! longer, and at least 32 MiB; an explicit value is used as given, which is
+//! what makes the sub-Mbit profiles finish). The profile is any
+//! `<rate>k_<rtt>ms`, `<rate>m_<rtt>ms` or `<rate>g_<rtt>ms`, such as
+//! `100m_300ms` or `64k_400ms`.
 //!
 //! An MB here is 2^20 bytes.
 
