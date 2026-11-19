@@ -34,7 +34,8 @@ pub use minip2p_swarm::{
     SwarmTimeouts,
 };
 pub use minip2p_transport::{
-    ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, Transport, TransportError,
+    ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, StreamKey, Transport,
+    TransportError,
 };
 
 pub(crate) use crate::connect::DEFAULT_CONNECT_DEADLINE_MS;
@@ -102,6 +103,7 @@ pub use crate::platform::{Platform, Portable};
 #[cfg(feature = "autonat")]
 use crate::setup::NatConfigError;
 use crate::setup::{self, Capabilities, PlatformCaps, SetupError};
+use crate::writes::WriteQueue;
 pub use minip2p_core::platform::{Clock, ManualClock};
 
 /// A portable endpoint: an [`Endpoint`] on the [`Portable`] platform, over
@@ -317,6 +319,7 @@ pub struct PortableEndpointBuilder<E, C> {
     entropy: E,
     clock: C,
     connect_deadline_ms: u64,
+    write_budget: usize,
     capabilities: Capabilities,
     /// The carrier [`Self::mdns`] hands over with `capabilities.mdns`.
     #[cfg(feature = "mdns")]
@@ -333,6 +336,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
             entropy,
             clock,
             connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
+            write_budget: crate::DEFAULT_WRITE_BUDGET,
             capabilities: Capabilities::default(),
             #[cfg(feature = "mdns")]
             mdns_io: None,
@@ -363,6 +367,16 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// Sets the Connection-attempt deadline. Default 30 seconds.
     pub fn connect_deadline(mut self, deadline: Duration) -> Self {
         self.connect_deadline_ms = duration_ms(deadline);
+        self
+    }
+
+    /// Sets how many bytes [`Endpoint::send_stream`](crate::Endpoint::send_stream)
+    /// may hold, across every stream, until their streams accept them.
+    /// Default [`DEFAULT_WRITE_BUDGET`](crate::DEFAULT_WRITE_BUDGET) (8 MiB);
+    /// `0` queues nothing, for hosts that use `try_send_stream` and hold
+    /// unsent tails themselves.
+    pub fn write_budget(mut self, bytes: usize) -> Self {
+        self.write_budget = bytes;
         self
     }
 
@@ -542,6 +556,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         // The swarm owns the entropy from here on; capabilities draw from it.
         let core = self.swarm.build_core(transport, self.entropy)?;
         let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
+        engine.writes = WriteQueue::new(self.write_budget);
         setup::install(
             &mut engine,
             validated,
@@ -576,6 +591,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
                 entropy: entropy.clone(),
                 clock: self.clock,
                 connect_deadline_ms: self.connect_deadline_ms,
+                write_budget: self.write_budget,
                 capabilities: self.capabilities,
                 mdns_io: self.mdns_io,
             },
@@ -662,6 +678,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
     /// Sets the Connection-attempt deadline. Default 30 seconds.
     pub fn connect_deadline(mut self, deadline: Duration) -> Self {
         self.portable = self.portable.connect_deadline(deadline);
+        self
+    }
+
+    /// Sets the write queue's budget (see
+    /// [`PortableEndpointBuilder::write_budget`]).
+    pub fn write_budget(mut self, bytes: usize) -> Self {
+        self.portable = self.portable.write_budget(bytes);
         self
     }
 
@@ -1071,7 +1094,7 @@ mod tests {
                 .build(NoopTransport)
                 .expect("mdns endpoint");
         let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
-        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
+        let stream = StreamKey::new(ConnectionId::new(1), StreamId::new(3));
         let other = EndpointEvent::ConnectionClosed {
             peer_id: peer,
             conn_id: ConnectionId::new(2),
@@ -1080,20 +1103,18 @@ mod tests {
         endpoint.engine.events.extend([
             EndpointEvent::StreamData {
                 peer_id: peer,
-                conn_id,
-                stream_id,
+                stream,
                 data: minip2p_core::Bytes::from_static(b"late"),
             },
             EndpointEvent::StreamClosed {
                 peer_id: peer,
-                conn_id,
-                stream_id,
+                stream,
             },
             other,
         ]);
         endpoint
             .at(Now::from_millis(0))
-            .abandon_stream(conn_id, stream_id)
+            .abandon_stream(stream)
             .expect("a held close proves the stream");
         assert!(
             matches!(

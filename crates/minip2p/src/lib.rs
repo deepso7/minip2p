@@ -45,7 +45,7 @@ mod setup;
 mod std;
 #[cfg(feature = "pubsub")]
 mod stream_conns;
-mod writer;
+mod writes;
 
 pub use portable::*;
 #[cfg(feature = "pubsub")]
@@ -58,4 +58,4 @@ pub use relay_server::RelayServerControlError;
 pub use setup::NatConfigError;
 #[cfg(feature = "std")]
 pub use std::*;
-pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
+pub use writes::{DEFAULT_WRITE_BUDGET, SendError, SendOutcome};

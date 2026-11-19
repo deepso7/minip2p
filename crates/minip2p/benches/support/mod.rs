@@ -20,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder, EndpointEvent,
-    EndpointWaitOutcome, Error, NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy,
-    StreamId, WaitDeadline,
+    Bytes, ConnectOutcome, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome,
+    NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy, SendOutcome, StreamKey,
+    WaitDeadline,
 };
 
 /// Upper bound for every setup step.
@@ -60,22 +60,19 @@ pub fn bind_on(builder: EndpointBuilder, listen: &str) -> Endpoint {
 /// panics.
 pub fn send_chunk(
     endpoint: &mut Endpoint,
-    stream: (ConnectionId, StreamId),
+    stream: StreamKey,
     chunk: &Bytes,
     held: &mut Option<Bytes>,
 ) -> (u64, bool) {
     let data = held.take().unwrap_or_else(|| chunk.clone());
     let len = data.len();
-    match endpoint.send_stream(stream.0, stream.1, data) {
-        Err(Error::Full { unsent, .. }) => {
+    match endpoint.try_send_stream(stream, data).expect("send failed") {
+        SendOutcome::Full { unsent } => {
             let accepted = len - unsent.len();
             *held = Some(unsent);
             (accepted as u64, true)
         }
-        other => {
-            other.expect("send failed");
-            (len as u64, false)
-        }
+        SendOutcome::Accepted => (len as u64, false),
     }
 }
 

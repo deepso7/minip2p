@@ -115,24 +115,25 @@ fn negotiated_bridge() -> BridgePair {
     }
     let inner_conn = inner_conn.expect("local connection id");
     let relay_conn = relay_conn.expect("relay connection id");
-    let (_, stream) = local
+    let stream = local
         .open_stream(relay_addr.peer_id(), HOP_PROTOCOL_ID)
-        .expect("open bridge stream");
+        .expect("open bridge stream")
+        .stream_id();
     let mut local_stream_ready = false;
     let mut relay_stream_ready = false;
     while !local_stream_ready || !relay_stream_ready {
         assert!(Instant::now() < deadline, "bridge stream did not negotiate");
-        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = local
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) = local
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive local stream")
-            && stream_id == stream
+            && ready.stream_id() == stream
         {
             local_stream_ready = true;
         }
-        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = relay
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) = relay
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive relay stream")
-            && stream_id == stream
+            && ready.stream_id() == stream
         {
             relay_stream_ready = true;
         }
@@ -1355,24 +1356,18 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
         {
             Some(EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 ..
             }) if protocol_id == AUTONAT_PROTOCOL_ID => {
                 let observed = server
-                    .connection_remote_addr(conn_id)
+                    .connection_remote_addr(stream.conn_id())
                     .expect("the stream's connection is open");
                 let machine = AutoNatServer::new(peer_id, observed);
-                machines.insert((conn_id, stream_id), machine);
+                machines.insert(stream, machine);
             }
-            Some(EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            }) => {
-                let Some(machine) = machines.get_mut(&(conn_id, stream_id)) else {
+            Some(EndpointEvent::StreamData { stream, data, .. }) => {
+                let Some(machine) = machines.get_mut(&stream) else {
                     continue;
                 };
                 machine.on_data(&data).expect("well-formed request");
@@ -1383,9 +1378,7 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
                             vouched += 1;
                         }
                         AutoNatServerOutput::Outbound(bytes) => {
-                            server
-                                .send_stream(conn_id, stream_id, bytes)
-                                .expect("send response");
+                            server.send_stream(stream, bytes).expect("send response");
                         }
                     }
                 }

@@ -1,13 +1,14 @@
 //! A bulk transfer to a reader that drains slowly completes without teardown
-//! (ADR 0012): the writer sees `Full`, holds the unsent tail, resends it on
-//! `StreamWritable`, and every byte arrives in order before the FIN.
+//! (ADR 0012): the writer's `try_send_stream` comes back `Full`, it holds
+//! the unsent tail, resends it on `StreamWritable`, and every byte arrives in
+//! order before the FIN.
 
 #![cfg(feature = "std")]
 
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, Error, PeerId, StreamId,
+    Bytes, Endpoint, EndpointEvent, EndpointWaitOutcome, Error, PeerId, SendOutcome, StreamKey,
 };
 
 #[path = "../../../tests/support/endpoint.rs"]
@@ -56,7 +57,7 @@ fn fail_on_teardown(event: &EndpointEvent) {
 }
 
 /// Connects the two endpoints and opens one negotiated stream from `writer`.
-fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (PeerId, ConnectionId, StreamId) {
+fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (PeerId, StreamKey) {
     let reader_addr = reader.listen().expect("reader listens");
     let reader_peer = *reader.peer_id();
     let writer_peer = *writer.peer_id();
@@ -67,17 +68,17 @@ fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (PeerId, ConnectionId, 
         let _ = next(writer, Duration::from_millis(5));
         let _ = next(reader, Duration::from_millis(5));
     }
-    let (conn_id, stream_id) = writer
+    let stream = writer
         .open_stream(&reader_peer, PROTOCOL)
         .expect("open stream");
     loop {
         assert!(Instant::now() < deadline, "stream never negotiated");
         let _ = next(reader, Duration::from_millis(5));
-        if let Some(EndpointEvent::StreamReady { stream_id: id, .. }) =
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) =
             next(writer, Duration::from_millis(5))
-            && id == stream_id
+            && ready == stream
         {
-            return (reader_peer, conn_id, stream_id);
+            return (reader_peer, stream);
         }
     }
 }
@@ -87,7 +88,7 @@ fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (PeerId, ConnectionId, 
 fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
     let mut reader = bind(listen);
     let mut writer = bind(listen);
-    let (reader_peer, conn_id, stream_id) = open(&mut writer, &mut reader);
+    let (reader_peer, stream) = open(&mut writer, &mut reader);
 
     let payload = Bytes::from((0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     let mut offset = 0;
@@ -117,31 +118,24 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
                 None => None,
             };
             if let Some(data) = data {
-                match writer.send_stream(conn_id, stream_id, data) {
-                    Ok(()) => {}
-                    Err(Error::Full { unsent, .. }) => {
+                match writer.try_send_stream(stream, data).expect("send failed") {
+                    SendOutcome::Accepted => {}
+                    SendOutcome::Full { unsent } => {
                         fulls += 1;
                         tail = Some(unsent);
                         writable = false;
                     }
-                    other => other.expect("send failed"),
                 }
             } else if !closed_write {
                 // Every byte is accepted, so the FIN may follow.
-                writer
-                    .close_stream_write(conn_id, stream_id)
-                    .expect("close write");
+                writer.close_stream_write(stream).expect("close write");
                 closed_write = true;
             }
         }
         while let Some(event) = next(&mut writer, Duration::from_millis(1)) {
             fail_on_teardown(&event);
-            if let EndpointEvent::StreamWritable {
-                conn_id: c,
-                stream_id: s,
-                ..
-            } = event
-                && (c, s) == (conn_id, stream_id)
+            if let EndpointEvent::StreamWritable { stream: s, .. } = event
+                && s == stream
             {
                 assert!(!writable, "Writable without a preceding Full");
                 writable = true;
@@ -206,7 +200,7 @@ impl Sender {
         }
     }
 
-    fn turn(&mut self, writer: &mut Endpoint, conn_id: ConnectionId, stream_id: StreamId) {
+    fn turn(&mut self, writer: &mut Endpoint, stream: StreamKey) {
         if self.writable {
             let data = self.tail.take().or_else(|| {
                 (self.offset < self.payload.len()).then(|| {
@@ -217,18 +211,15 @@ impl Sender {
                 })
             });
             match data {
-                Some(data) => match writer.send_stream(conn_id, stream_id, data) {
-                    Ok(()) => {}
-                    Err(Error::Full { unsent, .. }) => {
+                Some(data) => match writer.try_send_stream(stream, data).expect("send failed") {
+                    SendOutcome::Accepted => {}
+                    SendOutcome::Full { unsent } => {
                         self.tail = Some(unsent);
                         self.writable = false;
                     }
-                    other => other.expect("send failed"),
                 },
                 None if !self.closed_write => {
-                    writer
-                        .close_stream_write(conn_id, stream_id)
-                        .expect("close write");
+                    writer.close_stream_write(stream).expect("close write");
                     self.closed_write = true;
                 }
                 None => {}
@@ -236,8 +227,7 @@ impl Sender {
         }
         while let Some(event) = next(writer, Duration::from_millis(1)) {
             fail_on_teardown(&event);
-            if matches!(event, EndpointEvent::StreamWritable { stream_id: s, .. } if s == stream_id)
-            {
+            if matches!(event, EndpointEvent::StreamWritable { stream: s, .. } if s == stream) {
                 self.writable = true;
             }
         }
@@ -254,7 +244,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
         .bind()
         .expect("bind reader");
     let mut writer = bind(listen);
-    let (_, conn_id, stream_id) = open(&mut writer, &mut reader);
+    let (_, stream) = open(&mut writer, &mut reader);
     let total = 3 * window;
     let payload = Bytes::from((0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     let mut sender = Sender::new(payload.clone());
@@ -279,19 +269,13 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             "an unacknowledged reader should get one window, got {} of {window}",
             received.len()
         );
-        sender.turn(&mut writer, conn_id, stream_id);
+        sender.turn(&mut writer, stream);
         // Sampled before the drain, so a closed window gets one more poll.
         let quiet_closed = quiet_since.elapsed() >= Duration::from_millis(500);
         let mut arrived = false;
         while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
-            if let EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            } = event
-            {
-                reader_stream = Some((conn_id, stream_id));
+            if let EndpointEvent::StreamData { stream, data, .. } = event {
+                reader_stream = Some(stream);
                 received.extend_from_slice(&data);
                 arrived = true;
             } else {
@@ -310,8 +294,8 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
         }
     }
 
-    let (reader_conn, reader_stream) = reader_stream.expect("data arrived");
-    let over_ack = reader.stream_consumed(reader_conn, reader_stream, window + 1);
+    let reader_stream = reader_stream.expect("data arrived");
+    let over_ack = reader.stream_consumed(reader_stream, window + 1);
     assert!(
         matches!(
             over_ack,
@@ -326,7 +310,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
 
     // Consuming resumes the sender, and the transfer completes.
     reader
-        .stream_consumed(reader_conn, reader_stream, received.len())
+        .stream_consumed(reader_stream, received.len())
         .expect("consume the window");
     let mut eof = false;
     while !eof {
@@ -335,19 +319,12 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             "stalled at {} bytes",
             received.len()
         );
-        sender.turn(&mut writer, conn_id, stream_id);
+        sender.turn(&mut writer, stream);
         while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
             match event {
-                EndpointEvent::StreamData {
-                    conn_id,
-                    stream_id,
-                    data,
-                    ..
-                } => {
+                EndpointEvent::StreamData { stream, data, .. } => {
                     received.extend_from_slice(&data);
-                    reader
-                        .stream_consumed(conn_id, stream_id, data.len())
-                        .expect("consume");
+                    reader.stream_consumed(stream, data.len()).expect("consume");
                 }
                 EndpointEvent::StreamRemoteWriteClosed { .. } => eof = true,
                 other => fail_on_teardown(&other),

@@ -1,50 +1,52 @@
-//! The bindings' stream writes, held by `minip2p`'s shared [`StreamWriter`]
-//! (ADR 0012).
+//! The bindings' stream writes, queued by the endpoint's own write queue
+//! (ADR 0030).
 //!
-//! A binding hands over one whole payload per write. The writer sends as
-//! much as the stream accepts, holds the unsent tail, resends it on the
-//! stream's Writable, and ffi-core reports [`P2pEvent::StreamWriteAccepted`]
-//! once every byte has been accepted. Each stream holds at most one pending
-//! write; the binding serializes its writes behind that event.
+//! A binding hands over one whole payload per write. The endpoint sends as
+//! much as the stream accepts, holds the rest, resends it on the stream's
+//! Writable, and reports `StreamWriteAccepted` (converted to
+//! [`P2pEvent::StreamWriteAccepted`](crate::P2pEvent::StreamWriteAccepted))
+//! once every byte has been accepted. The bindings keep at most one pending
+//! write per stream, serializing their writes behind that event.
 
-use minip2p::{StreamWriteError, StreamWriter, WriteAccepted};
+use minip2p::{Bytes, Endpoint, Platform, SendError, StreamKey};
 
-use crate::{FfiError, P2pEvent};
+use crate::FfiError;
 
-/// A writer for the bindings. Its budget is unbounded because the bindings
-/// already bound what reaches it: the SDK admits writes per stream up to a
-/// high-water mark, each stream holds at most one pending write, and the
-/// stream limit caps the streams. A refusal here would have no wakeup the
-/// SDK waits for.
-pub fn stream_writer() -> StreamWriter {
-    StreamWriter::new(usize::MAX)
+/// The write budget the bindings' endpoints run with: unbounded, because
+/// the bindings already bound what reaches it. The SDK admits writes per
+/// stream up to a high-water mark, each stream holds at most one pending
+/// write, and the stream limit caps the streams. A refusal here would have
+/// no wakeup the SDK waits for.
+pub const BINDING_WRITE_BUDGET: usize = usize::MAX;
+
+/// Sends one binding payload: `true` once every byte is accepted, `false`
+/// while the endpoint holds the tail. A second write while one is pending is
+/// [`FfiError::Backpressure`].
+pub fn send_whole<P: Platform>(
+    endpoint: &mut Endpoint<P>,
+    stream: StreamKey,
+    data: impl Into<Bytes>,
+) -> Result<bool, FfiError> {
+    if endpoint.is_write_pending(stream) {
+        return Err(FfiError::Backpressure);
+    }
+    endpoint.send_stream(stream, data).map_err(map_send_error)?;
+    Ok(!endpoint.is_write_pending(stream))
 }
 
-/// Maps a writer refusal to the binding's error: a second write while one is
-/// pending is [`FfiError::Backpressure`], a write behind a deferred close is
-/// [`FfiError::InvalidState`].
-pub fn map_write_error(error: StreamWriteError) -> FfiError {
+/// Maps a write refusal to the binding's error: a write behind a deferred
+/// close is [`FfiError::InvalidState`].
+pub fn map_send_error(error: SendError) -> FfiError {
     match error {
         // The unbounded budget never refuses for size; mapped all the same.
-        StreamWriteError::Busy { .. }
-        | StreamWriteError::OverBudget { .. }
-        | StreamWriteError::TooLarge { .. } => FfiError::Backpressure,
-        StreamWriteError::Closing { stream_id, .. } => FfiError::InvalidState {
-            detail: format!("stream {stream_id} write side is closing"),
+        SendError::OverBudget { .. } | SendError::TooLarge { .. } => FfiError::Backpressure,
+        SendError::Closing { stream, .. } => FfiError::InvalidState {
+            detail: format!("stream {} write side is closing", stream.stream_id()),
         },
-        StreamWriteError::Endpoint(error) => crate::map_driver_error(error),
+        SendError::Driver(error) => crate::map_driver_error(error),
         // A refusal this core predates.
         error => FfiError::InvalidState {
             detail: error.to_string(),
         },
-    }
-}
-
-/// The binding's settlement of a held write.
-pub fn write_accepted_event(accepted: WriteAccepted) -> P2pEvent {
-    P2pEvent::StreamWriteAccepted {
-        peer_id: accepted.peer_id.to_base58(),
-        conn_id: accepted.conn_id.as_u64(),
-        stream_id: accepted.stream_id.as_u64(),
     }
 }

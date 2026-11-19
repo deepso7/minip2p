@@ -419,7 +419,7 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     while !a.is_peer_ready(&b_peer) {
         tick(&mut a, &mut b);
     }
-    let (conn, stream) = a
+    let stream = a
         .at(Now::from_millis(clock.get()))
         .open_stream(&b_peer, PROTOCOL)
         .expect("open");
@@ -437,7 +437,7 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     let now = Now::from_millis(clock.get());
     for chunk in 0..8u8 {
         a.at(now)
-            .send_stream(conn, stream, vec![chunk; 16])
+            .send_stream(stream, vec![chunk; 16])
             .expect("send");
     }
 

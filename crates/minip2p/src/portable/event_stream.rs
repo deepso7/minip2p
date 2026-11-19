@@ -6,7 +6,7 @@
 
 use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyFailure, IdentifyMessage, PingFailure, SwarmEvent, SwarmRuntimeError};
-use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
+use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamKey};
 
 use crate::connect::{ConnectId, ConnectOutcome};
 
@@ -26,7 +26,10 @@ use crate::connect::{ConnectId, ConnectOutcome};
 /// batch the order is:
 ///
 /// 1. the batch's swarm events (connection, Identify, ping, and stream
-///    events), in swarm order;
+///    events), in swarm order, each followed by the write-queue events it
+///    caused ([`Self::StreamWriteAccepted`] after the Writable that drained
+///    a queue, which itself is not delivered; [`Self::StreamWriteAborted`]
+///    after the event that ended a stream with queued bytes);
 /// 2. capability events: relay-server, NAT, Gossipsub, Discovery, mDNS;
 /// 3. Connection-attempt terminals ([`Self::ConnectSettled`]).
 ///
@@ -124,51 +127,61 @@ pub enum EndpointEvent {
     /// A user-registered protocol was successfully negotiated on a stream.
     StreamReady {
         peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         protocol_id: alloc::string::String,
         initiated_locally: bool,
     },
     /// Raw data arrived on a negotiated user stream.
     StreamData {
         peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         data: Bytes,
     },
-    /// A user stream whose `send_stream` returned Full can accept writes
-    /// again: resend the held tail now.
+    /// A user stream whose `try_send_stream` returned
+    /// [`SendOutcome::Full`](crate::SendOutcome::Full) can accept writes
+    /// again: resend the unsent tail now.
     ///
     /// Fires once per Full, and never after the stream's write side ended
     /// ([`Self::StreamWriteStopped`], a reset, [`Self::StreamClosed`], or the
-    /// connection closing); those mean the tail should be dropped.
-    StreamWritable {
+    /// connection closing); those mean the tail should be dropped. A stream
+    /// whose bytes the endpoint's write queue holds (from
+    /// [`send_stream`](crate::Endpoint::send_stream)) reports
+    /// [`Self::StreamWriteAccepted`] instead, once the queue has drained.
+    StreamWritable { peer_id: PeerId, stream: StreamKey },
+    /// Every byte [`send_stream`](crate::Endpoint::send_stream) queued for
+    /// the stream has now been accepted, and a deferred
+    /// [`close_stream_write`](crate::Endpoint::close_stream_write) FIN has
+    /// been sent behind them.
+    ///
+    /// Accepted means accepted locally, never delivered. Each time the
+    /// stream's queue fills it ends in exactly one `StreamWriteAccepted` or
+    /// [`Self::StreamWriteAborted`] (none after
+    /// [`abandon_stream`](crate::Endpoint::abandon_stream)). A stream whose
+    /// writes were all accepted at once never queued anything and reports
+    /// neither.
+    StreamWriteAccepted { peer_id: PeerId, stream: StreamKey },
+    /// The bytes the write queue held for the stream were dropped unsent:
+    /// the stream or its connection ended (queued right after the event that
+    /// ended it), the stream was reset, or a resend failed. `unsent` is how
+    /// many bytes were dropped.
+    StreamWriteAborted {
         peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
+        unsent: usize,
     },
     /// The remote closed its write side on a user stream.
-    StreamRemoteWriteClosed {
-        peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    },
+    StreamRemoteWriteClosed { peer_id: PeerId, stream: StreamKey },
     /// The remote asked us to stop sending on a user stream.
     ///
     /// Writes to the stream now fail and any queued bytes were dropped; the
     /// read side stays open until `StreamClosed`. Only QUIC emits this.
     StreamWriteStopped {
         peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         error_code: u64,
     },
     /// A user stream was fully closed.
-    StreamClosed {
-        peer_id: PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    },
+    StreamClosed { peer_id: PeerId, stream: StreamKey },
     /// A non-fatal runtime error occurred.
     Error(SwarmRuntimeError),
     /// A dial no Connection attempt owns (one a capability made, such as a
@@ -237,61 +250,31 @@ pub enum EndpointEvent {
 }
 
 impl EndpointEvent {
-    /// Returns `true` if this is a stream-scoped event for the given peer,
-    /// connection, and stream id. Stream ids are per connection, so the
-    /// connection must match too.
-    pub fn matches_stream(
-        &self,
-        peer_id: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> bool {
-        self.stream_peer(conn_id, stream_id) == Some(peer_id)
+    /// Returns `true` if this is a stream-scoped event for the given peer
+    /// and stream.
+    pub fn matches_stream(&self, peer_id: &PeerId, stream: StreamKey) -> bool {
+        self.stream() == Some((peer_id, stream))
     }
 
-    /// The peer a stream-scoped event names, if it is about `stream_id` on
-    /// `conn_id`.
-    pub(crate) fn stream_peer(
-        &self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Option<&PeerId> {
+    /// The peer and stream a stream-scoped event names.
+    pub fn stream(&self) -> Option<(&PeerId, StreamKey)> {
         match self {
             Self::StreamReady {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
-                ..
+                peer_id, stream, ..
             }
             | Self::StreamData {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
-                ..
+                peer_id, stream, ..
             }
-            | Self::StreamWritable {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
+            | Self::StreamWritable { peer_id, stream }
+            | Self::StreamWriteAccepted { peer_id, stream }
+            | Self::StreamWriteAborted {
+                peer_id, stream, ..
             }
-            | Self::StreamRemoteWriteClosed {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
-                ..
-            }
+            | Self::StreamRemoteWriteClosed { peer_id, stream }
             | Self::StreamWriteStopped {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
-                ..
+                peer_id, stream, ..
             }
-            | Self::StreamClosed {
-                peer_id,
-                conn_id: conn,
-                stream_id: stream,
-                ..
-            } if *conn == conn_id && *stream == stream_id => Some(peer_id),
+            | Self::StreamClosed { peer_id, stream } => Some((peer_id, *stream)),
             _ => None,
         }
     }
@@ -378,8 +361,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 initiated_locally,
             } => Self::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
                 protocol_id,
                 initiated_locally,
             },
@@ -390,8 +372,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 data,
             } => Self::StreamData {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
                 data,
             },
             SwarmEvent::StreamWritable {
@@ -400,8 +381,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 stream_id,
             } => Self::StreamWritable {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
             },
             SwarmEvent::StreamRemoteWriteClosed {
                 peer_id,
@@ -409,8 +389,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 stream_id,
             } => Self::StreamRemoteWriteClosed {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
             },
             SwarmEvent::StreamWriteStopped {
                 peer_id,
@@ -419,8 +398,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 error_code,
             } => Self::StreamWriteStopped {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
                 error_code,
             },
             SwarmEvent::StreamClosed {
@@ -429,8 +407,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 stream_id,
             } => Self::StreamClosed {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: StreamKey::new(conn_id, stream_id),
             },
             SwarmEvent::Error(error) => Self::Error(error),
             SwarmEvent::DialFailed {
