@@ -714,7 +714,8 @@ impl<P: Platform> Endpoint<P> {
     /// swarm queued even when the final drive fails. Dropping the transport
     /// releases listeners and in-progress connections as well as established
     /// ones; the report's `unfinished` lists those abandoned that way, with
-    /// [`CloseOutcome::DeadlineExpired`]. Every established peer is attempted
+    /// [`CloseOutcome::DeadlineExpired`] when the final drive succeeded
+    /// ([`CloseOutcome::Failed`] when it did not). Every established peer is attempted
     /// even if an earlier step fails. mDNS goodbyes are best effort: one that
     /// could not be sent is an `EndpointEvent::MdnsFailed` among the events,
     /// not an error.
