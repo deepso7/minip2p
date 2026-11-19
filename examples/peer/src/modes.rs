@@ -482,7 +482,7 @@ pub fn run_dial(
         }
     };
 
-    let path = wait_for_path("dial", &mut endpoint, connect_id)?;
+    let path = wait_for_path("dial", false, &mut endpoint, connect_id)?;
     println!(
         "[dial] path-established path={} elapsed={}ms elapsed-us={}",
         path_name(&path),
@@ -504,6 +504,21 @@ pub fn run_dial(
     );
 
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
+}
+
+/// Prints `event` under `role`, skipping Identify when the caller prints
+/// its own single Identify line.
+///
+/// `id` suppresses it in *both* of its waits. A circuit target's relay
+/// identifies to us before it opens the connection to the target, so
+/// suppressing only after the path wait would print the relay's Identify
+/// first and a script reading the first line would inspect the relay
+/// instead of the peer that was asked for.
+fn print_progress(role: &str, quiet_identify: bool, event: &EndpointEvent) {
+    if quiet_identify && matches!(event, EndpointEvent::IdentifyReceived { .. }) {
+        return;
+    }
+    print_event(role, event);
 }
 
 /// The NAT agent's relay list for a target: the circuit target's own relay
@@ -565,7 +580,7 @@ pub fn run_id(
         }
     };
 
-    let path = wait_for_path("id", &mut endpoint, connect_id)?;
+    let path = wait_for_path("id", true, &mut endpoint, connect_id)?;
     println!(
         "[id] path-established path={} elapsed={}ms",
         path_name(&path),
@@ -578,14 +593,7 @@ pub fn run_id(
             .wait(deadline)
             .map_err(|e| format!("waiting for identify: {e}"))?
         {
-            // The Identify result is this command's answer and is printed
-            // once below, from `peer_readiness`. Echoing the event here as
-            // well would print it twice.
-            EndpointWaitOutcome::Event(event) => {
-                if !matches!(event, EndpointEvent::IdentifyReceived { .. }) {
-                    print_event("id", &event);
-                }
-            }
+            EndpointWaitOutcome::Event(event) => print_progress("id", true, &event),
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed".into());
             }
@@ -606,6 +614,7 @@ pub fn run_id(
 /// settled on; a failed or cancelled one ends the run.
 fn wait_for_path(
     role: &str,
+    quiet_identify: bool,
     endpoint: &mut Endpoint,
     connect_id: ConnectId,
 ) -> Result<Path, Box<dyn Error>> {
@@ -623,7 +632,7 @@ fn wait_for_path(
             EndpointWaitOutcome::Event(
                 event @ EndpointEvent::ConnectSettled { connect_id: id, .. },
             ) if id == connect_id => {
-                print_event(role, &event);
+                print_progress(role, quiet_identify, &event);
                 return match event {
                     EndpointEvent::ConnectSettled {
                         outcome: ConnectOutcome::Connected { path, .. },
@@ -632,7 +641,7 @@ fn wait_for_path(
                     _ => Err("no path to the target".into()),
                 };
             }
-            EndpointWaitOutcome::Event(event) => print_event(role, &event),
+            EndpointWaitOutcome::Event(event) => print_progress(role, quiet_identify, &event),
             EndpointWaitOutcome::Deadline => return Err("no path to the target".into()),
             _ => {}
         }
