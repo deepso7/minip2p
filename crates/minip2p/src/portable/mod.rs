@@ -318,6 +318,9 @@ impl From<SetupError> for PortableBuildError {
 /// run relays. AutoNAT alone needs nothing from the transport.
 pub struct PortableEndpointBuilder<E, C> {
     swarm: SwarmBuilder,
+    /// The application protocols `protocol` registered, in order: the
+    /// order their handles number them in.
+    protocols: Vec<String>,
     identity: Ed25519Keypair,
     entropy: E,
     clock: C,
@@ -335,6 +338,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     pub fn new(identity: &Ed25519Keypair, entropy: E, clock: C) -> Self {
         Self {
             swarm: SwarmBuilder::new(identity),
+            protocols: Vec::new(),
             identity: identity.clone(),
             entropy,
             clock,
@@ -354,6 +358,8 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
 
     /// Registers an application stream protocol.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        let protocol_id = protocol_id.into();
+        self.protocols.push(protocol_id.clone());
         self.swarm = self.swarm.protocol(protocol_id);
         self
     }
@@ -560,6 +566,9 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         let core = self.swarm.build_core(transport, self.entropy)?;
         let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
         engine.writes = WriteQueue::new(self.write_budget);
+        for protocol in &self.protocols {
+            engine.protocols.intern(protocol)?;
+        }
         setup::install(
             &mut engine,
             validated,
@@ -590,6 +599,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         SmoltcpEndpointBuilder {
             portable: PortableEndpointBuilder {
                 swarm: self.swarm,
+                protocols: self.protocols,
                 identity: self.identity,
                 entropy: entropy.clone(),
                 clock: self.clock,

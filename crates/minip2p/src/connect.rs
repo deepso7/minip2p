@@ -1829,7 +1829,7 @@ mod tests {
         for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
             let consumed = engine.observe(&event, runtime, now_ms);
             if !consumed {
-                out.push(EndpointEvent::from(event));
+                out.push(EndpointEvent::from_swarm(event, &mut Default::default()));
             }
         }
         while let Some(engine_event) = engine.pop_resolved() {

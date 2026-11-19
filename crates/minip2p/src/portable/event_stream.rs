@@ -8,7 +8,9 @@ use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyFailure, IdentifyMessage, PingFailure, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamKey};
 
+use crate::ProtocolId;
 use crate::connect::{ConnectId, ConnectOutcome};
+use crate::protocols::ProtocolTable;
 
 /// Ordered application event from the Endpoint's single public stream.
 ///
@@ -125,9 +127,16 @@ pub enum EndpointEvent {
         cause: PingFailure,
     },
     /// A user-registered protocol was successfully negotiated on a stream.
+    ///
+    /// `protocol` is the endpoint's handle for it (ADR 0031): compare it
+    /// with one from [`Endpoint::protocol_id`](crate::Endpoint::protocol_id)
+    /// to dispatch without a string comparison. `protocol_id` is the same
+    /// protocol's string id, kept so the event stays self-describing after
+    /// the endpoint is gone (a close report's events, say).
     StreamReady {
         peer_id: PeerId,
         stream: StreamKey,
+        protocol: ProtocolId,
         protocol_id: alloc::string::String,
         initiated_locally: bool,
     },
@@ -284,8 +293,10 @@ impl EndpointEvent {
     }
 }
 
-impl From<SwarmEvent> for EndpointEvent {
-    fn from(event: SwarmEvent) -> Self {
+impl EndpointEvent {
+    /// The Endpoint event for a swarm event, naming a `StreamReady`'s
+    /// protocol by its handle in `protocols`.
+    pub(crate) fn from_swarm(event: SwarmEvent, protocols: &mut ProtocolTable) -> Self {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 Self::ConnectionEstablished { peer_id, conn_id }
@@ -366,6 +377,7 @@ impl From<SwarmEvent> for EndpointEvent {
             } => Self::StreamReady {
                 peer_id,
                 stream: StreamKey::new(conn_id, stream_id),
+                protocol: protocols.for_event(&protocol_id),
                 protocol_id,
                 initiated_locally,
             },

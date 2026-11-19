@@ -24,7 +24,7 @@ use crate::engine::Engine;
 use crate::platform::Platform;
 use crate::platform::sealed::Sealed;
 use crate::writes::{SendError, SendOutcome};
-use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
+use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent, ProtocolId, ProtocolRef};
 
 /// The engine an endpoint on platform `P` drives.
 pub(crate) type EngineOf<P> =
@@ -207,19 +207,43 @@ impl<P: Platform> Endpoint<P> {
         self.engine.core.listen_on_bound_addrs()
     }
 
-    /// Registers an application protocol for inbound and outbound negotiation.
+    /// Registers an application protocol for inbound and outbound negotiation,
+    /// returning its [`ProtocolId`] handle (the one it already had when it
+    /// was registered before).
     ///
     /// Built-in ids ([`RESERVED_PROTOCOL_IDS`](minip2p_swarm::RESERVED_PROTOCOL_IDS))
     /// are rejected with
     /// [`SwarmError::ReservedProtocol`](minip2p_swarm::SwarmError::ReservedProtocol);
     /// the endpoint's own identify and ping handlers already own them.
-    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), DriverError> {
-        Ok(self.engine.core.add_protocol(protocol_id)?)
+    pub fn add_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<ProtocolId, DriverError> {
+        let protocol_id = protocol_id.into();
+        self.engine.core.add_protocol(protocol_id.as_str())?;
+        self.engine.protocols.intern(&protocol_id)
+    }
+
+    /// The handle of an application protocol this endpoint registered (with
+    /// the builder's `protocol`, [`Self::add_protocol`] or
+    /// [`Self::add_manual_ack_protocol`]); `None` for any other string.
+    ///
+    /// Look a handle up once and compare it with
+    /// [`EndpointEvent::StreamReady`]'s `protocol` to dispatch streams
+    /// without comparing strings (ADR 0031).
+    pub fn protocol_id(&self, protocol_id: &str) -> Option<ProtocolId> {
+        self.engine.protocols.id(protocol_id)
+    }
+
+    /// The string id behind a handle this endpoint issued; `None` for a
+    /// handle from another endpoint.
+    pub fn protocol_name(&self, protocol: ProtocolId) -> Option<&str> {
+        self.engine.protocols.name(protocol)
     }
 
     /// Registers an application protocol whose received data the
     /// application acknowledges itself, with [`Self::stream_consumed`],
-    /// instead of as [`Self::poll`] returns it.
+    /// instead of as [`Self::poll`] returns it, returning its handle.
     ///
     /// Otherwise like [`Self::add_protocol`]. Use it when bytes outlive the
     /// event that carried them (a reader that queues them for later, a
@@ -229,7 +253,7 @@ impl<P: Platform> Endpoint<P> {
     pub fn add_manual_ack_protocol(
         &mut self,
         protocol_id: impl Into<String>,
-    ) -> Result<(), DriverError> {
+    ) -> Result<ProtocolId, DriverError> {
         self.engine.add_manual_ack_protocol(protocol_id.into())
     }
 
@@ -448,9 +472,13 @@ impl<P: Platform> Endpoint<P> {
         self.engine.set_external_addresses(addresses);
     }
 
-    /// Opens an application stream after negotiating `protocol_id`.
+    /// Opens an application stream after negotiating `protocol`: a
+    /// registered protocol's string id or its [`ProtocolId`] handle.
     ///
-    /// Allowed once the peer is connected. Identify (`PeerReady`) is not
+    /// The protocol must be registered first, or this fails with
+    /// [`SwarmError::ProtocolNotRegistered`](minip2p_swarm::SwarmError::ProtocolNotRegistered)
+    /// (as it does for a handle from another endpoint). Allowed once the
+    /// peer is connected. Identify (`PeerReady`) is not
     /// required first; after Identify completes, an unsupported protocol can
     /// fail early with
     /// [`SwarmError::RemoteDoesNotSupport`](minip2p_swarm::SwarmError::RemoteDoesNotSupport).
@@ -465,14 +493,16 @@ impl<P: Platform> Endpoint<P> {
     /// `StreamOpened`, so a QUIC open still waiting for the peer's stream
     /// credit is not timed. A closed or replaced connection ends it with its
     /// own event.
-    pub fn open_stream(
+    pub fn open_stream<'a>(
         &mut self,
         peer_id: &PeerId,
-        protocol_id: &str,
+        protocol: impl Into<ProtocolRef<'a>>,
     ) -> Result<StreamKey, DriverError> {
         let now = self.now();
+        let engine = &mut self.engine;
+        let protocol_id = engine.protocols.resolve(protocol.into())?;
         let (conn_id, stream_id) =
-            self.engine
+            engine
                 .core
                 .open_stream(peer_id, protocol_id, now.monotonic_ms)?;
         Ok(StreamKey::new(conn_id, stream_id))

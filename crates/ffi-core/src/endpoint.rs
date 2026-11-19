@@ -533,6 +533,7 @@ impl P2pEndpoint {
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .add_manual_ack_protocol(protocol_id)
+                .map(drop)
                 .map_err(map_driver_error)
         })
     }

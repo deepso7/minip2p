@@ -1122,7 +1122,14 @@ pub(super) fn build_endpoint(
             u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
         )
         .timeouts(options.timeouts);
+    // Numbered in registration order, like the portable builder's.
+    let mut protocols = crate::protocols::ProtocolTable::default();
     for protocol in options.protocols {
+        if protocols.intern(&protocol).is_err() {
+            return Err(BindError::Invariant {
+                reason: crate::protocols::TABLE_FULL,
+            });
+        }
         builder = builder.protocol(protocol);
     }
     let mut acks = StreamAcks::default();
@@ -1165,6 +1172,7 @@ pub(super) fn build_endpoint(
         acks,
     );
     engine.writes = WriteQueue::new(options.write_budget);
+    engine.protocols = protocols;
     setup::install(
         &mut engine,
         capabilities,

@@ -854,6 +854,7 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             stream,
             protocol_id,
             initiated_locally,
+            ..
         } => P2pEvent::StreamReady {
             peer_id: peer_id.to_base58(),
             conn_id: stream.conn_id().as_u64(),

@@ -324,6 +324,7 @@ impl<T: Transport> Host<T> {
     pub fn add_protocol(&mut self, protocol_id: String) -> Result<(), FfiError> {
         self.endpoint()?
             .add_manual_ack_protocol(protocol_id)
+            .map(drop)
             .map_err(map_driver_error)
     }
 
