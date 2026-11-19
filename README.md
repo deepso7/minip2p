@@ -93,7 +93,7 @@ For a complete application, run the gossipsub chat example:
 cargo run -p minip2p-chat -- host --nick hostess
 ```
 
-See [the chat guide](examples/chat/README.md) for NAT and cross-implementation recipes. The [peer example](examples/peer/README.md) demonstrates relay reservations and direct-path upgrades with DCUtR.
+See [the chat guide](examples/chat/README.md) for NAT and cross-implementation recipes. The [peer example](examples/peer/README.md) demonstrates relay reservations and direct-path upgrades with DCUtR. The [mDNS example](examples/mdns/README.md) needs no address at all: run two copies on one LAN and they find each other.
 
 ## Features
 
