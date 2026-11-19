@@ -18,9 +18,9 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    ConnectFailure, ConnectOutcome, ConnectionId, DriverError, Ed25519Keypair, Endpoint,
-    EndpointEvent, EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId,
-    ReservationPolicy, SmoltcpStack, StreamId, SwarmError,
+    ConnectFailure, ConnectOutcome, ConnectionId, DriverError, Ed25519Keypair, EndpointEvent,
+    EntropySource, ManualClock, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId,
+    PortableEndpointBuilder, ReservationPolicy, SmoltcpStack, StreamId, SwarmError,
 };
 use minip2p_core::platform::EntropyError;
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
@@ -196,10 +196,7 @@ impl RelayService {
 
     fn handle(
         &mut self,
-        endpoint: &mut minip2p::PortableEndpoint<
-            minip2p::SmoltcpTransport<BusDevice, CountingEntropy>,
-            minip2p::SharedEntropy<CountingEntropy>,
-        >,
+        endpoint: &mut minip2p::SmoltcpEndpoint<BusDevice, CountingEntropy, ManualClock>,
         event: EndpointEvent,
         now: Now,
     ) {
@@ -229,7 +226,8 @@ impl RelayService {
                 self.b_stop = Some((conn_id, stream_id));
                 let request = self.emulator.drain_stop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(conn_id, stream_id, request, now)
+                    .at(now)
+                    .send_stream(conn_id, stream_id, request)
                     .unwrap();
             }
             EndpointEvent::StreamData {
@@ -241,7 +239,8 @@ impl RelayService {
                 self.emulator.on_reserve_request(&self.b, &data).unwrap();
                 let response = self.emulator.drain_hop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(conn_id, stream_id, response, now)
+                    .at(now)
+                    .send_stream(conn_id, stream_id, response)
                     .unwrap();
             }
             EndpointEvent::StreamData {
@@ -271,7 +270,8 @@ impl RelayService {
                 assert!(response.is_empty());
                 self.pending = Some(pending_id);
                 let stop = endpoint
-                    .open_stream(&self.b, STOP_PROTOCOL_ID, now)
+                    .at(now)
+                    .open_stream(&self.b, STOP_PROTOCOL_ID)
                     .unwrap();
                 self.b_stop = Some(stop);
             }
@@ -291,10 +291,16 @@ impl RelayService {
                     .unwrap();
                 self.bridged = true;
                 let (conn, stream) = self.a_bridge.unwrap();
-                endpoint.send_stream(conn, stream, response, now).unwrap();
+                endpoint
+                    .at(now)
+                    .send_stream(conn, stream, response)
+                    .unwrap();
                 if !trailing.is_empty() {
                     let (conn, stream) = self.a_bridge.unwrap();
-                    endpoint.send_stream(conn, stream, trailing, now).unwrap();
+                    endpoint
+                        .at(now)
+                        .send_stream(conn, stream, trailing)
+                        .unwrap();
                 }
             }
             EndpointEvent::StreamData {
@@ -307,7 +313,7 @@ impl RelayService {
                 && Some((conn_id, stream_id)) == self.a_bridge =>
             {
                 let (conn, stream) = self.b_stop.unwrap();
-                endpoint.send_stream(conn, stream, data, now).unwrap();
+                endpoint.at(now).send_stream(conn, stream, data).unwrap();
             }
             EndpointEvent::StreamData {
                 peer_id,
@@ -316,7 +322,7 @@ impl RelayService {
                 data,
             } if self.bridged && peer_id == self.b && Some((conn_id, stream_id)) == self.b_stop => {
                 let (conn, stream) = self.a_bridge.unwrap();
-                endpoint.send_stream(conn, stream, data, now).unwrap();
+                endpoint.at(now).send_stream(conn, stream, data).unwrap();
             }
             EndpointEvent::StreamClosed {
                 peer_id,
@@ -347,25 +353,28 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     let relay_transport: Multiaddr = format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap();
     let relay_addr = PeerAddr::new(relay_transport, relay_peer).unwrap();
 
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(10))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
-        .protocol(APP_PROTOCOL)
-        .build()
-        .unwrap();
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(20))
-        .smoltcp(stack(bus.device(1), B_IP))
-        .nat_config(relay_config(relay_addr, ReservationPolicy::Always))
-        .protocol(APP_PROTOCOL)
-        .build()
-        .unwrap();
-    let mut relay = Endpoint::portable(&relay_identity, CountingEntropy(30))
-        .smoltcp(stack(bus.device(2), RELAY_IP))
-        .listen(format!("/ip4/{RELAY_IP}/tcp/4001"))
-        .protocol(HOP_PROTOCOL_ID)
-        .protocol(STOP_PROTOCOL_ID)
-        .build()
-        .unwrap();
+    let mut a =
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(10), ManualClock::default())
+            .smoltcp(stack(bus.device(0), A_IP))
+            .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
+            .protocol(APP_PROTOCOL)
+            .build()
+            .unwrap();
+    let mut b =
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(20), ManualClock::default())
+            .smoltcp(stack(bus.device(1), B_IP))
+            .nat_config(relay_config(relay_addr, ReservationPolicy::Always))
+            .protocol(APP_PROTOCOL)
+            .build()
+            .unwrap();
+    let mut relay =
+        PortableEndpointBuilder::new(&relay_identity, CountingEntropy(30), ManualClock::default())
+            .smoltcp(stack(bus.device(2), RELAY_IP))
+            .listen(format!("/ip4/{RELAY_IP}/tcp/4001"))
+            .protocol(HOP_PROTOCOL_ID)
+            .protocol(STOP_PROTOCOL_ID)
+            .build()
+            .unwrap();
     let mut service = RelayService::new(a_peer, b_peer);
 
     let mut now_ms = 0;
@@ -378,9 +387,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     let mut polls_after_circuit_close = 0;
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        a_events.extend(a.poll(now).unwrap());
-        b_events.extend(b.poll(now).unwrap());
-        for event in relay.poll(now).unwrap() {
+        a_events.extend(a.at(now).poll().unwrap());
+        b_events.extend(b.at(now).poll().unwrap());
+        for event in relay.at(now).poll().unwrap() {
             service.handle(&mut relay, event, now);
         }
 
@@ -389,7 +398,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 if relay == &relay_peer)
         });
         if reserved && connect_id.is_none() {
-            connect_id = Some(a.connect(b_peer, now).unwrap());
+            connect_id = Some(a.at(now).connect(b_peer).unwrap());
         }
         let a_relayed = a_events.iter().any(|event| {
             matches!(event, EndpointEvent::Nat(NatEvent::PathEstablished {
@@ -411,7 +420,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             })
         });
         if a_relayed && b_relayed && a_settled && app_stream.is_none() {
-            app_stream = Some(a.open_stream(&b_peer, APP_PROTOCOL, now).unwrap());
+            app_stream = Some(a.at(now).open_stream(&b_peer, APP_PROTOCOL).unwrap());
         }
         if let Some((conn, stream)) = app_stream
             && !sent
@@ -421,7 +430,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 } if peer_id == &b_peer && *conn_id == conn && *stream_id == stream)
             })
         {
-            a.send_stream(conn, stream, PAYLOAD.to_vec(), now).unwrap();
+            a.at(now)
+                .send_stream(conn, stream, PAYLOAD.to_vec())
+                .unwrap();
             sent = true;
         }
         // B's current connection to A: stream ids are only unique per
@@ -450,7 +461,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             assert!(
                 matches!(b.path(&a_peer), Some(Path::Relayed { relay }) if relay == relay_peer)
             );
-            a.disconnect(&relay_peer, now).unwrap();
+            a.at(now).disconnect(&relay_peer).unwrap();
             relay_cut = true;
         }
 
@@ -472,9 +483,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
 
         if bus.is_quiet() {
             let deadline = [
-                a.next_deadline(now),
-                b.next_deadline(now),
-                relay.next_deadline(now),
+                a.at(now).next_deadline(),
+                b.at(now).next_deadline(),
+                relay.at(now).next_deadline(),
             ]
             .into_iter()
             .flatten()
@@ -507,32 +518,35 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
     )
     .unwrap();
 
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(60))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
-        .protocol(APP_PROTOCOL)
-        .build()
-        .unwrap();
+    let mut a =
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(60), ManualClock::default())
+            .smoltcp(stack(bus.device(0), A_IP))
+            .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
+            .protocol(APP_PROTOCOL)
+            .build()
+            .unwrap();
     // Renews every two seconds: this endpoint has no wall clock, so renewal
     // runs at half the default TTL.
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(70))
-        .smoltcp(stack(bus.device(1), B_IP))
-        .nat_config(NatConfig {
-            dcutr: false,
-            reservation_default_ttl_secs: 4,
-            ..NatConfig::default()
-        })
-        .relay(relay_addr)
-        .protocol(APP_PROTOCOL)
-        .build()
-        .unwrap();
-    let mut relay = Endpoint::portable(&relay_identity, CountingEntropy(80))
-        .smoltcp(stack(bus.device(2), RELAY_IP))
-        .listen(format!("/ip4/{RELAY_IP}/tcp/4001"))
-        .protocol(HOP_PROTOCOL_ID)
-        .protocol(STOP_PROTOCOL_ID)
-        .build()
-        .unwrap();
+    let mut b =
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(70), ManualClock::default())
+            .smoltcp(stack(bus.device(1), B_IP))
+            .nat_config(NatConfig {
+                dcutr: false,
+                reservation_default_ttl_secs: 4,
+                ..NatConfig::default()
+            })
+            .relay(relay_addr)
+            .protocol(APP_PROTOCOL)
+            .build()
+            .unwrap();
+    let mut relay =
+        PortableEndpointBuilder::new(&relay_identity, CountingEntropy(80), ManualClock::default())
+            .smoltcp(stack(bus.device(2), RELAY_IP))
+            .listen(format!("/ip4/{RELAY_IP}/tcp/4001"))
+            .protocol(HOP_PROTOCOL_ID)
+            .protocol(STOP_PROTOCOL_ID)
+            .build()
+            .unwrap();
     let mut service = RelayService::new(a_peer, b_peer);
 
     let mut now_ms = 0;
@@ -543,9 +557,9 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
     let mut sent = false;
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        a_events.extend(a.poll(now).unwrap());
-        b_events.extend(b.poll(now).unwrap());
-        for event in relay.poll(now).unwrap() {
+        a_events.extend(a.at(now).poll().unwrap());
+        b_events.extend(b.at(now).poll().unwrap());
+        for event in relay.at(now).poll().unwrap() {
             service.handle(&mut relay, event, now);
         }
 
@@ -557,7 +571,7 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
             })
             .count();
         if reservations > 0 && connect_id.is_none() {
-            connect_id = Some(a.connect(b_peer, now).unwrap());
+            connect_id = Some(a.at(now).connect(b_peer).unwrap());
         }
         let a_settled = connect_id.is_some_and(|id| {
             a_events.iter().any(|event| {
@@ -569,7 +583,7 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
             })
         });
         if a_settled && app_stream.is_none() {
-            app_stream = Some(a.open_stream(&b_peer, APP_PROTOCOL, now).unwrap());
+            app_stream = Some(a.at(now).open_stream(&b_peer, APP_PROTOCOL).unwrap());
         }
         if let Some((conn, stream)) = app_stream
             && !sent
@@ -579,7 +593,9 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
                 } if peer_id == &b_peer && *conn_id == conn && *stream_id == stream)
             })
         {
-            a.send_stream(conn, stream, PAYLOAD.to_vec(), now).unwrap();
+            a.at(now)
+                .send_stream(conn, stream, PAYLOAD.to_vec())
+                .unwrap();
             sent = true;
         }
         // Inbound: B receives A's data on a circuit connection.
@@ -596,9 +612,9 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
 
         if bus.is_quiet() {
             let deadline = [
-                a.next_deadline(now),
-                b.next_deadline(now),
-                relay.next_deadline(now),
+                a.at(now).next_deadline(),
+                b.at(now).next_deadline(),
+                relay.at(now).next_deadline(),
             ]
             .into_iter()
             .flatten()
@@ -634,20 +650,25 @@ fn portable_relay_and_autonat_compose_and_register_their_protocols() {
         reservation_policy: ReservationPolicy::Always,
         ..NatConfig::default()
     };
-    let mut endpoint = Endpoint::portable(&local, CountingEntropy(50))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .nat_config(config)
-        .build()
-        .expect("relay and AutoNAT policy composes");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(50), ManualClock::default())
+            .smoltcp(stack(bus.device(0), A_IP))
+            .nat_config(config)
+            .build()
+            .expect("relay and AutoNAT policy composes");
 
     for protocol in [AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID] {
         assert!(matches!(
-            endpoint.open_stream(&remote, protocol, Now::from_millis(0)),
+            endpoint
+                .at(Now::from_millis(0))
+                .open_stream(&remote, protocol),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
     }
     assert!(matches!(
-        endpoint.open_stream(&remote, STOP_PROTOCOL_ID, Now::from_millis(0)),
+        endpoint
+            .at(Now::from_millis(0))
+            .open_stream(&remote, STOP_PROTOCOL_ID),
         Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
     ));
 }
@@ -662,15 +683,16 @@ fn peer_target_on_an_autonat_only_portable_endpoint_settles_no_usable_route() {
         server.peer_id(),
     )
     .unwrap();
-    let mut endpoint = Endpoint::portable(&local, CountingEntropy(51))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .autonat_server(server_addr)
-        .build()
-        .expect("AutoNAT-only policy builds with relay code available");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(51), ManualClock::default())
+            .smoltcp(stack(bus.device(0), A_IP))
+            .autonat_server(server_addr)
+            .build()
+            .expect("AutoNAT-only policy builds with relay code available");
 
     let peer = identity(132).peer_id();
-    let id = endpoint.connect(peer, Now::from_millis(0)).unwrap();
-    let events = endpoint.poll(Now::from_millis(0)).unwrap();
+    let id = endpoint.at(Now::from_millis(0)).connect(peer).unwrap();
+    let events = endpoint.at(Now::from_millis(0)).poll().unwrap();
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -701,16 +723,23 @@ fn relay_preserves_an_explicit_reservation_policy() {
         reservation_policy: ReservationPolicy::Always,
         ..NatConfig::default()
     };
-    let mut endpoint = Endpoint::portable(&local, CountingEntropy(52))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .nat_config(config)
-        .relay(relay_addr)
-        .build()
-        .expect("adding a relay completes the reservation policy");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(52), ManualClock::default())
+            .smoltcp(stack(bus.device(0), A_IP))
+            .nat_config(config)
+            .relay(relay_addr)
+            .build()
+            .expect("adding a relay completes the reservation policy");
 
     let now = Now::from_millis(0);
-    endpoint.poll(now).expect("reservation schedules a dial");
-    endpoint.poll(now).expect("reservation dial drives TCP");
+    endpoint
+        .at(now)
+        .poll()
+        .expect("reservation schedules a dial");
+    endpoint
+        .at(now)
+        .poll()
+        .expect("reservation dial drives TCP");
     assert!(
         !bus.is_quiet(),
         "ReservationPolicy::Always must survive the .relay() merge"
@@ -728,38 +757,40 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
         )
         .unwrap();
         let peer = identity(137).peer_id();
-        let mut endpoint = Endpoint::portable(&local, CountingEntropy(53))
-            .connect_deadline(core::time::Duration::from_millis(50))
-            .smoltcp(stack(bus.device(0), A_IP))
-            .nat_config(relay_config(relay, ReservationPolicy::Never))
-            .build()
-            .unwrap();
+        let mut endpoint =
+            PortableEndpointBuilder::new(&local, CountingEntropy(53), ManualClock::default())
+                .connect_deadline(core::time::Duration::from_millis(50))
+                .smoltcp(stack(bus.device(0), A_IP))
+                .nat_config(relay_config(relay, ReservationPolicy::Never))
+                .build()
+                .unwrap();
 
         // Starting well after zero catches deadlines anchored to an internal epoch.
         let start = Now::from_millis(50_000);
-        let id = endpoint.connect(peer, start).unwrap();
-        let mut events = endpoint.poll(start).unwrap();
+        let id = endpoint.at(start).connect(peer).unwrap();
+        let mut events = endpoint.at(start).poll().unwrap();
         assert!(!events.iter().any(|event| matches!(event,
             EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id)));
         let due = endpoint
-            .next_deadline(start)
+            .at(start)
+            .next_deadline()
             .expect("pending attempt has a deadline");
         assert!(due.as_millis() > start.monotonic_ms);
         assert!(due.as_millis() <= 50_050);
 
         if cancel {
-            endpoint.cancel_connect(id, Now::from_millis(50_025));
-            endpoint.cancel_connect(id, Now::from_millis(50_025));
+            endpoint.at(Now::from_millis(50_025)).cancel_connect(id);
+            endpoint.at(Now::from_millis(50_025)).cancel_connect(id);
         }
-        events.extend(endpoint.poll(Now::from_millis(50_049)).unwrap());
+        events.extend(endpoint.at(Now::from_millis(50_049)).poll().unwrap());
         if !cancel {
             assert!(!events.iter().any(|event| matches!(event,
                 EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id)));
         }
-        events.extend(endpoint.poll(Now::from_millis(50_050)).unwrap());
-        endpoint.cancel_connect(id, Now::from_millis(50_050));
+        events.extend(endpoint.at(Now::from_millis(50_050)).poll().unwrap());
+        endpoint.at(Now::from_millis(50_050)).cancel_connect(id);
         // Advancing beyond the abandoned relay dial must not settle the attempt again.
-        events.extend(endpoint.poll(Now::from_millis(100_000)).unwrap());
+        events.extend(endpoint.at(Now::from_millis(100_000)).poll().unwrap());
         let outcomes: Vec<_> = events
             .iter()
             .filter_map(|event| match event {

@@ -7,7 +7,10 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectFailure, ConnectOutcome, Endpoint, EndpointEvent, Multiaddr, PeerAddr};
+use minip2p::{
+    ConnectFailure, ConnectOutcome, Endpoint, EndpointEvent, ManualClock, Multiaddr, PeerAddr,
+    PortableEndpointBuilder,
+};
 use minip2p_core::platform::{Now, StdEntropy};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
@@ -191,7 +194,8 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
     assert!(!observed.is_quic_transport());
 }
 
-type PortableServer = minip2p::PortableEndpoint<minip2p_quic::QuicTransport, StdEntropy>;
+type PortableServer =
+    minip2p::PortableEndpoint<minip2p_quic::QuicTransport, StdEntropy, ManualClock>;
 
 /// A portable server over `quic-v1` + WebTransport on one loopback socket,
 /// so the test sets its wall clock.
@@ -206,7 +210,7 @@ fn portable_server(key: &Ed25519Keypair) -> PortableServer {
     let transport =
         minip2p_quic::QuicTransport::bind(minip2p_quic::QuicNodeConfig::new(key.clone()), &addrs)
             .expect("bind");
-    let mut server = Endpoint::portable(key, StdEntropy::new())
+    let mut server = PortableEndpointBuilder::new(key, StdEntropy::new(), ManualClock::default())
         .build(transport)
         .expect("portable server");
     server.listen_all().expect("listen");
@@ -216,7 +220,7 @@ fn portable_server(key: &Ed25519Keypair) -> PortableServer {
 /// Polls `server` with its wall clock at `unix`.
 fn poll_at(server: &mut PortableServer, epoch: Instant, unix: u64) -> Vec<EndpointEvent> {
     let now = Now::new(epoch.elapsed().as_millis() as u64, unix);
-    server.poll(now).expect("server poll")
+    server.at(now).poll().expect("server poll")
 }
 
 fn webtransport_of(addrs: &[PeerAddr]) -> PeerAddr {

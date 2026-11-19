@@ -12,7 +12,7 @@
 
 use minip2p::{
     CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
-    EndpointEvent, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
+    EndpointEvent, ManualClock, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
     PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
 };
 #[cfg(feature = "pubsub")]
@@ -39,7 +39,7 @@ pub struct Pumped {
 }
 
 /// The endpoint a [`Host`] drives: `T` behind a circuit transport.
-type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy>;
+type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy, ManualClock>;
 
 /// The endpoint with its pending stream writes, released together.
 struct Live<T: Transport> {
@@ -94,13 +94,14 @@ impl<T: Transport> Host<T> {
             .iter()
             .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut builder = PortableEndpointBuilder::new(&keypair, WebEntropy)
-            .agent_version(
-                config
-                    .agent_version
-                    .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
-            )
-            .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
+        let mut builder =
+            PortableEndpointBuilder::new(&keypair, WebEntropy, ManualClock::default())
+                .agent_version(
+                    config
+                        .agent_version
+                        .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
+                )
+                .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
         #[cfg(feature = "pubsub")]
         {
             builder = builder.gossipsub_config(minip2p::GossipsubConfig {
@@ -175,7 +176,7 @@ impl<T: Transport> Host<T> {
                 next_deadline: None,
             };
         };
-        match endpoint.poll(now) {
+        match endpoint.at(now).poll() {
             Ok(events) => {
                 let mut ring = false;
                 let mut events = events.into_iter().peekable();
@@ -185,8 +186,8 @@ impl<T: Transport> Host<T> {
                     let converted = self.convert(batch, now);
                     ring |= self.ingest(converted);
                 }
-                let next_deadline = match &self.lifecycle {
-                    Lifecycle::Running(live) => live.endpoint.next_deadline(now),
+                let next_deadline = match &mut self.lifecycle {
+                    Lifecycle::Running(live) => live.endpoint.at(now).next_deadline(),
                     Lifecycle::Created(_) | Lifecycle::Stopped => None,
                 };
                 Pumped {
@@ -269,7 +270,8 @@ impl<T: Transport> Host<T> {
     #[cfg(feature = "pubsub")]
     pub fn subscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
-            .subscribe(&topic, now)
+            .at(now)
+            .subscribe(&topic)
             .map_err(map_gossipsub_error)
     }
 
@@ -277,7 +279,8 @@ impl<T: Transport> Host<T> {
     #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
-            .unsubscribe(&topic, now)
+            .at(now)
+            .unsubscribe(&topic)
             .map_err(map_gossipsub_error)
     }
 
@@ -288,7 +291,8 @@ impl<T: Transport> Host<T> {
             return Err(FfiError::MessageTooLarge);
         }
         self.endpoint()?
-            .publish(&topic, data, now)
+            .at(now)
+            .publish(&topic, data)
             .map_err(map_gossipsub_error)
     }
 
@@ -317,7 +321,10 @@ impl<T: Transport> Host<T> {
     /// Sends an explicit ping; its result arrives as an event.
     pub fn ping(&mut self, peer_id: String, now: Now) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.endpoint()?.ping(&peer, now).map_err(map_driver_error)
+        self.endpoint()?
+            .at(now)
+            .ping(&peer)
+            .map_err(map_driver_error)
     }
 
     /// Registers an application protocol, acknowledged by the binding with
@@ -353,7 +360,8 @@ impl<T: Transport> Host<T> {
         let peer = parse_peer_id(&peer_id)?;
         let (conn_id, stream_id) = self
             .endpoint()?
-            .open_stream(&peer, &protocol_id, now)
+            .at(now)
+            .open_stream(&peer, &protocol_id)
             .map_err(map_driver_error)?;
         // The binding knows this connection now, so the carry must not
         // elide its events, its end above all.
@@ -375,12 +383,11 @@ impl<T: Transport> Host<T> {
     ) -> Result<bool, FfiError> {
         let Live { endpoint, writes } = self.lifecycle.live()?;
         writes
-            .write_at(
-                endpoint,
+            .write(
+                endpoint.at(now),
                 ConnectionId::new(conn_id),
                 StreamId::new(stream_id),
                 data,
-                now,
             )
             .map(|progress| progress == WriteProgress::Accepted)
             .map_err(map_write_error)
@@ -395,11 +402,10 @@ impl<T: Transport> Host<T> {
     ) -> Result<(), FfiError> {
         let Live { endpoint, writes } = self.lifecycle.live()?;
         writes
-            .close_write_at(
-                endpoint,
+            .close_write(
+                endpoint.at(now),
                 ConnectionId::new(conn_id),
                 StreamId::new(stream_id),
-                now,
             )
             .map_err(map_write_error)
     }
@@ -409,7 +415,8 @@ impl<T: Transport> Host<T> {
         let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
         let Live { endpoint, writes } = self.lifecycle.live()?;
         endpoint
-            .reset_stream(conn_id, stream_id, now)
+            .at(now)
+            .reset_stream(conn_id, stream_id)
             .map_err(map_driver_error)?;
         writes.forget(conn_id, stream_id);
         Ok(())
@@ -426,7 +433,7 @@ impl<T: Transport> Host<T> {
         let (raw_conn, raw_stream) = (conn_id, stream_id);
         let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
         let Live { endpoint, writes } = self.lifecycle.live()?;
-        let abandoned = endpoint.abandon_stream(conn_id, stream_id, now);
+        let abandoned = endpoint.at(now).abandon_stream(conn_id, stream_id);
         if abandoned.is_err() && !self.carry.holds_stream_close(raw_conn, raw_stream) {
             return abandoned.map_err(map_driver_error);
         }
@@ -446,7 +453,8 @@ impl<T: Transport> Host<T> {
     pub fn connect(&mut self, target: ConnectTarget, now: Now) -> Result<u64, FfiError> {
         let target = parse_connect_target(target)?;
         self.endpoint()?
-            .connect(target, now)
+            .at(now)
+            .connect(target)
             .map(|id| id.as_u64())
             .map_err(|error| FfiError::InvalidAddress {
                 detail: error.to_string(),
@@ -456,7 +464,8 @@ impl<T: Transport> Host<T> {
     /// Cancels a Connection attempt; idempotent.
     pub fn cancel_connect(&mut self, id: u64, now: Now) -> Result<(), FfiError> {
         self.endpoint()?
-            .cancel_connect(ConnectId::from_u64(id), now);
+            .at(now)
+            .cancel_connect(ConnectId::from_u64(id));
         Ok(())
     }
 
@@ -464,7 +473,8 @@ impl<T: Transport> Host<T> {
     pub fn disconnect(&mut self, peer_id: String, now: Now) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.endpoint()?
-            .disconnect(&peer, now)
+            .at(now)
+            .disconnect(&peer)
             .map_err(map_driver_error)
     }
 
@@ -529,7 +539,7 @@ impl<T: Transport> Host<T> {
         let mut converted = Vec::with_capacity(batch.len());
         for event in batch {
             let settled = writes
-                .observe_at(endpoint, &event, now)
+                .observe(endpoint.at(now), &event)
                 .map(write_accepted_event);
             converted.extend(convert_endpoint_event(event));
             converted.extend(settled);
@@ -557,7 +567,10 @@ impl<T: Transport> Host<T> {
             Lifecycle::Stopped => None,
         };
         let failed = failure.is_some();
-        let report = endpoint.map(|endpoint| endpoint.shutdown(now));
+        let report = endpoint.map(|mut endpoint| {
+            endpoint.at(now);
+            endpoint.close()
+        });
         let mut events: Vec<P2pEvent> = failure.into_iter().collect();
         let closed = match report {
             Some(report) => {

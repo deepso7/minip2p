@@ -1,6 +1,6 @@
 # Generic mDNS carrier on `PortableEndpoint`
 
-`PortableEndpoint<T, E>` does not take the mDNS carrier as a type parameter. When `mdns` (or `smoltcp`, which enables it) is compiled in, the carrier is stored as a `Box<dyn MdnsIo>`. In that build no `PortableEndpoint` is `Send`, including ones that never call `.mdns(..)`.
+`PortableEndpoint<T, E, C>` does not take the mDNS carrier as a type parameter. When `mdns` (or `smoltcp`, which enables it) is compiled in, the carrier is stored as a `Box<dyn MdnsIo>`. In that build no `PortableEndpoint` is `Send`, including ones that never call `.mdns(..)`.
 
 ## Why this is out of scope
 

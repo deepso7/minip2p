@@ -2,7 +2,9 @@ extern crate alloc;
 
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
+#[cfg(any(feature = "smoltcp", feature = "relay-server"))]
+use alloc::vec::Vec;
 use core::time::Duration;
 
 pub use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
@@ -89,469 +91,109 @@ pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
+pub use crate::endpoint::{CloseOutcome, CloseReport, ConnectionInfo, Endpoint, EndpointStats};
 use crate::engine::Engine;
 use crate::names::Concrete;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
+#[cfg(feature = "mdns")]
+use crate::platform::PortableCarrier;
+pub use crate::platform::{Platform, Portable};
 #[cfg(feature = "autonat")]
 use crate::setup::NatConfigError;
-use crate::setup::{self, Capabilities, Platform, SetupError};
+use crate::setup::{self, Capabilities, PlatformCaps, SetupError};
+pub use minip2p_core::platform::{Clock, ManualClock};
 
-/// Portable endpoint entry point when the std `Endpoint` is not compiled.
+/// A portable endpoint: an [`Endpoint`] on the [`Portable`] platform, over
+/// transport `T`, entropy source `E` and caller-supplied [`Clock`] `C`.
 ///
-/// Under `std`, the batteries-included endpoint exposes the same
-/// [`Endpoint::portable`] constructor alongside `Endpoint::builder`.
-#[cfg(not(feature = "std"))]
-pub struct Endpoint;
+/// It is `Send` whenever its transport, entropy source and clock are,
+/// unless `mdns` (or `smoltcp`, which enables it) is compiled in: the
+/// carrier is then held as a `Box<dyn MdnsIo>`, which embedded carriers on a
+/// shared stack are not.
+///
+/// Portable entry point for embedded systems, browsers and deterministic
+/// event loops. It performs no blocking and reads time only from its
+/// [`Clock`], sampled once per call. Callers drive it with
+/// [`poll`](Endpoint::poll) and may inspect
+/// [`next_deadline`](Endpoint::next_deadline) to decide how long their
+/// platform loop can idle. Call [`close`](Endpoint::close) to notify peers
+/// and collect the final events.
+///
+/// Every shared method is on [`Endpoint`]; the portable-only ones are
+/// [`listen_on`](Endpoint::listen_on), [`next_deadline`](Endpoint::next_deadline)
+/// and [`close`](Endpoint::close). Capabilities configured on
+/// [`PortableEndpointBuilder`] (AutoNAT and relay, the relay server,
+/// Gossipsub, signed discovery, mDNS) report through their [`EndpointEvent`]
+/// variants.
+pub type PortableEndpoint<T, E, C> = Endpoint<Portable<T, E, C>>;
 
-#[cfg(not(feature = "std"))]
-impl Endpoint {
-    /// Starts portable endpoint configuration with explicit identity and entropy.
-    pub fn portable<E: EntropySource>(
-        identity: &Ed25519Keypair,
-        entropy: E,
-    ) -> PortableEndpointBuilder<E> {
-        PortableEndpointBuilder::new(identity, entropy)
+/// The form for hosts that sample time themselves, over a [`ManualClock`].
+impl<T: Transport, E: EntropySource> Endpoint<Portable<T, E, ManualClock>> {
+    /// Sets the endpoint's clock to `now` and returns the endpoint, so the
+    /// next call runs at that sample: `endpoint.at(now).poll()`.
+    pub fn at(&mut self, now: Now) -> &mut Self {
+        self.platform.clock_mut().set(now);
+        self
     }
 }
-
-/// The mDNS carrier a portable endpoint holds: any caller-owned `MdnsIo`.
-#[cfg(feature = "mdns")]
-type PortableCarrier = Box<dyn MdnsIo>;
-#[cfg(not(feature = "mdns"))]
-type PortableCarrier = ();
 
 /// What a portable endpoint offers its capabilities: no DCUtR, circuit
 /// operations only over a `CircuitTransport`, and an mDNS carrier that may
 /// share the transport's stack.
-fn portable_platform(has_circuits: bool) -> Platform {
-    Platform {
+fn portable_platform(has_circuits: bool) -> PlatformCaps {
+    PlatformCaps {
         runs_dcutr: false,
         has_circuits,
         mdns_shares_transport: true,
     }
 }
 
-/// What [`PortableEndpoint::shutdown`] collected from its one final drive:
-/// every event, every error, and what dropping the transport abandoned.
-///
-/// A failure the swarm reports as it happens (a transport refusing to close
-/// a connection, say) arrives as [`EndpointEvent::Error`] in `events`, as it
-/// would from [`PortableEndpoint::poll`].
-#[derive(Debug)]
-#[must_use = "a shutdown report carries the shutdown's events and errors"]
-#[non_exhaustive]
-pub struct ShutdownReport {
-    /// Events queued before the shutdown and those its final drive
-    /// produced, in order, also when that drive failed.
-    pub events: Vec<EndpointEvent>,
-    /// Every failure: each disconnect, then a failed final drive.
-    pub errors: Vec<DriverError>,
-    /// Connections still tracked after the final drive, pending dials
-    /// included, with their peer when known (an inbound handshake may not
-    /// have identified one yet). The endpoint drops them without waiting
-    /// for their teardown; empty means none remained, not that peers
-    /// acknowledged a close.
-    pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
-}
-
-/// Caller-driven endpoint over an injected transport and entropy source.
-///
-/// It is `Send` whenever its transport and entropy source are, unless
-/// `mdns` (or `smoltcp`, which enables it) is compiled in: the carrier is
-/// then held as a `Box<dyn MdnsIo>`, which embedded carriers on a shared
-/// stack are not.
-///
-/// Portable entry point for embedded systems and deterministic event loops.
-/// It performs no blocking and never reads a system clock. Callers drive it
-/// with [`poll`](Self::poll) and may inspect
-/// [`next_deadline`](Self::next_deadline) to decide how long their platform
-/// loop can idle. Call [`shutdown`](Self::shutdown) to notify peers; there
-/// is no `Drop` disconnect.
-///
-/// It runs the same engine and the same per-batch event order as the std
-/// `Endpoint` (see [`EndpointEvent`]). Capabilities configured on
-/// [`PortableEndpointBuilder`] (AutoNAT and relay, the relay server,
-/// Gossipsub, signed discovery, mDNS) report through their [`EndpointEvent`]
-/// variants. Every
-/// dial goes through [`connect`](Self::connect).
-///
-/// # State snapshots
-///
-/// Getter-style snapshots ([`connected_peers`](Self::connected_peers),
-/// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
-/// [`connection_id`](Self::connection_id),
-/// [`connection_remote_addr`](Self::connection_remote_addr),
-/// [`connection_info`](Self::connection_info), [`path`](Self::path),
-/// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
-/// Separate getters are not one cross-getter atomic snapshot and may be ahead
-/// of the Endpoint event stream (state changes before its corresponding event
-/// is queued).
-pub struct PortableEndpoint<T: Transport, E: EntropySource> {
-    pub(crate) engine: Engine<T, E, PortableCarrier>,
-}
-
-/// Lightweight snapshot of portable endpoint state.
-///
-/// Aggregate counts only. Prefer the individual [State snapshot](PortableEndpoint#state-snapshots)
-/// getters for peer and connection detail.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PortableEndpointStats {
-    /// Number of peers with an established transport connection.
-    pub connected_peers: usize,
-    /// Number of connected peers that completed Identify and are ready for
-    /// application protocols.
-    pub ready_peers: usize,
-    /// Transport-bound local addresses (see [`PortableEndpoint::bound_addresses`]).
-    pub bound_addresses: Vec<Multiaddr>,
-}
-
-/// A snapshot of one established connection, from
-/// [`PortableEndpoint::connection_info`] or the std `Endpoint`'s.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectionInfo {
-    /// The peer on the other end.
-    pub peer_id: PeerId,
-    /// The connection this describes.
-    pub conn_id: ConnectionId,
-    /// The remote transport address the transport reported for it; a circuit
-    /// reports `/p2p/<relay>/p2p-circuit`.
-    pub remote_addr: Multiaddr,
-    /// How the connection was made.
-    pub path: Path,
-    /// The protocols the peer advertised through Identify on this
-    /// connection: `None` until it is identified (its
-    /// [`EndpointEvent::PeerReady`]), which is distinct from `Some` of an
-    /// empty list.
-    pub ready_protocols: Option<Vec<String>>,
-}
-
-impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
-    /// Returns this endpoint's peer ID.
-    pub fn peer_id(&self) -> &PeerId {
-        self.engine.core.local_peer_id()
+impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
+    /// The clock the endpoint samples, as passed to the builder.
+    pub fn clock_mut(&mut self) -> &mut C {
+        self.platform.clock_mut()
     }
 
-    /// Starts listening on a transport address.
-    pub fn listen(&mut self, address: &Multiaddr) -> Result<Multiaddr, DriverError> {
+    /// Starts listening on a transport address and returns the address the
+    /// transport listens on.
+    pub fn listen_on(&mut self, address: &Multiaddr) -> Result<Multiaddr, DriverError> {
         self.engine.core.listen(address)
-    }
-
-    /// Starts listening on every address already bound by the transport.
-    pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
-        self.engine.core.listen_on_bound_addrs()
-    }
-
-    /// Registers an application protocol for inbound and outbound negotiation.
-    ///
-    /// Built-in ids ([`minip2p_swarm::RESERVED_PROTOCOL_IDS`]) are rejected
-    /// with [`SwarmError::ReservedProtocol`].
-    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), DriverError> {
-        Ok(self.engine.core.add_protocol(protocol_id)?)
-    }
-
-    /// Registers an application protocol whose received data the caller
-    /// acknowledges itself, with [`Self::stream_consumed`], instead of as
-    /// [`Self::poll`] returns it.
-    ///
-    /// Otherwise like [`Self::add_protocol`]. A host that hands bytes on to
-    /// a reader which may hold them (a foreign runtime's stream queue) uses
-    /// it, so the sender waits until they are really consumed (ADR 0012).
-    /// Streams that became ready before this call keep the acknowledgement
-    /// they had.
-    pub fn add_manual_ack_protocol(
-        &mut self,
-        protocol_id: impl Into<String>,
-    ) -> Result<(), DriverError> {
-        self.engine.add_manual_ack_protocol(protocol_id.into())
-    }
-
-    /// Acknowledges `bytes` of a manual-acknowledgement stream's received
-    /// data as consumed, replenishing its receive budget (ADR 0012).
-    ///
-    /// The same contract as the std `Endpoint::stream_consumed`: more than
-    /// the stream's unacknowledged bytes fails with
-    /// [`TransportError::AckExceedsDelivered`](minip2p_transport::TransportError::AckExceedsDelivered),
-    /// a closed stream (also on an ended connection) releases its bytes, and
-    /// a settled or unknown stream is a no-op.
-    pub fn stream_consumed(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        bytes: usize,
-    ) -> Result<(), DriverError> {
-        self.engine.core.ack_stream(conn_id, stream_id, bytes)
-    }
-
-    /// Admits one Connection attempt. Sync errors: malformed target only.
-    ///
-    /// A [`PeerId`] target uses the discovery book's known addresses (when a
-    /// book exists) and the configured relay when one exists. When neither a
-    /// direct candidate nor a configured relay exists, the attempt settles
-    /// [`ConnectFailure::NoUsableRoute`] through one terminal event.
-    ///
-    /// Every candidate is dialed immediately. Candidate completion order is
-    /// not a public contract. The swarm still keeps a single connection per
-    /// peer, chosen the same way on both sides when candidates race (see
-    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
-    /// a candidate that finishes after the winner may still replace it
-    /// ([`EndpointEvent::ConnectionReplaced`]), so candidates that could still
-    /// win stay open until that window ends. The attempt is settled at the first
-    /// established connection the swarm keeps (including a simultaneous
-    /// inbound), and the app sees any later hand-over as an ordinary
-    /// connection event.
-    ///
-    /// Connecting to a peer that is already connected reuses that
-    /// connection: the attempt settles at once with the current connection,
-    /// and the addresses passed are not dialed.
-    #[expect(
-        clippy::result_large_err,
-        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
-    )]
-    pub fn connect(
-        &mut self,
-        target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
-        now: Now,
-    ) -> Result<ConnectId, ConnectTargetError> {
-        let target = target.try_into().map_err(Into::into)?;
-        Ok(self.engine.connect(target, &mut Concrete, now))
-    }
-
-    /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
-    ///
-    /// Cancels the attempt's NAT relay leg too.
-    pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
-        self.engine.cancel_connect(id, now);
-    }
-
-    /// Returns peers with an established transport connection.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.engine.core.connected_peers()
-    }
-
-    /// Returns whether a peer completed Identify and is ready for application protocols.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.engine.core.is_peer_ready(peer_id)
-    }
-
-    /// Returns the peer's current connection and its Identify info once that
-    /// connection is ready, as one coherent snapshot.
-    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
-        self.engine.core.peer_readiness(peer_id)
-    }
-
-    /// Returns the latest Identify information received for a peer.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.engine.core.peer_info(peer_id)
-    }
-
-    /// Returns the active transport connection selected for `peer_id`.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.engine.core.connection_id(peer_id)
-    }
-
-    /// Returns the remote transport address recorded for an exact connection.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.engine.core.connection_remote_addr(conn_id)
-    }
-
-    /// Returns the [`Path`] of `peer`'s established connection; `None` only
-    /// while the peer is not connected.
-    ///
-    /// See [`Self::connection_info`].
-    pub fn path(&self, peer: &PeerId) -> Option<Path> {
-        self.engine.path(peer)
-    }
-
-    /// Returns a snapshot of the established connection `conn_id`: its peer,
-    /// remote address, [`Path`], and Identify protocols once ready.
-    ///
-    /// `None` for a pending, replaced, or closed connection. A connection's
-    /// path is [`Path::Relayed`] for a circuit, [`Path::Direct`] for a direct
-    /// connection we dialed or accepted, or [`Path::Punched`] once NAT
-    /// reports its hole punch produced it. A Connection replacement's new
-    /// connection has its own path.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
-        self.engine.connection_info(conn_id)
-    }
-
-    /// Returns addresses currently bound on the local transport.
-    ///
-    /// These are what the sockets were given, not a signal that
-    /// [`Self::listen`] / [`Self::listen_all`] has started accepting. The set
-    /// can be non-empty before listening begins.
-    ///
-    /// See [State snapshots](Self#state-snapshots).
-    pub fn bound_addresses(&self) -> Vec<Multiaddr> {
-        self.engine.core.transport().local_addresses()
-    }
-
-    /// Sets externally validated addresses to advertise through Identify.
-    ///
-    /// Replaces the previous caller-set addresses; NAT contributions (relay
-    /// circuits, confirmed public addresses) are kept and merged after them.
-    pub fn set_external_addresses(&mut self, addresses: Vec<Multiaddr>) {
-        self.engine.set_external_addresses(addresses);
-    }
-
-    /// Requests a ping using the caller's time sample. Once accepted (`Ok`),
-    /// it ends in one [`EndpointEvent::PingRttMeasured`] or
-    /// [`EndpointEvent::PingFailed`], unless the connection closes first. Its
-    /// deadline (`SwarmTimeouts::ping_ms`) covers opening and negotiating the
-    /// ping stream as well as the echo.
-    pub fn ping(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
-        self.engine.core.ping(peer_id, now.monotonic_ms)
-    }
-
-    /// Disconnects from a peer, aborting any dials still kept open for its
-    /// simultaneous dial so none of them reconnects it.
-    pub fn disconnect(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
-        self.engine.disconnect(peer_id, now)
-    }
-
-    /// Opens an outbound application stream and returns its connection and
-    /// stream ids; later stream operations take both.
-    pub fn open_stream(
-        &mut self,
-        peer_id: &PeerId,
-        protocol_id: &str,
-        now: Now,
-    ) -> Result<(ConnectionId, StreamId), DriverError> {
-        self.engine
-            .core
-            .open_stream(peer_id, protocol_id, now.monotonic_ms)
-    }
-
-    /// Sends bytes on an application stream named by its connection and
-    /// stream ids; the peer is the connection's.
-    ///
-    /// Accepts as much as the stream can queue. [`DriverError::Full`] means
-    /// a prefix may already have been accepted and only `unsent` is yours to
-    /// resend after [`EndpointEvent::StreamWritable`]; a `?` on this call
-    /// drops that tail. Fails with [`SwarmError::StreamNotFound`] if `conn_id`
-    /// is no longer the connection holding the stream (or
-    /// [`TransportError::ConnectionNotFound`](minip2p_transport::TransportError::ConnectionNotFound)
-    /// once nothing names it), as do the other stream operations;
-    /// [`DriverError::is_stream_gone`] covers both.
-    pub fn send_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        data: impl Into<Bytes>,
-        now: Now,
-    ) -> Result<(), DriverError> {
-        self.engine
-            .send_stream(conn_id, stream_id, data.into(), now)
-    }
-
-    /// Half-closes the local write side of an application stream.
-    pub fn close_stream_write(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now: Now,
-    ) -> Result<(), DriverError> {
-        self.engine.close_stream_write(conn_id, stream_id, now)
-    }
-
-    /// Abruptly resets an application stream.
-    pub fn reset_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now: Now,
-    ) -> Result<(), DriverError> {
-        self.engine.reset_stream(conn_id, stream_id, now)
-    }
-
-    /// Resets a stream and removes all bookkeeping for it, including its
-    /// events still queued in the endpoint (a failed [`Self::poll`] keeps
-    /// them). A queued `StreamClosed` still counts as the stream existing.
-    pub fn abandon_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now: Now,
-    ) -> Result<(), DriverError> {
-        self.engine.abandon_stream(conn_id, stream_id, now)
-    }
-
-    /// Returns a lightweight aggregate of durable state without driving the endpoint.
-    ///
-    /// Prefer the individual State snapshot getters when you need peer or
-    /// connection detail. Aggregate counts here are not atomic with those getters
-    /// and may be ahead of the Endpoint event stream.
-    pub fn stats(&self) -> PortableEndpointStats {
-        let connected = self.engine.core.connected_peers();
-        PortableEndpointStats {
-            ready_peers: connected
-                .iter()
-                .filter(|peer_id| self.engine.core.is_peer_ready(peer_id))
-                .count(),
-            connected_peers: connected.len(),
-            bound_addresses: self.bound_addresses(),
-        }
-    }
-
-    /// Runs one drive batch with one host-supplied time sample and returns
-    /// every queued Endpoint event.
-    ///
-    /// Events come in the per-batch order documented on [`EndpointEvent`].
-    /// Returning an [`EndpointEvent::StreamData`] acknowledges its bytes
-    /// (ADR 0012): a sender's receive budget is replenished as the
-    /// application pulls its data, so polling less often slows the sender.
-    ///
-    /// An error discards nothing: events already queued come out of the next
-    /// call, and [`Self::next_deadline`] is immediate until then.
-    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
-        self.engine.drive(now, &mut Concrete)?;
-        Ok(self.engine.take_events())
     }
 
     /// Returns when the endpoint next needs to be polled: immediately while
     /// events wait to be returned, else the earliest transport, swarm,
-    /// Connection-attempt, or capability timer.
-    pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
+    /// Connection-attempt, or capability timer. Compare it with the same
+    /// clock the endpoint samples.
+    pub fn next_deadline(&mut self) -> Option<Deadline> {
+        let now = self.now();
         self.engine.next_deadline(now)
     }
 
     /// Sends mDNS goodbyes, closes established peers, drives the endpoint
     /// once more, and consumes it: one final drive, then destruction.
     ///
-    /// The [`ShutdownReport`] carries the final Endpoint events, including
-    /// capability events still queued (Gossipsub events still inside the
-    /// agent too), any a failed [`Self::poll`] left, and those the swarm
-    /// queued even when the final drive fails. Consuming `self` is
-    /// intentional: dropping the transport releases listeners and
-    /// in-progress connections as well as established ones; the report's
-    /// `unfinished` lists those abandoned that way. Every established peer is
+    /// A portable close does not wait for teardown: the [`CloseReport`]
+    /// carries the final Endpoint events, including capability events
+    /// still queued (Gossipsub events still inside the agent too), any a
+    /// failed [`poll`](Endpoint::poll) left, and those the swarm queued even
+    /// when the final drive fails. Dropping the transport releases listeners
+    /// and in-progress connections as well as established ones; the report's
+    /// `unfinished` lists those abandoned that way, with
+    /// [`CloseOutcome::DeadlineExpired`]. Every established peer is
     /// attempted even if an earlier step fails. mDNS goodbyes are best
     /// effort: one that could not be sent is an
     /// [`EndpointEvent::MdnsFailed`] among the events, not an error.
-    pub fn shutdown(mut self, now: Now) -> ShutdownReport {
+    pub fn close(mut self) -> CloseReport {
         // The failure is queued as an event too.
         #[cfg(feature = "mdns")]
-        drop(self.engine.shutdown_mdns(now));
-        let mut errors = Vec::new();
-        for peer_id in self.engine.core.connected_peers() {
-            if let Err(error) = self.engine.core.disconnect(&peer_id, now.monotonic_ms) {
-                errors.push(error);
-            }
-        }
+        drop(self.shutdown_mdns());
+        let mut errors = self.disconnect_established();
+        let now = self.now();
+        let mut outcome = CloseOutcome::Drained;
         if let Err(error) = self.engine.drive(now, &mut Concrete) {
             errors.push(error);
+            outcome = CloseOutcome::Failed;
         }
         // Hand over what the swarm queued without polling again: a failed
         // drive's leftovers (a disconnect's close failure, say), or what the
@@ -562,88 +204,16 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         #[cfg(feature = "pubsub")]
         self.engine.collect_agent_events();
         self.engine.settle(now);
-        ShutdownReport {
+        let unfinished = self.tracked_connections();
+        if outcome == CloseOutcome::Drained && !unfinished.is_empty() {
+            outcome = CloseOutcome::DeadlineExpired;
+        }
+        CloseReport {
+            outcome,
+            unfinished,
             events: self.engine.take_events(),
             errors,
-            unfinished: self
-                .engine
-                .core
-                .tracked_connections()
-                .map(|(conn_id, peer)| (conn_id, peer.cloned()))
-                .collect(),
         }
-    }
-
-    /// Pauses or resumes admission of new relay reservations and circuits.
-    ///
-    /// Existing reservations and circuits remain active, and HOP remains
-    /// advertised while admission is paused.
-    #[cfg(feature = "relay-server")]
-    #[expect(
-        clippy::result_large_err,
-        reason = "The error type retains a rejected address for the announce control."
-    )]
-    pub fn set_relay_server_accepting(
-        &mut self,
-        accepting: bool,
-    ) -> Result<(), crate::RelayServerControlError> {
-        let relay_server = self
-            .engine
-            .relay_server
-            .as_mut()
-            .ok_or(crate::RelayServerControlError::NotConfigured)?;
-        relay_server.agent.set_accepting(accepting);
-        Ok(())
-    }
-
-    /// Returns the currently held relay reservation, when any.
-    #[cfg(feature = "relay")]
-    pub fn active_reservation(&self) -> Option<ReservationInfo> {
-        self.engine.active_reservation()
-    }
-
-    /// Returns the current AutoNAT reachability verdict
-    /// ([`ReachabilityState::Unknown`] until a server exchange succeeds, or
-    /// when NAT is not configured).
-    #[cfg(feature = "autonat")]
-    pub fn reachability(&self) -> ReachabilityState {
-        self.engine.reachability()
-    }
-
-    /// Subscribes to an application topic. Returns `Ok(false)` when already
-    /// subscribed; [`crate::GossipsubError::NotEnabled`] unless Gossipsub
-    /// was configured.
-    #[cfg(feature = "pubsub")]
-    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, crate::GossipsubError> {
-        self.engine.subscribe(topic, now)
-    }
-
-    /// Withdraws an application topic subscription. The configured
-    /// discovery topic is reserved while discovery is enabled and returns
-    /// [`crate::GossipsubError::DiscoveryTopicReserved`].
-    #[cfg(feature = "pubsub")]
-    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, crate::GossipsubError> {
-        self.engine.unsubscribe(topic, now)
-    }
-
-    /// Publishes one application message. The configured discovery topic is
-    /// reserved while discovery is enabled and returns
-    /// [`crate::GossipsubError::DiscoveryTopicReserved`].
-    #[cfg(feature = "pubsub")]
-    pub fn publish(
-        &mut self,
-        topic: &str,
-        data: impl Into<Vec<u8>>,
-        now: Now,
-    ) -> Result<(), crate::GossipsubError> {
-        self.engine.publish(topic, data.into(), now)
-    }
-
-    /// Returns the bounded peer book shared by mDNS and signed beacons;
-    /// empty when neither is configured.
-    #[cfg(feature = "_peer-book")]
-    pub fn known_peers(&self) -> Vec<KnownPeer> {
-        self.engine.known_peers()
     }
 }
 
@@ -745,10 +315,11 @@ impl From<SetupError> for PortableBuildError {
 /// `PortableBuildError::NatConfig`; wrap the transport in a
 /// `CircuitTransport` and call `build_with_circuits` (feature `relay`) to
 /// run relays. AutoNAT alone needs nothing from the transport.
-pub struct PortableEndpointBuilder<E> {
+pub struct PortableEndpointBuilder<E, C> {
     swarm: SwarmBuilder,
     identity: Ed25519Keypair,
     entropy: E,
+    clock: C,
     connect_deadline_ms: u64,
     capabilities: Capabilities,
     /// The carrier [`Self::mdns`] hands over with `capabilities.mdns`.
@@ -756,13 +327,15 @@ pub struct PortableEndpointBuilder<E> {
     mdns_io: Option<PortableCarrier>,
 }
 
-impl<E: EntropySource> PortableEndpointBuilder<E> {
-    /// Starts a builder with explicit identity and entropy.
-    pub fn new(identity: &Ed25519Keypair, entropy: E) -> Self {
+impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
+    /// Starts a builder with explicit identity, entropy, and the clock every
+    /// endpoint call samples.
+    pub fn new(identity: &Ed25519Keypair, entropy: E, clock: C) -> Self {
         Self {
             swarm: SwarmBuilder::new(identity),
             identity: identity.clone(),
             entropy,
+            clock,
             connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
             capabilities: Capabilities::default(),
             #[cfg(feature = "mdns")]
@@ -856,7 +429,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     ///
     /// The server announces the transport's concrete listener addresses
     /// and any public addresses AutoNAT confirms. Pause and resume admission
-    /// with [`PortableEndpoint::set_relay_server_accepting`]; its events
+    /// with [`Endpoint::set_relay_server_accepting`]; its events
     /// arrive as [`EndpointEvent::RelayServer`].
     #[cfg(feature = "relay-server")]
     pub fn relay_server(self) -> Self {
@@ -936,7 +509,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     pub fn build<T: Transport>(
         self,
         transport: T,
-    ) -> Result<PortableEndpoint<T, E>, PortableBuildError> {
+    ) -> Result<PortableEndpoint<T, E, C>, PortableBuildError> {
         self.assemble(
             transport,
             #[cfg(feature = "relay")]
@@ -950,7 +523,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     pub fn build_with_circuits<T: Transport, R: EntropySource>(
         self,
         transport: CircuitTransport<T, R>,
-    ) -> Result<PortableEndpoint<CircuitTransport<T, R>, E>, PortableBuildError> {
+    ) -> Result<PortableEndpoint<CircuitTransport<T, R>, E, C>, PortableBuildError> {
         self.assemble(transport, Some(CircuitOps::circuit_transport()))
     }
 
@@ -960,7 +533,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self,
         transport: T,
         #[cfg(feature = "relay")] circuits: Option<CircuitOps<T>>,
-    ) -> Result<PortableEndpoint<T, E>, PortableBuildError> {
+    ) -> Result<PortableEndpoint<T, E, C>, PortableBuildError> {
         #[cfg(feature = "relay")]
         let has_circuits = circuits.is_some();
         #[cfg(not(feature = "relay"))]
@@ -982,7 +555,10 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             #[cfg(feature = "mdns")]
             self.mdns_io,
         )?;
-        Ok(PortableEndpoint { engine })
+        Ok(Endpoint {
+            engine,
+            platform: Portable::new(self.clock),
+        })
     }
 
     /// Selects the embedded smoltcp TCP backend over a host-configured stack.
@@ -994,13 +570,14 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     pub fn smoltcp<D: smoltcp::phy::Device>(
         self,
         stack: SmoltcpStack<D>,
-    ) -> SmoltcpEndpointBuilder<D, E> {
+    ) -> SmoltcpEndpointBuilder<D, E, C> {
         let entropy = SharedEntropy::new(self.entropy);
         SmoltcpEndpointBuilder {
             portable: PortableEndpointBuilder {
                 swarm: self.swarm,
                 identity: self.identity,
                 entropy: entropy.clone(),
+                clock: self.clock,
                 connect_deadline_ms: self.connect_deadline_ms,
                 capabilities: self.capabilities,
                 mdns_io: self.mdns_io,
@@ -1033,6 +610,10 @@ pub type SmoltcpTransport<D, E> = TcpTransport<SmoltcpTcpProvider<D>, SharedEntr
 pub type SmoltcpTransport<D, E> =
     CircuitTransport<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>;
 
+/// The endpoint a [`SmoltcpEndpointBuilder`] builds.
+#[cfg(feature = "smoltcp")]
+pub type SmoltcpEndpoint<D, E, C> = PortableEndpoint<SmoltcpTransport<D, E>, SharedEntropy<E>, C>;
+
 /// Embedded mDNS configuration.
 #[cfg(feature = "smoltcp")]
 struct EmbeddedMdnsConfig {
@@ -1047,8 +628,8 @@ struct EmbeddedMdnsConfig {
 /// a cloned [`SmoltcpStack`] from before `smoltcp(..)` to reconfigure the
 /// interface later.
 #[cfg(feature = "smoltcp")]
-pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
-    portable: PortableEndpointBuilder<SharedEntropy<E>>,
+pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource, C: Clock> {
+    portable: PortableEndpointBuilder<SharedEntropy<E>, C>,
     /// Shared with the swarm, for the TCP (and circuit) transport.
     entropy: SharedEntropy<E>,
     stack: SmoltcpStack<D>,
@@ -1061,7 +642,7 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
 }
 
 #[cfg(feature = "smoltcp")]
-impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
+impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder<D, E, C> {
     /// Overrides the Identify agent-version string.
     pub fn agent_version(mut self, value: impl Into<String>) -> Self {
         self.portable = self.portable.agent_version(value);
@@ -1233,9 +814,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
     /// Builds the endpoint: TCP (and mDNS) installed on the shared stack,
     /// every configured capability driven by one `poll`.
-    pub fn build(
-        self,
-    ) -> Result<PortableEndpoint<SmoltcpTransport<D, E>, SharedEntropy<E>>, PortableBuildError>
+    pub fn build(self) -> Result<SmoltcpEndpoint<D, E, C>, PortableBuildError>
     where
         D: 'static,
     {
@@ -1279,7 +858,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
                 Ok(parsed) => parsed,
                 Err(error) => return Err(PortableBuildError::ListenAddress { address, error }),
             };
-            endpoint.listen(&parsed)?;
+            endpoint.listen_on(&parsed)?;
         }
         Ok(endpoint)
     }
@@ -1288,10 +867,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Endpoint;
     use alloc::{rc::Rc, vec, vec::Vec};
     use core::cell::Cell;
     use minip2p_core::platform::EntropyError;
+    use minip2p_core::platform::ManualClock;
     use minip2p_test_support::InMemoryTransport;
     use minip2p_transport::{ConnectionEndpoint, ConnectionNamespace, TransportEvent};
 
@@ -1489,10 +1068,11 @@ mod tests {
     #[test]
     fn abandoning_a_stream_closed_in_held_events_drops_them() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .mdns(BrokenMdns, MdnsConfig::default())
-            .build(NoopTransport)
-            .expect("mdns endpoint");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .mdns(BrokenMdns, MdnsConfig::default())
+                .build(NoopTransport)
+                .expect("mdns endpoint");
         let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
         let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
         let other = EndpointEvent::ConnectionClosed {
@@ -1515,7 +1095,8 @@ mod tests {
             other,
         ]);
         endpoint
-            .abandon_stream(conn_id, stream_id, Now::from_millis(0))
+            .at(Now::from_millis(0))
+            .abandon_stream(conn_id, stream_id)
             .expect("a held close proves the stream");
         assert!(
             matches!(
@@ -1534,10 +1115,11 @@ mod tests {
     #[test]
     fn a_failing_mdns_carrier_is_an_event_not_a_poll_error() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .mdns(BrokenMdns, MdnsConfig::default())
-            .build(NoopTransport)
-            .expect("mdns endpoint");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .mdns(BrokenMdns, MdnsConfig::default())
+                .build(NoopTransport)
+                .expect("mdns endpoint");
         let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
         let target = PeerAddr::new(
             <Multiaddr as core::str::FromStr>::from_str("/ip4/192.0.2.1/tcp/4001").expect("addr"),
@@ -1546,10 +1128,11 @@ mod tests {
         .expect("peer addr");
         // The transport refuses the dial, so the attempt settles at once.
         let id = endpoint
-            .connect(target, Now::from_millis(0))
+            .at(Now::from_millis(0))
+            .connect(target)
             .expect("admitted");
 
-        let events = endpoint.poll(Now::from_millis(1)).expect("poll");
+        let events = endpoint.at(Now::from_millis(1)).poll().expect("poll");
         let failures = |events: &[EndpointEvent]| {
             events
                 .iter()
@@ -1576,7 +1159,8 @@ mod tests {
         );
         // The retry fails the same way: still running, nothing new to report.
         let retried = endpoint
-            .poll(Now::from_millis(1 + MDNS_FAILURE_RETRY))
+            .at(Now::from_millis(1 + MDNS_FAILURE_RETRY))
+            .poll()
             .expect("poll");
         assert_eq!(failures(&retried), 0, "{retried:?}");
     }
@@ -1587,11 +1171,13 @@ mod tests {
     #[test]
     fn a_failed_goodbye_is_an_event_from_shutdown() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
-        let endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .mdns(BrokenMdns, MdnsConfig::default())
-            .build(NoopTransport)
-            .expect("mdns endpoint");
-        let report = endpoint.shutdown(Now::from_millis(0));
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .mdns(BrokenMdns, MdnsConfig::default())
+                .build(NoopTransport)
+                .expect("mdns endpoint");
+        endpoint.at(Now::from_millis(0));
+        let report = endpoint.close();
         assert!(report.errors.is_empty(), "goodbyes are best effort");
         let events = report.events;
         assert!(
@@ -1605,24 +1191,25 @@ mod tests {
     #[test]
     fn portable_builder_constructs_a_protocol_ready_endpoint() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .protocol("/example/1.0.0")
-            .build(NoopTransport)
-            .expect("portable endpoint configuration is valid");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .protocol("/example/1.0.0")
+                .build(NoopTransport)
+                .expect("portable endpoint configuration is valid");
         let remote = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
 
         assert_eq!(endpoint.peer_id(), &identity.peer_id());
         let now = Now::from_millis(0);
         assert!(matches!(
-            endpoint.open_stream(&remote, "/example/1.0.0", now),
+            endpoint.at(now).open_stream(&remote, "/example/1.0.0"),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
         assert!(matches!(
-            endpoint.open_stream(&remote, "/missing/1.0.0", now),
+            endpoint.at(now).open_stream(&remote, "/missing/1.0.0"),
             Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
         ));
 
-        let error = Endpoint::portable(&identity, ZeroEntropy)
+        let error = PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
             .protocol(minip2p_swarm::RESERVED_PROTOCOL_IDS[0])
             .build(NoopTransport)
             .err()
@@ -1632,7 +1219,7 @@ mod tests {
             PortableBuildError::Swarm(SwarmError::ReservedProtocol { .. })
         ));
 
-        let error = Endpoint::portable(&identity, ZeroEntropy)
+        let error = PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
             .timeouts(SwarmTimeouts {
                 negotiation_ms: 0,
                 ..SwarmTimeouts::default()
@@ -1677,10 +1264,11 @@ mod tests {
             closed: Rc::new(Cell::new(false)),
             broken: false,
         };
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .build(transport)
-            .expect("endpoint configuration is valid");
-        endpoint.poll(Now::from_millis(0)).expect("poll");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .build(transport)
+                .expect("endpoint configuration is valid");
+        endpoint.at(Now::from_millis(0)).poll().expect("poll");
 
         assert_eq!(
             endpoint.connection_info(circuit),
@@ -1709,7 +1297,7 @@ mod tests {
                 id: direct,
                 endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
             });
-        endpoint.poll(Now::from_millis(1)).expect("poll");
+        endpoint.at(Now::from_millis(1)).poll().expect("poll");
         assert_eq!(endpoint.connection_info(circuit), None, "replaced");
         assert_eq!(
             endpoint.connection_info(direct).map(|info| info.path),
@@ -1726,7 +1314,7 @@ mod tests {
                 id: direct,
                 reason: ConnectionCloseReason::Local,
             });
-        endpoint.poll(Now::from_millis(2)).expect("poll");
+        endpoint.at(Now::from_millis(2)).poll().expect("poll");
         assert_eq!(endpoint.connection_info(direct), None, "closed");
         assert_eq!(endpoint.path(&peer), None);
     }
@@ -1753,16 +1341,18 @@ mod tests {
             closed: Rc::new(Cell::new(false)),
             broken: false,
         };
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .build(transport)
-            .expect("endpoint configuration is valid");
-        endpoint.poll(Now::from_millis(0)).expect("poll");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .build(transport)
+                .expect("endpoint configuration is valid");
+        endpoint.at(Now::from_millis(0)).poll().expect("poll");
 
         // Settles at once on the circuit; a direct connection replaces it
         // before the terminal is read.
         let target = PeerAddr::new(direct_addr.clone(), peer).expect("peer addr");
         let id = endpoint
-            .connect(target, Now::from_millis(1))
+            .at(Now::from_millis(1))
+            .connect(target)
             .expect("connect admitted");
         endpoint
             .engine
@@ -1773,7 +1363,7 @@ mod tests {
                 id: direct,
                 endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
             });
-        let events = endpoint.poll(Now::from_millis(2)).expect("poll");
+        let events = endpoint.at(Now::from_millis(2)).poll().expect("poll");
 
         assert_eq!(endpoint.connection_info(circuit), None, "replaced");
         let settled = events.iter().find_map(|event| match event {
@@ -1803,22 +1393,22 @@ mod tests {
         let (a_transport, b_transport) =
             InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
         let conn_id = a_transport.connection_id();
-        let mut a = Endpoint::portable(&a_identity, ZeroEntropy)
+        let mut a = PortableEndpointBuilder::new(&a_identity, ZeroEntropy, ManualClock::default())
             .build(a_transport)
             .expect("a endpoint configuration is valid");
-        let mut b = Endpoint::portable(&b_identity, ZeroEntropy)
+        let mut b = PortableEndpointBuilder::new(&b_identity, ZeroEntropy, ManualClock::default())
             .protocol("/app/1")
             .build(b_transport)
             .expect("b endpoint configuration is valid");
 
-        a.poll(Now::from_millis(0)).expect("drive a");
+        a.at(Now::from_millis(0)).poll().expect("drive a");
         let info = a.connection_info(conn_id).expect("established");
         assert_eq!(info.path, Path::Direct);
         assert_eq!(info.ready_protocols, None, "not identified yet");
 
         for now_ms in 1..64 {
-            b.poll(Now::from_millis(now_ms)).expect("drive b");
-            a.poll(Now::from_millis(now_ms)).expect("drive a");
+            b.at(Now::from_millis(now_ms)).poll().expect("drive b");
+            a.at(Now::from_millis(now_ms)).poll().expect("drive a");
             if a.is_peer_ready(&b_identity.peer_id()) {
                 break;
             }
@@ -1836,16 +1426,16 @@ mod tests {
         let b_identity = Ed25519Keypair::from_secret_key_bytes([12; 32]);
         let (a_transport, b_transport) =
             InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
-        let mut a = Endpoint::portable(&a_identity, ZeroEntropy)
+        let mut a = PortableEndpointBuilder::new(&a_identity, ZeroEntropy, ManualClock::default())
             .build(a_transport)
             .expect("a endpoint configuration is valid");
-        let mut b = Endpoint::portable(&b_identity, ZeroEntropy)
+        let mut b = PortableEndpointBuilder::new(&b_identity, ZeroEntropy, ManualClock::default())
             .build(b_transport)
             .expect("b endpoint configuration is valid");
 
         for now_ms in 0..64 {
-            a.poll(Now::from_millis(now_ms)).expect("drive a");
-            b.poll(Now::from_millis(now_ms)).expect("drive b");
+            a.at(Now::from_millis(now_ms)).poll().expect("drive a");
+            b.at(Now::from_millis(now_ms)).poll().expect("drive b");
             if a.is_peer_ready(&b_identity.peer_id()) && b.is_peer_ready(&a_identity.peer_id()) {
                 break;
             }
@@ -1868,16 +1458,16 @@ mod tests {
         let b_identity = Ed25519Keypair::from_secret_key_bytes([22; 32]);
         let (a_transport, b_transport) =
             InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
-        let mut a = Endpoint::portable(&a_identity, ZeroEntropy)
+        let mut a = PortableEndpointBuilder::new(&a_identity, ZeroEntropy, ManualClock::default())
             .build(a_transport)
             .expect("a endpoint configuration is valid");
-        let mut b = Endpoint::portable(&b_identity, ZeroEntropy)
+        let mut b = PortableEndpointBuilder::new(&b_identity, ZeroEntropy, ManualClock::default())
             .build(b_transport)
             .expect("b endpoint configuration is valid");
 
         for now_ms in 0..64 {
-            a.poll(Now::from_millis(now_ms)).expect("drive a");
-            b.poll(Now::from_millis(now_ms)).expect("drive b");
+            a.at(Now::from_millis(now_ms)).poll().expect("drive a");
+            b.at(Now::from_millis(now_ms)).poll().expect("drive b");
             if a.connection_id(&b_identity.peer_id()).is_some() {
                 break;
             }
@@ -1891,9 +1481,10 @@ mod tests {
         )
         .expect("peer addr");
         let id = a
-            .connect(target, Now::from_millis(80))
+            .at(Now::from_millis(80))
+            .connect(target)
             .expect("connect admitted");
-        let events = a.poll(Now::from_millis(80)).expect("drain settled");
+        let events = a.at(Now::from_millis(80)).poll().expect("drain settled");
         assert!(events.iter().any(|event| matches!(
             event,
             EndpointEvent::ConnectSettled {
@@ -1921,23 +1512,27 @@ mod tests {
             closed: closed.clone(),
             broken: false,
         };
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .build(transport)
-            .expect("portable endpoint configuration is valid");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .build(transport)
+                .expect("portable endpoint configuration is valid");
 
         endpoint
-            .poll(Now::from_millis(1))
+            .at(Now::from_millis(1))
+            .poll()
             .expect("connection event is accepted");
         assert_eq!(
             endpoint.stats(),
-            PortableEndpointStats {
+            EndpointStats {
                 connected_peers: 1,
                 ready_peers: 0,
                 bound_addresses: vec![address],
             }
         );
 
-        let report = endpoint.shutdown(Now::from_millis(2));
+        endpoint.at(Now::from_millis(2));
+
+        let report = endpoint.close();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.unfinished.is_empty(), "{:?}", report.unfinished);
         assert!(
@@ -1970,13 +1565,16 @@ mod tests {
             closed: Rc::new(Cell::new(false)),
             broken: false,
         };
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .build(transport)
-            .expect("portable endpoint configuration is valid");
-        endpoint.poll(Now::from_millis(1)).expect("connected");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .build(transport)
+                .expect("portable endpoint configuration is valid");
+        endpoint.at(Now::from_millis(1)).poll().expect("connected");
         endpoint.engine.core.transport_mut().broken = true;
 
-        let report = endpoint.shutdown(Now::from_millis(2));
+        endpoint.at(Now::from_millis(2));
+
+        let report = endpoint.close();
         assert!(
             matches!(
                 report.errors.as_slice(),
@@ -2011,11 +1609,12 @@ mod tests {
             &mut device,
             smoltcp::time::Instant::from_millis(0),
         );
-        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
-            .smoltcp(SmoltcpStack::new(device, interface))
-            .gossipsub()
-            .build()
-            .expect("embedded endpoint builds");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+                .smoltcp(SmoltcpStack::new(device, interface))
+                .gossipsub()
+                .build()
+                .expect("embedded endpoint builds");
 
         // An inbound meshsub stream carrying a subscribe leaves
         // `PeerSubscribed` in the agent; nothing has polled it out yet.
@@ -2050,7 +1649,9 @@ mod tests {
             0,
         ));
 
-        let report = endpoint.shutdown(Now::from_millis(0));
+        endpoint.at(Now::from_millis(0));
+
+        let report = endpoint.close();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let events = report.events;
         assert!(

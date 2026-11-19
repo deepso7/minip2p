@@ -4,14 +4,11 @@
 //! `send_stream` accepts what fits and hands the rest back in
 //! [`DriverError::Full`]. [`StreamWriter`] holds that tail, resends it when the
 //! stream reports [`EndpointEvent::StreamWritable`], and reports
-//! [`WriteAccepted`] once every byte has been accepted. It works on the
-//! engine both endpoints share: a [`PortableEndpoint`] through
-//! [`write_at`](StreamWriter::write_at),
-//! [`close_write_at`](StreamWriter::close_write_at) and
-//! [`observe_at`](StreamWriter::observe_at), which take the caller's [`Now`]
-//! like every portable call, and the std `Endpoint` through `write`,
-//! `close_write` and `observe`, which sample its clock. The ffi-core bindings
-//! use the same writer for their stream writes.
+//! [`WriteAccepted`] once every byte has been accepted. It works on any
+//! [`Endpoint`], whatever its platform, through
+//! [`write`](StreamWriter::write), [`close_write`](StreamWriter::close_write)
+//! and [`observe`](StreamWriter::observe), which sample the endpoint's clock.
+//! The ffi-core bindings use the same writer for their stream writes.
 
 use alloc::collections::BTreeMap;
 
@@ -20,7 +17,7 @@ use minip2p_transport::Transport;
 
 use crate::engine::{Carrier, Engine};
 use crate::{
-    ConnectionId, DriverError, EndpointEvent, EntropySource, Now, PortableEndpoint, StreamId,
+    ConnectionId, DriverError, Endpoint, EndpointEvent, EntropySource, Now, Platform, StreamId,
 };
 
 /// What a [`StreamWriter`] write did with its payload.
@@ -117,8 +114,8 @@ struct Pending {
 /// Holds the unsent tail of at most one write per stream, within a byte
 /// budget, and finishes it as the stream drains.
 ///
-/// Feed every [`EndpointEvent`] from `poll`/`wait` through `observe` (or
-/// [`observe_at`](Self::observe_at) on a [`PortableEndpoint`]): a [`StreamWritable`](EndpointEvent::StreamWritable)
+/// Feed every [`EndpointEvent`] from `poll`/`wait` through
+/// [`observe`](Self::observe): a [`StreamWritable`](EndpointEvent::StreamWritable)
 /// resends the stream's tail, and the event that ends a write side,
 /// stream, or connection (including `ConnectionReplaced`) drops what was
 /// held for it. Completion means the bytes were accepted locally, never
@@ -174,55 +171,6 @@ impl StreamWriter {
     /// Whether the stream has a write that is not yet fully accepted.
     pub fn is_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
         self.streams.contains_key(&(conn_id, stream_id))
-    }
-
-    /// Sends one payload on a [`PortableEndpoint`] at `now`, holding whatever
-    /// the stream does not accept yet.
-    ///
-    /// Fails with [`StreamWriteError::Busy`] while the stream has a pending
-    /// write, [`StreamWriteError::Closing`] after a deferred close,
-    /// [`StreamWriteError::OverBudget`] when the payload does not fit what is
-    /// left of the budget, and [`StreamWriteError::TooLarge`] when it exceeds
-    /// the whole budget; none of them sends anything.
-    pub fn write_at<T: Transport, E: EntropySource>(
-        &mut self,
-        endpoint: &mut PortableEndpoint<T, E>,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        data: impl Into<Bytes>,
-        now: Now,
-    ) -> Result<WriteProgress, StreamWriteError> {
-        self.write_on(&mut endpoint.engine, conn_id, stream_id, data.into(), now)
-    }
-
-    /// Half-closes the write side on a [`PortableEndpoint`] at `now`: now, or
-    /// once the pending write's tail has been accepted. Later writes are
-    /// refused either way.
-    pub fn close_write_at<T: Transport, E: EntropySource>(
-        &mut self,
-        endpoint: &mut PortableEndpoint<T, E>,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now: Now,
-    ) -> Result<(), StreamWriteError> {
-        self.close_write_on(&mut endpoint.engine, conn_id, stream_id, now)
-    }
-
-    /// Follows one event a [`PortableEndpoint`] returned; call it for every
-    /// event, before or after handling it yourself, with a current `now`.
-    ///
-    /// A Writable resends the stream's tail and returns [`WriteAccepted`]
-    /// once all of it is accepted, sending a deferred FIN right after.
-    /// `StreamWriteStopped`, `StreamClosed`, `ConnectionClosed`, and
-    /// `ConnectionReplaced` drop what was held for them; that event is how
-    /// the application learns the write will not complete.
-    pub fn observe_at<T: Transport, E: EntropySource>(
-        &mut self,
-        endpoint: &mut PortableEndpoint<T, E>,
-        event: &EndpointEvent,
-        now: Now,
-    ) -> Option<WriteAccepted> {
-        self.observe_on(&mut endpoint.engine, event, now)
     }
 
     /// Drops the stream's pending write, if any, without sending it; for a
@@ -377,8 +325,7 @@ impl StreamWriter {
     }
 }
 
-/// The std `Endpoint` forms, each sampling the endpoint's clock once.
-#[cfg(feature = "std")]
+/// The endpoint-facing forms, each sampling the endpoint's clock once.
 impl StreamWriter {
     /// Sends one payload, holding whatever the stream does not accept yet.
     ///
@@ -388,9 +335,9 @@ impl StreamWriter {
     /// when the payload does not fit what is left of the budget, and
     /// [`StreamWriteError::TooLarge`] when it exceeds the whole budget; none
     /// of them sends anything.
-    pub fn write(
+    pub fn write<P: Platform>(
         &mut self,
-        endpoint: &mut crate::Endpoint,
+        endpoint: &mut Endpoint<P>,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Bytes>,
@@ -401,9 +348,9 @@ impl StreamWriter {
 
     /// Half-closes the write side: now, or once the pending write's tail
     /// has been accepted. Later writes are refused either way.
-    pub fn close_write(
+    pub fn close_write<P: Platform>(
         &mut self,
-        endpoint: &mut crate::Endpoint,
+        endpoint: &mut Endpoint<P>,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), StreamWriteError> {
@@ -419,9 +366,9 @@ impl StreamWriter {
     /// `StreamWriteStopped`, `StreamClosed`, `ConnectionClosed`, and
     /// `ConnectionReplaced` drop what was held for them; that event is how
     /// the application learns the write will not complete.
-    pub fn observe(
+    pub fn observe<P: Platform>(
         &mut self,
-        endpoint: &mut crate::Endpoint,
+        endpoint: &mut Endpoint<P>,
         event: &EndpointEvent,
     ) -> Option<WriteAccepted> {
         let now = endpoint.now();

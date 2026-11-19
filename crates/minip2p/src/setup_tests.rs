@@ -21,7 +21,9 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmBuilder;
 use minip2p_test_support::InMemoryTransport;
 
-use super::{Capabilities, Platform, SetupError, install, validate};
+use super::{Capabilities, PlatformCaps, SetupError, install, validate};
+#[cfg(feature = "relay")]
+use crate::ManualClock;
 use crate::engine::Engine;
 use crate::names::Concrete;
 use crate::portable::StreamAcks;
@@ -55,7 +57,7 @@ impl EntropySource for FailingEntropy {
 }
 
 /// The std endpoint with QUIC: runs DCUtR, has circuits.
-const STD_QUIC: Platform = Platform {
+const STD_QUIC: PlatformCaps = PlatformCaps {
     runs_dcutr: true,
     has_circuits: true,
     mdns_shares_transport: false,
@@ -63,14 +65,14 @@ const STD_QUIC: Platform = Platform {
 
 /// A portable endpoint built with circuits: no DCUtR.
 #[cfg(feature = "relay")]
-const PORTABLE_CIRCUITS: Platform = Platform {
+const PORTABLE_CIRCUITS: PlatformCaps = PlatformCaps {
     runs_dcutr: false,
     has_circuits: true,
     mdns_shares_transport: true,
 };
 
 /// A portable endpoint over a plain transport.
-const PORTABLE_PLAIN: Platform = Platform {
+const PORTABLE_PLAIN: PlatformCaps = PlatformCaps {
     runs_dcutr: false,
     has_circuits: false,
     mdns_shares_transport: true,
@@ -110,7 +112,7 @@ fn engine<E: EntropySource>(
 fn setup<E: EntropySource>(
     engine: &mut TestEngine<E>,
     capabilities: Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
     identity: &Ed25519Keypair,
 ) -> Result<(), SetupError> {
     let validated = validate(capabilities, platform, &identity.peer_id())?;
@@ -128,13 +130,13 @@ fn setup<E: EntropySource>(
 /// Validates `capabilities` for `platform`, for the rules that need no
 /// engine.
 #[cfg(feature = "autonat")]
-fn check(capabilities: Capabilities, platform: Platform) -> Result<(), SetupError> {
+fn check(capabilities: Capabilities, platform: PlatformCaps) -> Result<(), SetupError> {
     validate(capabilities, platform, &key(1).peer_id()).map(drop)
 }
 
 /// Installs `capabilities` on one endpoint and returns the protocols a
 /// plain peer learns through Identify.
-fn advertised(capabilities: Capabilities, platform: Platform) -> Vec<String> {
+fn advertised(capabilities: Capabilities, platform: PlatformCaps) -> Vec<String> {
     let (a_id, b_id) = (key(1), key(2));
     let (a_transport, b_transport) = InMemoryTransport::pair(a_id.peer_id(), b_id.peer_id());
     let mut a = engine(&a_id, a_transport, CountingEntropy(0));
@@ -271,7 +273,7 @@ fn relays_without_the_relay_feature_are_refused() {
 
 /// The NAT config [`validate`] resolves from `capabilities` on `platform`.
 #[cfg(feature = "relay")]
-fn resolved(capabilities: Capabilities, platform: Platform) -> Option<NatConfig> {
+fn resolved(capabilities: Capabilities, platform: PlatformCaps) -> Option<NatConfig> {
     validate(capabilities, platform, &key(1).peer_id())
         .expect("validates")
         .capabilities
@@ -377,7 +379,7 @@ fn relay_and_nat_config_bind_the_same_config_in_either_order() {
         assert_eq!(config.relay_timeout_ms, 1_234);
     };
 
-    let portable = |builder: crate::PortableEndpointBuilder<CountingEntropy>| {
+    let portable = |builder: crate::PortableEndpointBuilder<CountingEntropy, ManualClock>| {
         let circuits = minip2p_circuit::CircuitTransport::new(
             FlashTransport::default(),
             key(1),
@@ -386,7 +388,8 @@ fn relay_and_nat_config_bind_the_same_config_in_either_order() {
         let endpoint = builder.build_with_circuits(circuits).expect("builds");
         check(endpoint.engine.nat.as_ref().expect("NAT").config());
     };
-    let builder = || crate::PortableEndpointBuilder::new(&key(1), CountingEntropy(0));
+    let builder =
+        || crate::PortableEndpointBuilder::new(&key(1), CountingEntropy(0), ManualClock::default());
     portable(
         builder()
             .relay(server(3))

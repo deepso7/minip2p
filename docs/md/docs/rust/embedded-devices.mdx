@@ -28,7 +28,7 @@ Add only what you need:
 
 These are the same names the std `Endpoint` uses.
 
-None of these needs smoltcp: they configure the same `PortableEndpoint` over any transport you build yourself (`Endpoint::portable(..).build(transport)`, or `build_with_circuits` over a `CircuitTransport` for relays). `.smoltcp(stack)` is the shortcut that builds TCP and mDNS on one stack for you.
+None of these needs smoltcp: they configure the same `PortableEndpoint` over any transport you build yourself (`PortableEndpointBuilder::new(..).build(transport)`, or `build_with_circuits` over a `CircuitTransport` for relays). `.smoltcp(stack)` is the shortcut that builds TCP and mDNS on one stack for you.
 
 The QUIC adapter needs `std`, so embedded endpoints cannot use QUIC or DCUtR. They can still use relay circuits.
 
@@ -37,7 +37,7 @@ The QUIC adapter needs `std`, so embedded endpoints cannot use QUIC or DCUtR. Th
 You own three things:
 
 1. A `smoltcp::phy::Device` and configured `smoltcp::iface::Interface`.
-2. A monotonic millisecond counter used to build `Now` values.
+2. A `Clock` over a monotonic millisecond counter, which the endpoint samples once per call.
 3. An `EntropySource` from a cryptographically secure hardware RNG or a securely seeded DRBG.
 
 Do not use a predictable PRNG. Identity, Noise, and protocol nonces all depend on this entropy; if it fails, the operation must fail.
@@ -59,12 +59,21 @@ let stack = SmoltcpStack::new(device, interface);
 Load or create an Ed25519 identity, inject entropy, add a TCP listener, and register application protocols before `build`:
 
 ```rust
-use minip2p::Endpoint;
+use minip2p::{Clock, Now, PortableEndpointBuilder};
+
+/// The board's monotonic millisecond timer, as the endpoint's clock.
+struct BoardClock;
+
+impl Clock for BoardClock {
+    fn now(&mut self) -> Now {
+        Now::from_millis(monotonic_millis())
+    }
+}
 
 let identity = load_device_identity()?;
 let entropy = HardwareEntropy::new(board_rng());
 
-let mut endpoint = Endpoint::portable(&identity, entropy)
+let mut endpoint = PortableEndpointBuilder::new(&identity, entropy, BoardClock)
     .agent_version("sensor-node/0.1.0")
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
@@ -77,7 +86,7 @@ Prefer a real interface address over `0.0.0.0` when Identify and discovery shoul
 Optional services go on the same builder. The following example requires the `smoltcp` and `discovery` features (`discovery` includes the pubsub it runs on):
 
 ```rust
-let mut endpoint = Endpoint::portable(&identity, entropy)
+let mut endpoint = PortableEndpointBuilder::new(&identity, entropy, BoardClock)
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
     .mdns()
@@ -89,15 +98,13 @@ For this combination, install with `cargo add minip2p-rs --no-default-features -
 
 ## Drive time and network progress
 
-No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. Each `poll` runs one batch and returns its events in the same order as the hosted endpoint: swarm events, then capability events, then `ConnectSettled` terminals. `poll(now)` returns `Vec<EndpointEvent>`, and `shutdown(now)` returns a `ShutdownReport` whose `events` holds the final ones (next to every `errors` entry and the `unfinished` connections dropped with the transport); enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and (with mDNS) `EndpointEvent::MdnsFailed` / `MdnsRecovered` variants. An mDNS carrier failure is one of those events, never a `poll` error: mDNS retries and the rest of the endpoint keeps running. In `shutdown(now)` mDNS goodbyes are best effort, so a failed one appears as `MdnsFailed` among the report's events:
+No executor, no background thread. Poll the endpoint, which samples its clock, handle every event, then use `next_deadline` to decide how long the board may sleep. (To take the sample yourself instead, build with a `ManualClock` and call `endpoint.at(now).poll()`.) Each `poll` runs one batch and returns its events in the same order as the hosted endpoint: swarm events, then capability events, then `ConnectSettled` terminals. `poll()` returns `Vec<EndpointEvent>`, and the consuming `close()` returns a `CloseReport` whose `events` holds the final ones (next to every `errors` entry and the `unfinished` connections dropped with the transport); enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and (with mDNS) `EndpointEvent::MdnsFailed` / `MdnsRecovered` variants. An mDNS carrier failure is one of those events, never a `poll` error: mDNS retries and the rest of the endpoint keeps running. In `close()` mDNS goodbyes are best effort, so a failed one appears as `MdnsFailed` among the report's events:
 
 ```rust
-use minip2p::{EndpointEvent, Now};
+use minip2p::EndpointEvent;
 
 loop {
-    let now = Now::from_millis(monotonic_millis());
-
-    for event in endpoint.poll(now)? {
+    for event in endpoint.poll()? {
         match event {
             EndpointEvent::Discovery(event) => handle_discovery_event(event),
             EndpointEvent::Gossipsub(event) => handle_pubsub_event(event),
@@ -105,8 +112,9 @@ loop {
         }
     }
 
+    let now = BoardClock.now();
     let wait_ms = endpoint
-        .next_deadline(now)
+        .next_deadline()
         .map(|deadline| deadline.millis_until(now));
 
     wait_for_network_irq_or_timer(wait_ms);
@@ -136,7 +144,7 @@ let transport = TcpConfig {
     ..TcpConfig::default()
 };
 
-let endpoint = Endpoint::portable(&identity, entropy)
+let endpoint = PortableEndpointBuilder::new(&identity, entropy, BoardClock)
     .smoltcp(stack)
     .smoltcp_config(provider)
     .tcp_config(transport)

@@ -410,11 +410,11 @@ impl Transport for Breakable {
 }
 
 /// Host `a` over a [`Breakable`] transport, connected to `b` and settled,
-/// with the switch for its mode. `b`'s host is pumped alongside, then dropped.
+/// with the switch for its mode, and `b`'s host, pumped alongside.
 fn connected_breakable(
     a: InMemoryTransport,
     b: InMemoryTransport,
-) -> (Host<Breakable>, Rc<Cell<Mode>>) {
+) -> (Host<Breakable>, Host<InMemoryTransport>, Rc<Cell<Mode>>) {
     let mode = Rc::new(Cell::new(Mode::Up));
     let mut a = Host::new(vec![1; 32], config(), |_| Breakable(a, mode.clone())).expect("a");
     let mut b = Host::new(vec![2; 32], config(), |_| b).expect("b");
@@ -426,7 +426,9 @@ fn connected_breakable(
         a.drain_events(LIMIT);
         b.drain_events(LIMIT);
     }
-    (a, mode)
+    // `b` is returned, not dropped: dropping an endpoint disconnects it,
+    // and these tests need a peer that stays connected but silent.
+    (a, b, mode)
 }
 
 /// A clean shutdown that leaves a connection still tracked ends
@@ -436,7 +438,7 @@ fn connected_breakable(
 fn a_close_that_abandons_a_connection_ends_deadline_expired() {
     let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
     let conn_id = a.connection_id();
-    let (mut a, mode) = connected_breakable(a, b);
+    let (mut a, _b, mode) = connected_breakable(a, b);
     mode.set(Mode::Deaf);
     a.close(Now::from_millis(32));
     let events = a.drain_events(LIMIT);
@@ -459,7 +461,7 @@ fn a_close_that_abandons_a_connection_ends_deadline_expired() {
 fn a_failed_close_carries_its_events_and_unfinished_connections() {
     let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
     let conn_id = a.connection_id();
-    let (mut a, mode) = connected_breakable(a, b);
+    let (mut a, _b, mode) = connected_breakable(a, b);
     mode.set(Mode::Gone);
     a.close(Now::from_millis(32));
     let events = a.drain_events(LIMIT);

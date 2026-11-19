@@ -92,12 +92,12 @@ use crate::{ConnectionInfo, EndpointEvent, StreamAcks};
 /// a type-erased, non-`Send` carrier never enters it; portable uses
 /// `Box<dyn MdnsIo>`.
 #[cfg(feature = "mdns")]
-pub(crate) trait Carrier: minip2p_mdns::MdnsIo {}
+pub trait Carrier: minip2p_mdns::MdnsIo {}
 #[cfg(feature = "mdns")]
 impl<I: minip2p_mdns::MdnsIo> Carrier for I {}
 /// What an engine needs from its mDNS carrier: nothing, without mDNS.
 #[cfg(not(feature = "mdns"))]
-pub(crate) trait Carrier {}
+pub trait Carrier {}
 #[cfg(not(feature = "mdns"))]
 impl<I> Carrier for I {}
 

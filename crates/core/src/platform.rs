@@ -9,8 +9,9 @@
 //! This module holds those contracts, plus the [`Deadline`] type that
 //! caller-driven components use to report when they next need attention, and
 //! [`IoErrorKind`], a portable classification of I/O failures. It is
-//! `no_std` + `alloc` compatible and has no networking code; the `std` feature
-//! adds [`StdClock`] and [`StdEntropy`] for hosted platforms.
+//! `no_std` + `alloc` compatible and has no networking code. [`ManualClock`]
+//! replays a sample the host set itself; the `std` feature adds
+//! [`StdClock`] and [`StdEntropy`] for hosted platforms.
 //!
 //! # Example
 //!
@@ -55,7 +56,7 @@ mod io;
 #[cfg(feature = "std")]
 mod std_impl;
 
-pub use clock::{Clock, Now};
+pub use clock::{Clock, ManualClock, Now};
 pub use deadline::Deadline;
 pub use entropy::{EntropyError, EntropySource, SharedEntropy};
 pub use io::IoErrorKind;
