@@ -56,12 +56,8 @@ pub(crate) type EngineOf<P> =
 ///
 /// Dropping an endpoint disconnects its established peers, best effort, so
 /// a listener is not left on an idle timeout; `close` reports what that
-/// teardown did. Neither helps after `kill -9` or a hard partition. On a
-/// [`Portable`](crate::Portable) platform a drop can only ask the transport
-/// to close: a transport whose stack the host drives (smoltcp) sends those
-/// closes only when it is polled again, which a dropped endpoint never is.
-/// To notify peers there, [`disconnect`](Self::disconnect) them and keep
-/// polling until their `ConnectionClosed` before closing the endpoint.
+/// teardown did, and both poll the transport again so its closes reach
+/// the wire. Neither helps after `kill -9` or a hard partition.
 ///
 /// # State snapshots
 ///
@@ -712,7 +708,8 @@ impl<P: Platform> Endpoint<P> {
     ///
     /// On a [`Portable`](crate::Portable) platform it does not wait for
     /// teardown. At one clock sample it sends mDNS goodbyes, disconnects
-    /// established peers, drives the endpoint once more, and consumes it. The
+    /// established peers, drives the endpoint twice more (once to run the
+    /// closes, once to send them), and consumes it. The
     /// [`CloseReport`] carries the final Endpoint events, including
     /// capability events still queued (Gossipsub events still inside the
     /// agent too), any a failed [`poll`](Self::poll) left, and those the
@@ -772,6 +769,13 @@ impl<P: Platform> Drop for Endpoint<P> {
         };
         if disconnect {
             drop(self.disconnect_established(now));
+            // Two polls before the transport goes: the first runs the
+            // swarm's deferred closes, the second puts them on the wire (a
+            // smoltcp provider sends its FINs only when polled). Their
+            // events have no reader any more.
+            for _ in 0..2 {
+                drop(self.engine.core.poll(now));
+            }
         }
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         if let Some(backbone) = self

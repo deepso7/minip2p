@@ -453,6 +453,90 @@ fn portable_connect_settles_over_smoltcp_tcp() {
     panic!("portable connect did not settle\n  dialer: {dialer_events:?}");
 }
 
+/// Dropping or closing a connected portable endpoint sends its close: the
+/// smoltcp provider owns the stack, so the teardown's final transport polls
+/// put the FIN on the wire and the remote sees the connection end.
+#[test]
+fn dropping_a_portable_endpoint_closes_its_smoltcp_connections() {
+    remote_sees_teardown(drop);
+}
+
+#[test]
+fn closing_a_portable_endpoint_closes_its_smoltcp_connections() {
+    remote_sees_teardown(|endpoint| drop(endpoint.close()));
+}
+
+fn remote_sees_teardown(teardown: impl FnOnce(Portable)) {
+    let wire = Wire::default();
+    let dialer_identity = identity(5);
+    let listener_identity = identity(6);
+    let dialer_peer = dialer_identity.peer_id();
+    let listener_peer = listener_identity.peer_id();
+    let mut dialer = endpoint(
+        wire.dialer_device(),
+        &format!("{DIALER_IP}/24"),
+        &dialer_identity,
+        31,
+    );
+    let mut listener = endpoint(
+        wire.listener_device(),
+        &format!("{LISTENER_IP}/24"),
+        &listener_identity,
+        41,
+    );
+    let listen: Multiaddr = format!("/ip4/{LISTENER_IP}/tcp/4001")
+        .parse()
+        .expect("valid listen address");
+    let bound = listener.listen_on(&listen).expect("listener binds");
+    let target = PeerAddr::new(bound, listener_peer).expect("valid peer address");
+    dialer
+        .at(Now::from_millis(0))
+        .connect(target)
+        .expect("connect admitted");
+
+    let mut now_ms = 0;
+    let mut connected = false;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        dialer.at(now).poll().expect("dialer polls");
+        listener.at(now).poll().expect("listener polls");
+        if dialer.connection_id(&listener_peer).is_some()
+            && listener.connection_id(&dialer_peer).is_some()
+        {
+            connected = true;
+            break;
+        }
+        if wire.is_quiet()
+            && let Some(deadline) = Deadline::earliest_opt(
+                dialer.at(now).next_deadline(),
+                listener.at(now).next_deadline(),
+            )
+        {
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    assert!(connected, "the peers did not connect");
+    let now = Now::from_millis(now_ms);
+
+    teardown(dialer);
+    // The clock stays put, so only the dialer's close can end the
+    // connection here, never an idle timeout.
+    let closed = (0..MAX_STEPS).any(|_| {
+        listener
+            .at(now)
+            .poll()
+            .expect("listener polls")
+            .iter()
+            .any(|event| {
+                matches!(event, EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == dialer_peer)
+            })
+    });
+    assert!(
+        closed,
+        "the listener never saw the torn-down dialer's close"
+    );
+}
+
 /// The host reconfigures a wildcard listener's interface through a stack
 /// handle it kept, with no further `listen`: the endpoint's warmed address
 /// cache must notice, so Identify advertises the new address.

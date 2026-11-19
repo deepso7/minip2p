@@ -181,9 +181,15 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
         drop(self.engine.shutdown_mdns(now));
         let mut errors = self.disconnect_established(now);
         let mut outcome = CloseOutcome::Drained;
-        if let Err(error) = self.engine.drive(now, &mut Concrete) {
-            errors.push(error);
-            outcome = CloseOutcome::Failed;
+        // Two final drives: the first runs the swarm's deferred closes, the
+        // second puts them on the wire (a smoltcp provider sends its FINs
+        // only when polled).
+        for _ in 0..2 {
+            if let Err(error) = self.engine.drive(now, &mut Concrete) {
+                errors.push(error);
+                outcome = CloseOutcome::Failed;
+                break;
+            }
         }
         // Hand over what the swarm queued without polling again: a failed
         // drive's leftovers (a disconnect's close failure, say), or what the
