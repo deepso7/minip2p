@@ -21,8 +21,12 @@ use minip2p_swarm::{DriverError, SwarmError};
 /// [`Endpoint::add_protocol`](crate::Endpoint::add_protocol), and carried on
 /// [`EndpointEvent::StreamReady`](crate::EndpointEvent::StreamReady).
 /// [`Endpoint::protocol_name`](crate::Endpoint::protocol_name) turns it back
-/// into the string id. A handle means nothing to another endpoint: two
-/// endpoints number the same protocol independently.
+/// into the string id.
+///
+/// A handle is an index into its endpoint's table, not a checked token:
+/// keep it with the endpoint that issued it. Two endpoints number their
+/// protocols independently, so another endpoint resolves the same handle
+/// to whatever it registered at that position, or to nothing.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolId(u16);
 
@@ -99,17 +103,34 @@ impl ProtocolTable {
         self.names.get(usize::from(id.0)).map(String::as_str)
     }
 
+    /// The handle the next new name gets; `None` when the table is full.
+    fn next_id(&self) -> Option<ProtocolId> {
+        u16::try_from(self.names.len())
+            .ok()
+            .filter(|&index| index != UNNAMED.0)
+            .map(ProtocolId)
+    }
+
     /// The handle for `name`, numbering it if it is new; `None` only when
     /// the table is full.
     fn try_intern(&mut self, name: &str) -> Option<ProtocolId> {
         if let Some(id) = self.id(name) {
             return Some(id);
         }
-        let id = u16::try_from(self.names.len())
-            .ok()
-            .filter(|&index| index != UNNAMED.0)?;
+        let id = self.next_id()?;
         self.names.push(name.to_string());
-        Some(ProtocolId(id))
+        Some(id)
+    }
+
+    /// Fails as [`Self::intern`] would for `name`, without numbering it: a
+    /// registration checks this before it touches the swarm, so a refused
+    /// protocol is never negotiated either.
+    pub(crate) fn check_room(&self, name: &str) -> Result<(), DriverError> {
+        if self.id(name).is_some() || self.next_id().is_some() {
+            Ok(())
+        } else {
+            Err(DriverError::Invariant { reason: TABLE_FULL })
+        }
     }
 
     /// The handle for a protocol being registered, numbering it if it is
@@ -159,5 +180,20 @@ mod tests {
             table.resolve(ProtocolId(7).into()),
             Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
         ));
+    }
+
+    #[test]
+    fn a_full_table_refuses_only_new_names() {
+        let mut table = ProtocolTable {
+            names: (0..UNNAMED.0).map(|i| alloc::format!("/p/{i}")).collect(),
+        };
+        table
+            .check_room("/p/7")
+            .expect("a known name needs no room");
+        table
+            .check_room("/new/1")
+            .expect_err("no room for a new name");
+        table.intern("/new/1").expect_err("no room for a new name");
+        assert_eq!(table.for_event("/new/1"), UNNAMED);
     }
 }

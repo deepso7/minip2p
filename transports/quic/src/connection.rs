@@ -231,6 +231,8 @@ pub(crate) struct QuicConnection {
     /// has not all acknowledged yet (the engine's `Finished`): still being
     /// delivered, so [`Self::has_pending_writes`] counts them.
     unacked_fins: BTreeSet<u64>,
+    /// Stream bytes the engine took that may not have left yet.
+    engine_output: EngineOutput,
     /// Streams that spent their receive budget with input still waiting in
     /// the engine. The engine raises `Readable` only when data arrives, so
     /// `ack_stream` rescans these.
@@ -259,6 +261,51 @@ struct WtConfig {
     context: SharedContext,
     /// How long, from QUIC handshake completion, Noise may take.
     handshake_timeout: Duration,
+}
+
+/// Stream bytes handed to the engine that may still be waiting in it.
+///
+/// quinn-proto keeps stream data the congestion window, pacing or the
+/// peer's credit holds back, and exposes no count of it. So this counts the
+/// bytes written since the engine last caught up and treats them as sent
+/// once the connection has put at least as many bytes on the wire since
+/// (`udp_tx`, which also counts headers and other frames, so it errs toward
+/// "sent" only by that overhead).
+#[derive(Debug, Default)]
+struct EngineOutput {
+    /// Bytes written into the engine since `tx_mark`.
+    written: u64,
+    /// The connection's `udp_tx` bytes when `written` started counting.
+    tx_mark: u64,
+}
+
+impl EngineOutput {
+    /// The engine took `bytes` more stream bytes.
+    fn wrote(&mut self, conn: &quinn_proto::Connection, bytes: usize) {
+        if self.written == 0 {
+            self.tx_mark = conn.stats().udp_tx.bytes;
+        }
+        self.written = self.written.saturating_add(bytes as u64);
+    }
+
+    /// Whether the engine may still hold some of what it took.
+    fn may_hold(&self, conn: &quinn_proto::Connection) -> bool {
+        self.written > conn.stats().udp_tx.bytes.saturating_sub(self.tx_mark)
+    }
+
+    /// Stops counting once everything written has gone out.
+    fn settle(&mut self, conn: &quinn_proto::Connection) {
+        if !self.may_hold(conn) {
+            self.written = 0;
+        }
+    }
+
+    /// A reset send half discarded what the engine held for it, and no
+    /// count says how much that was: stop counting rather than wait on
+    /// bytes that will never leave.
+    fn forget(&mut self) {
+        self.written = 0;
+    }
 }
 
 /// The engine's id for a raw stream id the adapter tracks.
@@ -303,6 +350,7 @@ impl QuicConnection {
             ),
             writable_armed: BTreeSet::new(),
             unacked_fins: BTreeSet::new(),
+            engine_output: EngineOutput::default(),
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
             timeout: None,
@@ -387,17 +435,21 @@ impl QuicConnection {
         self.timeout
     }
 
-    /// Whether the last service left work that needs another without any
-    /// packet or timer to prompt it.
     /// Whether accepted stream output is still on its way: bytes or FINs
-    /// queued here, output the socket pushed back, or a FIN the peer has not
-    /// acknowledged yet. Bytes on a stream left open count once the engine
-    /// took them. A closing connection has dropped its writes.
+    /// queued here, bytes the engine took but has not sent (congestion,
+    /// pacing or peer credit holding them), output the socket pushed back,
+    /// or a FIN the peer has not acknowledged yet. A closing connection has
+    /// dropped its writes.
     pub(crate) fn has_pending_writes(&self) -> bool {
         !self.is_closing()
-            && (!self.send_queues.is_empty() || !self.unacked_fins.is_empty() || self.unfinished)
+            && (!self.send_queues.is_empty()
+                || !self.unacked_fins.is_empty()
+                || self.unfinished
+                || self.engine_output.may_hold(&self.conn))
     }
 
+    /// Whether the last service left work that needs another without any
+    /// packet or timer to prompt it.
     pub(crate) fn is_unfinished(&self) -> bool {
         self.unfinished
     }
@@ -498,6 +550,7 @@ impl QuicConnection {
             }
         }
         let failure = self.transmit(now, cx);
+        self.engine_output.settle(&self.conn);
         // The engine's timer, or an earlier WebTransport one.
         let wt = self.wt.as_ref().and_then(WtSession::poll_timeout);
         self.timeout = [self.conn.poll_timeout(), wt].into_iter().flatten().min();
@@ -569,6 +622,8 @@ impl QuicConnection {
             }
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 let raw = u64::from(id);
+                // A stopped send half never reports `Finished`.
+                self.unacked_fins.remove(&raw);
                 if let Some(wt) = self.wt.as_mut()
                     && wt.on_stopped(&mut self.conn, raw, error_code)
                 {
@@ -1025,6 +1080,7 @@ impl QuicConnection {
                 match self.conn.send_stream(stream).reset(code) {
                     Ok(()) | Err(_) => {}
                 }
+                self.engine_output.forget();
                 self.note_stream_reset(raw, events);
             }
         }
@@ -1039,6 +1095,7 @@ impl QuicConnection {
     /// through unchanged.
     fn on_stopped(&mut self, raw: u64, error_code: VarInt, events: &mut Vec<TransportEvent>) {
         self.unacked_fins.remove(&raw);
+        self.engine_output.forget();
         match self.conn.send_stream(engine_stream(raw)).reset(error_code) {
             Ok(()) | Err(_) => {}
         }
@@ -1201,6 +1258,7 @@ impl QuicConnection {
             let offer = data.get(..room).unwrap_or(&data);
             match self.conn.send_stream(engine_stream(raw)).write(offer) {
                 Ok(written) => {
+                    self.engine_output.wrote(&self.conn, written);
                     if let Some(wt) = self.wt.as_mut() {
                         wt.note_sent(written);
                     }
@@ -1487,6 +1545,8 @@ impl QuicConnection {
     /// Resets a stream's send half and stops its receive half with `code`;
     /// a half already closed is left alone.
     fn reset_on_wire(&mut self, raw: u64, code: VarInt) {
+        self.unacked_fins.remove(&raw);
+        self.engine_output.forget();
         let stream = engine_stream(raw);
         match self.conn.send_stream(stream).reset(code) {
             Ok(()) | Err(_) => {}
@@ -1504,6 +1564,7 @@ impl QuicConnection {
         self.pending_write_bytes = 0;
         self.writable_armed.clear();
         self.unacked_fins.clear();
+        self.engine_output.forget();
     }
 
     /// Pushes queued writes into the engine, round-robin: each stream in turn
@@ -1579,6 +1640,7 @@ impl QuicConnection {
                 match self.conn.send_stream(stream).write(offer) {
                     Ok(0) => return progressed,
                     Ok(written) => {
+                        self.engine_output.wrote(&self.conn, written);
                         if !front.internal {
                             queue.pending -= written;
                             self.pending_write_bytes -= written;
@@ -1752,6 +1814,8 @@ impl QuicConnection {
     /// longer be delivered.
     fn note_stream_reset(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
         self.drop_send_queue(raw);
+        // A reset send half never reports `Finished`.
+        self.unacked_fins.remove(&raw);
         self.disarm_writable(raw, events);
         self.gated.remove(&raw);
         // The freed queue may unblock streams waiting on the shared cap.

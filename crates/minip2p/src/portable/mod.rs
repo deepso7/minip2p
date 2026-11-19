@@ -176,11 +176,24 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
     ///
     /// Never blocks: a host that is about to close, or to stop driving the
     /// endpoint, calls it until it returns `true` or its own deadline
-    /// passes, waiting on [`Self::next_deadline`] (and its transport's
-    /// readiness) in between. Returns `true` at once, without a drive, when
-    /// nothing is pending. Events the drive produced stay queued for the
-    /// next [`poll`](Endpoint::poll) or [`close`](Endpoint::close); an error
+    /// passes. Returns `true` at once, without a drive, when nothing is
+    /// pending. Events the drive produced stay queued for the next
+    /// [`poll`](Endpoint::poll) or [`close`](Endpoint::close); an error
     /// discards nothing either.
+    ///
+    /// Queued events keep [`Self::next_deadline`] immediate, so between
+    /// attempts the host must [`poll`](Endpoint::poll) (handling or
+    /// dropping what it returns) before it waits on that deadline and its
+    /// transport's readiness; flushing again without polling spins.
+    ///
+    /// ```ignore
+    /// while !endpoint.flush()? && clock.now() < give_up_at {
+    ///     for event in endpoint.poll()? {
+    ///         handle(event);
+    ///     }
+    ///     wait_until(endpoint.next_deadline()); // or transport readiness
+    /// }
+    /// ```
     pub fn flush(&mut self) -> Result<bool, DriverError> {
         if !self.has_pending_writes() {
             return Ok(true);

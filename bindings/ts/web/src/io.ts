@@ -13,7 +13,8 @@
  * - `write` copies what it accepts before returning, so a queued browser
  *   write never views wasm memory, and caps each stream's in-flight bytes;
  *   each accepted write reports exactly one `writeCompleted` with its own
- *   length, and a write the browser rejects reports nothing.
+ *   length, and a write the browser rejects reports nothing. `closeWrite`
+ *   reports one `writeClosed` once the close resolves (after every write).
  * - Reads are pulled: `grantRead` is additive, at most one read is
  *   outstanding per stream, and `data` never exceeds what was granted.
  * - Handles are never reused, and events for a reset stream or an ended
@@ -69,7 +70,8 @@ export type IoEvent =
       readonly kind: "writeCompleted";
       readonly stream: number;
       readonly bytes: number;
-    };
+    }
+  | { readonly kind: "writeClosed"; readonly stream: number };
 
 /** The part of a browser `WebTransport` that `JsIo` uses. */
 export type WebTransportSession = Pick<
@@ -266,13 +268,16 @@ export class JsIo {
     return accepted;
   }
 
-  /** Finishes the write side after every accepted write. */
+  /** Finishes the write side after every accepted write; `writeClosed` follows. */
   closeWrite(streamId: number): void {
     quietly(() => {
       const stream = this.#streams.get(streamId);
       // Resolves once every accepted write has resolved, and been reported.
       stream?.writer?.close().then(
         () => {
+          if (!stream.dead) {
+            this.#push({ kind: "writeClosed", stream: streamId });
+          }
           stream.writeEnded = true;
           this.#retireIfDone(streamId, stream);
         },

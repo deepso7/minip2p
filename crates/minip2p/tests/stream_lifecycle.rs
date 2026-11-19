@@ -7,9 +7,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use minip2p::{
-    ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, Error, ProtocolId, SwarmError,
-};
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, ProtocolId};
 
 const CHAT: &str = "/minip2p/lifecycle/chat/1";
 const FILE: &str = "/minip2p/lifecycle/file/1";
@@ -92,16 +90,6 @@ fn stream_ready_carries_the_handle_open_stream_takes() {
     }
     // Each side names it with its own handle.
     assert_eq!((local, remote), (Some(file), Some(b_file)));
-
-    // A handle another endpoint issued names nothing here.
-    let foreign = b
-        .add_protocol("/minip2p/lifecycle/only-b/1")
-        .expect("register");
-    assert!(a.protocol_name(foreign).is_none());
-    assert!(matches!(
-        a.open_stream(&b_peer, foreign),
-        Err(Error::Swarm(SwarmError::ProtocolNotRegistered { .. }))
-    ));
 }
 
 /// Larger than the transports' per-stream send caps, so the endpoint and the

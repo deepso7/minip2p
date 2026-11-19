@@ -220,6 +220,7 @@ impl<P: Platform> Endpoint<P> {
         protocol_id: impl Into<String>,
     ) -> Result<ProtocolId, DriverError> {
         let protocol_id = protocol_id.into();
+        self.engine.protocols.check_room(&protocol_id)?;
         self.engine.core.add_protocol(protocol_id.as_str())?;
         self.engine.protocols.intern(&protocol_id)
     }
@@ -236,7 +237,8 @@ impl<P: Platform> Endpoint<P> {
     }
 
     /// The string id behind a handle this endpoint issued; `None` for a
-    /// handle from another endpoint.
+    /// handle it never issued. Handles are endpoint-local indices: one from
+    /// another endpoint may name a different protocol here.
     pub fn protocol_name(&self, protocol: ProtocolId) -> Option<&str> {
         self.engine.protocols.name(protocol)
     }
@@ -477,7 +479,8 @@ impl<P: Platform> Endpoint<P> {
     ///
     /// The protocol must be registered first, or this fails with
     /// [`SwarmError::ProtocolNotRegistered`](minip2p_swarm::SwarmError::ProtocolNotRegistered)
-    /// (as it does for a handle from another endpoint). Allowed once the
+    /// (as it does for a handle this endpoint never issued; a handle from
+    /// another endpoint may name a different protocol here). Allowed once the
     /// peer is connected. Identify (`PeerReady`) is not
     /// required first; after Identify completes, an unsupported protocol can
     /// fail early with

@@ -56,6 +56,9 @@ struct FakeIo {
     connects: Vec<(String, Vec<Multihash>)>,
     streams: BTreeMap<u64, FakeStream>,
     closed_sessions: Vec<u64>,
+    /// `close_write` waits for [`Self::write_closed`] instead of reporting
+    /// the close at once.
+    hold_closes: bool,
     events: VecDeque<IoEvent>,
 }
 
@@ -67,6 +70,7 @@ impl FakeIo {
             connects: Vec::new(),
             streams: BTreeMap::new(),
             closed_sessions: Vec::new(),
+            hold_closes: false,
             events: VecDeque::new(),
         }
     }
@@ -93,6 +97,14 @@ impl FakeIo {
             stream: handle,
             bytes,
         });
+    }
+
+    /// Reports `handle`'s FIN closed, as the browser's `writer.close()`
+    /// resolving.
+    fn write_closed(&mut self, handle: StreamHandle) {
+        assert!(self.stream(handle).fin, "close_write first");
+        self.events
+            .push_back(IoEvent::WriteClosed { stream: handle });
     }
 
     /// Delivers `len` bytes on `handle`, which must have been granted.
@@ -152,6 +164,9 @@ impl WebTransportIo for FakeIo {
 
     fn close_write(&mut self, stream: StreamHandle) {
         self.stream(stream).fin = true;
+        if !self.hold_closes {
+            self.write_closed(stream);
+        }
     }
 
     fn reset(&mut self, stream: StreamHandle, _code: u8) {
@@ -975,4 +990,27 @@ fn stop_sending_on_a_pending_noise_stream_fails_the_handshake() {
     assert_eq!(poll(&mut client), []);
     assert_eq!(client.io_mut().stream(noise).written.len(), 10);
     assert_eq!(client.next_deadline(), None);
+}
+
+#[test]
+fn a_fin_stays_pending_until_the_platform_reports_it_closed() {
+    let mut client = client(WebTransportLimits::default());
+    let conn = connect(&mut client);
+    let (stream, handle) = open(&mut client, &conn);
+    assert!(!client.has_pending_writes());
+    client.io_mut().hold_closes = true;
+    client.close_stream_write(conn.id, stream).expect("fin");
+    poll(&mut client);
+    assert!(
+        client.io_mut().stream(handle).fin,
+        "the FIN is with the platform"
+    );
+    assert!(
+        client.has_pending_writes(),
+        "its close has not resolved yet"
+    );
+
+    client.io_mut().write_closed(handle);
+    poll(&mut client);
+    assert!(!client.has_pending_writes());
 }

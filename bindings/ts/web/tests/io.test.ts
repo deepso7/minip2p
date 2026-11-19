@@ -347,12 +347,16 @@ describe("JsIo", () => {
     await flush();
     expect(events()).toEqual([{ kind: "fin", stream }]);
 
-    // The write still in flight is reported, then the stream is gone.
+    // The write still in flight is reported, then the close, then the
+    // stream is gone.
     fake.completeWrite();
     await flush();
 
     expect(fake.closedWrite).toBe(true);
-    expect(events()).toEqual([{ bytes: 1, kind: "writeCompleted", stream }]);
+    expect(events()).toEqual([
+      { bytes: 1, kind: "writeCompleted", stream },
+      { kind: "writeClosed", stream },
+    ]);
     expect(() => io.write(stream, new Uint8Array([2]))).toThrow(
       /not writable/u
     );

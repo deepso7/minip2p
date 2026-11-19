@@ -595,6 +595,9 @@ impl QuinnIo {
                 match send.finish() {
                     Ok(()) | Err(_) => {}
                 }
+                self.events.push_back(IoEvent::WriteClosed {
+                    stream: StreamHandle(stream),
+                });
             }
         }
     }

@@ -146,6 +146,10 @@ struct Session {
     pending: usize,
     /// Streams that returned `Full` and wait for a `StreamWritable`.
     writable_armed: BTreeSet<StreamHandle>,
+    /// Streams whose FIN went to the platform and whose `WriteClosed` (or
+    /// stop or reset) has not arrived: still pending writes. Apart from
+    /// `streams`, which may forget a stream first.
+    closing: BTreeSet<StreamHandle>,
 }
 
 /// Whether a session is still coming up, or carries the caller's streams.
@@ -337,6 +341,7 @@ impl Session {
         }
         if state.write == Write::FinQueued {
             state.write = Write::Finished;
+            self.closing.insert(handle);
             io.close_write(handle);
         }
         false
@@ -360,6 +365,7 @@ impl Session {
     /// pending `StreamWritable`.
     fn drop_writes(&mut self, handle: StreamHandle) {
         self.writable_armed.remove(&handle);
+        self.closing.remove(&handle);
         if let Some(state) = self.streams.get_mut(&handle) {
             state.write = Write::Stopped;
             state.writes.clear();
@@ -514,6 +520,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             IoEvent::IncomingStream { session, stream } => self.on_incoming_stream(session, stream),
             IoEvent::Data { stream, bytes } => self.on_data(stream, bytes),
             IoEvent::Fin { stream } => self.on_fin(stream),
+            IoEvent::WriteClosed { stream } => self.write_closed(stream),
             IoEvent::Reset { stream, .. } => match self.owner(stream) {
                 // A caller stream's reset may be its session ending.
                 Some((_, false)) => self.held_resets.push((
@@ -522,7 +529,11 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 )),
                 _ => self.on_reset(stream),
             },
-            IoEvent::StopSending { stream, code } => self.on_stop_sending(stream, code),
+            IoEvent::StopSending { stream, code } => {
+                // A FIN the stream may still hold can no longer be sent.
+                self.write_closed(stream);
+                self.on_stop_sending(stream, code);
+            }
             IoEvent::WriteCompleted { stream, bytes } => {
                 let Some((id, noise)) = self.owner(stream) else {
                     return;
@@ -871,6 +882,16 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         }
     }
 
+    /// The platform is done with `handle`'s FIN: it closed the write side,
+    /// or a stop ended it.
+    fn write_closed(&mut self, handle: StreamHandle) {
+        for conn in self.connections.values_mut() {
+            if conn.closing.remove(&handle) {
+                return;
+            }
+        }
+    }
+
     fn on_reset(&mut self, handle: StreamHandle) {
         let Some((id, noise)) = self.owner(handle) else {
             return;
@@ -1074,6 +1095,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
                 streams: BTreeMap::new(),
                 pending: 0,
                 writable_armed: BTreeSet::new(),
+                closing: BTreeSet::new(),
             },
         );
         Ok(id)
@@ -1300,10 +1322,11 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
     }
 
     /// Bytes not yet reported written by the platform, or a FIN still
-    /// queued behind them.
+    /// queued behind them or not yet reported closed.
     fn has_pending_writes(&self) -> bool {
         self.connections.values().any(|session| {
             session.pending != 0
+                || !session.closing.is_empty()
                 || session
                     .streams
                     .values()

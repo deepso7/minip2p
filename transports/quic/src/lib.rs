@@ -1500,8 +1500,9 @@ impl Transport for QuicTransport {
     }
 
     /// Datagrams waiting on socket writability, or, on a connection that
-    /// is not closing, stream bytes or FINs still queued, output a service
-    /// left unfinished, or a FIN its peer has not acknowledged yet (see
+    /// is not closing, stream bytes or FINs still queued, bytes the engine
+    /// took but has not sent yet, output a service left unfinished, or a
+    /// FIN its peer has not acknowledged yet (see
     /// [`Transport::has_pending_writes`]).
     fn has_pending_writes(&self) -> bool {
         self.sockets.iter().any(Socket::has_pending)

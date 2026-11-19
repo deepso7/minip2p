@@ -79,6 +79,10 @@ pub enum IoEvent {
     /// One accepted [`WebTransportIo::write`] resolved, releasing exactly
     /// its `bytes`.
     WriteCompleted { stream: StreamHandle, bytes: usize },
+    /// A [`WebTransportIo::close_write`] resolved: the FIN, after every
+    /// accepted write, is the platform's to deliver. A stream stopped or
+    /// reset first reports that instead.
+    WriteClosed { stream: StreamHandle },
 }
 
 /// The platform's WebTransport API, as a caller-driven provider.
@@ -106,7 +110,8 @@ pub trait WebTransportIo {
     /// complete.
     fn write(&mut self, stream: StreamHandle, data: &[u8]) -> Result<usize, IoError>;
 
-    /// Finishes the write side after every accepted write.
+    /// Finishes the write side after every accepted write;
+    /// [`IoEvent::WriteClosed`] follows once the platform has.
     fn close_write(&mut self, stream: StreamHandle);
 
     /// Resets the stream in both directions (`abort()` and `cancel()`).

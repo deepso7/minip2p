@@ -448,6 +448,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         &mut self,
         protocol_id: String,
     ) -> Result<crate::ProtocolId, DriverError> {
+        self.protocols.check_room(&protocol_id)?;
         self.core.add_protocol(protocol_id.clone())?;
         let id = self.protocols.intern(&protocol_id)?;
         let queued = self.events.iter().filter_map(|event| match event {
