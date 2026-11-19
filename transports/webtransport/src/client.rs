@@ -906,6 +906,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 .is_some_and(|conn| !conn.state.is_connected())
             {
                 self.fail(id, "the server reset the Noise stream".into());
+            } else if let Some(conn) = self.connections.get_mut(&id) {
+                // A reset ends the platform's wait for the Noise FIN too.
+                conn.closing.remove(&handle);
             }
             return;
         }

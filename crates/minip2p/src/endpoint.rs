@@ -603,9 +603,10 @@ impl<P: Platform> Endpoint<P> {
     /// everything, close the write side before flushing. The std `flush`
     /// and a portable endpoint's `flush` drive the endpoint until this is
     /// `false`. Bytes a peer's stop or reset, or a connection failure,
-    /// discarded stop counting here; [`EndpointEvent::StreamWriteAborted`],
-    /// [`EndpointEvent::StreamWriteStopped`] or
-    /// [`EndpointEvent::ConnectionClosed`] reports the loss.
+    /// discarded stop counting here; the event that ended the stream or
+    /// connection ([`EndpointEvent::StreamWriteAborted`],
+    /// [`EndpointEvent::StreamWriteStopped`], [`EndpointEvent::StreamClosed`]
+    /// or [`EndpointEvent::ConnectionClosed`]) is all that reports it.
     pub fn has_pending_writes(&self) -> bool {
         !self.engine.writes.is_empty() || self.engine.core.transport().has_pending_writes()
     }

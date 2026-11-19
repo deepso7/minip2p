@@ -210,6 +210,7 @@ fn poll(client: &mut Client) -> Vec<TransportEvent> {
 struct Conn {
     id: ConnectionId,
     session: SessionHandle,
+    noise: StreamHandle,
 }
 
 /// Dials a fake server and answers the Noise handshake as it would.
@@ -283,7 +284,7 @@ fn connect_to(client: &mut Client, transport: &str, offered: Option<Vec<Multihas
         matches!(events.as_slice(), [TransportEvent::Connected { id: got, .. }] if *got == id),
         "{events:?}"
     );
-    Conn { id, session }
+    Conn { id, session, noise }
 }
 
 fn small_limits() -> WebTransportLimits {
@@ -1048,5 +1049,24 @@ fn a_reset_after_both_halves_closed_ends_the_wait_for_the_fin() {
         code: 0,
     });
     assert!(poll(&mut client).is_empty());
+    assert!(!client.has_pending_writes());
+}
+
+/// A reset of the Noise stream once the session is up ends the platform's
+/// wait for its FIN, as on any other stream.
+#[test]
+fn a_reset_noise_stream_ends_the_wait_for_its_fin() {
+    let mut client = client(WebTransportLimits::default());
+    client.io_mut().hold_closes = true;
+    let conn = connect(&mut client);
+    assert!(
+        client.has_pending_writes(),
+        "the Noise FIN waits for the platform"
+    );
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: conn.noise,
+        code: 0,
+    });
+    poll(&mut client);
     assert!(!client.has_pending_writes());
 }
