@@ -419,10 +419,11 @@ export class JsIo {
   ): void {
     stream.writer = bidi.writable.getWriter();
     stream.reader = chunkReader(bidi.readable);
-    // The peer's STOP_SENDING errors the write side.
+    // The peer's STOP_SENDING errors the write side. A rejected
+    // `closeWrite` rejects this too, after its own handler reported it.
     stream.writer.closed.catch((error: unknown) => {
       const code = peerStreamCode(error);
-      if (!stream.dead && code !== undefined) {
+      if (!stream.dead && !stream.writeEnded && code !== undefined) {
         stream.writeEnded = true;
         this.#push({ code, kind: "stopSending", stream: id });
         this.#retireIfDone(id, stream);

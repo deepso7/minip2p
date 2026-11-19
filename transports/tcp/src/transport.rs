@@ -930,7 +930,9 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 
         // Whether the socket already took everything (a flushed connection):
         // then only the `GoAway` can be left over, and it is best effort.
-        let drained = connection.outbound.is_empty() && !connection.session.has_pending_write();
+        // Stream bytes held behind the peer's window count as undelivered:
+        // `go_away` discards them.
+        let drained = connection.outbound.is_empty() && !connection.session.has_unsent_writes();
         // A connection still negotiating has no Yamux session to shut down, so
         // `go_away` refuses and the socket is aborted instead.
         let announced = connection.session.go_away(0).is_ok();

@@ -181,6 +181,13 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
     /// [`poll`](Endpoint::poll) or [`close`](Endpoint::close); an error
     /// discards nothing either.
     ///
+    /// Drained is not delivered: bytes a peer's stop or reset, or
+    /// a connection failure, discarded no longer count as pending, so a flush
+    /// can succeed over them. The loss is reported as
+    /// [`EndpointEvent::StreamWriteAborted`] (the write queue's bytes dropped),
+    /// [`EndpointEvent::StreamWriteStopped`] (the peer stopped reading), or
+    /// [`EndpointEvent::ConnectionClosed`]; watch for those after flushing.
+    ///
     /// Queued events keep [`Self::next_deadline`] immediate, so between
     /// attempts the host must [`poll`](Endpoint::poll) (handling or
     /// dropping what it returns) before it waits on that deadline and its

@@ -425,7 +425,16 @@ impl Endpoint {
     /// for congestion control. Over a relayed connection the FIN is handed
     /// to the relay, without waiting for its acknowledgement. To deliver
     /// everything, close the write side before flushing: `send_stream`,
-    /// `close_stream_write`, `flush`, then `close`. Returns
+    /// `close_stream_write`, `flush`, then `close`.
+    ///
+    /// Drained is not delivered: bytes a peer's stop or reset, or
+    /// a connection failure, discarded no longer count as pending, so a flush
+    /// can succeed over them. The loss is reported as
+    /// [`EndpointEvent::StreamWriteAborted`] (the write queue's bytes dropped),
+    /// [`EndpointEvent::StreamWriteStopped`] (the peer stopped reading), or
+    /// [`EndpointEvent::ConnectionClosed`]; watch for those after flushing.
+    ///
+    /// Returns
     /// `true` at once when nothing is pending; a passed deadline still
     /// drives once. Events the drive produces stay queued for the next
     /// [`wait`](Self::wait) or [`poll`](Endpoint::poll), and an interrupt
