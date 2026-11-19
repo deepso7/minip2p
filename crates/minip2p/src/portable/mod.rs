@@ -1589,6 +1589,7 @@ mod tests {
             report.events
         );
         assert_eq!(report.unfinished, vec![(conn_id, Some(remote))]);
+        assert_eq!(report.outcome, CloseOutcome::Failed);
     }
 
     /// A clock that advances on every read, counting the reads.

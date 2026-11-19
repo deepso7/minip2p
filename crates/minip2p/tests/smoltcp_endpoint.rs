@@ -458,15 +458,31 @@ fn portable_connect_settles_over_smoltcp_tcp() {
 /// put the FIN on the wire and the remote sees the connection end.
 #[test]
 fn dropping_a_portable_endpoint_closes_its_smoltcp_connections() {
-    remote_sees_teardown(drop);
+    remote_sees_teardown(|endpoint, _| drop(endpoint));
 }
 
 #[test]
 fn closing_a_portable_endpoint_closes_its_smoltcp_connections() {
-    remote_sees_teardown(|endpoint| drop(endpoint.close()));
+    remote_sees_teardown(|endpoint, _| drop(endpoint.close()));
 }
 
-fn remote_sees_teardown(teardown: impl FnOnce(Portable)) {
+/// An application that disconnected the peer and already saw its
+/// `ConnectionClosed` may drop at once: the close still reaches the wire.
+#[test]
+fn dropping_after_a_seen_disconnect_still_sends_the_close() {
+    remote_sees_teardown(|mut endpoint, peer| {
+        endpoint.disconnect(&peer).expect("disconnect");
+        let closed = (0..MAX_STEPS).any(|_| {
+            endpoint.poll().expect("poll").iter().any(
+                |event| matches!(event, EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == peer),
+            )
+        });
+        assert!(closed, "the local close was reported");
+        drop(endpoint);
+    });
+}
+
+fn remote_sees_teardown(teardown: impl FnOnce(Portable, PeerId)) {
     let wire = Wire::default();
     let dialer_identity = identity(5);
     let listener_identity = identity(6);
@@ -518,7 +534,7 @@ fn remote_sees_teardown(teardown: impl FnOnce(Portable)) {
     assert!(connected, "the peers did not connect");
     let now = Now::from_millis(now_ms);
 
-    teardown(dialer);
+    teardown(dialer, listener_peer);
     // The clock stays put, so only the dialer's close can end the
     // connection here, never an idle timeout.
     let closed = (0..MAX_STEPS).any(|_| {

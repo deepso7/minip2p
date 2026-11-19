@@ -749,33 +749,21 @@ impl<P: Platform> Endpoint<P> {
 impl<P: Platform> Drop for Endpoint<P> {
     fn drop(&mut self) {
         // Drop cannot surface disconnect failures; transports own final
-        // cleanup. It samples the clock only when there is work, and after a
-        // close it reuses that close's sample.
-        let disconnect = !self.engine.core.connected_peers().is_empty();
-        #[cfg(all(feature = "relay-server", feature = "quic"))]
-        let backbone = self
-            .engine
-            .relay_server
-            .as_ref()
-            .is_some_and(|relay_server| relay_server.backbone.is_some());
-        #[cfg(not(all(feature = "relay-server", feature = "quic")))]
-        let backbone = false;
-        if !disconnect && !backbone {
-            return;
-        }
+        // cleanup. After a close it reuses that close's clock sample.
         let now = match self.closed_at {
             Some(now) => now,
             None => self.now(),
         };
-        if disconnect {
+        if !self.engine.core.connected_peers().is_empty() {
             drop(self.disconnect_established(now));
-            // Two polls before the transport goes: the first runs the
-            // swarm's deferred closes, the second puts them on the wire (a
-            // smoltcp provider sends its FINs only when polled). Their
-            // events have no reader any more.
-            for _ in 0..2 {
-                drop(self.engine.core.poll(now));
-            }
+        }
+        // Two polls before the transport goes, even with no peer left (an
+        // application may have disconnected one and seen its close already):
+        // the first runs the swarm's deferred closes, the second puts them
+        // on the wire (a smoltcp provider sends its FINs only when polled).
+        // Their events have no reader any more.
+        for _ in 0..2 {
+            drop(self.engine.core.poll(now));
         }
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         if let Some(backbone) = self

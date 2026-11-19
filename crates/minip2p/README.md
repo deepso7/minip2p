@@ -89,7 +89,7 @@ let deadline = endpoint.next_deadline();
 
 A host that takes its own time sample each turn passes a `ManualClock` and sets it with `at`: `endpoint.at(now).poll()?`, `endpoint.at(now).send_stream(..)`.
 
-The portable endpoint supports listening (`listen_on(addr)` and `listen_all()`), Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `close()`, which runs one final drive and returns the same `CloseReport` as a std `close_within(Duration::ZERO)`: its events, every error, and the connections still tracked when the transport is dropped (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the report's events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). There is no access to the raw swarm: every dial goes through `connect`.
+The portable endpoint supports listening (`listen_on(addr)` and `listen_all()`), Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `close()`, which runs two final drives (the second sends the closes the first ran) and returns the same `CloseReport` type as std `close_within`: its events, every error, and the connections still tracked when the transport is dropped (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the report's events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). There is no access to the raw swarm: every dial goes through `connect`.
 
 ### Capabilities
 
