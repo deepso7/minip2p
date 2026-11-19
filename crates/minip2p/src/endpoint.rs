@@ -160,7 +160,9 @@ pub struct CloseReport {
     /// Empty means no tracked teardown remains, not that peers acknowledged
     /// it.
     pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
-    /// Events queued before the close and those its teardown produced.
+    /// Events queued before the close and those its teardown produced,
+    /// ending with a [`EndpointEvent::StreamWriteAborted`] for every write
+    /// [`Endpoint::send_stream`] still held.
     pub events: Vec<EndpointEvent>,
     /// Every transport or swarm failure: each disconnect, and a failed
     /// drive. An mDNS goodbye that could not be sent is an
@@ -525,9 +527,9 @@ impl<P: Platform> Endpoint<P> {
     /// [`EndpointEvent::StreamWritable`] for the stream, and send it again.
     /// Full is an outcome, not an error, so `?` never drops it, and the
     /// outcome is `#[must_use]`. While [`Self::send_stream`] holds bytes for
-    /// the stream this accepts nothing, keeping bytes in order, and
-    /// [`EndpointEvent::StreamWriteAccepted`] (not `StreamWritable`) says
-    /// when it drained.
+    /// the stream this accepts nothing, keeping bytes in order, and its
+    /// `StreamWritable` follows [`EndpointEvent::StreamWriteAccepted`] once
+    /// the queue drained.
     ///
     /// Errors as [`Self::send_stream`]'s driver errors do.
     pub fn try_send_stream(
@@ -543,6 +545,13 @@ impl<P: Platform> Endpoint<P> {
     /// stream that it has not finished yet.
     pub fn is_write_pending(&self, stream: StreamKey) -> bool {
         self.engine.writes.is_pending(stream)
+    }
+
+    /// Whether a [`Self::close_stream_write`] is deferred behind bytes
+    /// [`Self::send_stream`] still holds for the stream; further writes are
+    /// refused as [`SendError::Closing`].
+    pub fn is_write_closing(&self, stream: StreamKey) -> bool {
+        self.engine.writes.is_closing(stream)
     }
 
     /// Bytes [`Self::send_stream`] holds across every stream, as charged

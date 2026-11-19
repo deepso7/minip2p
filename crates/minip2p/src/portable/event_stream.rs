@@ -146,7 +146,9 @@ pub enum EndpointEvent {
     /// connection closing); those mean the tail should be dropped. A stream
     /// whose bytes the endpoint's write queue holds (from
     /// [`send_stream`](crate::Endpoint::send_stream)) reports
-    /// [`Self::StreamWriteAccepted`] instead, once the queue has drained.
+    /// [`Self::StreamWriteAccepted`] once the queue has drained, followed by
+    /// this event if a `try_send_stream` on it returned Full meanwhile and
+    /// no deferred FIN closed its write side.
     StreamWritable { peer_id: PeerId, stream: StreamKey },
     /// Every byte [`send_stream`](crate::Endpoint::send_stream) queued for
     /// the stream has now been accepted, and a deferred
@@ -162,8 +164,10 @@ pub enum EndpointEvent {
     StreamWriteAccepted { peer_id: PeerId, stream: StreamKey },
     /// The bytes the write queue held for the stream were dropped unsent:
     /// the stream or its connection ended (queued right after the event that
-    /// ended it), the stream was reset, or a resend failed. `unsent` is how
-    /// many bytes were dropped.
+    /// ended it, or at the end of its batch when a resend failed first), the
+    /// stream was reset, or the endpoint closed (in its
+    /// [`CloseReport`](crate::CloseReport)). `unsent` is how many bytes were
+    /// dropped.
     StreamWriteAborted {
         peer_id: PeerId,
         stream: StreamKey,

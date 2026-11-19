@@ -259,11 +259,8 @@ fn bind_portable() -> Portable {
         .expect("build portable endpoint")
 }
 
-#[test]
-fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
-    let mut clock = StdClock::new();
-    let mut reader = bind_portable();
-    let mut writer = bind_portable();
+/// Connects two portable endpoints and opens one negotiated stream.
+fn open_portable(clock: &mut StdClock, writer: &mut Portable, reader: &mut Portable) -> StreamKey {
     let reader_addr = PeerAddr::new(
         reader
             .listen_on(&"/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
@@ -287,17 +284,26 @@ fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
         .at(clock.now())
         .open_stream(&reader_peer, PROTOCOL)
         .expect("open stream");
-    'negotiate: loop {
+    loop {
         assert!(Instant::now() < deadline, "stream never negotiated");
         let now = clock.now();
         reader.at(now).poll().expect("reader polls");
         for event in writer.at(now).poll().expect("writer polls") {
             if matches!(event, EndpointEvent::StreamReady { stream: ready, .. } if ready == stream)
             {
-                break 'negotiate;
+                return stream;
             }
         }
     }
+}
+
+#[test]
+fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
+    let mut clock = StdClock::new();
+    let mut reader = bind_portable();
+    let mut writer = bind_portable();
+    let stream = open_portable(&mut clock, &mut writer, &mut reader);
+    let deadline = Instant::now() + BACKSTOP;
 
     let payload = payload();
     writer
@@ -341,4 +347,71 @@ fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
         "every byte arrives, in order, before the FIN"
     );
     assert_eq!(writer.queued_write_bytes(), 0);
+}
+
+fn assert_aborted(events: &[EndpointEvent], stream: StreamKey) {
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::StreamWriteAborted { stream: s, unsent, .. } if *s == stream && *unsent > 0
+        )),
+        "a close reports the write it drops: {events:?}"
+    );
+}
+
+#[test]
+fn closing_an_endpoint_aborts_writes_it_still_queues() {
+    // An immediate close ends before the transport reports the connection
+    // closed, so the abort cannot wait for that event.
+    let mut reader = bind(0);
+    let mut writer = bind(PAYLOAD);
+    let stream = open(&mut writer, &mut reader);
+    writer.send_stream(stream, payload()).expect("write");
+    assert!(writer.is_write_pending(stream));
+    assert_aborted(&writer.close_within(Duration::ZERO).events, stream);
+
+    let mut clock = StdClock::new();
+    let mut reader = bind_portable();
+    let mut writer = bind_portable();
+    let stream = open_portable(&mut clock, &mut writer, &mut reader);
+    writer
+        .at(clock.now())
+        .send_stream(stream, payload())
+        .expect("write");
+    assert!(writer.is_write_pending(stream));
+    assert_aborted(&writer.close().events, stream);
+}
+
+#[test]
+fn a_bare_write_waiting_on_writable_is_woken_after_the_queue_drains() {
+    let mut reader = bind(0);
+    let mut writer = bind(2 * PAYLOAD);
+    let stream = open(&mut writer, &mut reader);
+
+    // The bare write fills the stream and waits for its Writable...
+    let SendOutcome::Full { unsent } = writer.try_send_stream(stream, payload()).expect("try")
+    else {
+        panic!("a write past the send caps is not accepted whole");
+    };
+    // ...which the queued write behind it then consumes to drain itself.
+    writer.send_stream(stream, payload()).expect("queued");
+    assert!(writer.is_write_pending(stream));
+
+    let deadline = Instant::now() + BACKSTOP;
+    let mut accepted = false;
+    loop {
+        assert!(Instant::now() < deadline, "the bare writer was never woken");
+        let _ = next(&mut reader);
+        match next(&mut writer) {
+            Some(EndpointEvent::StreamWriteAccepted { stream: s, .. }) if s == stream => {
+                accepted = true;
+            }
+            Some(EndpointEvent::StreamWritable { stream: s, .. }) if s == stream => {
+                assert!(accepted, "the wakeup follows the queue's completion");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(!unsent.is_empty());
 }

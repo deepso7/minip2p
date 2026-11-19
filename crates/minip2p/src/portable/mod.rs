@@ -202,6 +202,9 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
         #[cfg(feature = "pubsub")]
         self.engine.collect_agent_events();
         self.engine.settle(now);
+        // Queued writes the transport has not ended yet die with the endpoint.
+        let aborted = self.engine.writes.abort_all();
+        self.engine.events.extend(aborted);
         let unfinished = self.tracked_connections();
         if outcome == CloseOutcome::Drained && !unfinished.is_empty() {
             outcome = CloseOutcome::DeadlineExpired;

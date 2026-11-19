@@ -290,15 +290,20 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     ) -> Result<SendOutcome, DriverError> {
         let peer_id = self.stream_peer(stream)?;
         if self.writes.is_pending(stream) {
+            self.writes.want_writable(stream);
             return Ok(SendOutcome::Full { unsent: data });
         }
-        SendOutcome::from_send(self.core.send_stream(
+        let outcome = SendOutcome::from_send(self.core.send_stream(
             &peer_id,
             stream.conn_id(),
             stream.stream_id(),
             data,
             now.monotonic_ms,
-        ))
+        ))?;
+        if !outcome.is_accepted() {
+            self.writes.want_writable(stream);
+        }
+        Ok(outcome)
     }
 
     /// Sends a whole payload, queueing what the stream does not accept yet;
@@ -919,6 +924,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// terminals are claimed (and update the book) before the book's events
     /// are drained, so the updates surface in the same batch.
     pub(crate) fn settle(&mut self, now: Now) {
+        self.events.extend(self.writes.take_failed());
         let settled = self.collect_terminals(now);
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_mut() {

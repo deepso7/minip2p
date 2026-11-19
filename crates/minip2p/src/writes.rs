@@ -10,7 +10,7 @@
 //! been accepted, or [`EndpointEvent::StreamWriteAborted`] when the stream
 //! or its connection ends first.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, PeerId, retain_slice};
@@ -126,6 +126,10 @@ struct Held {
     /// A write-side close requested behind the chunks; the FIN follows once
     /// they have all been accepted.
     close_after: bool,
+    /// A resend failed: the stream is gone. Its own terminal event later in
+    /// the batch reports the abort, or [`WriteQueue::take_failed`] does at
+    /// the batch's end.
+    failed: bool,
 }
 
 impl Held {
@@ -148,6 +152,9 @@ pub(crate) struct WriteQueue {
     budget: usize,
     held: usize,
     streams: BTreeMap<StreamKey, Held>,
+    /// Streams whose `try_send_stream` returned Full: their caller holds a
+    /// tail and waits for a Writable, which the queue must not swallow.
+    wake: BTreeSet<StreamKey>,
 }
 
 impl Default for WriteQueue {
@@ -162,6 +169,7 @@ impl WriteQueue {
             budget,
             held: 0,
             streams: BTreeMap::new(),
+            wake: BTreeSet::new(),
         }
     }
 
@@ -173,6 +181,19 @@ impl WriteQueue {
     /// Whether the stream has queued bytes (or a FIN behind them).
     pub(crate) fn is_pending(&self, stream: StreamKey) -> bool {
         self.streams.contains_key(&stream)
+    }
+
+    /// Records that a bare write to `stream` returned Full, so its caller
+    /// gets a `StreamWritable` even if queued bytes take the next one.
+    pub(crate) fn want_writable(&mut self, stream: StreamKey) {
+        self.wake.insert(stream);
+    }
+
+    /// Whether a write-side close is deferred behind the stream's queue.
+    pub(crate) fn is_closing(&self, stream: StreamKey) -> bool {
+        self.streams
+            .get(&stream)
+            .is_some_and(|held| held.close_after)
     }
 
     /// Admits one payload for `stream` against the budget, or hands it back.
@@ -214,6 +235,8 @@ impl WriteQueue {
         let data = self.admit(stream, data)?;
         let mut counted = data.len();
         let tail = match self.streams.get(&stream) {
+            // Nothing to queue, and nothing to charge.
+            Some(_) if data.is_empty() => return Ok(()),
             Some(_) => data,
             None => match SendOutcome::from_send(send(data))? {
                 SendOutcome::Accepted => return Ok(()),
@@ -230,6 +253,7 @@ impl WriteQueue {
                 peer_id,
                 chunks: VecDeque::new(),
                 close_after: false,
+                failed: false,
             })
             .chunks
             .push_back((tail, counted));
@@ -251,6 +275,7 @@ impl WriteQueue {
     /// Drops the stream's queued bytes: the abort event to queue, if any
     /// were held.
     pub(crate) fn forget(&mut self, stream: StreamKey) -> Option<EndpointEvent> {
+        self.wake.remove(&stream);
         let held = self.streams.remove(&stream)?;
         self.held -= held.counted();
         Some(EndpointEvent::StreamWriteAborted {
@@ -260,21 +285,51 @@ impl WriteQueue {
         })
     }
 
+    /// Aborts every queue whose resend failed with no terminal event for it
+    /// in the batch; the engine calls it once a batch is ingested.
+    pub(crate) fn take_failed(&mut self) -> Vec<EndpointEvent> {
+        if self.streams.is_empty() {
+            return Vec::new();
+        }
+        let failed: Vec<StreamKey> = self
+            .streams
+            .iter()
+            .filter(|(_, held)| held.failed)
+            .map(|(stream, _)| *stream)
+            .collect();
+        failed
+            .into_iter()
+            .filter_map(|stream| self.forget(stream))
+            .collect()
+    }
+
+    /// Aborts every queue: the endpoint is closing, and a connection whose
+    /// close the transport has not reported yet drops its bytes all the same.
+    pub(crate) fn abort_all(&mut self) -> Vec<EndpointEvent> {
+        let streams: Vec<StreamKey> = self.streams.keys().copied().collect();
+        streams
+            .into_iter()
+            .filter_map(|stream| self.forget(stream))
+            .collect()
+    }
+
     /// Follows one swarm event before the engine queues it, and returns
     /// whether to drop it plus what to queue right after it.
     ///
     /// A Writable for a stream with queued bytes resends them (and is
     /// consumed: the queue, not the application, owned that tail), yielding
-    /// `StreamWriteAccepted` once they are all accepted. The events that end
-    /// a write side, stream or connection (including `ConnectionReplaced`)
-    /// drop what was queued for it, yielding `StreamWriteAborted`.
+    /// `StreamWriteAccepted` once they are all accepted, then the Writable
+    /// itself if a `try_send_stream` caller is waiting on it. The events that
+    /// end a write side, stream or connection (including
+    /// `ConnectionReplaced`) drop what was queued for it, yielding
+    /// `StreamWriteAborted`.
     pub(crate) fn observe<T: Transport, E: EntropySource>(
         &mut self,
         core: &mut SwarmCore<T, E>,
         event: &SwarmEvent,
         now_ms: u64,
     ) -> (bool, Vec<EndpointEvent>) {
-        if self.streams.is_empty() {
+        if self.streams.is_empty() && self.wake.is_empty() {
             return (false, Vec::new());
         }
         match event {
@@ -283,9 +338,15 @@ impl WriteQueue {
             } => {
                 let stream = StreamKey::new(*conn_id, *stream_id);
                 if !self.is_pending(stream) {
+                    self.wake.remove(&stream);
                     return (false, Vec::new());
                 }
-                (true, self.retry(core, stream, now_ms).into_iter().collect())
+                let mut follow: Vec<EndpointEvent> =
+                    self.retry(core, stream, now_ms).into_iter().collect();
+                if !follow.is_empty() && self.wake.remove(&stream) {
+                    follow.push(event.clone().into());
+                }
+                (true, follow)
             }
             SwarmEvent::StreamWriteStopped {
                 conn_id, stream_id, ..
@@ -307,6 +368,7 @@ impl WriteQueue {
     }
 
     fn forget_connection(&mut self, conn_id: ConnectionId) -> Vec<EndpointEvent> {
+        self.wake.retain(|stream| stream.conn_id() != conn_id);
         let streams: Vec<StreamKey> = self
             .streams
             .keys()
@@ -319,7 +381,9 @@ impl WriteQueue {
             .collect()
     }
 
-    /// Resends the stream's queued chunks until one does not fit.
+    /// Resends the stream's queued chunks until one does not fit, yielding
+    /// `StreamWriteAccepted` once the queue drains. A write side closed
+    /// behind the queue takes no wakeup.
     fn retry<T: Transport, E: EntropySource>(
         &mut self,
         core: &mut SwarmCore<T, E>,
@@ -327,6 +391,9 @@ impl WriteQueue {
         now_ms: u64,
     ) -> Option<EndpointEvent> {
         let held = self.streams.get_mut(&stream)?;
+        if held.failed {
+            return None;
+        }
         let peer_id = held.peer_id;
         while let Some((chunk, counted)) = held.chunks.front_mut() {
             let sent = core.send_stream(
@@ -348,13 +415,18 @@ impl WriteQueue {
                     *chunk = unsent;
                     return None;
                 }
-                // The stream is gone; its own terminal event says why.
-                Err(_) => return self.forget(stream),
+                // The stream is gone; its own terminal event says why, and
+                // aborts the queue after it.
+                Err(_) => {
+                    held.failed = true;
+                    return None;
+                }
             }
         }
         let close_after = held.close_after;
         self.streams.remove(&stream);
         if close_after {
+            self.wake.remove(&stream);
             // A refused FIN means the stream already ended, which its own
             // terminal event reports.
             match core.close_stream_write(&peer_id, stream.conn_id(), stream.stream_id(), now_ms) {
@@ -362,5 +434,48 @@ impl WriteQueue {
             }
         }
         Some(EndpointEvent::StreamWriteAccepted { peer_id, stream })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use minip2p_identity::Ed25519Keypair;
+    use minip2p_transport::StreamId;
+
+    #[test]
+    fn an_empty_write_behind_a_queue_stores_nothing() {
+        let stream = StreamKey::new(ConnectionId::new(1), StreamId::new(1));
+        let peer_id = Ed25519Keypair::from_secret_key_bytes([1; 32]).peer_id();
+        let mut queue = WriteQueue::new(16);
+        let full = |data: Bytes| {
+            Err(DriverError::Full {
+                conn_id: stream.conn_id(),
+                stream_id: stream.stream_id(),
+                unsent: data,
+            })
+        };
+        queue
+            .send(stream, peer_id, Bytes::from(vec![1; 4]), full)
+            .expect("queued");
+        for _ in 0..3 {
+            queue
+                .send(stream, peer_id, Bytes::new(), |_| {
+                    panic!("a queued stream is not sent to")
+                })
+                .expect("empty write");
+        }
+        assert_eq!(queue.streams[&stream].chunks.len(), 1);
+        assert_eq!(queue.held_bytes(), 4);
+
+        // A deferred close still refuses it.
+        assert!(queue.defer_close(stream));
+        assert!(matches!(
+            queue.send(stream, peer_id, Bytes::new(), |_| panic!(
+                "a queued stream is not sent to"
+            )),
+            Err(SendError::Closing { .. })
+        ));
     }
 }
