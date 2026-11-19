@@ -1049,7 +1049,10 @@ impl QuicTransport {
                 self.handles.insert(handle, id);
                 self.received.push(id);
                 self.pending_events
-                    .push(TransportEvent::IncomingConnection { id, endpoint });
+                    .push(TransportEvent::IncomingConnection {
+                        id,
+                        endpoint: Box::new(endpoint),
+                    });
             }
             Err(error) => {
                 if let Some(transmit) = error.response {

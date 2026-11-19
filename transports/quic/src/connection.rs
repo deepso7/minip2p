@@ -682,13 +682,13 @@ impl QuicConnection {
         self.surfaces_streams = true;
         events.push(TransportEvent::Connected {
             id: self.id,
-            endpoint: self.endpoint.clone(),
+            endpoint: Box::new(self.endpoint.clone()),
         });
         if changed {
             events.push(TransportEvent::PeerIdentityVerified {
                 id: self.id,
-                endpoint: self.endpoint.clone(),
-                previous_peer_id: previous,
+                endpoint: Box::new(self.endpoint.clone()),
+                previous_peer_id: previous.map(Box::new),
             });
         }
     }

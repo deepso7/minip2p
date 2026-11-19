@@ -292,12 +292,12 @@ impl FuzzTransport {
         Self {
             initial: Some(TransportEvent::Connected {
                 id: ConnectionId::new(1),
-                endpoint: ConnectionEndpoint::with_peer_id(
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                     "/ip4/192.0.2.1/udp/4001/quic-v1"
                         .parse()
                         .expect("static fuzz address"),
                     relay,
-                ),
+                )),
             }),
         }
     }

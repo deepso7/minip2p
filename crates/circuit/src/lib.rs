@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -363,7 +364,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         if adoption.role == CircuitRole::Responder {
             self.pending.push_back(TransportEvent::IncomingConnection {
                 id,
-                endpoint: circuit.endpoint(None),
+                endpoint: Box::new(circuit.endpoint(None)),
             });
         }
         self.circuits.insert(id, circuit);
@@ -528,7 +529,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     }
                     TransportEvent::Connected {
                         id,
-                        endpoint: circuit.endpoint(Some(peer)),
+                        endpoint: Box::new(circuit.endpoint(Some(peer))),
                     }
                 }
                 SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
@@ -3024,12 +3025,12 @@ mod tests {
         let (mut a, _b, circuit_id, _bridge, _a_peer, b_peer) = setup_pair();
         a.inner_mut().push_event(TransportEvent::Connected {
             id: ConnectionId::new(2),
-            endpoint: ConnectionEndpoint::with_peer_id(
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                 "/ip4/198.51.100.1/udp/5001/quic-v1"
                     .parse()
                     .expect("direct endpoint"),
                 b_peer,
-            ),
+            )),
         });
         let events = a
             .poll(Now::from_millis(0))
@@ -3161,11 +3162,11 @@ mod tests {
             .inner_mut()
             .push_event(TransportEvent::IncomingConnection {
                 id: collision,
-                endpoint: ConnectionEndpoint::new(
+                endpoint: Box::new(ConnectionEndpoint::new(
                     "/ip4/203.0.113.7/udp/7007/quic-v1"
                         .parse()
                         .expect("collision endpoint"),
-                ),
+                )),
             });
         let events = transport
             .poll(Now::from_millis(0))

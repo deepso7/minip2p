@@ -160,7 +160,10 @@ fn connection_state_updates_before_establishment_event_is_queued() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
 
@@ -202,7 +205,10 @@ fn peer_ready_state_updates_before_event_is_queued() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
 
@@ -274,7 +280,7 @@ fn negotiating_user_stream(now_ms: u64) -> (SwarmState, ConnectionId, StreamId) 
         &mut core,
         TransportEvent::Connected {
             id: conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
     drain_actions(&mut core);
@@ -856,7 +862,7 @@ fn an_outbound_application_stream_is_control_only_while_it_negotiates() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
     drain_actions(&mut core);
@@ -1329,7 +1335,10 @@ fn is_idle_reflects_pending_actions_and_events() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     assert!(!core.is_idle());
@@ -1604,7 +1613,7 @@ fn transport_error_does_not_surface_synthetic_peer_id() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
@@ -1637,7 +1646,10 @@ fn transport_error_keeps_established_peer_id() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     feed(
@@ -1895,7 +1907,7 @@ fn identity_upgrade_moves_streams_to_verified_peer() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     let placeholder = core.conn_to_peer[&conn_id];
@@ -1906,7 +1918,10 @@ fn identity_upgrade_moves_streams_to_verified_peer() {
         &mut core,
         TransportEvent::PeerIdentityVerified {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), verified),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                verified,
+            )),
             previous_peer_id: None,
         },
     );
@@ -1932,7 +1947,10 @@ fn replacement_discards_undrained_old_actions() {
         &mut core,
         TransportEvent::Connected {
             id: original,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     core.insert_stream_owner(
@@ -1951,7 +1969,10 @@ fn replacement_discards_undrained_old_actions() {
         &mut core,
         TransportEvent::Connected {
             id: replacement,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
 
@@ -1979,7 +2000,7 @@ fn connect_again(core: &mut SwarmState, peer_id: &PeerId, conn_id: ConnectionId,
             core,
             TransportEvent::IncomingConnection {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::new(loopback_transport()),
+                endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
             },
         );
     }
@@ -1987,7 +2008,10 @@ fn connect_again(core: &mut SwarmState, peer_id: &PeerId, conn_id: ConnectionId,
         core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), *peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                *peer_id,
+            )),
         },
     );
 }
@@ -2291,14 +2315,17 @@ fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
         &mut core,
         TransportEvent::Connected {
             id: upgraded,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
         &mut core,
         TransportEvent::PeerIdentityVerified {
             id: upgraded,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
             previous_peer_id: None,
         },
     );
@@ -2316,7 +2343,10 @@ fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
         &mut core,
         TransportEvent::PeerIdentityVerified {
             id: original,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
             previous_peer_id: None,
         },
     );
@@ -2507,7 +2537,10 @@ fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
     core.handle_transport_event(
         TransportEvent::Connected {
             id: replacement,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
         6_000,
     );
@@ -2571,7 +2604,10 @@ fn overdue_ping_times_out_instead_of_being_resent_on_replacement() {
     core.handle_transport_event(
         TransportEvent::Connected {
             id: replacement,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
         12_000,
     );
@@ -2643,14 +2679,14 @@ fn connection_remote_addr_is_scoped_to_exact_connection() {
         &mut core,
         TransportEvent::IncomingConnection {
             id: first,
-            endpoint: ConnectionEndpoint::new(first_addr.clone()),
+            endpoint: Box::new(ConnectionEndpoint::new(first_addr.clone())),
         },
     );
     feed(
         &mut core,
         TransportEvent::IncomingConnection {
             id: second,
-            endpoint: ConnectionEndpoint::new(second_addr.clone()),
+            endpoint: Box::new(ConnectionEndpoint::new(second_addr.clone())),
         },
     );
 
@@ -2669,7 +2705,7 @@ fn incoming_connection_is_tracked_before_it_is_established() {
         &mut core,
         TransportEvent::IncomingConnection {
             id: incoming,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
 
@@ -2680,7 +2716,10 @@ fn incoming_connection_is_tracked_before_it_is_established() {
         &mut core,
         TransportEvent::Connected {
             id: incoming,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     let _ = drain_events(&mut core);
@@ -2785,7 +2824,10 @@ fn replacement_resets_stale_ping_stream() {
         &mut core,
         TransportEvent::Connected {
             id: original_conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     core.insert_stream_owner(original_conn, stale_stream, ProtocolKind::Ping);
@@ -2798,7 +2840,10 @@ fn replacement_resets_stale_ping_stream() {
         &mut core,
         TransportEvent::Connected {
             id: newer_conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     while core.poll_output().is_some() {}
@@ -2837,7 +2882,10 @@ fn replacement_requeues_pending_ping_open() {
         &mut core,
         TransportEvent::Connected {
             id: original_conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     while core.poll_output().is_some() {}
@@ -2848,7 +2896,10 @@ fn replacement_requeues_pending_ping_open() {
         &mut core,
         TransportEvent::Connected {
             id: newer_conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                peer_id,
+            )),
         },
     );
     let actions = drain_actions(&mut core);
@@ -2933,7 +2984,10 @@ fn setup_outbound_ping_stream(
         core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), *peer_id),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                loopback_transport(),
+                *peer_id,
+            )),
         },
     );
     while core.poll_output().is_some() {}
@@ -3137,7 +3191,7 @@ fn noted_dial_that_establishes_does_not_emit_dial_failed() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
 
@@ -3177,7 +3231,7 @@ fn noted_dial_connected_without_identity_then_closed_emits_dial_failed() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
@@ -3206,7 +3260,7 @@ fn taken_pending_dial_after_anonymous_connected_then_closed_is_silent() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     assert!(core.take_pending_dial(conn_id).is_some());
@@ -3251,7 +3305,7 @@ fn a_connection_that_fails_before_establishing_reports_a_transport_error() {
         &mut core,
         TransportEvent::IncomingConnection {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
@@ -3278,7 +3332,7 @@ fn a_connection_that_fails_before_establishing_reports_a_transport_error() {
         &mut core,
         TransportEvent::IncomingConnection {
             id: closed,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
@@ -3319,7 +3373,7 @@ fn veto_survives_connected_then_peer_identity_verified() {
         &mut core,
         TransportEvent::Connected {
             id: existing,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
     let _ = drain_events(&mut core);
@@ -3331,7 +3385,7 @@ fn veto_survives_connected_then_peer_identity_verified() {
         &mut core,
         TransportEvent::Connected {
             id: late,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     let after_connected = drain_events(&mut core);
@@ -3359,7 +3413,7 @@ fn veto_survives_connected_then_peer_identity_verified() {
         &mut core,
         TransportEvent::PeerIdentityVerified {
             id: late,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
             previous_peer_id: None,
         },
     );
@@ -3387,7 +3441,7 @@ fn vetoed_establish_suppresses_transport_error_after_dial_failed() {
         &mut core,
         TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     let after_reject = drain_events(&mut core);
@@ -3434,7 +3488,7 @@ fn incoming_connection_closed_does_not_emit_dial_failed() {
         &mut core,
         TransportEvent::IncomingConnection {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
@@ -3485,7 +3539,7 @@ fn established_connections_lists_each_connected_peers_current_connection() {
         &mut core,
         TransportEvent::Connected {
             id: circuit,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
     // A late identity upgrade replaces the first connection; an
@@ -3494,14 +3548,14 @@ fn established_connections_lists_each_connected_peers_current_connection() {
         &mut core,
         TransportEvent::Connected {
             id: direct,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     feed(
         &mut core,
         TransportEvent::PeerIdentityVerified {
             id: direct,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
             previous_peer_id: None,
         },
     );
@@ -3509,7 +3563,7 @@ fn established_connections_lists_each_connected_peers_current_connection() {
         &mut core,
         TransportEvent::Connected {
             id: unverified,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         },
     );
     assert_eq!(
@@ -3583,23 +3637,23 @@ fn register_with_token(
     } else {
         events.push(TransportEvent::IncomingConnection {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         });
     }
     if upgrade {
         events.push(TransportEvent::Connected {
             id: conn_id,
-            endpoint: ConnectionEndpoint::new(loopback_transport()),
+            endpoint: Box::new(ConnectionEndpoint::new(loopback_transport())),
         });
         events.push(TransportEvent::PeerIdentityVerified {
             id: conn_id,
-            endpoint,
+            endpoint: Box::new(endpoint),
             previous_peer_id: None,
         });
     } else {
         events.push(TransportEvent::Connected {
             id: conn_id,
-            endpoint,
+            endpoint: Box::new(endpoint),
         });
     }
     for event in events {
@@ -3889,7 +3943,7 @@ fn break_first_identify(how: IdentifyBreak) -> (SwarmState, PeerId, ConnectionId
         &mut core,
         TransportEvent::Connected {
             id: conn,
-            endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
     let actions = drain_actions(&mut core);

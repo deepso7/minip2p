@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use minip2p_core::{Bytes, Multiaddr, PeerId};
@@ -5,12 +6,17 @@ use minip2p_core::{Bytes, Multiaddr, PeerId};
 use crate::{ConnectionCloseReason, ConnectionEndpoint, ConnectionId, StreamId};
 
 /// Events emitted by a transport back to the host.
+///
+/// Per-connection variants box their [`ConnectionEndpoint`] (and
+/// `previous_peer_id`) so the enum stays the size of the per-chunk stream
+/// variants: every received chunk is a `StreamData` moved through the event
+/// queues, while the boxed variants fire a few times per connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportEvent {
     /// Connection handshake completed. No stream events precede this.
     Connected {
         id: ConnectionId,
-        endpoint: ConnectionEndpoint,
+        endpoint: Box<ConnectionEndpoint>,
     },
     /// A locally-opened stream is open and may send; the peer has not
     /// necessarily seen it yet. Emitted after `open_stream()`, possibly much
@@ -77,7 +83,7 @@ pub enum TransportEvent {
     /// A new inbound connection was accepted. `Connected` follows after handshake.
     IncomingConnection {
         id: ConnectionId,
-        endpoint: ConnectionEndpoint,
+        endpoint: Box<ConnectionEndpoint>,
     },
     /// A peer identity was bound to a connection.
     ///
@@ -88,9 +94,19 @@ pub enum TransportEvent {
     /// consistent signal to observe.
     PeerIdentityVerified {
         id: ConnectionId,
-        endpoint: ConnectionEndpoint,
-        previous_peer_id: Option<PeerId>,
+        endpoint: Box<ConnectionEndpoint>,
+        previous_peer_id: Option<Box<PeerId>>,
     },
     /// The transport is now listening on the given address.
     Listening { addr: Multiaddr },
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod size_tests {
+    /// Every received chunk moves through this enum as a `StreamData`: a cold
+    /// variant that outgrows it should box its payload instead.
+    #[test]
+    fn stays_the_size_of_its_hot_variants() {
+        assert!(core::mem::size_of::<super::TransportEvent>() <= 56);
+    }
 }

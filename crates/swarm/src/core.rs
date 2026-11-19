@@ -1098,6 +1098,7 @@ fn transport_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::string::ToString;
     use alloc::vec;
@@ -1475,12 +1476,12 @@ mod tests {
         ScriptedTransport {
             initial: vec![TransportEvent::Connected {
                 id: ConnectionId::new(1),
-                endpoint: ConnectionEndpoint::with_peer_id(
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                     "/ip4/198.51.100.7/udp/4001/quic-v1"
                         .parse()
                         .expect("endpoint"),
                     *peer,
-                ),
+                )),
             }],
             negotiate: true,
             ..ScriptedTransport::default()
@@ -1503,12 +1504,12 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let mut swarm = swarm(vec![TransportEvent::Connected {
             id: ConnectionId::new(1),
-            endpoint: ConnectionEndpoint::with_peer_id(
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                 "/ip4/198.51.100.7/udp/4001/quic-v1"
                     .parse()
                     .expect("endpoint"),
                 peer,
-            ),
+            )),
         }]);
 
         let events = swarm.poll(Now::from_millis(5_000)).expect("poll");
@@ -1551,12 +1552,12 @@ mod tests {
             ScriptedTransport {
                 initial: vec![TransportEvent::Connected {
                     id,
-                    endpoint: ConnectionEndpoint::with_peer_id(
+                    endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                         "/ip4/198.51.100.7/udp/4001/quic-v1"
                             .parse()
                             .expect("endpoint"),
                         peer,
-                    ),
+                    )),
                 }],
                 sends_end_connection: true,
                 ..ScriptedTransport::default()
@@ -1597,12 +1598,12 @@ mod tests {
         let mut swarm = swarm(vec![
             TransportEvent::Connected {
                 id,
-                endpoint: ConnectionEndpoint::with_peer_id(
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                     "/ip4/198.51.100.7/udp/4001/quic-v1"
                         .parse()
                         .expect("endpoint"),
                     peer,
-                ),
+                )),
             },
             TransportEvent::Closed {
                 id,
@@ -1703,12 +1704,12 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let mut swarm = swarm(vec![TransportEvent::Connected {
             id: ConnectionId::new(1),
-            endpoint: ConnectionEndpoint::with_peer_id(
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                 "/ip4/198.51.100.7/udp/4001/quic-v1"
                     .parse()
                     .expect("endpoint"),
                 peer,
-            ),
+            )),
         }]);
         swarm.poll(Now::from_millis(0)).expect("poll");
 
@@ -1788,7 +1789,7 @@ mod tests {
             ScriptedTransport {
                 initial: vec![TransportEvent::Connected {
                     id: conn,
-                    endpoint: ConnectionEndpoint::with_peer_id(address, peer),
+                    endpoint: Box::new(ConnectionEndpoint::with_peer_id(address, peer)),
                 }],
                 fail_second_close: true,
                 ..ScriptedTransport::default()
@@ -2045,7 +2046,7 @@ mod tests {
             ScriptedTransport {
                 initial: vec![TransportEvent::Connected {
                     id: conn,
-                    endpoint: ConnectionEndpoint::with_peer_id(address, peer),
+                    endpoint: Box::new(ConnectionEndpoint::with_peer_id(address, peer)),
                 }],
                 ended: Some(stream_not_found),
                 ..ScriptedTransport::default()
@@ -2180,7 +2181,7 @@ mod tests {
             .expect("endpoint");
         let mut swarm = swarm(vec![TransportEvent::Connected {
             id: conn,
-            endpoint: ConnectionEndpoint::with_peer_id(address, peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(address, peer)),
         }]);
         swarm.add_protocol("/app/1").expect("protocol");
         swarm.poll(Now::from_millis(0)).expect("connect");
@@ -2291,7 +2292,10 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                    addr.transport().clone(),
+                    peer,
+                )),
             });
         // The rejection's own close is refused too, which surfaces as a
         // runtime error beside the DialFailed.
@@ -2325,7 +2329,10 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                    addr.transport().clone(),
+                    peer,
+                )),
             });
         assert!(swarm.abort_dial(conn_id).expect("abort"));
         let events = swarm.poll(Now::from_millis(1)).expect("late connected");
@@ -2365,7 +2372,10 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: existing,
-                endpoint: ConnectionEndpoint::with_peer_id(existing_addr.transport().clone(), peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                    existing_addr.transport().clone(),
+                    peer,
+                )),
             });
         let _ = swarm.poll(Now::from_millis(0)).expect("existing");
         assert_eq!(swarm.connection_id(&peer), Some(existing));
@@ -2377,7 +2387,10 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: late,
-                endpoint: ConnectionEndpoint::with_peer_id(late_addr.transport().clone(), peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                    late_addr.transport().clone(),
+                    peer,
+                )),
             });
         let events = swarm.poll(Now::from_millis(1)).expect("vetoed");
         assert!(
