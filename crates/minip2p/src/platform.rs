@@ -55,6 +55,10 @@ pub(crate) mod sealed {
         /// Collects readiness without blocking before a drive; a no-op for a
         /// platform whose transport reads its own input when polled.
         fn harvest(&mut self, transport: &mut Self::Transport) -> Result<(), DriverError>;
+        /// The platform's teardown behind `Endpoint::close`.
+        fn close(endpoint: crate::Endpoint<Self>) -> crate::CloseReport
+        where
+            Self: super::Platform;
     }
 }
 
@@ -110,6 +114,10 @@ impl<T: Transport, E: EntropySource, C: Clock> sealed::Sealed for Portable<T, E,
 
     fn harvest(&mut self, _transport: &mut T) -> Result<(), DriverError> {
         Ok(())
+    }
+
+    fn close(endpoint: crate::Endpoint<Self>) -> crate::CloseReport {
+        endpoint.close_portable()
     }
 }
 

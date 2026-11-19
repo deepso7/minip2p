@@ -81,6 +81,18 @@ pub struct Endpoint<P: Platform = crate::StdPlatform> {
 /// Without `std` the only platform is [`Portable`](crate::Portable), named
 /// [`PortableEndpoint`](crate::PortableEndpoint) and built with
 /// [`PortableEndpointBuilder`](crate::PortableEndpointBuilder).
+///
+/// # State snapshots
+///
+/// Getter-style snapshots ([`connected_peers`](Self::connected_peers),
+/// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
+/// [`connection_id`](Self::connection_id),
+/// [`connection_remote_addr`](Self::connection_remote_addr),
+/// [`connection_info`](Self::connection_info), [`path`](Self::path),
+/// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
+/// Separate getters are not one cross-getter atomic snapshot and may be
+/// ahead of the Endpoint event stream (state changes before its
+/// corresponding event is queued).
 #[cfg(not(feature = "std"))]
 pub struct Endpoint<P: Platform> {
     pub(crate) engine: EngineOf<P>,
@@ -684,9 +696,20 @@ impl<P: Platform> Endpoint<P> {
         self.engine.shutdown_mdns(now)
     }
 
-    /// Disconnects every established peer, returning each failure.
-    pub(crate) fn disconnect_established(&mut self) -> Vec<DriverError> {
-        let now = self.now();
+    /// Consumes the endpoint after tearing it down, reporting what that did.
+    ///
+    /// On std this is `close_within(DEFAULT_CLOSE_TIMEOUT)`: it disconnects
+    /// established peers and waits up to 500 ms until none remain. On a
+    /// [`Portable`](crate::Portable) platform it is one final drive (see
+    /// `PortableEndpoint`'s close docs): it sends mDNS goodbyes, disconnects
+    /// established peers, drives once, and reports what was still tracked as
+    /// [`CloseOutcome::DeadlineExpired`].
+    pub fn close(self) -> CloseReport {
+        P::close(self)
+    }
+
+    /// Disconnects every established peer at `now`, returning each failure.
+    pub(crate) fn disconnect_established(&mut self, now: Now) -> Vec<DriverError> {
         self.engine
             .core
             .connected_peers()
@@ -708,8 +731,13 @@ impl<P: Platform> Endpoint<P> {
 
 impl<P: Platform> Drop for Endpoint<P> {
     fn drop(&mut self) {
-        // Drop cannot surface disconnect failures; transports own final cleanup.
-        drop(self.disconnect_established());
+        // Drop cannot surface disconnect failures; transports own final
+        // cleanup. A closed endpoint has no peers left, so it does not
+        // sample the clock again.
+        if !self.engine.core.connected_peers().is_empty() {
+            let now = self.now();
+            drop(self.disconnect_established(now));
+        }
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         {
             let now = self.now();

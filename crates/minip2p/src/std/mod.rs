@@ -201,6 +201,12 @@ impl Sealed for StdPlatform {
     fn harvest(&mut self, transport: &mut EndpointTransport) -> Result<(), Error> {
         harvest(&mut self.poll, transport, Duration::ZERO)
     }
+
+    /// [`close_within`](Endpoint::close_within) with
+    /// [`DEFAULT_CLOSE_TIMEOUT`] (500 ms).
+    fn close(endpoint: Endpoint) -> CloseReport {
+        endpoint.close_within(DEFAULT_CLOSE_TIMEOUT)
+    }
 }
 
 impl Platform for StdPlatform {}
@@ -514,14 +520,6 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Disconnects established peers, waits up to
-    /// [`DEFAULT_CLOSE_TIMEOUT`] (500 ms) until none remain, and consumes
-    /// the endpoint: [`close_within`](Self::close_within) with that
-    /// deadline.
-    pub fn close(self) -> CloseReport {
-        self.close_within(DEFAULT_CLOSE_TIMEOUT)
-    }
-
     /// Disconnects established peers, waits up to `timeout` until no
     /// connection is tracked, and consumes the endpoint. A dial still
     /// pending is tracked: the drain waits for it to fail, or to establish
@@ -558,7 +556,8 @@ impl Endpoint {
         drop(self.shutdown_mdns());
         let drain_by = std::time::Instant::now() + timeout;
         loop {
-            report.errors.extend(self.disconnect_established());
+            let now = self.now();
+            report.errors.extend(self.disconnect_established(now));
             #[cfg(all(feature = "relay-server", feature = "quic"))]
             {
                 let now = self.now();
