@@ -932,15 +932,18 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // then only the `GoAway` can be left over, and it is best effort.
         // Stream bytes held behind the peer's window count as undelivered:
         // `go_away` discards them.
-        let drained = connection.outbound.is_empty() && !connection.session.has_unsent_writes();
+        let held = connection.session.has_unsent_writes();
+        let drained = connection.outbound.is_empty() && !held;
         // A connection still negotiating has no Yamux session to shut down, so
         // `go_away` refuses and the socket is aborted instead.
         let announced = connection.session.go_away(0).is_ok();
         let flushed = announced && self.pump_and_flush(&mut connection).is_ok();
-        // Anything else still buffered would be discarded by the FIN, so
-        // only a socket left with at most the `GoAway` closes gracefully; a
-        // socket too full for the `GoAway` still delivers what it took.
+        // Anything else still buffered (or held behind the window, which
+        // `go_away` just discarded) would be cut off by the FIN, so only a
+        // socket left with at most the `GoAway` closes gracefully; a socket
+        // too full for the `GoAway` still delivers what it took.
         let graceful = flushed
+            && !held
             && (drained
                 || (connection.outbound.is_empty() && !connection.session.has_pending_write()))
             && self.provider.close_write(connection.socket).is_ok();

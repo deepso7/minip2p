@@ -601,8 +601,9 @@ impl<P: Platform> Endpoint<P> {
     /// for congestion control. Over a relayed connection the FIN is handed
     /// to the relay, without waiting for its acknowledgement. To deliver
     /// everything, close the write side before flushing. The std `flush`
-    /// and a portable endpoint's `flush` drive the endpoint until this is
-    /// `false`. Bytes a peer's stop or reset, or a connection failure,
+    /// drives the endpoint until this is `false` or its deadline passes; a
+    /// portable endpoint's `flush` drives one batch, so the host repeats it,
+    /// polling between attempts, until it returns `true`. Bytes a peer's stop or reset, or a connection failure,
     /// discarded stop counting here; the event that ended the stream or
     /// connection ([`EndpointEvent::StreamWriteAborted`],
     /// [`EndpointEvent::StreamWriteStopped`], [`EndpointEvent::StreamClosed`]

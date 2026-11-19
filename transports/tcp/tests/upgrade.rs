@@ -640,6 +640,38 @@ fn closing_with_window_blocked_bytes_aborts_when_the_go_away_does_not_fit() {
 }
 
 #[test]
+fn closing_with_window_blocked_bytes_aborts_when_the_go_away_fits() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // More than the peer's initial window, never acknowledged: the socket
+    // takes every frame it may, and the rest waits behind the window.
+    for _ in 0..64 {
+        if pair
+            .dialer
+            .send_stream(id, stream, Bytes::from(vec![7u8; 16 * 1024]))
+            .is_err()
+        {
+            break;
+        }
+        drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    }
+    assert!(pair.dialer.has_pending_writes(), "bytes wait on the window");
+    let (close_writes, aborts) = (
+        pair.dialer.provider().close_write_calls(),
+        pair.dialer.provider().abort_calls(),
+    );
+
+    // `go_away` discards the held bytes, so a FIN would pass the truncated
+    // stream off as complete.
+    pair.dialer.close(id).expect("close");
+    assert_eq!(pair.dialer.provider().close_write_calls(), close_writes);
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
+}
+
+#[test]
 fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
     let mut pair = upgraded_pair();
     let id = pair.connection;
