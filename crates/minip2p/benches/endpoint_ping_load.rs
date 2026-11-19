@@ -310,7 +310,7 @@ fn case(kind: LoadKind, listen: &str, samples: usize) -> Vec<String> {
 
     let mut probe = bind_on(Endpoint::builder(), listen);
     let probe_addr = probe.listen().expect("probe listens");
-    let probe_peer = probe_addr.peer_id().clone();
+    let probe_peer = *probe_addr.peer_id();
     let _probe = Driven::spawn(probe, |_, _| {});
     m.connect(&probe_addr).expect("connect probe");
     let deadline = Instant::now() + SETUP_TIMEOUT;

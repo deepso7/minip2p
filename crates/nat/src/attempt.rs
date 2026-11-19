@@ -397,7 +397,7 @@ impl ConnectAttempt {
     ) {
         shared.push_event(NatEvent::FellBackToRelay {
             connect_id: self.id,
-            peer: self.peer.clone(),
+            peer: self.peer,
             reason,
         });
         self.release(swarm, shared, now);
@@ -476,7 +476,7 @@ impl ConnectAttempt {
             return None;
         }
         Some(Claim::Circuit {
-            relay: self.relay_peer()?.clone(),
+            relay: *self.relay_peer()?,
             owner: Owner::Attempt(self.id),
         })
     }
@@ -519,24 +519,24 @@ impl ConnectAttempt {
             }
             return true;
         }
-        let path = attribution.path.clone();
+        let path = attribution.path;
         match &self.best {
             None => {
-                self.best = Some((path.clone(), conn_id));
+                self.best = Some((path, conn_id));
                 shared.push_event(NatEvent::PathEstablished {
                     connect_id: self.id,
-                    peer: self.peer.clone(),
+                    peer: self.peer,
                     path,
                 });
             }
             Some((Path::Relayed { .. }, _)) => {
                 let (from, old_conn_id) = self
                     .best
-                    .replace((path.clone(), conn_id))
+                    .replace((path, conn_id))
                     .expect("checked Some above");
                 shared.push_event(NatEvent::PathUpgraded {
                     connect_id: self.id,
-                    peer: self.peer.clone(),
+                    peer: self.peer,
                     from,
                     to: path,
                     old_conn_id,
@@ -999,7 +999,7 @@ impl ConnectAttempt {
             let Some(relay) = self.untried.pop_front() else {
                 return;
             };
-            let relay_peer = relay.peer_id().clone();
+            let relay_peer = *relay.peer_id();
             if !self.is_relay_peer(&relay_peer) {
                 self.relay_budget_deadline =
                     self.clip(now.monotonic_ms + shared.config.relay_timeout_ms);
@@ -1166,7 +1166,7 @@ impl ConnectAttempt {
             inner_conn: conn,
             stream_id: stream,
             relay,
-            remote_peer: self.peer.clone(),
+            remote_peer: self.peer,
             role: BridgeRole::Initiator,
             pending_data,
             unsent_data: Vec::new(),
@@ -1188,7 +1188,7 @@ impl ConnectAttempt {
 
     fn issue_punch_dials(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared) {
         for addr in &self.punch_addrs {
-            let Ok(peer_addr) = PeerAddr::new(addr.clone(), self.peer.clone()) else {
+            let Ok(peer_addr) = PeerAddr::new(addr.clone(), self.peer) else {
                 continue;
             };
             // A refused punch dial just does not race; the window decides.
@@ -1206,7 +1206,7 @@ impl ConnectAttempt {
             return;
         };
         let path = Path::Relayed { relay };
-        self.best = Some((path.clone(), conn_id));
+        self.best = Some((path, conn_id));
         if shared.config.upgrades() {
             self.budget = Some(
                 UpgradeBudget::arm(now.monotonic_ms, &shared.config, self.attempt_deadline)
@@ -1215,7 +1215,7 @@ impl ConnectAttempt {
         }
         shared.push_event(NatEvent::PathEstablished {
             connect_id: self.id,
-            peer: self.peer.clone(),
+            peer: self.peer,
             path,
         });
     }
@@ -1337,7 +1337,7 @@ impl ConnectAttempt {
         self.teardown_relay_leg(swarm, shared, now);
         shared.push_event(NatEvent::ConnectFailed {
             connect_id: self.id,
-            peer: self.peer.clone(),
+            peer: self.peer,
             error,
         });
         self.done = true;

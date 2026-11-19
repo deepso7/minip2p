@@ -339,7 +339,7 @@ fn stop_initiator_sends_connect_then_accepts_with_pipelined_payload() {
         duration: Some(120),
         data: Some(131_072),
     };
-    let mut initiator = StopInitiator::new(source.clone(), Some(limit.clone()));
+    let mut initiator = StopInitiator::new(source, Some(limit.clone()));
 
     let Some(StopInitiatorOutput::Outbound(frame)) = initiator.poll_output() else {
         panic!("expected STOP CONNECT");

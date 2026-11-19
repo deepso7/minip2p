@@ -71,14 +71,14 @@ impl From<PeerId> for ConnectTarget {
 
 impl From<&PeerId> for ConnectTarget {
     fn from(peer: &PeerId) -> Self {
-        Self::from(peer.clone())
+        Self::from(*peer)
     }
 }
 
 impl From<PeerAddr> for ConnectTarget {
     fn from(addr: PeerAddr) -> Self {
         Self {
-            peer: addr.peer_id().clone(),
+            peer: *addr.peer_id(),
             addrs: alloc::vec![addr],
         }
     }
@@ -98,12 +98,12 @@ impl TryFrom<Vec<PeerAddr>> for ConnectTarget {
         let Some(first) = iter.next() else {
             return Err(ConnectTargetError::Empty);
         };
-        let expected = first.peer_id().clone();
+        let expected = *first.peer_id();
         for addr in iter {
             if addr.peer_id() != &expected {
                 return Err(ConnectTargetError::MixedPeers {
                     expected,
-                    found: addr.peer_id().clone(),
+                    found: *addr.peer_id(),
                 });
             }
         }
@@ -487,7 +487,7 @@ impl ConnectEngine {
         now_ms: u64,
     ) -> ConnectId {
         self.connect_candidates(
-            target.peer_id().clone(),
+            *target.peer_id(),
             Candidates::ready(target.candidates().to_vec()),
             RelayPolicy::None,
             runtime,
@@ -703,7 +703,9 @@ impl ConnectEngine {
                 self.peer_connected(peer_id, *conn_id, runtime, now_ms);
                 false
             }
-            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+            SwarmEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } => {
                 self.unannounced.remove(new);
                 // `old` has ended as surely as a closed one, even when `new`
                 // is already gone too and so takes no attempt's place.
@@ -855,7 +857,7 @@ impl ConnectEngine {
                         retained.dials.extend(pending);
                     } else if !pending.is_empty() {
                         self.retained.insert(
-                            peer_id.clone(),
+                            *peer_id,
                             RetainedDials {
                                 dials: pending.into_iter().collect(),
                                 expires_ms,
@@ -865,11 +867,11 @@ impl ConnectEngine {
                 } else {
                     self.abort_pending(runtime, pending);
                 }
-                self.push_connected(id, attempt.peer, conn_id, circuit_relay.clone());
+                self.push_connected(id, attempt.peer, conn_id, circuit_relay);
                 continue;
             }
             // Only a circuit reaches here, so its relay is known.
-            if let Some(circuit_relay) = circuit_relay.clone()
+            if let Some(circuit_relay) = circuit_relay
                 && let RelayLeg::Pending { policy, relay }
                 | RelayLeg::Provisional { policy, relay, .. } = attempt.relay
             {
@@ -903,7 +905,7 @@ impl ConnectEngine {
             .retained
             .iter()
             .filter(|(_, retained)| now_ms >= retained.expires_ms)
-            .map(|(peer, _)| peer.clone())
+            .map(|(peer, _)| *peer)
             .collect();
         for peer in lapsed {
             if let Some(retained) = self.retained.remove(&peer) {
@@ -996,7 +998,7 @@ impl ConnectEngine {
                 self.unresolved -= 1;
                 *terminal = Terminal::Settled(EndpointEvent::ConnectSettled {
                     connect_id: *connect_id,
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     outcome: ConnectOutcome::Connected {
                         conn_id: *conn_id,
                         path,
@@ -1050,7 +1052,7 @@ impl ConnectEngine {
                 policy,
                 ..
             } if policy.circuit_settles(attempt.racing_direct()) => {
-                let circuit_relay = circuit_relay.clone();
+                let circuit_relay = *circuit_relay;
                 self.push_connected(id, attempt.peer, conn_id, Some(circuit_relay));
             }
             RelayLeg::Pending { .. } | RelayLeg::Provisional { .. } => {
@@ -1238,7 +1240,7 @@ pub(crate) fn circuit_relay<T: Transport, E: EntropySource>(
 ) -> Option<PeerId> {
     let addr = runtime.connection_remote_addr(conn_id)?;
     let relay = match addr.protocols() {
-        [.., Protocol::P2p(relay), Protocol::P2pCircuit] => Some(relay.clone()),
+        [.., Protocol::P2p(relay), Protocol::P2pCircuit] => Some(*relay),
         _ => None,
     };
     debug_assert!(
@@ -1432,7 +1434,7 @@ impl ConnectEngine {
                 }
             }
         }
-        let id = self.connect_candidates(peer.clone(), sorted, relay, core, now.monotonic_ms);
+        let id = self.connect_candidates(peer, sorted, relay, core, now.monotonic_ms);
         #[cfg(feature = "autonat")]
         if let Some(nat) = legs.nat.as_deref_mut()
             && self.is_pending(id)
@@ -1595,7 +1597,7 @@ mod tests {
     }
 
     fn addr(peer: &PeerId, port: u16) -> PeerAddr {
-        PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port, peer.clone())
+        PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port, *peer)
     }
 
     #[test]
@@ -1632,7 +1634,7 @@ mod tests {
     #[test]
     fn peer_id_target_has_empty_candidates() {
         let p = peer(b"peer-only");
-        let target = ConnectTarget::from(p.clone());
+        let target = ConnectTarget::from(p);
         assert!(target.candidates().is_empty());
         assert_eq!(target.peer_id(), &p);
         assert_eq!(ConnectTarget::from(&p).peer_id(), &p);
@@ -1857,7 +1859,7 @@ mod tests {
         let conn_id = ConnectionId::new(1);
         runtime
             .transport_mut()
-            .push_connected(conn_id, peer.clone(), target);
+            .push_connected(conn_id, peer, target);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             matches!(
@@ -1899,7 +1901,7 @@ mod tests {
         runtime.transport_mut().push_closed(ConnectionId::new(1));
         runtime
             .transport_mut()
-            .push_connected(ConnectionId::new(2), peer.clone(), second);
+            .push_connected(ConnectionId::new(2), peer, second);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             events
@@ -1948,7 +1950,7 @@ mod tests {
         let peer = peer(b"peer-no-route");
         let mut runtime = runtime(FakeTransport::default());
         let mut engine = ConnectEngine::new(30_000);
-        let id = engine.connect(ConnectTarget::from(peer.clone()), &mut runtime, 0);
+        let id = engine.connect(ConnectTarget::from(peer), &mut runtime, 0);
         assert_eq!(runtime.transport().dials.len(), 0);
         match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
@@ -2094,7 +2096,7 @@ mod tests {
         let conn_id = runtime.dial(&target).expect("seed dial");
         runtime
             .transport_mut()
-            .push_connected(conn_id, peer.clone(), target.clone());
+            .push_connected(conn_id, peer, target.clone());
         let _ = runtime.poll(Now::from_millis(0)).expect("establish");
         assert_eq!(runtime.connection_id(&peer), Some(conn_id));
 
@@ -2131,7 +2133,7 @@ mod tests {
         let inbound = ConnectionId::new(99);
         runtime
             .transport_mut()
-            .push_connected(inbound, peer.clone(), target);
+            .push_connected(inbound, peer, target);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
@@ -2158,9 +2160,7 @@ mod tests {
         let target = ConnectTarget::try_from(vec![first.clone(), second]).expect("same peer");
         let id = engine.connect(target, &mut runtime, 0);
         let inbound = ConnectionId::new(99);
-        runtime
-            .transport_mut()
-            .push_connected(inbound, peer.clone(), first);
+        runtime.transport_mut().push_connected(inbound, peer, first);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
@@ -2180,7 +2180,7 @@ mod tests {
         let first = addr(&peer, 1);
         runtime
             .transport_mut()
-            .push_connected(ConnectionId::new(1), peer.clone(), first);
+            .push_connected(ConnectionId::new(1), peer, first);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             events.iter().any(|event| matches!(
@@ -2243,11 +2243,9 @@ mod tests {
         runtime.transport_mut().push_closed(inbound);
         drain(&mut engine, &mut runtime, 1_000);
         let id = engine.connect(addr(&peer, 3).into(), &mut runtime, 3_000);
-        runtime.transport_mut().push_connected(
-            ConnectionId::new(100),
-            peer.clone(),
-            addr(&peer, 1),
-        );
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(100), peer, addr(&peer, 1));
         let events = drain(&mut engine, &mut runtime, 3_000);
         assert!(settled_for(&events, id).is_some(), "{events:?}");
 
@@ -2284,7 +2282,7 @@ mod tests {
         // batch. abort_dial cannot retract the queued DialFailed.
         runtime
             .transport_mut()
-            .push_connected(ConnectionId::new(1), peer.clone(), second);
+            .push_connected(ConnectionId::new(1), peer, second);
         runtime.transport_mut().push_closed(ConnectionId::new(2));
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
@@ -2316,8 +2314,8 @@ mod tests {
                 0,
             );
             let transport = runtime.transport_mut();
-            transport.push_connected_with_token(d1, peer.clone(), first, tokens.0);
-            transport.push_connected_with_token(d2, peer.clone(), second, tokens.1);
+            transport.push_connected_with_token(d1, peer, first, tokens.0);
+            transport.push_connected_with_token(d2, peer, second, tokens.1);
             let events = drain(&mut engine, &mut runtime, 0);
 
             let case = format!("kept={kept}");
@@ -2370,9 +2368,9 @@ mod tests {
         // d3 has the lowest token, so it replaces d1 before the engine sees
         // d1 establish, and d2's failure is queued in between.
         let transport = runtime.transport_mut();
-        transport.push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 3);
+        transport.push_connected_with_token(d1, peer, addr(&peer, 1), 3);
         transport.push_closed(d2);
-        transport.push_connected_with_token(d3, peer.clone(), addr(&peer, 3), 1);
+        transport.push_connected_with_token(d3, peer, addr(&peer, 3), 1);
         let events = drain(&mut engine, &mut runtime, 0);
 
         for id in [first, second] {
@@ -2411,14 +2409,14 @@ mod tests {
         );
         runtime
             .transport_mut()
-            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 3);
+            .push_connected_with_token(d1, peer, addr(&peer, 1), 3);
         let _ = drain(&mut engine, &mut runtime, 0);
 
         // d2 wins the race at 4 s, so the swarm compares against it until
         // 9 s; d3 may still win at the peer and replace it here before then.
         runtime
             .transport_mut()
-            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 2);
+            .push_connected_with_token(d2, peer, addr(&peer, 2), 2);
         let _ = drain(&mut engine, &mut runtime, 4_000);
         let _ = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
         assert!(!runtime.transport().closes.contains(&d3));
@@ -2452,7 +2450,7 @@ mod tests {
         );
         runtime
             .transport_mut()
-            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+            .push_connected_with_token(d1, peer, addr(&peer, 1), 5);
         let _ = drain(&mut engine, &mut runtime, 0);
         runtime.transport_mut().push_closed(d1);
         let _ = drain(&mut engine, &mut runtime, 1);
@@ -2462,7 +2460,7 @@ mod tests {
         let _ = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 1);
         runtime
             .transport_mut()
-            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 9);
+            .push_connected_with_token(d2, peer, addr(&peer, 2), 9);
         let _ = drain(&mut engine, &mut runtime, 2);
         assert!(!runtime.transport().closes.contains(&d3));
     }
@@ -2488,7 +2486,7 @@ mod tests {
         );
         runtime
             .transport_mut()
-            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+            .push_connected_with_token(d1, peer, addr(&peer, 1), 5);
         let _ = drain(&mut engine, &mut runtime, 0);
         runtime.transport_mut().push_closed(d1);
         let _ = drain(&mut engine, &mut runtime, 1);
@@ -2498,7 +2496,7 @@ mod tests {
         // to the engine after the retained window has lapsed.
         runtime
             .transport_mut()
-            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 9);
+            .push_connected_with_token(d2, peer, addr(&peer, 2), 9);
         let buffered = runtime.poll(Now::from_millis(4_000)).expect("poll");
         engine.tick(&mut runtime, 6_000);
         for event in &buffered {
@@ -2525,7 +2523,7 @@ mod tests {
         );
         runtime
             .transport_mut()
-            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+            .push_connected_with_token(d1, peer, addr(&peer, 1), 5);
         let _ = drain(&mut engine, &mut runtime, 0);
         assert!(runtime.transport().closes.is_empty(), "d2 is kept");
 
@@ -2533,7 +2531,7 @@ mod tests {
         // sides and goes now rather than when the window ends.
         runtime
             .transport_mut()
-            .push_connected(inbound, peer.clone(), addr(&peer, 9));
+            .push_connected(inbound, peer, addr(&peer, 9));
         let _ = drain(&mut engine, &mut runtime, 1);
         assert_eq!(runtime.connection_id(&peer), Some(inbound));
         assert!(runtime.transport().closes.contains(&d2));
@@ -2551,7 +2549,7 @@ mod tests {
         let second = engine.connect(second_addr.clone().into(), &mut runtime, 0);
         runtime
             .transport_mut()
-            .push_connected(ConnectionId::new(2), peer.clone(), second_addr);
+            .push_connected(ConnectionId::new(2), peer, second_addr);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, first),
@@ -2591,7 +2589,7 @@ mod tests {
         runtime.transport_mut().refuse_close = false;
         runtime
             .transport_mut()
-            .push_connected(conn_id, peer.clone(), target);
+            .push_connected(conn_id, peer, target);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             events
@@ -2641,7 +2639,7 @@ mod tests {
         runtime.transport_mut().refuse_close = false;
         runtime
             .transport_mut()
-            .push_connected(existing, peer.clone(), existing_addr);
+            .push_connected(existing, peer, existing_addr);
         let mid = drain(&mut engine, &mut runtime, 0);
         assert!(
             mid.iter().any(|event| {
@@ -2658,9 +2656,7 @@ mod tests {
         assert_eq!(runtime.connection_id(&peer), Some(existing));
 
         // Late establish of the vetoed dial must close by conn_id only.
-        runtime
-            .transport_mut()
-            .push_connected(late, peer.clone(), target);
+        runtime.transport_mut().push_connected(late, peer, target);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             events.iter().all(|event| !matches!(
@@ -2716,7 +2712,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
@@ -2735,14 +2731,14 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Forced,
             &mut runtime,
             0,
         );
         let conn = circuit(7);
-        runtime.transport_mut().push_circuit(conn, peer.clone());
+        runtime.transport_mut().push_circuit(conn, peer);
         let events = drain(&mut engine, &mut runtime, 0);
         assert_eq!(
             settled_for(&events, id),
@@ -2763,14 +2759,14 @@ mod tests {
         let mut engine = ConnectEngine::new(1_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         let conn = circuit(3);
-        runtime.transport_mut().push_circuit(conn, peer.clone());
+        runtime.transport_mut().push_circuit(conn, peer);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(settled_for(&events, id).is_none(), "{events:?}");
         assert!(engine.is_pending(id));
@@ -2855,14 +2851,14 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         let conn = circuit(4);
-        runtime.transport_mut().push_circuit(conn, peer.clone());
+        runtime.transport_mut().push_circuit(conn, peer);
         let _ = drain(&mut engine, &mut runtime, 0);
         engine.abort_attempt(id, &mut runtime);
         match engine.pop_resolved() {
@@ -2885,7 +2881,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(target.into(), &mut runtime, 0);
         let inbound = circuit(11);
-        runtime.transport_mut().push_circuit(inbound, peer.clone());
+        runtime.transport_mut().push_circuit(inbound, peer);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
@@ -2902,20 +2898,18 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             vec![target.clone()],
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         let circuit_conn = circuit(5);
-        runtime
-            .transport_mut()
-            .push_circuit(circuit_conn, peer.clone());
+        runtime.transport_mut().push_circuit(circuit_conn, peer);
         assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
         runtime
             .transport_mut()
-            .push_connected(ConnectionId::new(1), peer.clone(), target);
+            .push_connected(ConnectionId::new(1), peer, target);
         let events = drain(&mut engine, &mut runtime, 0);
         // The direct connection replaces the provisional circuit: one
         // hand-over, never a disconnect, and exactly one terminal.
@@ -2950,7 +2944,7 @@ mod tests {
             let mut engine = ConnectEngine::new(30_000);
             let id = admit(
                 &mut engine,
-                peer.clone(),
+                peer,
                 vec![addr(&peer, 1)],
                 RelayPolicy::RaceWithoutUpgrade,
                 &mut runtime,
@@ -2958,14 +2952,14 @@ mod tests {
             );
             let conn = circuit(9);
             let (first, second) = if circuit_first {
-                runtime.transport_mut().push_circuit(conn, peer.clone());
+                runtime.transport_mut().push_circuit(conn, peer);
                 let first = drain(&mut engine, &mut runtime, 0);
                 runtime.transport_mut().push_closed(ConnectionId::new(1));
                 (first, drain(&mut engine, &mut runtime, 0))
             } else {
                 runtime.transport_mut().push_closed(ConnectionId::new(1));
                 let first = drain(&mut engine, &mut runtime, 0);
-                runtime.transport_mut().push_circuit(conn, peer.clone());
+                runtime.transport_mut().push_circuit(conn, peer);
                 (first, drain(&mut engine, &mut runtime, 0))
             };
             assert!(settled_for(&first, id).is_none(), "{first:?}");
@@ -2987,14 +2981,14 @@ mod tests {
         let mut engine = ConnectEngine::new(1_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         for conn in [circuit(3), circuit(4)] {
-            runtime.transport_mut().push_circuit(conn, peer.clone());
+            runtime.transport_mut().push_circuit(conn, peer);
             assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
         }
         let events = drain(&mut engine, &mut runtime, 1_000);
@@ -3016,21 +3010,19 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
-        runtime
-            .transport_mut()
-            .push_circuit(circuit(3), peer.clone());
+        runtime.transport_mut().push_circuit(circuit(3), peer);
         assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
 
         let punch = ConnectionId::new(1);
         let transport = runtime.transport_mut();
-        transport.push_circuit(circuit(4), peer.clone());
-        transport.push_connected(punch, peer.clone(), addr(&peer, 1));
+        transport.push_circuit(circuit(4), peer);
+        transport.push_connected(punch, peer, addr(&peer, 1));
         // Stands in for NAT: the punch is recorded once its event is seen.
         // Paths are named after each event, terminals popped at batch end,
         // as the Endpoint engine does.
@@ -3060,22 +3052,20 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Forced,
             &mut runtime,
             0,
         );
         let transport = runtime.transport_mut();
-        transport.push_circuit(circuit(1), peer.clone());
+        transport.push_circuit(circuit(1), peer);
         transport.push_closed(circuit(1));
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(settled_for(&events, id).is_none(), "{events:?}");
         assert!(engine.is_pending(id));
 
-        runtime
-            .transport_mut()
-            .push_circuit(circuit(2), peer.clone());
+        runtime.transport_mut().push_circuit(circuit(2), peer);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
@@ -3092,19 +3082,17 @@ mod tests {
         let mut engine = ConnectEngine::new(1_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
-        runtime
-            .transport_mut()
-            .push_circuit(circuit(3), peer.clone());
+        runtime.transport_mut().push_circuit(circuit(3), peer);
         assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
 
         let transport = runtime.transport_mut();
-        transport.push_circuit(circuit(4), peer.clone());
+        transport.push_circuit(circuit(4), peer);
         transport.push_closed(circuit(4));
         let events = drain(&mut engine, &mut runtime, 1);
         assert!(settled_for(&events, id).is_none(), "{events:?}");
@@ -3123,7 +3111,7 @@ mod tests {
     fn nat_failed(id: ConnectId, peer: &PeerId, reason: &str) -> minip2p_nat::NatEvent {
         minip2p_nat::NatEvent::ConnectFailed {
             connect_id: id,
-            peer: peer.clone(),
+            peer: *peer,
             error: minip2p_nat::NatError::DialFailed(reason.into()),
         }
     }
@@ -3137,7 +3125,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             vec![first],
             RelayPolicy::Race,
             &mut runtime,
@@ -3175,7 +3163,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             vec![first],
             RelayPolicy::Race,
             &mut runtime,
@@ -3214,7 +3202,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
@@ -3251,7 +3239,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Forced,
             &mut runtime,
@@ -3279,7 +3267,7 @@ mod tests {
         engine.observe_nat(
             &NatEvent::ConnectFailed {
                 connect_id: id,
-                peer: peer.clone(),
+                peer,
                 error: NatError::DialFailed("unreachable".into()),
             },
             &mut runtime,
@@ -3308,7 +3296,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Forced,
             &mut runtime,
@@ -3328,7 +3316,7 @@ mod tests {
         engine.observe_nat(
             &NatEvent::ConnectFailed {
                 connect_id: id,
-                peer: peer.clone(),
+                peer,
                 error,
             },
             &mut runtime,
@@ -3354,19 +3342,19 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         let conn = circuit(8);
-        runtime.transport_mut().push_circuit(conn, peer.clone());
+        runtime.transport_mut().push_circuit(conn, peer);
         assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
         engine.observe_nat(
             &minip2p_nat::NatEvent::FellBackToRelay {
                 connect_id: id,
-                peer: peer.clone(),
+                peer,
                 reason: minip2p_nat::UpgradeStop::PunchFailed { rounds: 3 },
             },
             &mut runtime,
@@ -3394,14 +3382,14 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
             0,
         );
         let conn = circuit(9);
-        runtime.transport_mut().push_circuit(conn, peer.clone());
+        runtime.transport_mut().push_circuit(conn, peer);
         let _ = drain(&mut engine, &mut runtime, 0);
         runtime.transport_mut().push_closed(conn);
         let events = drain(&mut engine, &mut runtime, 0);
@@ -3430,7 +3418,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = admit(
             &mut engine,
-            peer.clone(),
+            peer,
             Vec::new(),
             RelayPolicy::Race,
             &mut runtime,
@@ -3448,7 +3436,7 @@ mod tests {
         engine.observe_nat(
             &minip2p_nat::NatEvent::PathEstablished {
                 connect_id: id,
-                peer: peer.clone(),
+                peer,
                 path: minip2p_nat::Path::Direct,
             },
             &mut runtime,

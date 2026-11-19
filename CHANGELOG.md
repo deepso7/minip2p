@@ -4,6 +4,11 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### `PeerId` and `Path` are `Copy`; `ConnectionReplaced` carries both paths
+
+- **`PeerId` and `Path` derive `Copy`**: drop `.clone()` calls on them (clippy's `clone_on_copy` flags them).
+- **`SwarmEvent::ConnectionReplaced` and `EndpointEvent::ConnectionReplaced` gain `old_path: Path` and `new_path: Path`**: a relayed `old` replaced by a `Direct` or `Punched` `new` is the planned upgrade off the relay, so stop inspecting `ConnectionId::is_circuit()`. Patterns naming every field need the two new ones or `..`; code constructing the swarm event passes both (the swarm reports `Relayed` for a circuit and `Direct` otherwise; the Endpoint refines a hole punch to `Punched`).
+
 ### Relay-mesh membership is signed, not listed
 
 The public identity now vouches for each node's backbone key ([ADR 0028](docs/adr/0028-relay-mesh-identity-signed-membership.md)), so a mesh has no allowlist and a new node joins by listing the existing ones, with no change on them. The mesh wire gains `/minip2p/relay-mesh/member/1.0.0`, so every node of a mesh must upgrade together.

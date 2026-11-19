@@ -235,13 +235,13 @@ impl RelayServerAgent {
         match io.swarm.open_stream(peer, protocol_id, io.now_ms()) {
             Ok(stream) if stream.conn_id == conn_id => Some(stream),
             Ok(stream) => {
-                self.reset(io, peer.clone(), stream);
+                self.reset(io, *peer, stream);
                 None
             }
             Err(error) => {
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::OpenStream,
-                    Some(peer.clone()),
+                    Some(*peer),
                     error.to_string(),
                 );
                 None
@@ -278,7 +278,7 @@ impl RelayServerAgent {
         mesh.pending.insert(
             conn_id,
             Pending {
-                peer: peer.clone(),
+                peer,
                 outbound: None,
                 inbound: None,
                 inbound_seen: false,
@@ -323,13 +323,13 @@ impl RelayServerAgent {
             mesh.proof_deadlines.remove(&old);
             pending.holds_entry
         } else if mesh.forget_link(peer, old) {
-            mesh.directory.member_connected(peer.clone());
+            mesh.directory.member_connected(*peer);
             true
         } else {
             false
         };
         self.on_connection_closed(io, peer, old);
-        self.start_pending(io, peer.clone(), new, holds_entry);
+        self.start_pending(io, *peer, new, holds_entry);
     }
 
     /// Forgets the backbone connection `conn_id` to `peer`, link or pending.
@@ -348,9 +348,8 @@ impl RelayServerAgent {
         } else if !mesh.forget_link(peer, conn_id) {
             return false;
         }
-        self.events.push_back(RelayServerEvent::MeshMemberDown {
-            member: peer.clone(),
-        });
+        self.events
+            .push_back(RelayServerEvent::MeshMemberDown { member: *peer });
         true
     }
 
@@ -364,8 +363,8 @@ impl RelayServerAgent {
         };
         if !mesh.is_member_stream(stream) {
             // Its connection was retired or rejected while it negotiated.
-            self.rejected_hop_streams.insert(stream, peer.clone());
-            self.reset(io, peer.clone(), stream);
+            self.rejected_hop_streams.insert(stream, *peer);
+            self.reset(io, *peer, stream);
             return;
         }
         let proof = mesh.proof;
@@ -377,12 +376,12 @@ impl RelayServerAgent {
             // The exchange is left to its deadline.
             self.runtime_error(
                 RelayServerRuntimeErrorKind::SendStream,
-                Some(peer.clone()),
+                Some(*peer),
                 control_send_failure(error),
             );
             self.drop_member_stream(stream);
-            self.rejected_hop_streams.insert(stream, peer.clone());
-            self.reset(io, peer.clone(), stream);
+            self.rejected_hop_streams.insert(stream, *peer);
+            self.reset(io, *peer, stream);
         }
     }
 
@@ -400,14 +399,14 @@ impl RelayServerAgent {
                 pending.inbound = Some((stream, MemberReader::proof()));
             }
             Some(_) => {
-                self.rejected_hop_streams.insert(stream, peer.clone());
-                self.reset(io, peer.clone(), stream);
+                self.rejected_hop_streams.insert(stream, *peer);
+                self.reset(io, *peer, stream);
                 self.reject(io, stream.conn_id, MeshRejectionReason::DuplicateProof);
             }
             // A verified link proves itself once.
             None => {
-                self.rejected_hop_streams.insert(stream, peer.clone());
-                self.reset(io, peer.clone(), stream);
+                self.rejected_hop_streams.insert(stream, *peer);
+                self.reset(io, *peer, stream);
             }
         }
     }
@@ -444,7 +443,7 @@ impl RelayServerAgent {
         let Some(pending) = mesh.pending.get_mut(&stream.conn_id) else {
             return false;
         };
-        let peer = pending.peer.clone();
+        let peer = pending.peer;
         match pending.side(stream) {
             None => return false,
             Some(Side::Outbound) => {
@@ -550,11 +549,7 @@ impl RelayServerAgent {
         let Some(mesh) = &mut self.mesh else {
             return;
         };
-        let Some(peer) = mesh
-            .pending
-            .get(&conn_id)
-            .map(|pending| pending.peer.clone())
-        else {
+        let Some(peer) = mesh.pending.get(&conn_id).map(|pending| pending.peer) else {
             return;
         };
         if io.swarm.connection_peer(conn_id) != Some(&peer) {
@@ -571,13 +566,13 @@ impl RelayServerAgent {
             mesh.directory.member_disconnected(&peer);
         }
         self.events.push_back(RelayServerEvent::MeshPeerRejected {
-            peer_id: peer.clone(),
+            peer_id: peer,
             reason,
         });
         if let Err(error) = io.swarm.close_connection(&peer, conn_id, io.now_ms()) {
             self.runtime_error(
                 RelayServerRuntimeErrorKind::Mesh,
-                Some(peer.clone()),
+                Some(peer),
                 error.to_string(),
             );
         }
@@ -614,7 +609,7 @@ impl RelayServerAgent {
             return;
         };
         mesh.links.insert(
-            peer.clone(),
+            peer,
             Link {
                 conn_id,
                 stream: None,
@@ -625,21 +620,20 @@ impl RelayServerAgent {
             },
         );
         mesh.reopen.remove(&peer);
-        mesh.directory.member_connected(peer.clone());
+        mesh.directory.member_connected(peer);
         // Only each member's latest counts, so a host that never takes
         // them holds one per member.
         mesh.verified.retain(|(member, _)| *member != peer);
-        mesh.verified.push((peer.clone(), conn_id));
+        mesh.verified.push((peer, conn_id));
         if !in_directory {
-            self.events.push_back(RelayServerEvent::MeshMemberUp {
-                member: peer.clone(),
-            });
+            self.events
+                .push_back(RelayServerEvent::MeshMemberUp { member: peer });
         }
         // Kept like any connection, so circuits and workers on it end with it.
         self.connections.insert(
             conn_id,
             Connection {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 ip: None,
                 is_circuit: false,
             },
@@ -679,7 +673,7 @@ impl RelayServerAgent {
         {
             let delay_ms = link.backoff.next_delay_ms();
             mesh.reopen
-                .set(member.clone(), io.now_ms().saturating_add(delay_ms));
+                .set(*member, io.now_ms().saturating_add(delay_ms));
         }
     }
 
@@ -741,7 +735,7 @@ impl RelayServerAgent {
         for (peer, record) in &self.reservations {
             snapshot.extend_from_slice(
                 &DirectoryMessage::Present {
-                    peer: peer.clone(),
+                    peer: *peer,
                     expires_unix: record.expires_unix,
                 }
                 .encode_frame(),
@@ -772,7 +766,7 @@ impl RelayServerAgent {
             .links
             .iter()
             .filter(|(_, link)| link.live)
-            .map(|(member, _)| member.clone())
+            .map(|(member, _)| *member)
             .collect();
         if members.is_empty() {
             return;
@@ -800,7 +794,7 @@ impl RelayServerAgent {
         if link.blocked {
             link.backlog.extend_from_slice(&data);
             if link.backlog.len() > MAX_DIRECTORY_BACKLOG {
-                self.reset(io, member.clone(), stream);
+                self.reset(io, *member, stream);
                 self.lose_directory(io, member);
             }
             return;
@@ -819,10 +813,10 @@ impl RelayServerAgent {
             Err(error) => {
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::SendStream,
-                    Some(member.clone()),
+                    Some(*member),
                     control_send_failure(error),
                 );
-                self.reset(io, member.clone(), stream);
+                self.reset(io, *member, stream);
                 self.lose_directory(io, member);
             }
         }
@@ -879,30 +873,30 @@ impl RelayServerAgent {
             .as_ref()
             .is_some_and(|mesh| mesh.pending.contains_key(&stream.conn_id))
         {
-            self.rejected_hop_streams.insert(stream, peer.clone());
-            self.reset(io, peer.clone(), stream);
+            self.rejected_hop_streams.insert(stream, *peer);
+            self.reset(io, *peer, stream);
             return true;
         }
         if !self.is_member_link(peer, stream.conn_id) {
-            self.rejected_hop_streams.insert(stream, peer.clone());
-            self.reset(io, peer.clone(), stream);
+            self.rejected_hop_streams.insert(stream, *peer);
+            self.reset(io, *peer, stream);
             self.runtime_error(
                 RelayServerRuntimeErrorKind::Mesh,
-                Some(peer.clone()),
+                Some(*peer),
                 format!("refused {protocol_id} from a peer that is not a mesh member"),
             );
             return true;
         }
         if protocol_id == DIRECTORY_PROTOCOL_ID {
             if let Some(mesh) = &mut self.mesh {
-                mesh.directory.stream_opened(peer.clone(), stream);
-                mesh.receiving.insert(stream, peer.clone());
+                mesh.directory.stream_opened(*peer, stream);
+                mesh.receiving.insert(stream, *peer);
             }
         } else {
             self.hop_workers.insert(
                 stream,
                 HopWorker {
-                    peer_id: peer.clone(),
+                    peer_id: *peer,
                     responder: Responder::Forward {
                         request: Vec::new(),
                         source: None,
@@ -951,8 +945,8 @@ impl RelayServerAgent {
             }
             DirectoryInput::Reset(reason) => {
                 mesh.receiving.remove(&stream);
-                self.rejected_hop_streams.insert(stream, member.clone());
-                self.reset(io, member.clone(), stream);
+                self.rejected_hop_streams.insert(stream, member);
+                self.reset(io, member, stream);
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::Mesh,
                     Some(member),
@@ -1033,12 +1027,12 @@ impl RelayServerAgent {
             .into_iter()
             .map(|claim| {
                 let link = mesh.links.get(claim.member).map(|link| link.conn_id);
-                (claim.member.clone(), link)
+                (*claim.member, link)
             })
             .filter(|tried| !resolution.tried.contains(tried))
             .collect();
         for (member, link) in claims {
-            resolution.tried.push((member.clone(), link));
+            resolution.tried.push((member, link));
             // A claim whose link is gone, or replaced under the agent, is a
             // failed one.
             let opened = link
@@ -1065,7 +1059,7 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
-        let destination = circuit.destination_peer_id.clone();
+        let destination = circuit.destination_peer_id;
         let source_ip = circuit.source_ip.clone();
         let held_ip = circuit.destination_ip.clone();
         // The destination may have reserved here since admission. Its IP
@@ -1167,7 +1161,7 @@ impl RelayServerAgent {
         if let Some(mesh) = &mut circuit.mesh {
             mesh.resolution.last_status = Some(status);
         }
-        let member = circuit.destination_leg_peer().clone();
+        let member = *circuit.destination_leg_peer();
         let ready = circuit.destination_ready();
         let stream = circuit.destination_stream.take();
         let conn_id = circuit.destination_conn_id.take();
@@ -1195,7 +1189,7 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return 0;
         };
-        let member = circuit.destination_leg_peer().clone();
+        let member = *circuit.destination_leg_peer();
         let PendingDestination::Forward(forward) = &mut circuit.destination else {
             return 0;
         };
@@ -1272,7 +1266,7 @@ impl RelayServerAgent {
                 consumed,
             ))) => {
                 *request_known = true;
-                *source = Some(forwarded.clone());
+                *source = Some(forwarded);
                 let pipelined = request.split_off(consumed);
                 request.clear();
                 io.ack(stream, data.len() - pipelined.len());
@@ -1290,11 +1284,11 @@ impl RelayServerAgent {
                 }
             }
             Ok(Some((ForwardMessage::Status(_), _))) | Err(_) => {
-                let member = peer_id.clone();
+                let member = *peer_id;
                 io.ack(stream, data.len());
                 self.remove_hop_worker(stream);
-                self.rejected_hop_streams.insert(stream, member.clone());
-                self.reset(io, member.clone(), stream);
+                self.rejected_hop_streams.insert(stream, member);
+                self.reset(io, member, stream);
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::Mesh,
                     Some(member),
@@ -1318,11 +1312,7 @@ impl RelayServerAgent {
         destination: PeerId,
         limit: Limit,
     ) {
-        let Some(member) = self
-            .hop_workers
-            .get(&stream)
-            .map(|worker| worker.peer_id.clone())
-        else {
+        let Some(member) = self.hop_workers.get(&stream).map(|worker| worker.peer_id) else {
             return;
         };
         let conn_id = self.live_reservation(&destination);

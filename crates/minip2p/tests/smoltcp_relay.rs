@@ -345,7 +345,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     let b_peer = b_identity.peer_id();
     let relay_peer = relay_identity.peer_id();
     let relay_transport: Multiaddr = format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap();
-    let relay_addr = PeerAddr::new(relay_transport, relay_peer.clone()).unwrap();
+    let relay_addr = PeerAddr::new(relay_transport, relay_peer).unwrap();
 
     let mut a = Endpoint::portable(&a_identity, CountingEntropy(10))
         .smoltcp(stack(bus.device(0), A_IP))
@@ -366,7 +366,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         .protocol(STOP_PROTOCOL_ID)
         .build()
         .unwrap();
-    let mut service = RelayService::new(a_peer.clone(), b_peer.clone());
+    let mut service = RelayService::new(a_peer, b_peer);
 
     let mut now_ms = 0;
     let mut connect_id = None;
@@ -389,7 +389,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 if relay == &relay_peer)
         });
         if reserved && connect_id.is_none() {
-            connect_id = Some(a.connect(&b_peer, now).unwrap());
+            connect_id = Some(a.connect(b_peer, now).unwrap());
         }
         let a_relayed = a_events.iter().any(|event| {
             matches!(event, EndpointEvent::Nat(NatEvent::PathEstablished {
@@ -503,7 +503,7 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
     let relay_peer = relay_identity.peer_id();
     let relay_addr = PeerAddr::new(
         format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
-        relay_peer.clone(),
+        relay_peer,
     )
     .unwrap();
 
@@ -533,7 +533,7 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
         .protocol(STOP_PROTOCOL_ID)
         .build()
         .unwrap();
-    let mut service = RelayService::new(a_peer.clone(), b_peer.clone());
+    let mut service = RelayService::new(a_peer, b_peer);
 
     let mut now_ms = 0;
     let mut a_events = Vec::new();
@@ -557,7 +557,7 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
             })
             .count();
         if reservations > 0 && connect_id.is_none() {
-            connect_id = Some(a.connect(&b_peer, now).unwrap());
+            connect_id = Some(a.connect(b_peer, now).unwrap());
         }
         let a_settled = connect_id.is_some_and(|id| {
             a_events.iter().any(|event| {
@@ -669,7 +669,7 @@ fn peer_target_on_an_autonat_only_portable_endpoint_settles_no_usable_route() {
         .expect("AutoNAT-only policy builds with relay code available");
 
     let peer = identity(132).peer_id();
-    let id = endpoint.connect(&peer, Now::from_millis(0)).unwrap();
+    let id = endpoint.connect(peer, Now::from_millis(0)).unwrap();
     let events = endpoint.poll(Now::from_millis(0)).unwrap();
     assert!(
         events.iter().any(|event| {
@@ -737,7 +737,7 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
 
         // Starting well after zero catches deadlines anchored to an internal epoch.
         let start = Now::from_millis(50_000);
-        let id = endpoint.connect(&peer, start).unwrap();
+        let id = endpoint.connect(peer, start).unwrap();
         let mut events = endpoint.poll(start).unwrap();
         assert!(!events.iter().any(|event| matches!(event,
             EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id)));

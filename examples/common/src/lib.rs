@@ -376,19 +376,16 @@ pub fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {
     let mut rewritten = Vec::with_capacity(protocols.len());
     rewritten.push(replacement);
     rewritten.extend_from_slice(rest);
-    PeerAddr::new(
-        Multiaddr::from_protocols(rewritten),
-        peer_addr.peer_id().clone(),
-    )
-    .unwrap_or_else(|_| peer_addr.clone())
+    PeerAddr::new(Multiaddr::from_protocols(rewritten), *peer_addr.peer_id())
+        .unwrap_or_else(|_| peer_addr.clone())
 }
 
 /// The circuit address a dialer pastes to reach `us` through `relay`.
 pub fn circuit_addr(relay: &PeerAddr, us: &PeerId) -> Multiaddr {
     let mut protocols = relay.transport().protocols().to_vec();
-    protocols.push(Protocol::P2p(relay.peer_id().clone()));
+    protocols.push(Protocol::P2p(*relay.peer_id()));
     protocols.push(Protocol::P2pCircuit);
-    protocols.push(Protocol::P2p(us.clone()));
+    protocols.push(Protocol::P2p(*us));
     Multiaddr::from_protocols(protocols)
 }
 

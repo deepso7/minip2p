@@ -1633,7 +1633,7 @@ impl EndpointBuilder {
                 addrs
                     .iter()
                     .find_map(|address| match address.iter().last() {
-                        Some(Protocol::P2p(peer_id)) => Some(peer_id.clone()),
+                        Some(Protocol::P2p(peer_id)) => Some(*peer_id),
                         _ => None,
                     })
             })
@@ -2648,7 +2648,7 @@ mod tests {
             .bind()
             .expect("bind listener");
         let quic_addr = listener.listen().expect("listen");
-        let tcp_addr = tcp_peer_addr(quic_addr.peer_id().clone(), 9);
+        let tcp_addr = tcp_peer_addr(*quic_addr.peer_id(), 9);
         let _driver = Driven::new(listener);
         let mut dialer = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -2752,7 +2752,7 @@ mod tests {
     fn named(addr: &PeerAddr, host: &str) -> PeerAddr {
         let mut protocols = addr.transport().protocols().to_vec();
         *protocols.first_mut().expect("a host") = Protocol::Dns(host.to_string());
-        PeerAddr::new(Multiaddr::from_protocols(protocols), addr.peer_id().clone())
+        PeerAddr::new(Multiaddr::from_protocols(protocols), *addr.peer_id())
             .expect("named peer addr")
     }
 
@@ -2812,9 +2812,8 @@ mod tests {
         let (lookup, started, answer) = stalling_lookup();
         with_lookup(&mut dialer, lookup);
         let peer = Ed25519Keypair::generate().peer_id();
-        let target = |text: &str| {
-            PeerAddr::new(text.parse().expect("addr"), peer.clone()).expect("peer addr")
-        };
+        let target =
+            |text: &str| PeerAddr::new(text.parse().expect("addr"), peer).expect("peer addr");
 
         let first = dialer
             .connect(target("/dns/gone.invalid/udp/4001/quic-v1"))
@@ -2873,7 +2872,7 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let named_target = PeerAddr::new(
             "/dns/gone.invalid/udp/4001/quic-v1".parse().expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let connect_id = dialer.connect(named_target).expect("connect");
@@ -2886,7 +2885,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let other = Ed25519Keypair::generate().peer_id();
         dialer.engine.events.push_back(EndpointEvent::PingFailed {
-            peer_id: other.clone(),
+            peer_id: other,
             conn_id: ConnectionId::new(1),
             cause: minip2p_swarm::PingFailure::TimedOut,
         });
@@ -2994,7 +2993,7 @@ mod tests {
 
         let mut protocols = addr.transport().protocols().to_vec();
         *protocols.first_mut().expect("a host") = Protocol::Dns4("localhost".to_string());
-        let target = PeerAddr::new(Multiaddr::from_protocols(protocols), addr.peer_id().clone())
+        let target = PeerAddr::new(Multiaddr::from_protocols(protocols), *addr.peer_id())
             .expect("named peer addr");
         let id = dialer.connect(target).expect("connect");
         let ConnectOutcome::Connected { conn_id, .. } = connect_outcome(&mut dialer, id) else {
@@ -3015,7 +3014,7 @@ mod tests {
             .bind()
             .expect("bind listener");
         let quic_addr = listener.listen().expect("listen");
-        let tcp_addr = tcp_peer_addr(quic_addr.peer_id().clone(), 9);
+        let tcp_addr = tcp_peer_addr(*quic_addr.peer_id(), 9);
         let _driver = Driven::new(listener);
         let mut dialer = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -3557,7 +3556,7 @@ mod tests {
             .into_iter()
             .find(|addr| addr.to_string().contains("quic"))
             .expect("a bound quic socket");
-        let quic_addr = PeerAddr::new(bound, listener.peer_id().clone()).expect("target");
+        let quic_addr = PeerAddr::new(bound, *listener.peer_id()).expect("target");
         let first = listener.listen().expect("listen returns the first address");
         assert!(
             first.transport().to_string().contains("/tcp/"),
@@ -3767,7 +3766,7 @@ mod tests {
             .engine
             .events
             .push_back(EndpointEvent::ConnectionClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id: ConnectionId::new(1),
                 reason: ConnectionCloseReason::Local,
             });
@@ -3832,7 +3831,7 @@ mod tests {
                 .engine
                 .events
                 .push_back(EndpointEvent::ConnectionClosed {
-                    peer_id: peer.clone(),
+                    peer_id: peer,
                     conn_id: ConnectionId::new(1),
                     reason: ConnectionCloseReason::Local,
                 });
@@ -3929,7 +3928,7 @@ mod tests {
             .engine
             .events
             .push_back(EndpointEvent::ConnectionClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id: ConnectionId::new(1),
                 reason: ConnectionCloseReason::Local,
             });
@@ -3975,7 +3974,7 @@ mod tests {
         let _listener = Driven::new(listener);
 
         dialer.connect(&listen_addr).expect("connect");
-        let peer = listen_addr.peer_id().clone();
+        let peer = *listen_addr.peer_id();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut established_count = 0u32;
@@ -4026,7 +4025,7 @@ mod tests {
         let _listener = Driven::new(listener);
 
         dialer.connect(&listen_addr).expect("connect");
-        let peer = listen_addr.peer_id().clone();
+        let peer = *listen_addr.peer_id();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut ready = false;
         while std::time::Instant::now() < deadline {
@@ -4113,7 +4112,7 @@ mod tests {
             .expect("pubsub configured")
             .events
             .push_back(GossipsubEvent::PeerSubscribed {
-                peer: peer.clone(),
+                peer,
                 topic: "test".into(),
             });
 
@@ -4145,13 +4144,13 @@ mod tests {
             .unwrap()
             .events
             .push_back(GossipsubEvent::PeerSubscribed {
-                peer: peer.clone(),
+                peer,
                 topic: "test".into(),
             });
         let nat = endpoint.engine.nat.as_mut().unwrap();
         nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
-            peer: peer.clone(),
+            peer,
             reason: minip2p_nat::UpgradeStop::PunchFailed { rounds: 3 },
         });
         nat.push_event(NatEvent::ReachabilityChanged {
@@ -4298,7 +4297,7 @@ mod tests {
             .engine
             .events
             .push_back(EndpointEvent::ConnectionClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id: ConnectionId::new(1),
                 reason: ConnectionCloseReason::Local,
             });
@@ -4336,7 +4335,7 @@ mod tests {
             .engine
             .events
             .push_back(EndpointEvent::ConnectionClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id: ConnectionId::new(1),
                 reason: ConnectionCloseReason::Local,
             });
@@ -4395,7 +4394,7 @@ mod tests {
 
         let report = dialer.close_within(Duration::ZERO);
         assert_eq!(report.outcome, CloseOutcome::DeadlineExpired);
-        assert_eq!(report.unfinished, [(conn_id, Some(addr.peer_id().clone()))]);
+        assert_eq!(report.unfinished, [(conn_id, Some(*addr.peer_id()))]);
     }
 
     /// A dial the transport still holds is unfinished teardown, not a drain.
@@ -4408,7 +4407,7 @@ mod tests {
             format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
                 .parse()
                 .expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let mut dialer = quic_endpoint();
@@ -5243,7 +5242,7 @@ mod tests {
                 .expect("bind endpoint")
         };
         let (mut writer, mut reader) = (bind(), bind());
-        let (writer_peer, reader_peer) = (writer.peer_id().clone(), reader.peer_id().clone());
+        let (writer_peer, reader_peer) = (*writer.peer_id(), *reader.peer_id());
         let give_up = std::time::Instant::now() + Duration::from_secs(10);
         let tick = Duration::from_millis(5);
         writer

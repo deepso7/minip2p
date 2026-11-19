@@ -291,7 +291,7 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
     let bound = listener.listen(&listen).expect("listener binds");
     dialer
         .connect(
-            PeerAddr::new(bound, listener_peer.clone()).expect("valid peer address"),
+            PeerAddr::new(bound, listener_peer).expect("valid peer address"),
             Now::from_millis(0),
         )
         .expect("connect starts");
@@ -403,7 +403,7 @@ fn portable_connect_settles_over_smoltcp_tcp() {
         .parse()
         .expect("valid listen address");
     let bound = listener.listen(&listen).expect("listener binds");
-    let target = PeerAddr::new(bound, listener_peer.clone()).expect("valid peer address");
+    let target = PeerAddr::new(bound, listener_peer).expect("valid peer address");
     let id = dialer
         .connect(target, Now::from_millis(0))
         .expect("connect admitted");
@@ -486,7 +486,7 @@ fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
         format!("/ip4/{LISTENER_IP}/tcp/4001")
             .parse()
             .expect("listener address"),
-        listener_peer.clone(),
+        listener_peer,
     )
     .expect("peer address");
     dialer
@@ -648,7 +648,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
     a.connect(
         PeerAddr::new(
             format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
-            b_peer.clone(),
+            b_peer,
         )
         .unwrap(),
         Now::from_millis(0),
@@ -740,7 +740,7 @@ fn signed_beacons_populate_discovery_without_mdns() {
     a.connect(
         PeerAddr::new(
             format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
-            b_peer.clone(),
+            b_peer,
         )
         .unwrap(),
         Now::from_millis(0),

@@ -480,14 +480,14 @@ pub fn run_dial(
             let id = endpoint
                 .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
-            (peer.clone(), id)
+            (*peer, id)
         }
         DialTarget::Direct(addr) => {
             println!("[dial] target={addr}");
             let id = endpoint
                 .connect(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
-            (addr.peer_id().clone(), id)
+            (*addr.peer_id(), id)
         }
     };
 

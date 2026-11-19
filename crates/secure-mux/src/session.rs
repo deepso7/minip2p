@@ -855,7 +855,7 @@ impl SecureMuxSession {
         self.outputs.insert(
             established_at,
             SessionOutput::Established {
-                peer: peer.clone(),
+                peer,
                 handshake_hash,
             },
         );

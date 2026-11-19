@@ -538,7 +538,7 @@ impl RelayEmulator {
             return Err(RelayEmulatorError::Unexpected("expected RESERVE"));
         }
 
-        let channels = self.reservations.entry(reserver.clone()).or_default();
+        let channels = self.reservations.entry(*reserver).or_default();
         let response = HopMessage {
             kind: HopMessageType::Status,
             peer: None,
@@ -551,9 +551,8 @@ impl RelayEmulator {
             status: Some(Status::Ok),
         };
         channels.hop_inbox.extend(encode_frame(&response.encode()));
-        self.events.push(RelayEvent::ReservationStored {
-            peer: reserver.clone(),
-        });
+        self.events
+            .push(RelayEvent::ReservationStored { peer: *reserver });
         trailing_bytes(bytes, consumed)
     }
 
@@ -624,8 +623,8 @@ impl RelayEmulator {
         self.pending_connects.insert(
             pending_id,
             PendingConnect {
-                initiator: initiator.clone(),
-                target: target.clone(),
+                initiator: *initiator,
+                target,
             },
         );
         Ok(ConnectRequestOutcome::Bridging {

@@ -85,7 +85,7 @@ impl PeerAddr {
         let transport = Multiaddr::from_protocols(transport_slice.to_vec());
         Ok(Self {
             transport,
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
         })
     }
 
@@ -107,7 +107,7 @@ impl PeerAddr {
     /// Rebuilds the full multiaddr with the terminal `/p2p/<peer-id>`.
     pub fn to_multiaddr(&self) -> Multiaddr {
         let mut protocols = self.transport.protocols().to_vec();
-        protocols.push(Protocol::P2p(self.peer_id.clone()));
+        protocols.push(Protocol::P2p(self.peer_id));
         Multiaddr::from_protocols(protocols)
     }
 }
@@ -204,11 +204,7 @@ mod tests {
     #[test]
     fn tcp_constructor_builds_peer_addrs() {
         let peer_id = PeerId::from_str(PEER_ID).expect("peer id must parse");
-        let v4 = PeerAddr::tcp(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            4001,
-            peer_id.clone(),
-        );
+        let v4 = PeerAddr::tcp(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4001, peer_id);
         assert_eq!(v4.transport().to_string(), "/ip4/192.0.2.1/tcp/4001");
         assert!(v4.transport().is_tcp_transport());
         assert_eq!(

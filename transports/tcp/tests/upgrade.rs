@@ -122,7 +122,7 @@ fn upgraded_pair_with(dialer_config: TcpConfig, listener_config: TcpConfig) -> P
     let mut listener = node_with(&net, listener_key, 20, listener_config);
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
-    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("dial target");
+    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
     let connection = dialer.dial(&target).expect("dial starts");
     let (dialer_events, listener_events) = drive(&net, &mut dialer, &mut listener);
 
@@ -1213,7 +1213,7 @@ fn a_dial_past_the_ceiling_is_refused_and_costs_nothing() {
     );
     let listener_peer = identity(2).peer_id();
     dialer
-        .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+        .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("target"))
         .expect("the first dial fits");
 
     let error = dialer
@@ -1254,7 +1254,7 @@ fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
     let mut second = node(&net, identity(3), 30);
     for dialer in [&mut first, &mut second] {
         dialer
-            .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+            .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("target"))
             .expect("dial starts");
     }
 

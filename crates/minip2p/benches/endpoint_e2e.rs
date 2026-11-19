@@ -107,7 +107,7 @@ impl EchoServer {
                         conn_id,
                         stream_id,
                         data,
-                    }) if streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
+                    }) if streams.contains(&(peer_id, conn_id, stream_id)) => {
                         endpoint
                             .send_stream(conn_id, stream_id, data)
                             .expect("echo");
@@ -116,7 +116,7 @@ impl EchoServer {
                         peer_id,
                         conn_id,
                         stream_id,
-                    }) if streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
+                    }) if streams.contains(&(peer_id, conn_id, stream_id)) => {
                         endpoint
                             .close_stream_write(conn_id, stream_id)
                             .expect("close echo");
@@ -163,12 +163,12 @@ struct Crossed {
 impl Crossed {
     fn connected(kind: Kind) -> Self {
         let server = EchoServer::start(kind);
-        let peer = server.address.peer_id().clone();
+        let peer = *server.address.peer_id();
         let mut clients = Vec::new();
         for _ in 0..4 {
             let mut client = bind(kind);
             connect_ready(&mut client, &server.address);
-            clients.push((client, peer.clone()));
+            clients.push((client, peer));
         }
         Self {
             _server: server,
@@ -251,7 +251,7 @@ impl Crossed {
 impl Pair {
     fn disconnected(kind: Kind) -> Self {
         let server = EchoServer::start(kind);
-        let peer = server.address.peer_id().clone();
+        let peer = *server.address.peer_id();
         Self {
             _server: server,
             client: bind(kind),

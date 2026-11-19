@@ -224,7 +224,7 @@ impl DatagramTally {
                 return Self { atomics };
             }
             let atomics = Arc::new(Atomics::default());
-            registry.push((peer.clone(), Arc::downgrade(&atomics)));
+            registry.push((*peer, Arc::downgrade(&atomics)));
             Self { atomics }
         }
         #[cfg(not(feature = "diagnostics"))]

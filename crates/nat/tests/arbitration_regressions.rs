@@ -38,7 +38,7 @@ fn drive_to_relayed(h: &mut Harness) -> (ConnectId, ConnectionId) {
 
 fn drive_to_relayed_with(h: &mut Harness, legs: ConnectLegs) -> (ConnectId, ConnectionId) {
     let (id, _, promotion) = drive_to_bridged_with(h, legs);
-    let target = h.target.clone();
+    let target = h.target;
     let conn = complete_promotion(&mut h.agent, &target, &promotion, at(301));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
@@ -56,7 +56,7 @@ fn open_inbound_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, 
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -103,7 +103,7 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&[
                 maddr("/ip4/10.0.0.7/udp/4002/quic-v1"),
@@ -119,7 +119,7 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_sync()),
         },
@@ -158,7 +158,7 @@ fn circuit_dialer_caps_peer_supplied_punch_targets() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&addrs)),
         },
@@ -169,7 +169,7 @@ fn circuit_dialer_caps_peer_supplied_punch_targets() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_sync()),
         },
@@ -197,7 +197,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(std::slice::from_ref(&punch))),
         },
@@ -208,7 +208,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_sync()),
         },
@@ -219,7 +219,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
     let punch_conn = dial_conn_for(&actions, &h.target);
     drain_events(&mut h.agent);
 
-    let punch_addr = PeerAddr::new(punch, h.target.clone()).expect("punch addr");
+    let punch_addr = PeerAddr::new(punch, h.target).expect("punch addr");
     assert!(h.agent.handle_event(
         &SwarmEvent::DialFailed {
             conn_id: punch_conn,
@@ -249,7 +249,7 @@ fn foreign_streams_do_not_mutate_an_active_dcutr_exchange() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: foreign,
             data: Bytes::from_static(b"foreign"),
         },
@@ -290,7 +290,7 @@ fn promoted_circuit_closed_before_fallback_fails_the_leg() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             reason: ConnectionCloseReason::Local,
         },
         true,
@@ -364,7 +364,7 @@ fn cancel_closes_an_in_flight_relay_dial() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: conn,
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
         },
         false,
         at(3),
@@ -395,7 +395,7 @@ fn cancel_closes_an_in_flight_punch_dial() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: punch_conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
         },
         false,
         at(315),
@@ -445,7 +445,7 @@ fn fallback_closes_an_in_flight_punch_dial() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: punch_conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
         },
         false,
         at(1_153),
@@ -474,7 +474,7 @@ fn incomplete_dcutr_close_fails_and_resets_the_exchange() {
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
         },
         false,
@@ -518,7 +518,7 @@ fn drive_round_to(
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(addrs)),
         },
@@ -529,7 +529,7 @@ fn drive_round_to(
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_sync()),
         },
@@ -604,7 +604,7 @@ fn the_holder_runs_three_rounds_and_each_failed_round_cancels_its_dials() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: fourth,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -624,7 +624,7 @@ fn empty_filtered_dcutr_targets_fail_permanently() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&[maddr(
                 "/ip4/10.0.0.7/udp/4002/quic-v1",
@@ -638,7 +638,7 @@ fn empty_filtered_dcutr_targets_fail_permanently() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_sync()),
         },
@@ -668,7 +668,7 @@ fn established_during_punch_window_is_direct_dialed_unless_punch_conn() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(99),
-            peer_id: h.target.clone(),
+            peer_id: h.target,
         },
         false,
         at(314),
@@ -695,7 +695,7 @@ fn punch_conn_established_during_window_is_direct_punched() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: punch_conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
         },
         false,
         at(314),
@@ -741,15 +741,17 @@ fn a_second_punch_replacing_the_first_is_punched() {
     };
 
     // The swarm is past both replacements when NAT sees the first.
-    let target = h.target.clone();
+    let target = h.target;
     h.agent.swarm.connect(&target, second);
     for (old, new) in [(circuit, first), (first, second)] {
         drain_events(&mut h.agent);
         h.agent.deliver_late(
             &SwarmEvent::ConnectionReplaced {
-                peer_id: h.target.clone(),
+                peer_id: h.target,
                 old,
                 new,
+                old_path: minip2p_core::Path::Direct,
+                new_path: minip2p_core::Path::Direct,
             },
             false,
             at(314),
@@ -779,7 +781,7 @@ fn an_unclaimed_punch_replacing_the_circuit_upgrades_to_punched() {
     let last = drive_round_at(&mut h, circuit, StreamId::new(92), 6_500);
     let punch = dial_conn_for(&last, &h.target);
     // The swarm already holds the punch when the window ends.
-    let target = h.target.clone();
+    let target = h.target;
     h.agent.swarm.connect(&target, punch);
     h.agent.handle_tick(at(9_502));
     assert!(matches!(
@@ -792,6 +794,8 @@ fn an_unclaimed_punch_replacing_the_circuit_upgrades_to_punched() {
             peer_id: target,
             old: circuit,
             new: punch,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(9_510),
@@ -849,9 +853,11 @@ fn a_punch_landing_during_another_attempts_relay_leg_is_punched() {
 fn replace_target(h: &mut Harness, old: ConnectionId, new: ConnectionId, t: u64) {
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             old,
             new,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         new.is_circuit(),
         at(t),
@@ -881,7 +887,7 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
     // A late close of the replaced circuit reports nothing more.
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             conn_id: circuit,
             reason: ConnectionCloseReason::Local,
         },
@@ -905,7 +911,7 @@ fn direct_replacement_after_the_attempt_ended_reports_against_its_path_record() 
     drain_actions(&mut h.agent);
     h.stream_data(stream, hop_status(Status::Ok), at(30));
     let promotion = drain_actions(&mut h.agent);
-    let target = h.target.clone();
+    let target = h.target;
     let circuit = complete_promotion(&mut h.agent, &target, &promotion, at(31));
     drain_events(&mut h.agent);
     assert!(h.agent.is_idle(), "a forced relay attempt ends at Relayed");
@@ -1018,7 +1024,7 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: stop,
             protocol_id: minip2p_nat::STOP_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -1026,7 +1032,7 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
         false,
         at(310),
     );
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(311));
     let inbound_circuit = promoted_circuit(&drain_actions(&mut h.agent));
     replace_target(&mut h, circuit, inbound_circuit, 313);
@@ -1082,7 +1088,7 @@ fn a_remote_without_dcutr_settles_relayed_once_identified() {
     let (id, conn) = drive_to_relayed(&mut h);
     h.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             conn_id: conn,
             protocols: vec!["/ipfs/ping/1.0.0".into()],
         },
@@ -1141,7 +1147,7 @@ fn an_exchange_finishing_near_its_deadline_keeps_its_punch_window() {
         h.agent.handle_event(
             &SwarmEvent::StreamData {
                 conn_id: conn,
-                peer_id: h.target.clone(),
+                peer_id: h.target,
                 stream_id: stream,
                 data: Bytes::from(data),
             },
@@ -1173,7 +1179,7 @@ fn a_dcutr_stream_arriving_after_the_start_budget_settles_relayed() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -1214,7 +1220,7 @@ fn a_sync_arriving_after_the_exchange_budget_dials_nothing() {
         h.agent.handle_event(
             &SwarmEvent::StreamData {
                 conn_id: conn,
-                peer_id: h.target.clone(),
+                peer_id: h.target,
                 stream_id: stream,
                 data: Bytes::from(data),
             },
@@ -1322,7 +1328,7 @@ fn no_attempt_event_follows_the_engine_settling() {
     h.agent.handle_tick(at(60_000));
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             conn_id: conn,
             reason: ConnectionCloseReason::Local,
         },
@@ -1348,7 +1354,7 @@ fn settling_clears_what_the_attempt_held() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&[maddr(
                 "/ip4/9.9.9.9/udp/4002/quic-v1",

@@ -294,8 +294,7 @@ pub(crate) fn validate(
     #[cfg(feature = "relay-server")]
     let relay_server = match capabilities.relay_server.take() {
         Some(setup) => {
-            let mut agent =
-                minip2p_relay_server::RelayServerAgent::new(local_peer.clone(), setup.config)?;
+            let mut agent = minip2p_relay_server::RelayServerAgent::new(*local_peer, setup.config)?;
             agent
                 .replace_announce_addrs(setup.announce_addrs)
                 .map_err(|error| SetupError::RelayServerAnnounce(alloc::boxed::Box::new(error)))?;
@@ -446,11 +445,11 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
         let relay_addrs = config
             .relays
             .iter()
-            .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
+            .map(|relay| (*relay.peer_id(), relay.transport().clone()))
             .collect();
         let jitter_seed = core.entropy_mut().next_u64()?;
         // The driver seeds the agent's listen addresses on its first turn.
-        let agent = minip2p_nat::NatAgent::new(core.local_peer_id().clone(), config);
+        let agent = minip2p_nat::NatAgent::new(*core.local_peer_id(), config);
         let driver = NatDriver::new(agent, relay_addrs, jitter_seed);
         #[cfg(feature = "relay")]
         let driver = match circuits {
@@ -503,11 +502,8 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
     if let (Some(config), Some(io)) = (capabilities.mdns, mdns_carrier) {
         let mut seed = [0; 32];
         engine.core.entropy_mut().fill_bytes(&mut seed)?;
-        let agent = minip2p_mdns::MdnsAgent::new(
-            engine.core.local_peer_id().clone(),
-            config.clone(),
-            seed,
-        )?;
+        let agent =
+            minip2p_mdns::MdnsAgent::new(*engine.core.local_peer_id(), config.clone(), seed)?;
         engine.set_mdns(
             minip2p_mdns::MdnsDriver::new(agent, io, &config),
             platform.mdns_shares_transport,
@@ -526,7 +522,7 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
         let mdns_enabled = false;
         if beacon_enabled || mdns_enabled {
             let book = minip2p_discovery::PeerDiscoveryAgent::new(
-                engine.core.local_peer_id().clone(),
+                *engine.core.local_peer_id(),
                 capabilities.peer_discovery,
             )?;
             engine.discovery = Some(DiscoveryDriver::new(

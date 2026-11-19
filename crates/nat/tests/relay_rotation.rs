@@ -22,7 +22,7 @@ struct World {
 }
 
 fn relay_addr(addr: &str, relay: &PeerId) -> PeerAddr {
-    PeerAddr::new(maddr(addr), relay.clone()).expect("valid relay addr")
+    PeerAddr::new(maddr(addr), *relay).expect("valid relay addr")
 }
 
 /// An agent configured with relays `[A, B]` and no reservations.
@@ -93,7 +93,7 @@ fn hop_exchange(
 ) -> StreamId {
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id,
         },
         false,
@@ -101,7 +101,7 @@ fn hop_exchange(
     );
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
@@ -112,7 +112,7 @@ fn hop_exchange(
     w.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id,
-            peer_id: relay.clone(),
+            peer_id: *relay,
             stream_id: stream,
             protocol_id: HOP_PROTOCOL_ID.to_string(),
             initiated_locally: true,
@@ -124,7 +124,7 @@ fn hop_exchange(
     w.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id,
-            peer_id: relay.clone(),
+            peer_id: *relay,
             stream_id: stream,
             data: Bytes::from(hop_status(status)),
         },
@@ -144,7 +144,7 @@ fn assert_relayed_via(w: &mut World, relay: &PeerId, now: u64) {
         )),
         "the bridge through {relay} must be promoted"
     );
-    let target = w.target.clone();
+    let target = w.target;
     complete_promotion(&mut w.agent, &target, &actions, at(now));
     assert!(matches!(
         drain_events(&mut w.agent).as_slice(),
@@ -155,7 +155,7 @@ fn assert_relayed_via(w: &mut World, relay: &PeerId, now: u64) {
 #[test]
 fn stalled_first_relay_hands_over_after_its_own_budget() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &w.a), 1);
@@ -171,7 +171,7 @@ fn stalled_first_relay_hands_over_after_its_own_budget() {
     w.agent.handle_tick(at(12_000));
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &w.b), 1);
-    let a = w.a.clone();
+    let a = w.a;
     assert!(
         matches!(
             drain_all_events(&mut w.agent).as_slice(),
@@ -192,7 +192,7 @@ fn stalled_first_relay_hands_over_after_its_own_budget() {
         "A's stalled stage is reported and the leg moves on to B"
     );
 
-    let b = w.b.clone();
+    let b = w.b;
     let b_conn = dial_conn_for(&actions, &b);
     hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_500);
     assert_relayed_via(&mut w, &b, 12_501);
@@ -201,17 +201,17 @@ fn stalled_first_relay_hands_over_after_its_own_budget() {
 #[test]
 fn a_relay_stalled_on_hop_status_reports_that_stage() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let legs = ConnectLegs {
         deadline_ms: Some(5_000),
         ..RELAY_NOW
     };
     let _ = start(&mut w.agent, 1, target, legs, at(0));
-    let a = w.a.clone();
+    let a = w.a;
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: a.clone(),
+            peer_id: a,
             conn_id: a_conn,
         },
         false,
@@ -219,7 +219,7 @@ fn a_relay_stalled_on_hop_status_reports_that_stage() {
     );
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: a.clone(),
+            peer_id: a,
             conn_id: a_conn,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
@@ -230,7 +230,7 @@ fn a_relay_stalled_on_hop_status_reports_that_stage() {
     w.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: a_conn,
-            peer_id: a.clone(),
+            peer_id: a,
             stream_id: stream,
             protocol_id: HOP_PROTOCOL_ID.to_string(),
             initiated_locally: true,
@@ -260,7 +260,7 @@ fn a_relay_stalled_on_hop_status_reports_that_stage() {
 #[test]
 fn the_relay_budget_is_clipped_by_a_shorter_caller_deadline() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let legs = ConnectLegs {
         deadline_ms: Some(4_000),
         ..RELAY_NOW
@@ -286,7 +286,7 @@ fn the_relay_budget_is_clipped_by_a_shorter_caller_deadline() {
 #[test]
 fn relay_the_target_is_known_through_goes_first() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let unconfigured = peer(b"relay-c");
     let legs = ConnectLegs {
         target_addrs: vec![
@@ -311,7 +311,7 @@ fn relay_the_target_is_known_through_goes_first() {
         "only configured relays are eligible"
     );
 
-    let b = w.b.clone();
+    let b = w.b;
     let b_conn = dial_conn_for(&actions, &b);
     hop_exchange(&mut w, &b, b_conn, Status::NoReservation, 10);
     assert_eq!(
@@ -324,7 +324,7 @@ fn relay_the_target_is_known_through_goes_first() {
 #[test]
 fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
     w.agent.handle_tick(at(12_000));
@@ -338,7 +338,7 @@ fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
     );
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.a), 0);
 
-    let b = w.b.clone();
+    let b = w.b;
     let b_conn = dial_conn_for(&actions, &b);
     hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_200);
     assert_relayed_via(&mut w, &b, 12_201);
@@ -347,14 +347,14 @@ fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
 #[test]
 fn dial_failure_after_the_relay_became_ready_is_ignored() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
     // Another connection to A lands and becomes ready; the leg opens HOP.
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: w.a.clone(),
+            peer_id: w.a,
             conn_id: ConnectionId::new(9),
         },
         false,
@@ -362,7 +362,7 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     );
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: w.a.clone(),
+            peer_id: w.a,
             conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
@@ -384,14 +384,14 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
 #[test]
 fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
     // Another connection to A lands; identify has not finished yet.
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: w.a.clone(),
+            peer_id: w.a,
             conn_id: ConnectionId::new(9),
         },
         false,
@@ -403,7 +403,7 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
 
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: w.a.clone(),
+            peer_id: w.a,
             conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
@@ -419,9 +419,9 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
 #[test]
 fn no_reservation_at_first_relay_moves_to_the_next() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     let refused = hop_exchange(&mut w, &a, a_conn, Status::NoReservation, 10);
@@ -443,17 +443,17 @@ fn a_full_circuit_table_fails_the_leg_before_hop_connect() {
     // the whole leg fails with ResourceExhausted and CONNECT is never sent.
     let mut w = two_relays();
     w.agent.swarm.circuit_slots = NatConfig::default().max_circuits;
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let a = w.a.clone();
+    let a = w.a;
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
     for event in [
         SwarmEvent::ConnectionEstablished {
-            peer_id: a.clone(),
+            peer_id: a,
             conn_id: a_conn,
         },
         SwarmEvent::PeerReady {
-            peer_id: a.clone(),
+            peer_id: a,
             conn_id: a_conn,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
@@ -465,7 +465,7 @@ fn a_full_circuit_table_fails_the_leg_before_hop_connect() {
     w.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: a_conn,
-            peer_id: a.clone(),
+            peer_id: a,
             stream_id: stream,
             protocol_id: HOP_PROTOCOL_ID.to_string(),
             initiated_locally: true,
@@ -496,7 +496,7 @@ fn a_full_circuit_table_fails_the_leg_before_hop_connect() {
 #[test]
 fn leg_fails_with_the_last_relays_error_after_trying_all() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
     dial_failed(&mut w, a_dial, "relay A unreachable", 10);
@@ -507,7 +507,7 @@ fn leg_fails_with_the_last_relays_error_after_trying_all() {
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &w.b), 1);
 
-    let b = w.b.clone();
+    let b = w.b;
     hop_exchange(
         &mut w,
         &b,
@@ -527,9 +527,9 @@ fn leg_fails_with_the_last_relays_error_after_trying_all() {
 #[test]
 fn failed_promotion_at_first_relay_moves_to_the_next() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     w.agent
@@ -553,9 +553,9 @@ fn failed_promotion_at_first_relay_moves_to_the_next() {
 #[test]
 fn an_adopted_circuit_whose_relay_times_out_closes_and_hands_over() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
     let a_circuit = promoted_circuit(&drain_actions(&mut w.agent));
@@ -587,9 +587,9 @@ fn an_adopted_circuit_whose_relay_times_out_closes_and_hands_over() {
 #[test]
 fn a_peer_already_direct_disarms_the_relay_budget() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let a = w.a.clone();
+    let a = w.a;
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
     w.agent
         .swarm
@@ -608,9 +608,9 @@ fn a_peer_already_direct_disarms_the_relay_budget() {
 #[test]
 fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
     let mut w = two_relays();
-    let target = w.target.clone();
-    let _ = start(&mut w.agent, 1, target.clone(), RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let target = w.target;
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
@@ -641,7 +641,7 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
         ]
     });
     let tcp = relay_addr("/ip4/203.0.113.1/tcp/4001", &w.a);
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let quic_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
     dial_failed(&mut w, quic_dial, "QUIC unreachable", 10);
@@ -658,7 +658,7 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
         .expect("A's TCP address is tried next");
 
     // Reached over TCP, A refuses: its addresses are spent, B is next.
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     hop_exchange(&mut w, &a, tcp_conn, Status::NoReservation, 20);
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &b), 1);
@@ -675,7 +675,7 @@ fn a_relays_addresses_split_its_budget_not_the_next_relays() {
             relay_addr("/ip4/203.0.113.1/tcp/4001", a),
         ]
     });
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     drain_actions(&mut w.agent);
 
@@ -702,7 +702,7 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
         ]
     });
     let tcp = relay_addr("/ip4/203.0.113.1/tcp/4001", &w.a);
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let quic_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
@@ -729,7 +729,7 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
 fn a_relay_refused_at_once_never_reports_started() {
     let mut w = two_relays();
     w.agent.swarm.refuse_dials = Some("no transport".into());
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let events = drain_all_events(&mut w.agent);
     assert!(
@@ -752,11 +752,11 @@ fn a_relay_refused_at_once_never_reports_started() {
 fn relay_ready(w: &mut World, relay: &PeerId, conn_id: ConnectionId, protocols: &[&str]) {
     for event in [
         SwarmEvent::ConnectionEstablished {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id,
         },
         SwarmEvent::PeerReady {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id,
             protocols: protocols.iter().map(|p| p.to_string()).collect(),
         },
@@ -768,9 +768,9 @@ fn relay_ready(w: &mut World, relay: &PeerId, conn_id: ConnectionId, protocols: 
 #[test]
 fn a_relay_without_hop_moves_to_the_next() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     relay_ready(&mut w, &a, a_conn, &[]);
@@ -794,9 +794,9 @@ fn a_relay_without_hop_moves_to_the_next() {
 #[test]
 fn a_refused_hop_stream_open_moves_to_the_next() {
     let mut w = two_relays();
-    let target = w.target.clone();
+    let target = w.target;
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let (a, b) = (w.a.clone(), w.b.clone());
+    let (a, b) = (w.a, w.b);
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     w.agent.swarm.refuse_opens = Some("stream limit".into());

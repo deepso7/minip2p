@@ -1496,19 +1496,19 @@ mod tests {
         let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
         let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
         let other = EndpointEvent::ConnectionClosed {
-            peer_id: peer.clone(),
+            peer_id: peer,
             conn_id: ConnectionId::new(2),
             reason: ConnectionCloseReason::Local,
         };
         endpoint.engine.events.extend([
             EndpointEvent::StreamData {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id,
                 stream_id,
                 data: minip2p_core::Bytes::from_static(b"late"),
             },
             EndpointEvent::StreamClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id,
                 stream_id,
             },
@@ -1658,14 +1658,14 @@ mod tests {
         let relay = Ed25519Keypair::from_secret_key_bytes([33; 32]).peer_id();
         let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("id");
         let circuit_addr =
-            Multiaddr::from_protocols(vec![Protocol::P2p(relay.clone()), Protocol::P2pCircuit]);
+            Multiaddr::from_protocols(vec![Protocol::P2p(relay), Protocol::P2pCircuit]);
         let direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id");
         let direct_addr: Multiaddr = "/ip4/192.0.2.7/tcp/4001".parse().expect("address");
         let transport = RecordingTransport {
             events: vec![
                 TransportEvent::Connected {
                     id: circuit,
-                    endpoint: ConnectionEndpoint::with_peer_id(circuit_addr.clone(), peer.clone()),
+                    endpoint: ConnectionEndpoint::with_peer_id(circuit_addr.clone(), peer),
                 },
                 TransportEvent::IncomingConnection {
                     id: direct,
@@ -1685,7 +1685,7 @@ mod tests {
         assert_eq!(
             endpoint.connection_info(circuit),
             Some(ConnectionInfo {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id: circuit,
                 remote_addr: circuit_addr,
                 path: Path::Relayed { relay },
@@ -1707,7 +1707,7 @@ mod tests {
             .events
             .push(TransportEvent::Connected {
                 id: direct,
-                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
             });
         endpoint.poll(Now::from_millis(1)).expect("poll");
         assert_eq!(endpoint.connection_info(circuit), None, "replaced");
@@ -1740,13 +1740,13 @@ mod tests {
         let relay = Ed25519Keypair::from_secret_key_bytes([38; 32]).peer_id();
         let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("id");
         let circuit_addr =
-            Multiaddr::from_protocols(vec![Protocol::P2p(relay.clone()), Protocol::P2pCircuit]);
+            Multiaddr::from_protocols(vec![Protocol::P2p(relay), Protocol::P2pCircuit]);
         let direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id");
         let direct_addr: Multiaddr = "/ip4/192.0.2.8/tcp/4001".parse().expect("address");
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: circuit,
-                endpoint: ConnectionEndpoint::with_peer_id(circuit_addr, peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(circuit_addr, peer),
             }],
             local_address: direct_addr.clone(),
             next_stream_id: 0,
@@ -1760,7 +1760,7 @@ mod tests {
 
         // Settles at once on the circuit; a direct connection replaces it
         // before the terminal is read.
-        let target = PeerAddr::new(direct_addr.clone(), peer.clone()).expect("peer addr");
+        let target = PeerAddr::new(direct_addr.clone(), peer).expect("peer addr");
         let id = endpoint
             .connect(target, Now::from_millis(1))
             .expect("connect admitted");
@@ -1771,7 +1771,7 @@ mod tests {
             .events
             .push(TransportEvent::Connected {
                 id: direct,
-                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
             });
         let events = endpoint.poll(Now::from_millis(2)).expect("poll");
 
@@ -1914,7 +1914,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
             }],
             local_address: address.clone(),
             next_stream_id: 0,
@@ -1963,7 +1963,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
             }],
             local_address: address,
             next_stream_id: 0,
@@ -2024,7 +2024,7 @@ mod tests {
         let agent = &mut endpoint.engine.gossipsub.as_mut().expect("gossipsub").agent;
         assert!(agent.handle_event(
             &SwarmEvent::StreamReady {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id,
                 stream_id,
                 protocol_id: MESHSUB_PROTOCOL_ID_V11.into(),
@@ -2042,7 +2042,7 @@ mod tests {
         };
         assert!(agent.handle_event(
             &SwarmEvent::StreamData {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 conn_id,
                 stream_id,
                 data: Bytes::from(encode_frame(&rpc.encode())),

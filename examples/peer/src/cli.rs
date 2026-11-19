@@ -145,13 +145,10 @@ pub fn parse_dial_target(raw: &str) -> Result<DialTarget, CliError> {
             Protocol::P2pCircuit,
             Protocol::P2p(peer),
         ] if !prefix.is_empty() => {
-            let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), relay_id.clone())
+            let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), *relay_id)
                 .map_err(|e| CliError(format!("invalid relay address in '{raw}': {e}")))?;
             require_supported_transport("circuit relay", raw, &relay)?;
-            Ok(DialTarget::Circuit {
-                relay,
-                peer: peer.clone(),
-            })
+            Ok(DialTarget::Circuit { relay, peer: *peer })
         }
         _ => Err(CliError(format!(
             "circuit target must end /p2p/<relay>/p2p-circuit/p2p/<peer>, got '{raw}'"
@@ -294,7 +291,9 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         } => {
             println!("[{role}] disconnected peer={peer_id} reason={reason}");
         }
-        EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+        EndpointEvent::ConnectionReplaced {
+            peer_id, old, new, ..
+        } => {
             println!("[{role}] connection-replaced peer={peer_id} old={old} new={new}");
         }
         EndpointEvent::IdentifyReceived {

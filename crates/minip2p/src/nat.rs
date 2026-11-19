@@ -668,9 +668,9 @@ impl<T: Transport> NatDriver<T> {
                     return;
                 };
                 let mut circuit = transport.clone();
-                circuit.push(Protocol::P2p(relay.clone()));
+                circuit.push(Protocol::P2p(*relay));
                 circuit.push(Protocol::P2pCircuit);
-                self.reserved_relays.push((relay.clone(), circuit));
+                self.reserved_relays.push((*relay, circuit));
                 self.addresses_changed = true;
             }
             NatEvent::RelayReservationLost { relay } => {

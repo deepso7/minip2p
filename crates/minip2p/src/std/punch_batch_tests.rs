@@ -244,7 +244,7 @@ fn a_punch_settled_on_ahead_of_its_event_is_punched() {
         .expect("listen addresses")
         .bind()
         .expect("bind responder");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         assert!(Instant::now() < deadline, "responder did not reserve");
@@ -257,9 +257,9 @@ fn a_punch_settled_on_ahead_of_its_event_is_punched() {
         relay.assert_healthy();
     }
 
-    let (mut initiator, gate_state) = gated_initiator(relay.addr().clone(), responder_peer.clone());
+    let (mut initiator, gate_state) = gated_initiator(relay.addr().clone(), responder_peer);
     // No candidates: every dial to the responder is a punch.
-    let connect_id = initiator.connect(&responder_peer).expect("connect starts");
+    let connect_id = initiator.connect(responder_peer).expect("connect starts");
     let mut trace = Vec::new();
     let mut upgraded_to = None;
     let outcome = loop {
@@ -332,7 +332,7 @@ fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
         .expect("listen address")
         .bind()
         .expect("bind responder");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         assert!(Instant::now() < deadline, "responder did not reserve");
@@ -366,10 +366,10 @@ fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
         )
         .parse()
         .expect("addr"),
-        responder_peer.clone(),
+        responder_peer,
     )
     .expect("peer addr");
-    let first = initiator.connect(&responder_peer).expect("first connect");
+    let first = initiator.connect(responder_peer).expect("first connect");
     let second = initiator.connect(silent_addr).expect("second connect");
 
     let mut trace = Vec::new();

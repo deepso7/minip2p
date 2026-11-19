@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
 use minip2p_core::platform::{Deadline, Now};
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId, Protocol};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
     IdentifyOutput, IdentifyProtocol,
@@ -194,7 +194,7 @@ impl OwnedStream {
     /// connection.
     fn peer_range(peer_id: &PeerId, first: StreamId, last: StreamId) -> RangeInclusive<Self> {
         let key = |stream_id, conn_id| Self {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             stream_id,
             conn_id,
         };
@@ -952,9 +952,7 @@ impl SwarmState {
         now_ms: u64,
     ) -> Result<(), SwarmError> {
         if !self.peer_to_conn.contains_key(peer_id) {
-            return Err(SwarmError::NotConnected {
-                peer_id: peer_id.clone(),
-            });
+            return Err(SwarmError::NotConnected { peer_id: *peer_id });
         }
 
         // Case 1: a ping stream is already negotiated -- fire now.
@@ -999,9 +997,7 @@ impl SwarmState {
             });
         }
         if !self.peer_to_conn.contains_key(peer_id) {
-            return Err(SwarmError::NotConnected {
-                peer_id: peer_id.clone(),
-            });
+            return Err(SwarmError::NotConnected { peer_id: *peer_id });
         }
         if self.ready_peers.contains(peer_id)
             && !self
@@ -1011,7 +1007,7 @@ impl SwarmState {
                 .unwrap_or(false)
         {
             return Err(SwarmError::RemoteDoesNotSupport {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 protocol_id: protocol_id.to_string(),
             });
         }
@@ -1266,7 +1262,7 @@ impl SwarmState {
     ) -> Result<(), SwarmError> {
         if let Some(peer_id) = self.conn_to_peer.get(&conn_id) {
             return Err(SwarmError::StreamNotFound {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 conn_id,
                 stream_id,
             });
@@ -1519,7 +1515,7 @@ impl SwarmState {
                     return;
                 }
                 if let Some(peer_id) = endpoint.peer_id() {
-                    self.register_connection(id, peer_id.clone(), endpoint.token(), now_ms);
+                    self.register_connection(id, *peer_id, endpoint.token(), now_ms);
                 } else {
                     // Peer identity is not yet known. Synthesize a placeholder PeerId
                     // for internal bookkeeping so protocol handlers can still
@@ -1542,7 +1538,7 @@ impl SwarmState {
                     return;
                 }
                 if let Some(peer_id) = endpoint.peer_id() {
-                    self.upgrade_connection_identity(id, peer_id.clone(), endpoint.token(), now_ms);
+                    self.upgrade_connection_identity(id, *peer_id, endpoint.token(), now_ms);
                 }
             }
             TransportEvent::IncomingConnection { id, endpoint } => {
@@ -1621,7 +1617,7 @@ impl SwarmState {
             .pings
             .iter()
             .filter(|(_, attempt)| attempt.deadline_ms <= now_ms)
-            .map(|(peer_id, _)| peer_id.clone())
+            .map(|(peer_id, _)| *peer_id)
             .collect();
         for peer_id in overdue {
             self.fail_ping(&peer_id, PingFailure::TimedOut);
@@ -1761,9 +1757,7 @@ impl SwarmState {
         self.peer_to_conn
             .get(peer_id)
             .copied()
-            .ok_or_else(|| SwarmError::NotConnected {
-                peer_id: peer_id.clone(),
-            })
+            .ok_or_else(|| SwarmError::NotConnected { peer_id: *peer_id })
     }
 
     /// Checks that `conn_id` is `peer_id`'s connection and holds the
@@ -1792,7 +1786,7 @@ impl SwarmState {
             Err(SwarmError::StreamNotReady { conn_id, stream_id })
         } else {
             Err(SwarmError::StreamNotFound {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 conn_id,
                 stream_id,
             })
@@ -1824,7 +1818,7 @@ impl SwarmState {
     /// The `stream_owner` key for a stream on `conn_id`, if the connection
     /// has a peer (every owned stream's connection does).
     fn owned_stream(&self, conn_id: ConnectionId, stream_id: StreamId) -> Option<OwnedStream> {
-        let peer_id = self.conn_to_peer.get(&conn_id)?.clone();
+        let peer_id = *self.conn_to_peer.get(&conn_id)?;
         Some(OwnedStream {
             peer_id,
             stream_id,
@@ -1868,7 +1862,7 @@ impl SwarmState {
     /// Maps `conn_id` to `peer_id`, moving the connection's owned streams
     /// from any previous peer so `stream_owner` keys stay in sync.
     fn set_conn_peer(&mut self, conn_id: ConnectionId, peer_id: PeerId) {
-        let Some(old) = self.conn_to_peer.insert(conn_id, peer_id.clone()) else {
+        let Some(old) = self.conn_to_peer.insert(conn_id, peer_id) else {
             return;
         };
         if old == peer_id {
@@ -1886,7 +1880,7 @@ impl SwarmState {
             .collect();
         for mut key in moved {
             if let Some(protocol) = self.stream_owner.remove(&key) {
-                key.peer_id = peer_id.clone();
+                key.peer_id = peer_id;
                 self.stream_owner.insert(key, protocol);
             }
         }
@@ -1895,7 +1889,7 @@ impl SwarmState {
     fn established_peer_for_conn(&self, conn_id: ConnectionId) -> Option<PeerId> {
         let peer_id = self.conn_to_peer.get(&conn_id)?;
         if self.established_peers.contains(peer_id) {
-            Some(peer_id.clone())
+            Some(*peer_id)
         } else {
             None
         }
@@ -1989,9 +1983,9 @@ impl SwarmState {
             return;
         }
 
-        self.ready_peers.insert(peer_id.clone());
+        self.ready_peers.insert(*peer_id);
         self.events.push_back(SwarmEvent::PeerReady {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             conn_id,
             protocols: info.protocols.clone(),
         });
@@ -2012,7 +2006,7 @@ impl SwarmState {
         now_ms: u64,
     ) {
         let deadline_ms = now_ms.saturating_add(self.timeouts.ping_ms);
-        let attempt = self.pings.entry(peer_id.clone()).or_insert(PingAttempt {
+        let attempt = self.pings.entry(*peer_id).or_insert(PingAttempt {
             deadline_ms,
             queued: None,
         });
@@ -2075,7 +2069,7 @@ impl SwarmState {
             }
         }
         self.events.push_back(SwarmEvent::PingFailed {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             conn_id,
             cause,
         });
@@ -2144,13 +2138,13 @@ impl SwarmState {
     /// application does not see a `ConnectionEstablished` event for them.
     fn ensure_peer_id_for_conn(&mut self, conn_id: ConnectionId) -> PeerId {
         if let Some(peer_id) = self.conn_to_peer.get(&conn_id) {
-            return peer_id.clone();
+            return *peer_id;
         }
 
         let synthetic_key = format!("minip2p-synthetic-conn-{}", conn_id.as_u64());
         let peer_id = PeerId::from_public_key_protobuf(synthetic_key.as_bytes());
-        self.conn_to_peer.insert(conn_id, peer_id.clone());
-        self.peer_to_conn.insert(peer_id.clone(), conn_id);
+        self.conn_to_peer.insert(conn_id, peer_id);
+        self.peer_to_conn.insert(peer_id, conn_id);
         peer_id
     }
 
@@ -2303,7 +2297,7 @@ impl SwarmState {
             Ok(()) => {}
             Err(e) => self.emit_error(
                 SwarmErrorKind::Identify,
-                Some(peer_id.clone()),
+                Some(*peer_id),
                 Some(conn_id),
                 format!("failed to queue identify stream to {peer_id}: {e}"),
             ),
@@ -2320,7 +2314,7 @@ impl SwarmState {
         {
             self.emit_error(
                 SwarmErrorKind::Ping,
-                Some(peer_id.clone()),
+                Some(*peer_id),
                 Some(conn_id),
                 format!("failed to requeue pending ping stream to {peer_id}: {e}"),
             );
@@ -2357,7 +2351,7 @@ impl SwarmState {
         let ping_intent = if overdue {
             self.pings.remove(peer_id);
             self.events.push_back(SwarmEvent::PingFailed {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 conn_id: old,
                 cause: PingFailure::TimedOut,
             });
@@ -2383,20 +2377,38 @@ impl SwarmState {
         ping_intent
     }
 
+    /// A connection's path as far as the swarm can tell from its remote
+    /// address: Relayed for a circuit, through the relay the address names;
+    /// otherwise Direct (only the host knows which direct connections a hole
+    /// punch made). A circuit transport always names the relay; a circuit
+    /// address that does not reads as Direct.
+    fn connection_path(&self, conn_id: ConnectionId) -> Path {
+        if conn_id.is_circuit()
+            && let Some([.., Protocol::P2p(relay), Protocol::P2pCircuit]) = self
+                .conn_to_remote_addr
+                .get(&conn_id)
+                .map(Multiaddr::protocols)
+        {
+            return Path::Relayed { relay: *relay };
+        }
+        Path::Direct
+    }
+
     /// Makes `conn_id` the peer's current connection and reports it: as
-    /// `ConnectionReplaced` when it takes the slot from `old` of an already
-    /// connected peer, otherwise as `ConnectionEstablished`.
+    /// `ConnectionReplaced` when it takes the slot from `old` (with `old`'s
+    /// path, read before it was retired) of an already connected peer,
+    /// otherwise as `ConnectionEstablished`.
     fn announce_connection(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
-        old: Option<ConnectionId>,
+        old: Option<(ConnectionId, Path)>,
         ping_intent: Option<[u8; PING_PAYLOAD_LEN]>,
         token: Option<ConnectionToken>,
         now_ms: u64,
     ) {
-        self.set_conn_peer(conn_id, peer_id.clone());
-        self.peer_to_conn.insert(peer_id.clone(), conn_id);
+        self.set_conn_peer(conn_id, *peer_id);
+        self.peer_to_conn.insert(*peer_id, conn_id);
         let outbound = matches!(
             self.conn_phases.remove(&conn_id),
             Some(ConnPhase::Dialing(_))
@@ -2413,17 +2425,20 @@ impl SwarmState {
             self.start_ping_attempt(peer_id, Some(payload), now_ms);
         }
         match old {
-            Some(old) if self.established_peers.contains(peer_id) => {
+            Some((old, old_path)) if self.established_peers.contains(peer_id) => {
+                let new_path = self.connection_path(conn_id);
                 self.events.push_back(SwarmEvent::ConnectionReplaced {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     old,
                     new: conn_id,
+                    old_path,
+                    new_path,
                 });
             }
             _ => {
-                self.established_peers.insert(peer_id.clone());
+                self.established_peers.insert(*peer_id);
                 self.events.push_back(SwarmEvent::ConnectionEstablished {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     conn_id,
                 });
             }
@@ -2451,7 +2466,10 @@ impl SwarmState {
             self.reject_race_loser(id);
             return;
         }
-        let ping_intent = old.and_then(|old| self.retire_for_replacement(&peer_id, old, now_ms));
+        // Read before retiring `old` drops its remote address.
+        let old = old.map(|old| (old, self.connection_path(old)));
+        let ping_intent =
+            old.and_then(|(old, _)| self.retire_for_replacement(&peer_id, old, now_ms));
         self.announce_connection(&peer_id, id, old, ping_intent, token, now_ms);
         self.start_connection_protocols(&peer_id, id, now_ms);
     }
@@ -2482,8 +2500,10 @@ impl SwarmState {
             self.reject_race_loser(conn_id);
             return;
         }
+        // Read before retiring `old` drops its remote address.
+        let old = old.map(|old| (old, self.connection_path(old)));
         let ping_intent =
-            old.and_then(|old| self.retire_for_replacement(&new_peer_id, old, now_ms));
+            old.and_then(|(old, _)| self.retire_for_replacement(&new_peer_id, old, now_ms));
 
         if let Some(stale) = existing {
             // State gathered under the placeholder belongs to this
@@ -2494,12 +2514,12 @@ impl SwarmState {
             // The ping attempt moves with the protocol state, before the
             // drain looks for attempts that lost their stream.
             if let Some(attempt) = self.pings.remove(&stale) {
-                self.pings.insert(new_peer_id.clone(), attempt);
+                self.pings.insert(new_peer_id, attempt);
             }
             self.drain_ping_outputs();
             self.drain_identify_outputs();
             if let Some(info) = self.peer_info.remove(&stale) {
-                self.peer_info.insert(new_peer_id.clone(), info);
+                self.peer_info.insert(new_peer_id, info);
             }
             self.ready_peers.remove(&stale);
             self.established_peers.remove(&stale);
@@ -2516,7 +2536,7 @@ impl SwarmState {
             if let Some(peer_id) = event_peer_mut(event)
                 && peer_id == old
             {
-                *peer_id = new.clone();
+                *peer_id = *new;
             }
         }
     }
@@ -3078,7 +3098,7 @@ impl SwarmState {
             // Snapshot of the transport's listening addresses at this
             // moment; the core keeps `local_addresses` refreshed.
             let listen_addrs = self.local_addresses.clone();
-            let responder_peer_id = peer_id.clone();
+            let responder_peer_id = peer_id;
             match self.identify.register_outbound_stream(
                 peer_id,
                 stream_id,
@@ -3135,13 +3155,10 @@ impl SwarmState {
 
         match target {
             ProtocolKind::Ping => {
-                if let Err(e) = self
-                    .ping
-                    .register_outbound_stream(peer_id.clone(), stream_id)
-                {
+                if let Err(e) = self.ping.register_outbound_stream(peer_id, stream_id) {
                     self.emit_error(
                         SwarmErrorKind::Ping,
-                        Some(peer_id.clone()),
+                        Some(peer_id),
                         Some(conn_id),
                         format!("ping register error: {e}"),
                     );
@@ -3161,7 +3178,7 @@ impl SwarmState {
                         Ok(()) => self.drain_ping_outputs(),
                         Err(e) => self.emit_error(
                             SwarmErrorKind::Ping,
-                            Some(peer_id.clone()),
+                            Some(peer_id),
                             Some(conn_id),
                             format!("deferred ping send failed: {e}"),
                         ),
@@ -3288,7 +3305,7 @@ impl SwarmState {
             .filter(|(peer_id, attempt)| {
                 attempt.queued.is_none() && self.ping.in_flight_payload(peer_id).is_none()
             })
-            .map(|(peer_id, _)| peer_id.clone())
+            .map(|(peer_id, _)| *peer_id)
             .collect();
         for peer_id in lost {
             self.fail_ping(&peer_id, PingFailure::StreamClosed);
@@ -3337,7 +3354,7 @@ impl SwarmState {
             } => {
                 self.emit_error(
                     SwarmErrorKind::Ping,
-                    Some(peer_id.clone()),
+                    Some(peer_id),
                     self.connection_id(&peer_id),
                     format!("ping protocol violation from {peer_id}: {reason}"),
                 );
@@ -3358,10 +3375,10 @@ impl SwarmState {
                     }
                     self.first_identify.remove(&conn_id);
                 }
-                self.peer_info.insert(peer_id.clone(), info.clone());
+                self.peer_info.insert(peer_id, info.clone());
                 if let Some(conn_id) = conn_id {
                     self.events.push_back(SwarmEvent::IdentifyReceived {
-                        peer_id: peer_id.clone(),
+                        peer_id,
                         conn_id,
                         info,
                     });
@@ -3426,6 +3443,7 @@ mod tests {
     /// One step of the state's queues in delivery order: ordinary actions,
     /// then events, then deferred closes.
     #[derive(Debug)]
+    #[expect(clippy::large_enum_variant, reason = "test-only queue view")]
     enum Output {
         Action(Action),
         Event(SwarmEvent),
@@ -3554,7 +3572,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
 
@@ -3596,7 +3614,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
 
@@ -3668,7 +3686,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
         drain_actions(&mut core);
@@ -3800,7 +3818,7 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"stalled-inbound-peer");
         let conn = ConnectionId::new(91);
         let stream = StreamId::new(3);
-        core.conn_to_peer.insert(conn, peer.clone());
+        core.conn_to_peer.insert(conn, peer);
         core.peer_to_conn.insert(peer, conn);
         core.handle_transport_event(
             TransportEvent::IncomingStream {
@@ -3859,7 +3877,7 @@ mod tests {
         let conn = ConnectionId::new(92);
         let stream = StreamId::new(1);
         let peer = PeerId::from_public_key_protobuf(b"finished-inbound-peer");
-        core.conn_to_peer.insert(conn, peer.clone());
+        core.conn_to_peer.insert(conn, peer);
         core.peer_to_conn.insert(peer, conn);
         feed(
             &mut core,
@@ -3907,8 +3925,8 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"unsupported-peer");
         let conn = ConnectionId::new(48);
         let stream = StreamId::new(13);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         let mut negotiator = MultistreamSelect::dialer("/test/1");
         negotiator.start();
         while negotiator.poll_output().is_some() {}
@@ -3965,8 +3983,8 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"outbound-only-peer");
         let conn_id = ConnectionId::new(70);
         let inbound_stream = StreamId::new(1);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
 
         core.open_stream(&peer_id, OUTBOUND_ONLY)
             .expect("outbound membership permits opening");
@@ -4013,7 +4031,7 @@ mod tests {
         let conn_id = ConnectionId::new(75);
         let stream_id = StreamId::new(1);
         let peer_id = PeerId::from_public_key_protobuf(b"inbound-snapshot-peer");
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
         feed(
             &mut core,
@@ -4051,8 +4069,8 @@ mod tests {
         let conn_id = ConnectionId::new(76);
         let stream_id = StreamId::new(2);
         let peer_id = PeerId::from_public_key_protobuf(b"advertised-only-peer");
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         core.add_advertised_protocol(ADVERTISED_ONLY)
             .expect("service protocol is not reserved");
 
@@ -4131,7 +4149,7 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"ack-peer");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
         feed(
             &mut core,
@@ -4204,7 +4222,7 @@ mod tests {
         core.add_protocol(PROTOCOL).expect("register protocol");
         let peer_id = PeerId::from_public_key_protobuf(b"control-peer");
         let conn_id = ConnectionId::new(7);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
 
         for (stream_id, protocol, marks) in [
@@ -4250,7 +4268,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
         drain_actions(&mut core);
@@ -4291,8 +4309,8 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"fallback-peer");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
 
         feed(
             &mut core,
@@ -4393,8 +4411,8 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         let send = |data: &[u8]| Action::SendStream {
             conn_id,
             stream_id,
@@ -4519,7 +4537,7 @@ mod tests {
             let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
             let conn_id = ConnectionId::new(7);
             let stream_id = StreamId::new(3);
-            core.conn_to_peer.insert(conn_id, peer_id.clone());
+            core.conn_to_peer.insert(conn_id, peer_id);
             core.peer_to_conn.insert(peer_id, conn_id);
 
             // The negotiation header comes back Full, and the echo queues
@@ -4580,8 +4598,8 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
         let tail = Bytes::from_static(b"tail");
         core.handle_send_full(conn_id, stream_id, tail.clone(), 4);
@@ -4624,8 +4642,8 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
         core.handle_send_full(conn_id, stream_id, Bytes::from_static(b"tail"), 4);
         core.close_stream_write(&peer_id, conn_id, stream_id)
@@ -4651,8 +4669,8 @@ mod tests {
         core.add_protocol(PROTOCOL).expect("register protocol");
         let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
         let conn_id = ConnectionId::new(7);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         let closed = StreamId::new(3);
         let reset = StreamId::new(5);
         for stream_id in [closed, reset] {
@@ -4693,7 +4711,7 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"flooder");
         let conn_id = ConnectionId::new(7);
         let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
         core.handle_send_full(conn_id, stream_id, Bytes::from_static(b"x"), 1);
         for _ in 0..=MAX_HELD_PER_STREAM / 32 {
@@ -4723,7 +4741,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         assert!(!core.is_idle());
@@ -4739,7 +4757,7 @@ mod tests {
         let conn_id = ConnectionId::new(2);
         let stream_id = StreamId::new(9);
 
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
 
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 0);
@@ -4754,11 +4772,11 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"abandoned-peer");
         let conn = ConnectionId::new(44);
         let stream = StreamId::new(9);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
         core.events.push_back(SwarmEvent::StreamData {
-            peer_id: peer.clone(),
+            peer_id: peer,
             conn_id: conn,
             stream_id: stream,
             data: Bytes::from(vec![1]),
@@ -4813,8 +4831,8 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"closed-abandon-peer");
         let conn = ConnectionId::new(61);
         let stream = StreamId::new(7);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
         // The peer sends, then closes. Both events queue undelivered, and the
@@ -4869,8 +4887,8 @@ mod tests {
         let conn = ConnectionId::new(47);
         let stream = StreamId::new(12);
         let key = (conn, stream);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.outbound_negotiators.insert(
             key,
             PendingOutbound {
@@ -4901,8 +4919,8 @@ mod tests {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"not-ready-peer");
         let (conn, stream) = (ConnectionId::new(48), StreamId::new(14));
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.outbound_negotiators.insert(
             (conn, stream),
             PendingOutbound {
@@ -4937,8 +4955,8 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"reset-retry-peer");
         let conn = ConnectionId::new(45);
         let stream = StreamId::new(10);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
         core.reset_stream(&peer, conn, stream).unwrap();
@@ -4972,8 +4990,8 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"closed-before-abandon-peer");
         let conn = ConnectionId::new(46);
         let stream = StreamId::new(11);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
         feed(
@@ -5031,7 +5049,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         feed(
@@ -5062,9 +5080,9 @@ mod tests {
         let newer_conn = ConnectionId::new(2);
         let stream_id = StreamId::new(4);
 
-        core.conn_to_peer.insert(original_conn, peer_id.clone());
-        core.conn_to_peer.insert(newer_conn, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.conn_to_peer.insert(original_conn, peer_id);
+        core.conn_to_peer.insert(newer_conn, peer_id);
+        core.peer_to_conn.insert(peer_id, newer_conn);
         core.insert_stream_owner(
             original_conn,
             stream_id,
@@ -5094,8 +5112,8 @@ mod tests {
         let conn_id = ConnectionId::new(12);
         let user = StreamId::new(4);
         let ping = StreamId::new(8);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         core.insert_stream_owner(
             conn_id,
             user,
@@ -5222,7 +5240,7 @@ mod tests {
         let peer_id = PeerId::from_public_key_protobuf(b"identify-stop-peer");
         let conn_id = ConnectionId::new(13);
         let stream_id = StreamId::new(4);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::IdentifyInitiator);
 
@@ -5245,9 +5263,9 @@ mod tests {
         let closed = ConnectionId::new(1);
         let surviving = ConnectionId::new(2);
         let stream_id = StreamId::new(4);
-        core.conn_to_peer.insert(closed, peer_id.clone());
-        core.conn_to_peer.insert(surviving, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), surviving);
+        core.conn_to_peer.insert(closed, peer_id);
+        core.conn_to_peer.insert(surviving, peer_id);
+        core.peer_to_conn.insert(peer_id, surviving);
         for conn_id in [closed, surviving] {
             core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User("/test/1".into()));
         }
@@ -5292,7 +5310,7 @@ mod tests {
                 endpoint: ConnectionEndpoint::new(loopback_transport()),
             },
         );
-        let placeholder = core.conn_to_peer[&conn_id].clone();
+        let placeholder = core.conn_to_peer[&conn_id];
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User("/test/1".into()));
 
         let verified = PeerId::from_public_key_protobuf(b"verified-peer");
@@ -5300,7 +5318,7 @@ mod tests {
             &mut core,
             TransportEvent::PeerIdentityVerified {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), verified.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), verified),
                 previous_peer_id: None,
             },
         );
@@ -5326,7 +5344,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: original,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         core.insert_stream_owner(
@@ -5345,7 +5363,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: replacement,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
 
@@ -5386,7 +5404,7 @@ mod tests {
             core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), *peer_id),
             },
         );
     }
@@ -5509,7 +5527,7 @@ mod tests {
     fn abandoning_an_old_connection_stream_keeps_the_successors_events() {
         let (mut core, peer_id, old, new, stream) = peer_with_stream_on_two_generations(true);
         let data = |conn_id| SwarmEvent::StreamData {
-            peer_id: peer_id.clone(),
+            peer_id,
             conn_id,
             stream_id: stream,
             data: Bytes::from(vec![1]),
@@ -5700,7 +5718,7 @@ mod tests {
             &mut core,
             TransportEvent::PeerIdentityVerified {
                 id: upgraded,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
                 previous_peer_id: None,
             },
         );
@@ -5718,7 +5736,7 @@ mod tests {
             &mut core,
             TransportEvent::PeerIdentityVerified {
                 id: original,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
                 previous_peer_id: None,
             },
         );
@@ -5909,7 +5927,7 @@ mod tests {
         core.handle_transport_event(
             TransportEvent::Connected {
                 id: replacement,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
             6_000,
         );
@@ -5973,7 +5991,7 @@ mod tests {
         core.handle_transport_event(
             TransportEvent::Connected {
                 id: replacement,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
             12_000,
         );
@@ -6082,7 +6100,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: incoming,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         let _ = drain_events(&mut core);
@@ -6108,8 +6126,8 @@ mod tests {
         let conn = ConnectionId::new(30);
         let stream = StreamId::new(7);
         let key = (conn, stream);
-        core.conn_to_peer.insert(conn, peer.clone());
-        core.peer_to_conn.insert(peer.clone(), conn);
+        core.conn_to_peer.insert(conn, peer);
+        core.peer_to_conn.insert(peer, conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
         core.inbound_negotiators.insert(
             key,
@@ -6145,7 +6163,7 @@ mod tests {
             stream_id: other_stream,
         });
         core.events.push_back(SwarmEvent::StreamData {
-            peer_id: peer.clone(),
+            peer_id: peer,
             conn_id: conn,
             stream_id: stream,
             data: Bytes::from(vec![1]),
@@ -6187,12 +6205,12 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: original_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         core.insert_stream_owner(original_conn, stale_stream, ProtocolKind::Ping);
         core.ping
-            .register_outbound_stream(peer_id.clone(), stale_stream)
+            .register_outbound_stream(peer_id, stale_stream)
             .expect("register ping stream");
         while core.ping.poll_output().is_some() {}
 
@@ -6200,7 +6218,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: newer_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         while core.poll_output().is_some() {}
@@ -6239,7 +6257,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: original_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         while core.poll_output().is_some() {}
@@ -6250,7 +6268,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: newer_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
             },
         );
         let actions = drain_actions(&mut core);
@@ -6271,12 +6289,11 @@ mod tests {
         let newer_conn = ConnectionId::new(11);
         let inbound_stream = StreamId::new(8);
 
-        core.conn_to_peer.insert(original_conn, peer_id.clone());
-        core.conn_to_peer.insert(newer_conn, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.conn_to_peer.insert(original_conn, peer_id);
+        core.conn_to_peer.insert(newer_conn, peer_id);
+        core.peer_to_conn.insert(peer_id, newer_conn);
         core.insert_stream_owner(original_conn, inbound_stream, ProtocolKind::Ping);
-        core.ping
-            .register_inbound_stream(peer_id.clone(), inbound_stream);
+        core.ping.register_inbound_stream(peer_id, inbound_stream);
         while core.ping.poll_output().is_some() {}
 
         core.ping
@@ -6305,12 +6322,11 @@ mod tests {
         let newer_conn = ConnectionId::new(11);
         let stream_id = StreamId::new(8);
 
-        core.conn_to_peer.insert(original_conn, peer_id.clone());
-        core.conn_to_peer.insert(newer_conn, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.conn_to_peer.insert(original_conn, peer_id);
+        core.conn_to_peer.insert(newer_conn, peer_id);
+        core.peer_to_conn.insert(peer_id, newer_conn);
         core.insert_stream_owner(original_conn, stream_id, ProtocolKind::IdentifyInitiator);
-        core.identify
-            .register_inbound_stream(peer_id.clone(), stream_id);
+        core.identify.register_inbound_stream(peer_id, stream_id);
 
         // A header declaring a frame far beyond identify's limit.
         let mut data = Vec::new();
@@ -6337,7 +6353,7 @@ mod tests {
             core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), *peer_id),
             },
         );
         while core.poll_output().is_some() {}
@@ -6345,7 +6361,7 @@ mod tests {
         core.first_identify.clear();
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
         core.ping
-            .register_outbound_stream(peer_id.clone(), stream_id)
+            .register_outbound_stream(*peer_id, stream_id)
             .expect("register outbound ping stream");
         while core.ping.poll_output().is_some() {}
     }
@@ -6471,7 +6487,7 @@ mod tests {
 
     fn noted_dial_addr(label: &[u8]) -> (PeerId, PeerAddr, ConnectionId) {
         let peer = PeerId::from_public_key_protobuf(label);
-        let addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("valid peer addr");
+        let addr = PeerAddr::new(loopback_transport(), peer).expect("valid peer addr");
         (peer, addr, ConnectionId::new(81))
     }
 
@@ -6541,7 +6557,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
 
@@ -6717,13 +6733,13 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"veto-two-stage-peer");
         let existing = ConnectionId::new(41);
         let late = ConnectionId::new(42);
-        let late_addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("peer addr");
+        let late_addr = PeerAddr::new(loopback_transport(), peer).expect("peer addr");
 
         feed(
             &mut core,
             TransportEvent::Connected {
                 id: existing,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
         let _ = drain_events(&mut core);
@@ -6763,7 +6779,7 @@ mod tests {
             &mut core,
             TransportEvent::PeerIdentityVerified {
                 id: late,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
                 previous_peer_id: None,
             },
         );
@@ -6862,8 +6878,8 @@ mod tests {
         let conn_id = ConnectionId::new(2);
         let stream_id = StreamId::new(9);
 
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.conn_to_peer.insert(conn_id, peer_id);
+        core.peer_to_conn.insert(peer_id, conn_id);
         core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 1_000)
             .expect("queue ping");
 
@@ -6889,7 +6905,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: circuit,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
         // A late identity upgrade replaces the first connection; an
@@ -6905,7 +6921,7 @@ mod tests {
             &mut core,
             TransportEvent::PeerIdentityVerified {
                 id: direct,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
                 previous_peer_id: None,
             },
         );
@@ -6976,13 +6992,13 @@ mod tests {
         token: Option<u8>,
         now_ms: u64,
     ) {
-        let mut endpoint = ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone());
+        let mut endpoint = ConnectionEndpoint::with_peer_id(loopback_transport(), *peer);
         if let Some(token) = token {
             endpoint.set_token(ConnectionToken::new([token; 32]));
         }
         let mut events = Vec::new();
         if outbound {
-            let addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("peer addr");
+            let addr = PeerAddr::new(loopback_transport(), *peer).expect("peer addr");
             core.note_dial(conn_id, addr);
         } else {
             events.push(TransportEvent::IncomingConnection {
@@ -7301,7 +7317,7 @@ mod tests {
             &mut core,
             TransportEvent::Connected {
                 id: conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer),
             },
         );
         let actions = drain_actions(&mut core);
@@ -7404,15 +7420,11 @@ mod tests {
                         peer_id,
                         conn_id,
                         cause,
-                    }) => Some((peer_id.clone(), *conn_id, *cause)),
+                    }) => Some((*peer_id, *conn_id, *cause)),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                failed,
-                [(peer.clone(), conn, cause)],
-                "{how:?}: {outputs:?}"
-            );
+            assert_eq!(failed, [(peer, conn, cause)], "{how:?}: {outputs:?}");
             assert!(
                 outputs.iter().any(|output| matches!(
                     output,

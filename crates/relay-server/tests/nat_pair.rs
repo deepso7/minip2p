@@ -68,7 +68,7 @@ fn ready_server_hop(
 ) {
     assert!(server.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: client.clone(),
+            peer_id: *client,
             conn_id,
             stream_id,
             protocol_id: minip2p_nat::HOP_PROTOCOL_ID.to_owned(),
@@ -84,16 +84,16 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let relay = peer(b"relay");
     let source = peer(b"source");
     let destination = peer(b"destination");
-    let relay_addr = PeerAddr::new(addr("/ip4/203.0.113.1/udp/4001/quic-v1"), relay.clone())
-        .expect("peer address");
+    let relay_addr =
+        PeerAddr::new(addr("/ip4/203.0.113.1/udp/4001/quic-v1"), relay).expect("peer address");
 
     let mut server = Node::unannounced(RelayServerConfig::default());
     server
         .set_listener_addrs(vec![addr("/ip4/203.0.113.1/udp/4001/quic-v1")])
         .expect("usable relay address");
     for (client, conn_id) in [
-        (source.clone(), SOURCE_RELAY_CONN),
-        (destination.clone(), DESTINATION_RELAY_CONN),
+        (source, SOURCE_RELAY_CONN),
+        (destination, DESTINATION_RELAY_CONN),
     ] {
         server.handle_event(
             &SwarmEvent::ConnectionEstablished {
@@ -106,7 +106,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     }
 
     let mut destination_nat = NatAgent::new(
-        destination.clone(),
+        destination,
         NatConfig {
             relays: vec![relay_addr.clone()],
             reservation_policy: ReservationPolicy::Always,
@@ -137,7 +137,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let reserve_request = destination_swarm.take_sent();
     server.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: destination.clone(),
+            peer_id: destination,
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: reserve_hop,
             data: Bytes::from(reserve_request),
@@ -149,7 +149,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: reserve_hop,
             data: Bytes::from(reserve_response),
@@ -161,7 +161,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     assert_eq!(server.reservation_count(), 1);
 
     let mut source_nat = NatAgent::new(
-        source.clone(),
+        source,
         NatConfig {
             relays: vec![relay_addr],
             reservation_policy: ReservationPolicy::Never,
@@ -176,7 +176,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     source_nat.connect(
         &mut source_swarm,
         connect_id,
-        destination.clone(),
+        destination,
         ConnectLegs {
             direct_racing: false,
             allow_relay: true,
@@ -197,7 +197,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     server.swarm.next_open = Some(stop_key);
     server.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: source.clone(),
+            peer_id: source,
             conn_id: SOURCE_RELAY_CONN,
             stream_id: source_hop,
             data: Bytes::from(connect_request),
@@ -214,7 +214,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamReady {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
             protocol_id: minip2p_nat::STOP_PROTOCOL_ID.to_owned(),
@@ -227,7 +227,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
             data: Bytes::from(stop_request),
@@ -239,7 +239,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let destination_circuit = destination_swarm.promoted_circuit();
     server.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: destination.clone(),
+            peer_id: destination,
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
             data: Bytes::from(stop_response),
@@ -251,7 +251,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: source_hop,
             data: Bytes::from(hop_response),
@@ -264,7 +264,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let source_payload = b"payload from source".to_vec();
     server.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: source.clone(),
+            peer_id: source,
             conn_id: SOURCE_RELAY_CONN,
             stream_id: source_hop,
             data: Bytes::from(source_payload.clone()),
@@ -279,7 +279,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let destination_payload = b"payload from destination".to_vec();
     server.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: destination.clone(),
+            peer_id: destination,
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
             data: Bytes::from(destination_payload.clone()),
@@ -295,7 +295,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::ConnectionEstablished {
-            peer_id: destination.clone(),
+            peer_id: destination,
             conn_id: source_circuit,
         },
         true,
@@ -304,7 +304,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::ConnectionEstablished {
-            peer_id: source.clone(),
+            peer_id: source,
             conn_id: destination_circuit,
         },
         true,
@@ -371,14 +371,14 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     let relay = peer(b"relay");
     let source = peer(b"source");
     let destination = peer(b"destination");
-    let relay_addr = PeerAddr::new(addr("/ip4/192.0.2.1/udp/4001/quic-v1"), relay.clone())
-        .expect("peer address");
+    let relay_addr =
+        PeerAddr::new(addr("/ip4/192.0.2.1/udp/4001/quic-v1"), relay).expect("peer address");
     let mut mesh = Mesh::new(vec![RelayServerConfig::default(); 2]);
     mesh.nodes[HOLDING].establish(&destination, DESTINATION_RELAY_CONN);
     mesh.nodes[ENTRY].establish(&source, SOURCE_RELAY_CONN);
 
     let mut destination_nat = NatAgent::new(
-        destination.clone(),
+        destination,
         NatConfig {
             relays: vec![relay_addr.clone()],
             reservation_policy: ReservationPolicy::Always,
@@ -421,7 +421,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: reserve_hop,
             data: Bytes::from(reserve_response),
@@ -432,7 +432,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     assert!(destination_nat.active_reservation().is_some());
 
     let mut source_nat = NatAgent::new(
-        source.clone(),
+        source,
         NatConfig {
             relays: vec![relay_addr],
             reservation_policy: ReservationPolicy::Never,
@@ -447,7 +447,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     source_nat.connect(
         &mut source_swarm,
         connect_id,
-        destination.clone(),
+        destination,
         ConnectLegs {
             direct_racing: false,
             allow_relay: true,
@@ -480,7 +480,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamReady {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: stop_key.stream_id,
             protocol_id: minip2p_nat::STOP_PROTOCOL_ID.to_owned(),
@@ -493,7 +493,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: stop_key.stream_id,
             data: Bytes::from(stop_request),
@@ -510,7 +510,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::StreamData {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id: source_hop,
             data: Bytes::from(hop_response),
@@ -535,7 +535,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::ConnectionEstablished {
-            peer_id: destination.clone(),
+            peer_id: destination,
             conn_id: source_circuit,
         },
         true,
@@ -544,7 +544,7 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::ConnectionEstablished {
-            peer_id: source.clone(),
+            peer_id: source,
             conn_id: destination_circuit,
         },
         true,

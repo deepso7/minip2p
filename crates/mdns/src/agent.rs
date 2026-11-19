@@ -431,7 +431,7 @@ impl MdnsAgent {
                         );
                         return;
                     }
-                    claimed_peer.get_or_insert_with(|| peer.clone());
+                    claimed_peer.get_or_insert(*peer);
                     let transport = Multiaddr::from_protocols(transport_protocols.to_vec());
                     if !is_supported_transport(&transport) {
                         invalid_claim = true;
@@ -501,7 +501,7 @@ impl MdnsAgent {
             if values.len() == self.config.max_announced_addrs {
                 break;
             }
-            addr.push(Protocol::P2p(self.peer_id.clone()));
+            addr.push(Protocol::P2p(self.peer_id));
             let text = addr.to_string();
             if text.len() > 247 {
                 continue;
@@ -678,7 +678,7 @@ mod tests {
 
     fn response_from(remote: &PeerId, ttl: u32) -> Vec<u8> {
         let mut addr: Multiaddr = "/ip4/192.168.1.2/udp/4001/quic-v1".parse().unwrap();
-        addr.push(Protocol::P2p(remote.clone()));
+        addr.push(Protocol::P2p(*remote));
         encode_response_segments(ResponseSpec {
             id: 0,
             question: None,
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn own_response_and_ttl_zero_do_not_end_fast_phase() {
         let local = peer(1);
-        let mut agent = MdnsAgent::new(local.clone(), MdnsConfig::default(), [7; 32]).unwrap();
+        let mut agent = MdnsAgent::new(local, MdnsConfig::default(), [7; 32]).unwrap();
         agent.set_interfaces(&[iface(1)], 0);
         let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
         agent.handle_packet(InterfaceId::new(1), from, &response_from(&local, 120), 1);
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn dnsaddr_character_string_limit_includes_the_prefix() {
         let local = peer(1);
-        let mut agent = MdnsAgent::new(local.clone(), MdnsConfig::default(), [7; 32]).unwrap();
+        let mut agent = MdnsAgent::new(local, MdnsConfig::default(), [7; 32]).unwrap();
         agent.set_interfaces(&[iface(1)], 0);
 
         let address_with_len = |wanted: usize| {
@@ -925,7 +925,7 @@ mod tests {
                         Protocol::QuicV1,
                     ]);
                     let mut advertised = addr.clone();
-                    advertised.push(Protocol::P2p(local.clone()));
+                    advertised.push(Protocol::P2p(local));
                     (advertised.to_string().len() == wanted).then_some(addr)
                 })
                 .expect("a DNS multiaddr reaches the requested text length")

@@ -283,7 +283,7 @@ impl AutoNatClient {
             .queue(&msg.encode())
             .expect("addresses were trimmed to fit one frame");
         Self {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             requested,
             frames,
             state: FlowState::Pending,
@@ -377,7 +377,7 @@ impl AutoNatClient {
     /// address matches a requested one exactly, or with a trailing
     /// `/p2p/<our peer id>`; malformed or unrelated addresses match nothing.
     fn confirmed(&self, raw: &[Vec<u8>]) -> Vec<Multiaddr> {
-        let ours = Protocol::P2p(self.peer_id.clone());
+        let ours = Protocol::P2p(self.peer_id);
         let returned = decode_addrs(raw);
         let names = |requested: &Multiaddr, addr: &Multiaddr| {
             addr == requested

@@ -655,10 +655,7 @@ impl GossipsubAgent {
                     None
                 };
                 if let Some(version) = version {
-                    self.peers
-                        .entry(peer_id.clone())
-                        .or_default()
-                        .advertised_version = Some(version);
+                    self.peers.entry(*peer_id).or_default().advertised_version = Some(version);
                     self.drive_sender(peer_id, now_ms);
                 }
                 false
@@ -723,14 +720,14 @@ impl GossipsubAgent {
             Err(reason) => {
                 self.restore_commit(peer, commit);
                 self.actions.push_back(GossipsubAction::ResetStream {
-                    peer: peer.clone(),
+                    peer: *peer,
                     stream_id,
                 });
                 if let Some(state) = self.peers.get_mut(peer) {
                     state.sender = SendState::Idle;
                 }
                 self.events.push_back(GossipsubEvent::OutboundFailure {
-                    peer: peer.clone(),
+                    peer: *peer,
                     reason: format!("send failed: {reason}"),
                 });
             }
@@ -789,7 +786,7 @@ impl GossipsubAgent {
         frame.token = token;
         self.actions.push_back(GossipsubAction::SendStream {
             token,
-            peer: peer.clone(),
+            peer: *peer,
             stream_id,
             data,
         });
@@ -826,7 +823,7 @@ impl GossipsubAgent {
                     };
                 }
                 self.roles
-                    .entry(peer.clone())
+                    .entry(*peer)
                     .or_default()
                     .insert(stream_id, StreamRole::Outbound);
             }
@@ -835,7 +832,7 @@ impl GossipsubAgent {
                     state.sender = SendState::Idle;
                 }
                 self.events.push_back(GossipsubEvent::OutboundFailure {
-                    peer: peer.clone(),
+                    peer: *peer,
                     reason: format!("open failed: {reason}"),
                 });
             }
@@ -854,7 +851,7 @@ impl GossipsubAgent {
             .filter_map(|(peer, state)| {
                 let since = state.sender.establishment_since()?;
                 (now_ms.saturating_sub(since) >= self.config.send_timeout_ms)
-                    .then(|| (peer.clone(), state.sender.stream_id()))
+                    .then(|| (*peer, state.sender.stream_id()))
             })
             .collect();
         for (peer, stream) in timed_out {
@@ -927,7 +924,7 @@ impl GossipsubAgent {
     fn on_connection_replaced(&mut self, peer: &PeerId) {
         if self.peers.contains_key(peer) {
             self.remove_peer(peer, "connection replaced");
-            self.peers.insert(peer.clone(), PeerState::default());
+            self.peers.insert(*peer, PeerState::default());
         }
         self.actions.retain(|action| match action {
             GossipsubAction::OpenStream { peer: p, .. }
@@ -946,15 +943,13 @@ impl GossipsubAgent {
             let dropped = state.queued_work();
             if dropped > 0 {
                 self.events.push_back(GossipsubEvent::OutboundFailure {
-                    peer: peer.clone(),
+                    peer: *peer,
                     reason: format!("{cause}; dropped {dropped} queued items"),
                 });
             }
             for topic in state.remote_topics {
-                self.events.push_back(GossipsubEvent::PeerUnsubscribed {
-                    peer: peer.clone(),
-                    topic,
-                });
+                self.events
+                    .push_back(GossipsubEvent::PeerUnsubscribed { peer: *peer, topic });
             }
         }
         self.roles.remove(peer);
@@ -1010,10 +1005,10 @@ impl GossipsubAgent {
             return true;
         }
 
-        let state = self.peers.entry(peer.clone()).or_default();
+        let state = self.peers.entry(*peer).or_default();
         if state.inbound.len() >= self.config.max_inbound_streams_per_peer {
             self.events.push_back(GossipsubEvent::ProtocolViolation {
-                peer: peer.clone(),
+                peer: *peer,
                 reason: "too many concurrent inbound streams".to_string(),
             });
             self.reject_stream(peer, stream_id);
@@ -1021,7 +1016,7 @@ impl GossipsubAgent {
         }
         state.inbound.insert(stream_id, Vec::new());
         self.roles
-            .entry(peer.clone())
+            .entry(*peer)
             .or_default()
             .insert(stream_id, StreamRole::Inbound);
         true
@@ -1065,7 +1060,7 @@ impl GossipsubAgent {
     fn ack(&mut self, peer: &PeerId, stream_id: StreamId, bytes: usize) {
         if bytes != 0 {
             self.actions.push_back(GossipsubAction::AckStream {
-                peer: peer.clone(),
+                peer: *peer,
                 stream_id,
                 bytes,
             });
@@ -1167,7 +1162,7 @@ impl GossipsubAgent {
             self.violation_reset(peer, stream_id, "EOF inside a frame");
         } else {
             self.actions.push_back(GossipsubAction::CloseStreamWrite {
-                peer: peer.clone(),
+                peer: *peer,
                 stream_id,
             });
         }
@@ -1181,7 +1176,7 @@ impl GossipsubAgent {
         match self.role(peer, stream_id) {
             Some(StreamRole::Outbound) => {
                 self.actions.push_back(GossipsubAction::ResetStream {
-                    peer: peer.clone(),
+                    peer: *peer,
                     stream_id,
                 });
                 true
@@ -1217,7 +1212,7 @@ impl GossipsubAgent {
                     }) => self.restore_commit(peer, frame.commit),
                     Some(SendState::Negotiating { .. }) => {
                         self.events.push_back(GossipsubEvent::OutboundFailure {
-                            peer: peer.clone(),
+                            peer: *peer,
                             reason: "stream closed during negotiation".to_string(),
                         });
                     }
@@ -1299,13 +1294,13 @@ impl GossipsubAgent {
         state.remote_topics = candidate;
         if invalid {
             self.events.push_back(GossipsubEvent::ProtocolViolation {
-                peer: peer.clone(),
+                peer: *peer,
                 reason: "subscription entries with invalid topics skipped".to_string(),
             });
         }
         for topic in &added {
             self.events.push_back(GossipsubEvent::PeerSubscribed {
-                peer: peer.clone(),
+                peer: *peer,
                 topic: topic.clone(),
             });
         }
@@ -1316,10 +1311,8 @@ impl GossipsubAgent {
             if let Some(fanout) = self.fanout.get_mut(&topic) {
                 fanout.remove(peer);
             }
-            self.events.push_back(GossipsubEvent::PeerUnsubscribed {
-                peer: peer.clone(),
-                topic,
-            });
+            self.events
+                .push_back(GossipsubEvent::PeerUnsubscribed { peer: *peer, topic });
         }
         Some(added)
     }
@@ -1333,7 +1326,7 @@ impl GossipsubAgent {
                     .is_none_or(|mesh| mesh.len() < self.config.d_low && !mesh.contains(peer))
                 && self.peer_is_eligible(peer, &topic, now_ms);
             if should_graft && self.queue_control(peer, ControlItem::Graft(topic.clone()), now_ms) {
-                self.mesh.entry(topic).or_default().insert(peer.clone());
+                self.mesh.entry(topic).or_default().insert(*peer);
             }
         }
     }
@@ -1372,7 +1365,7 @@ impl GossipsubAgent {
                     now_ms,
                 );
             } else {
-                self.mesh.entry(topic).or_default().insert(peer.clone());
+                self.mesh.entry(topic).or_default().insert(*peer);
             }
         }
         for prune in control.prune {
@@ -1405,7 +1398,7 @@ impl GossipsubAgent {
             if validate_topic(topic).is_err() || !self.topics.contains(topic) {
                 continue;
             }
-            let count = self.ihave_budget.entry(peer.clone()).or_default();
+            let count = self.ihave_budget.entry(*peer).or_default();
             if *count >= self.config.max_ihave_messages_per_heartbeat {
                 continue;
             }
@@ -1452,7 +1445,7 @@ impl GossipsubAgent {
                 if body.len() <= MAX_RPC_SIZE
                     && self.queue_message(peer, encode_frame(&body).into())
                 {
-                    *self.iwant_served.entry(peer.clone()).or_default() += 1;
+                    *self.iwant_served.entry(*peer).or_default() += 1;
                 }
             }
         }
@@ -1463,7 +1456,7 @@ impl GossipsubAgent {
             Ok(value) => value,
             Err(error) => {
                 self.events.push_back(GossipsubEvent::ProtocolViolation {
-                    peer: arrival.clone(),
+                    peer: *arrival,
                     reason: format!("message rejected: {error}"),
                 });
                 return;
@@ -1478,7 +1471,7 @@ impl GossipsubAgent {
             Ok(value) => value,
             Err(error) => {
                 self.events.push_back(GossipsubEvent::ProtocolViolation {
-                    peer: arrival.clone(),
+                    peer: *arrival,
                     reason: format!("message rejected: {error}"),
                 });
                 return;
@@ -1504,7 +1497,7 @@ impl GossipsubAgent {
             self.config.max_seen_messages,
         );
         self.events.push_back(GossipsubEvent::Message {
-            from: from.clone(),
+            from,
             topics: message.topic_ids.clone(),
             data: message.data.clone().unwrap_or_default(),
             seqno,
@@ -1656,7 +1649,7 @@ impl GossipsubAgent {
                         && !mesh.contains(*peer)
                         && !fanout.contains(*peer)
                 })
-                .map(|(peer, _)| peer.clone())
+                .map(|(peer, _)| *peer)
                 .collect();
             for peer in self.select_peers(candidates, self.config.d_lazy) {
                 for id in ids.iter().take(self.config.max_ihave_length) {
@@ -1697,7 +1690,7 @@ impl GossipsubAgent {
                 }
                 self.actions.push_back(GossipsubAction::OpenStream {
                     token,
-                    peer: peer.clone(),
+                    peer: *peer,
                     protocol_id: String::from(version.protocol_id()),
                 });
             }
@@ -1788,7 +1781,7 @@ impl GossipsubAgent {
         }
         self.actions.push_back(GossipsubAction::SendStream {
             token,
-            peer: peer.clone(),
+            peer: *peer,
             stream_id,
             data: frame,
         });
@@ -1858,7 +1851,7 @@ impl GossipsubAgent {
         };
         if state.pending_messages.len() >= self.config.max_pending_per_peer {
             self.events.push_back(GossipsubEvent::OutboundFailure {
-                peer: peer.clone(),
+                peer: *peer,
                 reason: "outbound message dropped: queue is full".to_string(),
             });
             return false;
@@ -1902,7 +1895,7 @@ impl GossipsubAgent {
                     && state.remote_topics.contains(topic)
                     && !self.is_backed_off(topic, peer, now_ms)
             })
-            .map(|(peer, _)| peer.clone())
+            .map(|(peer, _)| *peer)
             .collect()
     }
 
@@ -1925,14 +1918,14 @@ impl GossipsubAgent {
 
     fn is_backed_off(&self, topic: &str, peer: &PeerId, now_ms: u64) -> bool {
         self.backoff
-            .get(&(String::from(topic), peer.clone()))
+            .get(&(String::from(topic), *peer))
             .is_some_and(|expiry| *expiry > now_ms)
     }
 
     fn record_backoff(&mut self, topic: &str, peer: &PeerId, duration_ms: u64, now_ms: u64) {
         let expiry = now_ms.saturating_add(duration_ms);
         self.backoff
-            .entry((String::from(topic), peer.clone()))
+            .entry((String::from(topic), *peer))
             .and_modify(|current| *current = (*current).max(expiry))
             .or_insert(expiry);
     }
@@ -1952,11 +1945,11 @@ impl GossipsubAgent {
 
     fn reject_stream(&mut self, peer: &PeerId, stream_id: StreamId) {
         self.roles
-            .entry(peer.clone())
+            .entry(*peer)
             .or_default()
             .insert(stream_id, StreamRole::Rejected);
         self.actions.push_back(GossipsubAction::ResetStream {
-            peer: peer.clone(),
+            peer: *peer,
             stream_id,
         });
     }
@@ -1966,7 +1959,7 @@ impl GossipsubAgent {
             state.inbound.remove(&stream_id);
         }
         self.events.push_back(GossipsubEvent::ProtocolViolation {
-            peer: peer.clone(),
+            peer: *peer,
             reason: reason.to_string(),
         });
         self.reject_stream(peer, stream_id);
@@ -2036,7 +2029,7 @@ mod tests {
             let mut state = PeerState::default();
             state.remote_topics.insert(String::from("topic"));
             state.advertised_version = Some(MeshsubVersion::V11);
-            agent.peers.insert(peer.clone(), state);
+            agent.peers.insert(*peer, state);
         }
 
         agent
@@ -2161,7 +2154,7 @@ mod tests {
             remote_topics: topics.iter().map(|topic| String::from(*topic)).collect(),
             ..PeerState::default()
         };
-        agent.peers.insert(peer.clone(), state);
+        agent.peers.insert(peer, state);
         (agent, peer)
     }
 
@@ -2212,7 +2205,7 @@ mod tests {
     fn prune_for_joined_topic_blocks_regraft_until_backoff_expires() {
         let (mut agent, peer) = agent_with_peer(&["room"]);
         agent.subscribe("room", 0).unwrap();
-        assert_eq!(agent.mesh_peers("room"), alloc::vec![peer.clone()]);
+        assert_eq!(agent.mesh_peers("room"), alloc::vec![peer]);
 
         agent.process_control(&peer, prune("room", 120), 1);
         assert!(agent.mesh_peers("room").is_empty());

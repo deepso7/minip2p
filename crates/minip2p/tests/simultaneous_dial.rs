@@ -76,7 +76,7 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
     let mut b = bind(listen, Ed25519Keypair::generate());
     let a_addr = a.listen().expect("a listens");
     let b_addr = b.listen().expect("b listens");
-    let (a_peer, b_peer) = (a.peer_id().clone(), b.peer_id().clone());
+    let (a_peer, b_peer) = (*a.peer_id(), *b.peer_id());
 
     a.connect(&b_addr).expect("a connects");
     b.connect(&a_addr).expect("b connects");
@@ -486,7 +486,7 @@ fn reconnect_after_silent_death(a_is_lower: bool) {
     let a_addr = a.listen().expect("a listens");
     let mut b = bind_short_window(b_key.clone());
     let b_addr = b.listen().expect("b listens");
-    let (a_peer, b_peer) = (a.peer_id().clone(), b.peer_id().clone());
+    let (a_peer, b_peer) = (*a.peer_id(), *b.peer_id());
 
     a.connect(&b_addr).expect("a connects");
     let mut ignored = Vec::new();

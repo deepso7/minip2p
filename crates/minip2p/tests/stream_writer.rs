@@ -40,8 +40,8 @@ fn next(endpoint: &mut Endpoint) -> Option<EndpointEvent> {
 /// Connects `writer` to `reader` and opens one negotiated stream.
 fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (ConnectionId, StreamId) {
     let reader_addr = reader.listen().expect("reader listens");
-    let reader_peer = reader.peer_id().clone();
-    let writer_peer = writer.peer_id().clone();
+    let reader_peer = *reader.peer_id();
+    let writer_peer = *writer.peer_id();
     writer.connect(&reader_addr).expect("connect");
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {
@@ -123,7 +123,7 @@ fn a_held_write_completes_on_writable_and_the_fin_waits_for_it() {
     assert_eq!(
         accepted,
         vec![WriteAccepted {
-            peer_id: reader.peer_id().clone(),
+            peer_id: *reader.peer_id(),
             conn_id,
             stream_id,
         }],
@@ -161,9 +161,11 @@ fn a_held_tail_is_dropped_when_its_stream_or_connection_ends() {
         "{waiting:?}"
     );
     let replaced = EndpointEvent::ConnectionReplaced {
-        peer_id: reader.peer_id().clone(),
+        peer_id: *reader.peer_id(),
         old: conn_id,
         new: ConnectionId::new(u64::MAX),
+        old_path: minip2p_core::Path::Direct,
+        new_path: minip2p_core::Path::Direct,
     };
     assert_eq!(streams.observe(&mut writer, &replaced), None);
     assert!(!streams.is_pending(conn_id, stream_id));
@@ -250,10 +252,10 @@ fn a_portable_endpoint_finishes_a_held_write_and_the_deferred_fin() {
         reader
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
             .expect("reader listens"),
-        reader.peer_id().clone(),
+        *reader.peer_id(),
     )
     .expect("reader address");
-    let (reader_peer, writer_peer) = (reader.peer_id().clone(), writer.peer_id().clone());
+    let (reader_peer, writer_peer) = (*reader.peer_id(), *writer.peer_id());
     writer.connect(reader_addr, clock.now()).expect("connect");
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {

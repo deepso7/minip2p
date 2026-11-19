@@ -121,8 +121,8 @@ fn normalize_addr(
     if let Some(Protocol::P2p(found)) = protocols.last() {
         if found != local_peer_id {
             return Err(RelayServerAddressErrorKind::ConflictingPeerId {
-                expected: local_peer_id.clone(),
-                found: found.clone(),
+                expected: *local_peer_id,
+                found: *found,
             });
         }
         protocols.pop();
@@ -191,7 +191,7 @@ mod tests {
         // A CA-certified listener's address carries no certhash.
         let ca_webtransport = addr("/dns/relay.example/udp/4002/quic-v1/webtransport");
         let mut tcp_with_peer = tcp.clone();
-        tcp_with_peer.push(Protocol::P2p(local.clone()));
+        tcp_with_peer.push(Protocol::P2p(local));
 
         assert_eq!(
             normalize_addrs(
@@ -224,7 +224,7 @@ mod tests {
 
         let mut conflicting = addr("/ip4/192.0.2.1/tcp/4001");
         let found = peer(b"other-peer");
-        conflicting.push(Protocol::P2p(found.clone()));
+        conflicting.push(Protocol::P2p(found));
         assert_eq!(
             normalize_addrs(&local, vec![conflicting.clone()])
                 .unwrap_err()

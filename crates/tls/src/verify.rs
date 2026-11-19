@@ -565,7 +565,7 @@ mod tests {
                 .expect("must generate");
         let verified =
             verify_libp2p_certificate(&cert_der, Duration::from_secs(NOT_BEFORE)).expect("valid");
-        assert_eq!(certificate_peer_id(&cert_der), Ok(verified.clone()));
+        assert_eq!(certificate_peer_id(&cert_der), Ok(verified));
         assert_eq!(verified, keypair.peer_id());
         assert!(matches!(
             certificate_peer_id(&[0x30, 0x00]),

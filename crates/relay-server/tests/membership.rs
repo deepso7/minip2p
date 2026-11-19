@@ -526,7 +526,7 @@ fn opens_meant_for_a_replaced_connection_are_not_made_on_the_replacement() {
     let inbound = stream(conn(1), 13);
     stream_ready(&mut node, inbound, DIRECTORY_PROTOCOL_ID, false);
     let mut snapshot = DirectoryMessage::Present {
-        peer: alice.clone(),
+        peer: alice,
         expires_unix: u64::MAX,
     }
     .encode_frame();

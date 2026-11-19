@@ -58,8 +58,8 @@ fn fail_on_teardown(event: &EndpointEvent) {
 /// Connects the two endpoints and opens one negotiated stream from `writer`.
 fn open(writer: &mut Endpoint, reader: &mut Endpoint) -> (PeerId, ConnectionId, StreamId) {
     let reader_addr = reader.listen().expect("reader listens");
-    let reader_peer = reader.peer_id().clone();
-    let writer_peer = writer.peer_id().clone();
+    let reader_peer = *reader.peer_id();
+    let writer_peer = *writer.peer_id();
     writer.connect(&reader_addr).expect("connect");
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {

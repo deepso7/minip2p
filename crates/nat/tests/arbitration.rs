@@ -36,14 +36,14 @@ fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
 fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
     drive_to_bridged(h, t0);
     let promotion = drain_actions(&mut h.agent);
-    let target = h.target.clone();
+    let target = h.target;
     complete_promotion(&mut h.agent, &target, &promotion, at(t0 + 301));
     drain_events(&mut h.agent);
     let stream = StreamId::new(8_000 + t0);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
-            peer_id: target.clone(),
+            peer_id: target,
             stream_id: stream,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -154,7 +154,7 @@ fn force_relay_skips_direct_dials_and_dcutr() {
             ..
         }
     )));
-    let target = h.target.clone();
+    let target = h.target;
     complete_promotion(&mut h.agent, &target, &promotion, at(31));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
@@ -188,7 +188,7 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
     h.stream_data(stream, hop_status(Status::Ok), at(300));
 
     let promotion = drain_actions(&mut h.agent);
-    let target = h.target.clone();
+    let target = h.target;
     complete_promotion(&mut h.agent, &target, &promotion, at(301));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
@@ -199,7 +199,7 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
     // Identify on the circuit offers DCUtR; still no round starts.
     h.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: target.clone(),
+            peer_id: target,
             conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
             protocols: vec![minip2p_nat::DCUTR_PROTOCOL_ID.into()],
         },
@@ -272,7 +272,7 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, _) = drive_to_bridged(&mut h, 0);
     let promotion = drain_actions(&mut h.agent);
-    let target = h.target.clone();
+    let target = h.target;
     complete_promotion(&mut h.agent, &target, &promotion, at(301));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
@@ -284,7 +284,7 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
-            peer_id: target.clone(),
+            peer_id: target,
             stream_id: stream,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -378,7 +378,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     let handled = h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: attacker.clone(),
+            peer_id: attacker,
             stream_id: stream,
             protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
             initiated_locally: false,
@@ -397,7 +397,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     assert!(h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: attacker.clone(),
+            peer_id: attacker,
             stream_id: stream,
             data: Bytes::from(stop_connect(&h.target)),
         },
@@ -407,7 +407,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     assert!(h.agent.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: attacker.clone(),
+            peer_id: attacker,
             stream_id: stream,
         },
         false,
@@ -416,7 +416,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     assert!(h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: attacker.clone(),
+            peer_id: attacker,
             stream_id: stream,
         },
         false,
@@ -436,7 +436,7 @@ fn write_stop_resets_only_nat_owned_streams() {
     assert!(h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id,
-            peer_id: remote.clone(),
+            peer_id: remote,
             stream_id: owned,
             protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
             initiated_locally: false,
@@ -448,7 +448,7 @@ fn write_stop_resets_only_nat_owned_streams() {
 
     let stopped = |stream_id| SwarmEvent::StreamWriteStopped {
         conn_id,
-        peer_id: remote.clone(),
+        peer_id: remote,
         stream_id,
         error_code: 0,
     };
@@ -470,16 +470,18 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
         },
         false,
         at(10),
     );
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(11),
@@ -488,7 +490,7 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
 
     h.agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             conn_id: ConnectionId::new(2),
             protocols: vec![HOP_PROTOCOL_ID.into()],
         },
@@ -517,24 +519,26 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
 
     // The buffered lifecycle catches up; none of it may end the work on
     // `new` or start a second exchange.
-    let relay = h.relay.clone();
+    let relay = h.relay;
     for event in [
         SwarmEvent::ConnectionEstablished {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: old,
         },
         SwarmEvent::PeerReady {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: old,
             protocols: vec![HOP_PROTOCOL_ID.into()],
         },
         SwarmEvent::ConnectionReplaced {
-            peer_id: relay.clone(),
+            peer_id: relay,
             old,
             new,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         SwarmEvent::PeerReady {
-            peer_id: relay.clone(),
+            peer_id: relay,
             conn_id: new,
             protocols: vec![HOP_PROTOCOL_ID.into()],
         },
@@ -552,7 +556,7 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: new,
-            peer_id: relay.clone(),
+            peer_id: relay,
             stream_id: stream,
             protocol_id: HOP_PROTOCOL_ID.into(),
             initiated_locally: true,
@@ -570,7 +574,7 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
 fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
-    let relay = h.relay.clone();
+    let relay = h.relay;
     h.relay_session_ready(at(0));
     let first = h.start(RELAY_NOW, at(1));
     let stream = opened_stream(&drain_actions(&mut h.agent));
@@ -599,9 +603,11 @@ fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
     );
     h.agent.deliver_late(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: relay.clone(),
+            peer_id: relay,
             old,
             new,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(4),
@@ -634,7 +640,7 @@ fn a_stale_buffered_establishment_keeps_a_newer_relay_dial_gate() {
     h.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(7),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
         },
         false,
         at(1),
@@ -655,7 +661,7 @@ fn cancelling_keeps_a_dialed_relay_session_another_attempt_already_uses() {
 
     // The swarm is ready on the dialed connection before NAT handles its
     // buffered events, so a second attempt opens HOP on it at once.
-    let relay = h.relay.clone();
+    let relay = h.relay;
     h.agent
         .swarm
         .make_ready(&relay, dialed, &[HOP_PROTOCOL_ID.to_string()]);
@@ -680,7 +686,7 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: stream,
         },
         false,
@@ -907,7 +913,7 @@ fn latest_observation_per_reporter_wins() {
     let mut h = Harness::with_relay(NatConfig::default());
 
     // Same reporter twice: only the fresh observation survives.
-    let relay = h.relay.clone();
+    let relay = h.relay;
     identify_observed(&mut h.agent, &relay, &maddr(stale), at(0));
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(1));
 
@@ -923,11 +929,11 @@ fn reporter_disconnect_drops_its_observation() {
 
     // The relay reports a mapping, then its connection closes; the attempt
     // reconnects the relay, but the stale observation must not come back.
-    let relay = h.relay.clone();
+    let relay = h.relay;
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(1),
-            peer_id: relay.clone(),
+            peer_id: relay,
         },
         false,
         at(0),
@@ -977,7 +983,7 @@ fn observed_addrs_from_untrusted_peers_are_ignored() {
     // Valid QUIC shapes, but neither reporter is a configured relay or
     // AutoNAT server — believing them would let any connected peer aim
     // punch-time UDP blasts at an address of its choosing.
-    let target = h.target.clone();
+    let target = h.target;
     identify_observed(&mut h.agent, &target, &maddr(attacker_chosen), at(0));
     let other = peer(b"other-peer");
     identify_observed(&mut h.agent, &other, &maddr(attacker_chosen), at(1));
@@ -994,7 +1000,7 @@ fn observed_addrs_from_untrusted_peers_are_ignored() {
 /// connection 2 (the relay takes connection 1).
 fn with_connected_autonat_server() -> (Harness, PeerId) {
     let autonat = peer(b"autonat-server");
-    let autonat_addr = PeerAddr::new(maddr("/ip4/203.0.113.60/udp/4009/quic-v1"), autonat.clone())
+    let autonat_addr = PeerAddr::new(maddr("/ip4/203.0.113.60/udp/4009/quic-v1"), autonat)
         .expect("valid autonat addr");
     let mut h = Harness::with_relay(NatConfig {
         autonat_servers: vec![autonat_addr],
@@ -1002,7 +1008,7 @@ fn with_connected_autonat_server() -> (Harness, PeerId) {
     });
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: autonat.clone(),
+            peer_id: autonat,
             conn_id: ConnectionId::new(2),
         },
         false,
@@ -1027,7 +1033,7 @@ fn autonat_server_is_a_trusted_reporter() {
 fn a_replaced_reporter_connection_drops_exactly_its_observation() {
     let departed = "/ip4/203.0.113.88/udp/2222/quic-v1";
     let (mut h, autonat) = with_connected_autonat_server();
-    let relay = h.relay.clone();
+    let relay = h.relay;
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
     identify_observed(&mut h.agent, &autonat, &maddr(departed), at(0));
 
@@ -1037,6 +1043,8 @@ fn a_replaced_reporter_connection_drops_exactly_its_observation() {
             peer_id: autonat,
             old: ConnectionId::new(2),
             new: ConnectionId::new(3),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(1),
@@ -1052,7 +1060,7 @@ fn a_reporter_vouches_only_for_the_family_it_is_connected_over() {
     let relay_v6 = "/ip6/2001:db8::77/udp/45679/quic-v1";
     let autonat_v6 = "/ip6/2001:db8::78/udp/45680/quic-v1";
     let (mut h, autonat) = with_connected_autonat_server();
-    let relay = h.relay.clone();
+    let relay = h.relay;
     // The relay is reached over IPv4: its IPv6 claim is ignored and does not
     // evict its IPv4 one.
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
@@ -1090,9 +1098,11 @@ fn an_observation_from_a_stale_connection_is_ignored() {
     let (mut h, autonat) = with_connected_autonat_server();
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: autonat.clone(),
+            peer_id: autonat,
             old: ConnectionId::new(2),
             new: ConnectionId::new(3),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(1),
@@ -1114,7 +1124,7 @@ fn an_observation_from_a_stale_connection_is_ignored() {
 #[test]
 fn undecodable_observed_addr_bytes_are_ignored() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let relay = h.relay.clone();
+    let relay = h.relay;
     h.agent.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: relay,
@@ -1237,7 +1247,7 @@ fn a_hop_connect_refused_as_full_is_resent_when_the_stream_is_writable() {
     let connect = sent_data_on(&drain_actions(&mut h.agent), stream);
 
     h.agent.swarm.full_sends = false;
-    let relay = h.relay.clone();
+    let relay = h.relay;
     h.agent.handle_event(
         &SwarmEvent::StreamWritable {
             peer_id: relay,

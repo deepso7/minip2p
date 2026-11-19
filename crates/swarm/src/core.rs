@@ -475,7 +475,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
     /// `addr` as this node's dialable peer address.
     fn local_peer_addr(&self, addr: Multiaddr) -> Result<PeerAddr, TransportError> {
-        PeerAddr::new(addr.clone(), self.local_peer_id.clone())
+        PeerAddr::new(addr.clone(), self.local_peer_id)
             .map_err(|error| TransportError::LocalPeerAddr { addr, error })
     }
 
@@ -1128,7 +1128,7 @@ mod tests {
         });
         let gone = [
             DriverError::from(SwarmError::StreamNotFound {
-                peer_id: peer_id.clone(),
+                peer_id,
                 conn_id,
                 stream_id,
             }),
@@ -1479,7 +1479,7 @@ mod tests {
                     "/ip4/198.51.100.7/udp/4001/quic-v1"
                         .parse()
                         .expect("endpoint"),
-                    peer.clone(),
+                    *peer,
                 ),
             }],
             negotiate: true,
@@ -1507,7 +1507,7 @@ mod tests {
                 "/ip4/198.51.100.7/udp/4001/quic-v1"
                     .parse()
                     .expect("endpoint"),
-                peer.clone(),
+                peer,
             ),
         }]);
 
@@ -1555,7 +1555,7 @@ mod tests {
                         "/ip4/198.51.100.7/udp/4001/quic-v1"
                             .parse()
                             .expect("endpoint"),
-                        peer.clone(),
+                        peer,
                     ),
                 }],
                 sends_end_connection: true,
@@ -1707,7 +1707,7 @@ mod tests {
                 "/ip4/198.51.100.7/udp/4001/quic-v1"
                     .parse()
                     .expect("endpoint"),
-                peer.clone(),
+                peer,
             ),
         }]);
         swarm.poll(Now::from_millis(0)).expect("poll");
@@ -1788,7 +1788,7 @@ mod tests {
             ScriptedTransport {
                 initial: vec![TransportEvent::Connected {
                     id: conn,
-                    endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+                    endpoint: ConnectionEndpoint::with_peer_id(address, peer),
                 }],
                 fail_second_close: true,
                 ..ScriptedTransport::default()
@@ -2045,7 +2045,7 @@ mod tests {
             ScriptedTransport {
                 initial: vec![TransportEvent::Connected {
                     id: conn,
-                    endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+                    endpoint: ConnectionEndpoint::with_peer_id(address, peer),
                 }],
                 ended: Some(stream_not_found),
                 ..ScriptedTransport::default()
@@ -2180,7 +2180,7 @@ mod tests {
             .expect("endpoint");
         let mut swarm = swarm(vec![TransportEvent::Connected {
             id: conn,
-            endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+            endpoint: ConnectionEndpoint::with_peer_id(address, peer),
         }]);
         swarm.add_protocol("/app/1").expect("protocol");
         swarm.poll(Now::from_millis(0)).expect("connect");
@@ -2271,7 +2271,7 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let addr = PeerAddr::new(
             "/ip4/198.51.100.12/udp/4001/quic-v1".parse().expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let mut swarm = swarm_with(
@@ -2291,7 +2291,7 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer),
             });
         // The rejection's own close is refused too, which surfaces as a
         // runtime error beside the DialFailed.
@@ -2313,7 +2313,7 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let addr = PeerAddr::new(
             "/ip4/198.51.100.11/udp/4001/quic-v1".parse().expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let mut swarm = swarm_with(ScriptedTransport::default(), SeqEntropy(1));
@@ -2325,7 +2325,7 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
+                endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer),
             });
         assert!(swarm.abort_dial(conn_id).expect("abort"));
         let events = swarm.poll(Now::from_millis(1)).expect("late connected");
@@ -2349,12 +2349,12 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let existing_addr = PeerAddr::new(
             "/ip4/198.51.100.9/udp/4001/quic-v1".parse().expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let late_addr = PeerAddr::new(
             "/ip4/198.51.100.10/udp/4001/quic-v1".parse().expect("addr"),
-            peer.clone(),
+            peer,
         )
         .expect("peer addr");
         let existing = ConnectionId::new(1);
@@ -2365,10 +2365,7 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: existing,
-                endpoint: ConnectionEndpoint::with_peer_id(
-                    existing_addr.transport().clone(),
-                    peer.clone(),
-                ),
+                endpoint: ConnectionEndpoint::with_peer_id(existing_addr.transport().clone(), peer),
             });
         let _ = swarm.poll(Now::from_millis(0)).expect("existing");
         assert_eq!(swarm.connection_id(&peer), Some(existing));
@@ -2380,10 +2377,7 @@ mod tests {
             .initial
             .push(TransportEvent::Connected {
                 id: late,
-                endpoint: ConnectionEndpoint::with_peer_id(
-                    late_addr.transport().clone(),
-                    peer.clone(),
-                ),
+                endpoint: ConnectionEndpoint::with_peer_id(late_addr.transport().clone(), peer),
             });
         let events = swarm.poll(Now::from_millis(1)).expect("vetoed");
         assert!(
@@ -2465,9 +2459,9 @@ mod tests {
 
         let events = swarm.poll(Now::from_millis(1)).expect("poll");
 
-        let local = swarm.local_peer_id.clone();
+        let local = swarm.local_peer_id;
         let expected = vec![
-            PeerAddr::new(quic.clone(), local.clone()).expect("quic peer addr"),
+            PeerAddr::new(quic.clone(), local).expect("quic peer addr"),
             PeerAddr::new(webtransport(2), local).expect("wt peer addr"),
         ];
         assert_eq!(listen_changes(&events), [expected]);

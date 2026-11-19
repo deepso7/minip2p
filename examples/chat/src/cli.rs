@@ -145,13 +145,10 @@ pub fn parse_join_target(raw: &str) -> Result<JoinTarget, CliError> {
             Protocol::P2pCircuit,
             Protocol::P2p(peer),
         ] if !prefix.is_empty() => {
-            let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), relay_id.clone())
+            let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), *relay_id)
                 .map_err(|e| CliError(format!("invalid relay address in '{raw}': {e}")))?;
             require_quic_transport("circuit relay", raw, &relay)?;
-            Ok(JoinTarget::Circuit {
-                relay,
-                peer: peer.clone(),
-            })
+            Ok(JoinTarget::Circuit { relay, peer: *peer })
         }
         _ => Err(CliError(format!(
             "circuit target must end /p2p/<relay>/p2p-circuit/p2p/<peer>, got '{raw}'"

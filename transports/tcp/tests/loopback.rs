@@ -235,7 +235,7 @@ fn upgraded_pair() -> Pair {
         "the kernel's chosen port must be reported back"
     );
 
-    let target = PeerAddr::new(bound, listener_peer.clone()).expect("dial target");
+    let target = PeerAddr::new(bound, listener_peer).expect("dial target");
     let dialer_connection = dialer.dial(&target).expect("dial starts");
 
     let mut dialer_events = Vec::new();

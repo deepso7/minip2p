@@ -116,7 +116,7 @@ fn relay_server_registers_hop_and_stop_with_directional_swarm_roles() {
         id: conn_id,
         endpoint: ConnectionEndpoint::with_peer_id(
             "/ip4/192.0.2.1/tcp/4001".parse().unwrap(),
-            peer.clone(),
+            peer,
         ),
     });
     transport

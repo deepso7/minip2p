@@ -125,7 +125,7 @@ impl Bob {
             "/ip4/192.0.2.1/udp/4001/quic-v1"
                 .parse()
                 .expect("multiaddr"),
-            relay.clone(),
+            relay,
         )
         .expect("peer address");
         let mut agent = NatAgent::new(

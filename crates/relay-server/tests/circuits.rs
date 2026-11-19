@@ -744,7 +744,7 @@ fn a_late_stop_readiness_after_a_timeout_or_source_close_resets_the_stream() {
         assert_eq!(
             node.calls(),
             [Call::Reset {
-                peer: destination.clone(),
+                peer: destination,
                 stream: stop_stream,
             }],
             "{cause}"

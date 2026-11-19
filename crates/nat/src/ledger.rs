@@ -213,8 +213,8 @@ impl PathLedger {
         match (&old.path, &new.path, old.owner) {
             (Path::Relayed { .. }, Path::Direct | Path::Punched, Some(owner)) => Some(Upgrade {
                 owner,
-                from: old.path.clone(),
-                to: new.path.clone(),
+                from: old.path,
+                to: new.path,
             }),
             _ => None,
         }
@@ -315,7 +315,7 @@ mod tests {
         let mut ledger = PathLedger::default();
         let relay = peer(9);
         let claim = Claim::Circuit {
-            relay: relay.clone(),
+            relay,
             owner: Owner::Inbound,
         };
         assert_eq!(
@@ -379,7 +379,7 @@ mod tests {
             ledger.replaced(&relayed, conn(1)),
             Some(Upgrade {
                 owner: Owner::Attempt(id),
-                from: relayed.path.clone(),
+                from: relayed.path,
                 to: Path::Punched,
             })
         );
