@@ -363,7 +363,9 @@ impl WriteQueue {
         }
         match event {
             SwarmEvent::StreamWritable {
-                conn_id, stream_id, ..
+                peer_id,
+                conn_id,
+                stream_id,
             } => {
                 let stream = StreamKey::new(*conn_id, *stream_id);
                 if !self.is_pending(stream) {
@@ -373,7 +375,10 @@ impl WriteQueue {
                 let mut follow: Vec<EndpointEvent> =
                     self.retry(core, stream, now_ms).into_iter().collect();
                 if !follow.is_empty() && self.wake.remove(&stream) {
-                    follow.push(event.clone().into());
+                    follow.push(EndpointEvent::StreamWritable {
+                        peer_id: *peer_id,
+                        stream,
+                    });
                 }
                 (true, follow)
             }
