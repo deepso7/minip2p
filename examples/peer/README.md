@@ -1,22 +1,26 @@
 # minip2p-peer
 
-A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the `minip2p` `Endpoint` API (`features = ["relay", "tcp"]`). Two subcommands:
+A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the `minip2p` `Endpoint` API (`features = ["relay", "tcp"]`). Three subcommands:
 
 - **`listen`** — bind QUIC or TCP, echo every inbound ping stream byte for byte. With `--relay`, hold a Circuit Relay v2 reservation and print a paste-ready circuit address.
 - **`dial`** — `connect` to a target (direct candidates and/or a relay leg) and ping once per second, tagging every RTT with the path it travelled. When a DCUtR hole punch upgrades the path mid-run, the seq sequence continues unbroken and the RTT visibly drops.
+- **`id`** — `connect`, print the peer's Identify result, and exit. The one-shot "what is on the other end of this address", including when the other end is go-libp2p, rust-libp2p or js-libp2p.
 
-The same two commands work on loopback, across the open internet, and between two NATed hosts via a relay — the agent adapts; nothing is configured per environment.
+The same commands work on loopback, across the open internet, and between two NATed hosts via a relay — the agent adapts; nothing is configured per environment.
 
 ```text
 USAGE:
     minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
     minip2p-peer dial   <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <transport-multiaddr>]
+    minip2p-peer id     <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
 ```
 
 `<target>` accepts two shapes:
 
 - a **circuit address** copied from the listener's `circuit=` line — `/ip4/…/udp/…/quic-v1/p2p/<relay>/p2p-circuit/p2p/<peer>`. The dialer derives the relay and the target peer from it; nothing else is needed.
 - a **plain peer-addr** — `/ip4/…/udp/…/quic-v1/p2p/<peer-id>` — for a directly reachable peer. `--relay` optionally adds a relay leg to race against the direct dial.
+
+Both `dial` and `id` take a `<target>`, so a peer can equally be inspected through a relay.
 
 `--count n` (dial only) stops after `n` pings, prints a summary, and exits `0`. Without it the dialer pings until interrupted; a running summary is printed every tenth pong as a periodic checkpoint (Ctrl-C itself prints nothing further).
 
@@ -43,6 +47,23 @@ $ cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/64294/quic-v1/p2p/12D3Koo
 ```
 
 This is exactly what the CI E2E test (`tests/ping.rs`) runs.
+
+## Inspecting a peer: `id`
+
+Against the listener from the quickstart above, or against any other implementation's address:
+
+```console
+$ cargo run -p minip2p-peer -- id /ip4/127.0.0.1/udp/58472/quic-v1/p2p/12D3KooWQiAz…
+[id] us=12D3KooWBt86…
+[id] target=/ip4/127.0.0.1/udp/58472/quic-v1/p2p/12D3KooWQiAz…
+[id] connected peer=12D3KooWQiAz…
+[id] path-established path=direct elapsed=11ms
+[id] identify peer=12D3KooWQiAz… conn=quic/ip4#1 agent=minip2p-peer/0.1.0 protocols=3 list=[/ipfs/id/1.0.0,/ipfs/ping/1.0.0,/minip2p/echo/1] observed=/ip4/127.0.0.1/udp/49184/quic-v1
+```
+
+Exactly one `identify` line is printed, and the command exits `0`. A connection that never forms, or a peer that never completes Identify, exits non-zero with the reason on stderr — so `id` works as a reachability check in a script or a CI gate.
+
+`observed=` is the address the *remote* saw us on, which is the quickest way to see what a NAT is doing to your source port.
 
 ## The real payoff: two peers behind NATs
 
