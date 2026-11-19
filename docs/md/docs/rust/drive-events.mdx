@@ -123,7 +123,7 @@ Synchronous method failures on a running endpoint are returned as `minip2p::Erro
 
 ## Stream and connection shutdown
 
-- Call `close_stream_write` after the final byte for a graceful half-close, or `StreamWriter::close_write` to send it once a held tail has been accepted.
+- Call `close_stream_write` after the final byte for a graceful half-close; behind bytes `send_stream` still queues, the FIN waits until they are accepted.
 - Call `reset_stream` when the peer should observe abrupt termination and the application still wants terminal events.
 - Call `abandon_stream` when no matching buffered or future events should be delivered.
 - Call `disconnect` to close the active peer connection.

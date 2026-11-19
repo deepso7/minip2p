@@ -342,11 +342,12 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         }
         EndpointEvent::StreamReady {
             peer_id,
-            stream_id,
+            stream,
             protocol_id,
             initiated_locally,
             ..
         } => {
+            let stream_id = stream.stream_id();
             let dir = if *initiated_locally {
                 "outbound"
             } else {
@@ -359,23 +360,21 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         }
         EndpointEvent::StreamData {
             peer_id,
-            stream_id,
+            stream,
             data,
-            ..
         } => {
+            let stream_id = stream.stream_id();
             println!(
                 "[{role}] user-stream-data peer={peer_id} stream={stream_id} bytes={}",
                 data.len()
             );
         }
-        EndpointEvent::StreamRemoteWriteClosed {
-            peer_id, stream_id, ..
-        } => {
+        EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } => {
+            let stream_id = stream.stream_id();
             println!("[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}");
         }
-        EndpointEvent::StreamClosed {
-            peer_id, stream_id, ..
-        } => {
+        EndpointEvent::StreamClosed { peer_id, stream } => {
+            let stream_id = stream.stream_id();
             println!("[{role}] user-stream-closed peer={peer_id} stream={stream_id}");
         }
         EndpointEvent::Error(error) => {

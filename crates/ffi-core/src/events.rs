@@ -60,6 +60,15 @@ pub struct OpenStreamResult {
     pub stream_id: u64,
 }
 
+impl From<minip2p::StreamKey> for OpenStreamResult {
+    fn from(stream: minip2p::StreamKey) -> Self {
+        Self {
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
+        }
+    }
+}
+
 /// State snapshot of a peer's established connection; see
 /// `minip2p::ConnectionInfo`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -842,58 +851,49 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
         },
         EndpointEvent::StreamReady {
             peer_id,
-            conn_id,
-            stream_id,
+            stream,
             protocol_id,
             initiated_locally,
         } => P2pEvent::StreamReady {
             peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
             protocol_id,
             initiated_locally,
         },
         EndpointEvent::StreamData {
             peer_id,
-            conn_id,
-            stream_id,
+            stream,
             data,
         } => P2pEvent::StreamData {
             peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
             // Takes the allocation back without a copy when the handle is
             // the only one, which it is for transport reads.
             data: Vec::from(data),
         },
         EndpointEvent::StreamWriteStopped {
             peer_id,
-            conn_id,
-            stream_id,
+            stream,
             error_code,
         } => P2pEvent::StreamWriteStopped {
             peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
             error_code,
         },
-        EndpointEvent::StreamRemoteWriteClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => P2pEvent::StreamRemoteWriteClosed {
+        EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } => {
+            P2pEvent::StreamRemoteWriteClosed {
+                peer_id: peer_id.to_base58(),
+                conn_id: stream.conn_id().as_u64(),
+                stream_id: stream.stream_id().as_u64(),
+            }
+        }
+        EndpointEvent::StreamClosed { peer_id, stream } => P2pEvent::StreamClosed {
             peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-        },
-        EndpointEvent::StreamClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => P2pEvent::StreamClosed {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
         },
         EndpointEvent::Error(error) => P2pEvent::EndpointError {
             kind: convert_swarm_error_kind(error.kind),
@@ -905,11 +905,17 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
         EndpointEvent::ListenAddressesChanged { addrs } => P2pEvent::ListenAddressesChanged {
             addrs: addrs.iter().map(ToString::to_string).collect(),
         },
+        EndpointEvent::StreamWriteAccepted { peer_id, stream } => P2pEvent::StreamWriteAccepted {
+            peer_id: peer_id.to_base58(),
+            conn_id: stream.conn_id().as_u64(),
+            stream_id: stream.stream_id().as_u64(),
+        },
         // Capability variants are dispatched by `convert_endpoint_event`;
         // raw dial failures and variants of capabilities this core does
-        // not surface (relay service) have no foreign event. A Writable is
-        // consumed by the pending writes, which settle the binding's write
-        // with `StreamWriteAccepted` instead.
+        // not surface (relay service) have no foreign event. A binding's
+        // writes all go through the endpoint's write queue, so a Writable
+        // never concerns it, and an aborted write is told by the event that
+        // ended its stream (a stop, close or connection end).
         _ => return None,
     })
 }
@@ -1374,8 +1380,7 @@ mod tests {
         assert_eq!(
             convert_swarm(EndpointEvent::StreamData {
                 peer_id: remote,
-                conn_id: ConnectionId::new(8),
-                stream_id: StreamId::new(12),
+                stream: minip2p::StreamKey::new(ConnectionId::new(8), StreamId::new(12)),
                 data: minip2p::Bytes::from(vec![1, 2, 3]),
             }),
             Some(P2pEvent::StreamData {

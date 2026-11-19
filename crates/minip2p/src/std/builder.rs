@@ -22,6 +22,7 @@ use crate::engine::Engine;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
 use crate::setup::{self, Capabilities};
+use crate::writes::WriteQueue;
 #[cfg(feature = "relay-server")]
 use crate::{RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig};
 use minip2p_core::Multiaddr;
@@ -94,6 +95,7 @@ pub struct EndpointBuilder {
     connect_deadline: std::time::Duration,
     simultaneous_dial_window: std::time::Duration,
     timeouts: SwarmTimeouts,
+    write_budget: usize,
 }
 
 impl Default for EndpointBuilder {
@@ -106,6 +108,7 @@ impl Default for EndpointBuilder {
                 minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS,
             ),
             timeouts: SwarmTimeouts::default(),
+            write_budget: crate::DEFAULT_WRITE_BUDGET,
             #[cfg(feature = "quic")]
             quic_limits: QuicLimits::default(),
             #[cfg(feature = "quic")]
@@ -172,6 +175,19 @@ impl EndpointBuilder {
     /// `TcpConfig::handshake_timeout_ms` (see `tcp_config` for an example).
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Sets how many bytes [`Endpoint::send_stream`] may hold, across every
+    /// stream, until their streams accept them. Default
+    /// [`DEFAULT_WRITE_BUDGET`](crate::DEFAULT_WRITE_BUDGET) (8 MiB).
+    ///
+    /// A payload is admitted whole or not at all, so one larger than the
+    /// budget always fails with [`SendError::TooLarge`](crate::SendError::TooLarge).
+    /// `0` queues nothing: use [`Endpoint::try_send_stream`] and hold
+    /// unsent tails yourself.
+    pub fn write_budget(mut self, bytes: usize) -> Self {
+        self.write_budget = bytes;
         self
     }
 
@@ -1148,6 +1164,7 @@ pub(super) fn build_endpoint(
         u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
         acks,
     );
+    engine.writes = WriteQueue::new(options.write_budget);
     setup::install(
         &mut engine,
         capabilities,

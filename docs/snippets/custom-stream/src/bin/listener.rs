@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use minip2p::{
-    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamId,
-    StreamWriter, WaitDeadline,
-};
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamKey, WaitDeadline};
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
@@ -18,59 +15,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("listen={}", local_dialable(&address));
     }
 
-    // Stream ids are per connection, so a stream is named by both.
-    let mut echo_streams: HashSet<(ConnectionId, StreamId)> = HashSet::new();
-    // Holds what a full stream could not take yet and finishes it on
-    // `StreamWritable`; `?` on a bare `send_stream` would drop that tail.
-    let mut writer = StreamWriter::new(1024 * 1024);
+    // A `StreamKey` names a stream by its connection and its id.
+    let mut echo_streams: HashSet<StreamKey> = HashSet::new();
 
     loop {
         let EndpointWaitOutcome::Event(event) = node.wait(WaitDeadline::NEVER)? else {
             continue;
         };
-        writer.observe(&mut node, &event);
         match event {
             EndpointEvent::StreamReady {
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 initiated_locally: false,
                 ..
             } if protocol_id == ECHO_PROTOCOL => {
-                echo_streams.insert((conn_id, stream_id));
+                echo_streams.insert(stream);
             }
-            EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            } if echo_streams.remove(&(conn_id, stream_id)) => {
-                // A single-chunk echo: it answers the first `StreamData`
-                // and half-closes, so a message split across chunks loses
-                // the rest. Echoing every chunk needs a backlog behind the
-                // one pending write (see `examples/peer`). The FIN waits for
-                // every byte of the echo, and a failure ends this stream,
-                // not the listener.
-                let echoed = writer
-                    .write(&mut node, conn_id, stream_id, data)
-                    .and_then(|_| writer.close_write(&mut node, conn_id, stream_id));
-                if let Err(error) = echoed {
-                    eprintln!("echo on stream {stream_id} failed: {error}");
-                    writer.forget(conn_id, stream_id);
-                    let _ = node.reset_stream(conn_id, stream_id);
+            EndpointEvent::StreamData { stream, data, .. } if echo_streams.contains(&stream) => {
+                // `send_stream` queues what a full stream cannot take yet and
+                // resends it on its own, so every chunk is echoed in order.
+                // A failure ends this stream, not the listener.
+                if let Err(error) = node.send_stream(stream, data) {
+                    eprintln!("echo on stream {stream} failed: {error}");
+                    echo_streams.remove(&stream);
+                    let _ = node.reset_stream(stream);
                 }
             }
-            EndpointEvent::StreamRemoteWriteClosed {
-                conn_id, stream_id, ..
-            } if echo_streams.remove(&(conn_id, stream_id)) => {
-                if let Err(error) = writer.close_write(&mut node, conn_id, stream_id) {
-                    eprintln!("closing stream {stream_id} failed: {error}");
+            EndpointEvent::StreamRemoteWriteClosed { stream, .. }
+                if echo_streams.remove(&stream) =>
+            {
+                // The FIN waits behind every echoed byte still queued.
+                if let Err(error) = node.close_stream_write(stream) {
+                    eprintln!("closing stream {stream} failed: {error}");
                 }
             }
-            EndpointEvent::StreamClosed {
-                conn_id, stream_id, ..
-            } => {
-                echo_streams.remove(&(conn_id, stream_id));
+            EndpointEvent::StreamClosed { stream, .. } => {
+                echo_streams.remove(&stream);
             }
             EndpointEvent::Error(error) => eprintln!("runtime error: {error:?}"),
             _ => {}

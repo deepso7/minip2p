@@ -21,13 +21,14 @@ use std::thread;
 use std::time::Duration;
 
 use minip2p::{
-    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
+    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, SendOutcome,
+    StreamKey,
 };
 use minip2p_relay::{FrameDecode, HOP_PROTOCOL_ID, HopMessage, HopMessageType, STOP_PROTOCOL_ID};
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
 
-/// Stream ids are per connection, so a stream is named by all three.
-type StreamKey = (PeerId, ConnectionId, StreamId);
+/// A stream with the peer on its other end.
+type Key = (PeerId, StreamKey);
 
 enum Command {
     CutAll,
@@ -36,7 +37,7 @@ enum Command {
 
 struct PendingStop {
     pending_id: PendingConnectId,
-    hop: StreamKey,
+    hop: Key,
     target: PeerId,
     connect_bytes: Vec<u8>,
     hop_trailing: Vec<u8>,
@@ -46,10 +47,10 @@ struct PendingStop {
 #[derive(Default)]
 struct RelayMachine {
     protocol: RelayEmulator,
-    hop_buffers: BTreeMap<StreamKey, Vec<u8>>,
-    pending_stops: BTreeMap<StreamKey, PendingStop>,
-    hop_to_stop: BTreeMap<StreamKey, StreamKey>,
-    bridges: BTreeMap<StreamKey, StreamKey>,
+    hop_buffers: BTreeMap<Key, Vec<u8>>,
+    pending_stops: BTreeMap<Key, PendingStop>,
+    hop_to_stop: BTreeMap<Key, Key>,
+    bridges: BTreeMap<Key, Key>,
     trace: Vec<String>,
 }
 
@@ -58,58 +59,45 @@ impl RelayMachine {
         match event {
             EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 initiated_locally,
             } if protocol_id == HOP_PROTOCOL_ID && !initiated_locally => {
-                self.hop_buffers
-                    .entry((peer_id, conn_id, stream_id))
-                    .or_default();
+                self.hop_buffers.entry((peer_id, stream)).or_default();
             }
             EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 initiated_locally,
             } if protocol_id == STOP_PROTOCOL_ID && initiated_locally => {
-                let key = (peer_id, conn_id, stream_id);
+                let key = (peer_id, stream);
                 let bytes = self
                     .pending_stops
                     .get(&key)
                     .ok_or_else(|| format!("STOP stream ready without pending CONNECT: {key:?}"))?
                     .connect_bytes
                     .clone();
-                endpoint
-                    .send_stream(conn_id, stream_id, bytes)
-                    .map_err(|e| format!("send STOP CONNECT: {e}"))?;
+                send_all(endpoint, stream, bytes).map_err(|e| format!("send STOP CONNECT: {e}"))?;
             }
             EndpointEvent::StreamData {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 data,
-            } => self.on_data(endpoint, (peer_id, conn_id, stream_id), data.to_vec())?,
-            EndpointEvent::StreamRemoteWriteClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => {
-                let key = (peer_id, conn_id, stream_id);
-                if let Some((_, other_conn, other_stream)) = self.bridges.get(&key).cloned() {
+            } => self.on_data(endpoint, (peer_id, stream), data.to_vec())?,
+            EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } => {
+                let key = (peer_id, stream);
+                if let Some((_, other)) = self.bridges.get(&key).copied() {
                     // A FIN can race teardown of the other bridge half; that
                     // stale close must not replace the original lifecycle event.
-                    match endpoint.close_stream_write(other_conn, other_stream) {
+                    match endpoint.close_stream_write(other) {
                         Ok(()) | Err(_) => {}
                     }
                 }
             }
-            EndpointEvent::StreamClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => self.drop_stream(endpoint, &(peer_id, conn_id, stream_id)),
+            EndpointEvent::StreamClosed { peer_id, stream } => {
+                self.drop_stream(endpoint, &(peer_id, stream))
+            }
             // A replaced connection ends its streams without per-stream
             // `StreamClosed` events, exactly like a closed one.
             EndpointEvent::ConnectionClosed {
@@ -125,15 +113,10 @@ impl RelayMachine {
         Ok(())
     }
 
-    fn on_data(
-        &mut self,
-        endpoint: &mut Endpoint,
-        key: StreamKey,
-        data: Vec<u8>,
-    ) -> Result<(), String> {
-        if let Some((other_peer, other_conn, other_stream)) = self.bridges.get(&key).cloned() {
+    fn on_data(&mut self, endpoint: &mut Endpoint, key: Key, data: Vec<u8>) -> Result<(), String> {
+        if let Some((other_peer, other)) = self.bridges.get(&key).copied() {
             self.trace.push(format!(
-                "forward {} bytes {:?} -> ({other_peer}, {other_conn}, {other_stream})",
+                "forward {} bytes {:?} -> ({other_peer}, {other})",
                 data.len(),
                 key
             ));
@@ -141,7 +124,7 @@ impl RelayMachine {
             // connection may already be closing before its `ConnectionClosed`
             // arrives, and the transport rejects writes there. That ends the
             // bridge; any other failure (`Full` included) is a relay fault.
-            match endpoint.send_stream(other_conn, other_stream, data) {
+            match send_all(endpoint, other, data) {
                 Ok(()) => {}
                 Err(error) if other_half_is_gone(&error) => {
                     self.trace
@@ -190,8 +173,7 @@ impl RelayMachine {
                     return Err("unexpected bytes trailing RESERVE".into());
                 }
                 let response = self.protocol.drain_hop_bytes_for(&key.0);
-                endpoint
-                    .send_stream(key.1, key.2, response)
+                send_all(endpoint, key.1, response)
                     .map_err(|e| format!("send RESERVE response: {e}"))?;
             }
             HopMessageType::Connect => {
@@ -205,8 +187,7 @@ impl RelayMachine {
                         if !trailing.is_empty() {
                             return Err("unexpected bytes trailing refused CONNECT".into());
                         }
-                        endpoint
-                            .send_stream(key.1, key.2, response)
+                        send_all(endpoint, key.1, response)
                             .map_err(|e| format!("send CONNECT refusal: {e}"))?;
                     }
                     ConnectRequestOutcome::Bridging {
@@ -214,10 +195,10 @@ impl RelayMachine {
                         target,
                         trailing,
                     } => {
-                        let (stop_conn, stop_stream) = endpoint
+                        let stop_stream = endpoint
                             .open_stream(&target, STOP_PROTOCOL_ID)
                             .map_err(|e| format!("open STOP stream to {target}: {e}"))?;
-                        let stop_key = (target, stop_conn, stop_stream);
+                        let stop_key = (target, stop_stream);
                         let connect_bytes = self.protocol.drain_stop_bytes_for(&target);
                         self.hop_to_stop.insert(key, stop_key);
                         self.pending_stops.insert(
@@ -242,7 +223,7 @@ impl RelayMachine {
     fn on_stop_data(
         &mut self,
         endpoint: &mut Endpoint,
-        key: StreamKey,
+        key: Key,
         data: Vec<u8>,
     ) -> Result<(), String> {
         {
@@ -275,17 +256,14 @@ impl RelayMachine {
             )
             .map_err(|e| format!("handle STOP response: {e}"))?;
 
-        endpoint
-            .send_stream(pending.hop.1, pending.hop.2, initiator_response)
+        send_all(endpoint, pending.hop.1, initiator_response)
             .map_err(|e| format!("send HOP success: {e}"))?;
         if !pending.hop_trailing.is_empty() {
-            endpoint
-                .send_stream(key.1, key.2, pending.hop_trailing)
+            send_all(endpoint, key.1, pending.hop_trailing)
                 .map_err(|e| format!("forward pipelined initiator bytes: {e}"))?;
         }
         if !stop_trailing.is_empty() {
-            endpoint
-                .send_stream(pending.hop.1, pending.hop.2, stop_trailing)
+            send_all(endpoint, pending.hop.1, stop_trailing)
                 .map_err(|e| format!("forward pipelined responder bytes: {e}"))?;
         }
         self.bridges.insert(pending.hop, key);
@@ -297,7 +275,7 @@ impl RelayMachine {
     /// Forgets every stream on `(peer, conn)`, resetting the far half of
     /// its bridges and its pending STOP streams.
     fn drop_connection(&mut self, endpoint: &mut Endpoint, peer: &PeerId, conn: ConnectionId) {
-        let on_conn = |(p, c, _): &StreamKey| p == peer && *c == conn;
+        let on_conn = |(p, stream): &Key| p == peer && stream.conn_id() == conn;
         let dead: Vec<_> = self
             .bridges
             .keys()
@@ -313,17 +291,17 @@ impl RelayMachine {
         self.hop_to_stop.retain(|_, stop| !on_conn(stop));
     }
 
-    fn drop_stream(&mut self, endpoint: &mut Endpoint, key: &StreamKey) {
+    fn drop_stream(&mut self, endpoint: &mut Endpoint, key: &Key) {
         self.hop_buffers.remove(key);
         if let Some(stop) = self.hop_to_stop.remove(key) {
             self.pending_stops.remove(&stop);
-            match endpoint.reset_stream(stop.1, stop.2) {
+            match endpoint.reset_stream(stop.1) {
                 Ok(()) | Err(_) => {}
             }
         }
         if let Some(other) = self.bridges.remove(key) {
             self.bridges.remove(&other);
-            match endpoint.reset_stream(other.1, other.2) {
+            match endpoint.reset_stream(other.1) {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -482,6 +460,23 @@ impl Drop for RelayServer {
 /// Whether a forward failed only because the other bridge half's stream or
 /// connection is gone or closing, or its write side already ended (the peer
 /// stopped it, say).
+/// Sends every byte at once: a relay that falls behind (`Full`) is a fault
+/// here, never queued.
+fn send_all(
+    endpoint: &mut Endpoint,
+    stream: StreamKey,
+    data: Vec<u8>,
+) -> Result<(), minip2p::Error> {
+    match endpoint.try_send_stream(stream, data)? {
+        SendOutcome::Accepted => Ok(()),
+        SendOutcome::Full { unsent } => Err(minip2p::Error::Full {
+            conn_id: stream.conn_id(),
+            stream_id: stream.stream_id(),
+            unsent,
+        }),
+    }
+}
+
 fn other_half_is_gone(error: &minip2p::Error) -> bool {
     error.is_stream_gone()
         || matches!(

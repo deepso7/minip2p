@@ -58,11 +58,13 @@ pub use events::{
     OpenStreamResult, P2pEvent, PathKind, PingFailure, Reachability, UnfinishedConnection,
     convert_endpoint_event, convert_identify, convert_path,
 };
-pub use writes::{map_write_error, stream_writer, write_accepted_event};
+pub use writes::{BINDING_WRITE_BUDGET, map_send_error, send_whole};
 
 use std::str::FromStr;
 
-use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p::{
+    ConnectionId, Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol, StreamId, StreamKey,
+};
 
 // The `uniffi` feature makes this crate its own UniFFI namespace, so the
 // UniFFI shell exports these records, enums and errors without mirroring them.
@@ -92,6 +94,12 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
     protocols.push(Protocol::P2pCircuit);
     protocols.push(Protocol::P2p(target));
     Ok(Multiaddr::from_protocols(protocols).to_string())
+}
+
+/// Names a stream from the two numeric ids a binding carries: the
+/// bindings flatten a [`StreamKey`] into `conn_id` and `stream_id`.
+pub fn stream_key(conn_id: u64, stream_id: u64) -> StreamKey {
+    StreamKey::new(ConnectionId::new(conn_id), StreamId::new(stream_id))
 }
 
 /// Parses a base58 peer ID supplied by a binding.

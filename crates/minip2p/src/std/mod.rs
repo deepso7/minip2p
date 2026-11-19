@@ -619,6 +619,9 @@ impl Endpoint {
             self.engine.ingest(event, now);
         }
         self.engine.settle(now);
+        // Queued writes the transport has not ended yet die with the endpoint.
+        let aborted = self.engine.writes.abort_all();
+        self.engine.events.extend(aborted);
         report.events.extend(self.engine.events.drain(..));
         report.unfinished = self.tracked_connections();
         #[cfg(all(feature = "relay-server", feature = "quic"))]

@@ -3,9 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use minip2p::{
-    ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamWriter,
-};
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
@@ -23,10 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind()?;
 
     let connect_id = node.connect(target)?;
-    // Stream ids are per connection, so a stream is named by both.
+    // A `StreamKey`: stream ids are per connection, so it names both.
     let mut stream = None;
-    // Finishes a write the stream could not take at once, then sends the FIN.
-    let mut writer = StreamWriter::new(1024);
     let mut response = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -37,7 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
             _ => continue, // interrupted by a WaitHandle
         };
-        writer.observe(&mut node, &event);
 
         match event {
             EndpointEvent::ConnectSettled {
@@ -55,41 +50,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             EndpointEvent::StreamReady {
                 peer_id: peer,
-                conn_id,
-                stream_id: ready,
+                stream: ready,
                 protocol_id,
                 ..
-            } if peer == peer_id
-                && Some((conn_id, ready)) == stream
-                && protocol_id == ECHO_PROTOCOL =>
-            {
-                writer.write(&mut node, conn_id, ready, b"hello".to_vec())?;
-                writer.close_write(&mut node, conn_id, ready)?;
+            } if peer == peer_id && Some(ready) == stream && protocol_id == ECHO_PROTOCOL => {
+                // The endpoint queues what the stream cannot take at once,
+                // and the FIN waits behind it.
+                node.send_stream(ready, b"hello".to_vec())?;
+                node.close_stream_write(ready)?;
             }
             EndpointEvent::StreamData {
                 peer_id: peer,
-                conn_id,
-                stream_id: ready,
+                stream: from,
                 data,
-                ..
-            } if peer == peer_id && Some((conn_id, ready)) == stream => {
+            } if peer == peer_id && Some(from) == stream => {
                 response.extend_from_slice(&data);
             }
             EndpointEvent::StreamRemoteWriteClosed {
                 peer_id: peer,
-                conn_id,
-                stream_id: ready,
-                ..
-            } if peer == peer_id && Some((conn_id, ready)) == stream => {
+                stream: from,
+            } if peer == peer_id && Some(from) == stream => {
                 println!("{}", String::from_utf8_lossy(&response));
                 return Ok(());
             }
             EndpointEvent::StreamClosed {
                 peer_id: peer,
-                conn_id,
-                stream_id: ready,
-                ..
-            } if peer == peer_id && Some((conn_id, ready)) == stream => {
+                stream: from,
+            } if peer == peer_id && Some(from) == stream => {
                 return Err("stream closed before the echo completed".into());
             }
             EndpointEvent::Error(error) => eprintln!("runtime error: {error:?}"),

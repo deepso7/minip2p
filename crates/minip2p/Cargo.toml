@@ -55,6 +55,7 @@ bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]
 _peer-book = ["dep:minip2p-discovery"]
 
 [dependencies]
+bytes = { workspace = true }
 minip2p-core = { path = "../core", version = "0.11.11", default-features = false }
 minip2p-circuit = { path = "../circuit", version = "0.11.11", default-features = false, optional = true }
 minip2p-discovery = { path = "../discovery", version = "0.11.11", default-features = false, optional = true }

@@ -11,19 +11,19 @@
 //! and is tested natively.
 
 use minip2p::{
-    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
-    EndpointEvent, ManualClock, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
-    PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
+    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair, ManualClock,
+    NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint, PortableEndpointBuilder,
+    ReservationPolicy, Transport,
 };
 #[cfg(feature = "pubsub")]
 use minip2p_ffi_core::map_gossipsub_error;
 use minip2p_ffi_core::{
-    CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, EndpointConfig, EventCarry,
-    FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent, PUMP_DRAIN_LIMIT, PathKind,
-    Reachability, RelayReservationInfo, UnfinishedConnection, convert_endpoint_event,
-    convert_identify, convert_path, convert_reachability, driver_failure_kind, keypair_from_bytes,
-    map_driver_error, map_write_error, parse_connect_target, parse_direct_peer_addr, parse_peer_id,
-    stream_writer, write_accepted_event,
+    BINDING_WRITE_BUDGET, CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo,
+    EndpointConfig, EventCarry, FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent,
+    PUMP_DRAIN_LIMIT, PathKind, Reachability, RelayReservationInfo, UnfinishedConnection,
+    convert_endpoint_event, convert_identify, convert_path, convert_reachability,
+    driver_failure_kind, keypair_from_bytes, map_driver_error, parse_connect_target,
+    parse_direct_peer_addr, parse_peer_id, send_whole, stream_key,
 };
 
 use crate::WebEntropy;
@@ -41,23 +41,17 @@ pub struct Pumped {
 /// The endpoint a [`Host`] drives: `T` behind a circuit transport.
 type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy, ManualClock>;
 
-/// The endpoint with its pending stream writes, released together.
-struct Live<T: Transport> {
-    endpoint: HostEndpoint<T>,
-    writes: minip2p::StreamWriter,
-}
-
 enum Lifecycle<T: Transport> {
     /// Commands work; [`Host::pump`] does nothing yet.
-    Created(Live<T>),
-    Running(Live<T>),
+    Created(HostEndpoint<T>),
+    Running(HostEndpoint<T>),
     /// Closed or failed: the endpoint is released.
     Stopped,
 }
 
 impl<T: Transport> Lifecycle<T> {
     /// The endpoint while it accepts commands: created or running.
-    fn live(&mut self) -> Result<&mut Live<T>, FfiError> {
+    fn live(&mut self) -> Result<&mut HostEndpoint<T>, FfiError> {
         match self {
             Self::Created(live) | Self::Running(live) => Ok(live),
             Self::Stopped => Err(FfiError::Stopped),
@@ -65,8 +59,8 @@ impl<T: Transport> Lifecycle<T> {
     }
 }
 
-/// A browser endpoint: the portable endpoint, its pending stream writes, and
-/// the carry its events wait in until the binding drains them.
+/// A browser endpoint: the portable endpoint and the carry its events wait
+/// in until the binding drains them.
 pub struct Host<T: Transport> {
     peer_id: String,
     lifecycle: Lifecycle<T>,
@@ -101,7 +95,8 @@ impl<T: Transport> Host<T> {
                         .agent_version
                         .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
                 )
-                .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
+                .timeouts(config.timeouts.map(Into::into).unwrap_or_default())
+                .write_budget(BINDING_WRITE_BUDGET);
         #[cfg(feature = "pubsub")]
         {
             builder = builder.gossipsub_config(minip2p::GossipsubConfig {
@@ -140,10 +135,7 @@ impl<T: Transport> Host<T> {
         }
         Ok(Self {
             peer_id: keypair.peer_id().to_base58(),
-            lifecycle: Lifecycle::Created(Live {
-                endpoint,
-                writes: stream_writer(),
-            }),
+            lifecycle: Lifecycle::Created(endpoint),
             carry: EventCarry::default(),
             listen_addrs: Vec::new(),
         })
@@ -170,7 +162,7 @@ impl<T: Transport> Host<T> {
     /// `EndpointClosed` are carried, and every later command is
     /// [`FfiError::Stopped`].
     pub fn pump(&mut self, now: Now) -> Pumped {
-        let Lifecycle::Running(Live { endpoint, .. }) = &mut self.lifecycle else {
+        let Lifecycle::Running(endpoint) = &mut self.lifecycle else {
             return Pumped {
                 ring: false,
                 next_deadline: None,
@@ -183,11 +175,11 @@ impl<T: Transport> Host<T> {
                 // Each ingest takes a bounded batch, as the carry expects.
                 while events.peek().is_some() {
                     let batch: Vec<_> = events.by_ref().take(PUMP_DRAIN_LIMIT).collect();
-                    let converted = self.convert(batch, now);
-                    ring |= self.ingest(converted);
+                    let converted = batch.into_iter().filter_map(convert_endpoint_event);
+                    ring |= self.ingest(converted.collect());
                 }
                 let next_deadline = match &mut self.lifecycle {
-                    Lifecycle::Running(live) => live.endpoint.at(now).next_deadline(),
+                    Lifecycle::Running(endpoint) => endpoint.at(now).next_deadline(),
                     Lifecycle::Created(_) | Lifecycle::Stopped => None,
                 };
                 Pumped {
@@ -346,7 +338,7 @@ impl<T: Transport> Host<T> {
     ) -> Result<(), FfiError> {
         let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
         self.endpoint()?
-            .stream_consumed(ConnectionId::new(conn_id), StreamId::new(stream_id), bytes)
+            .stream_consumed(stream_key(conn_id, stream_id), bytes)
             .map_err(map_driver_error)
     }
 
@@ -358,18 +350,15 @@ impl<T: Transport> Host<T> {
         now: Now,
     ) -> Result<OpenStreamResult, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        let (conn_id, stream_id) = self
+        let stream = self
             .endpoint()?
             .at(now)
             .open_stream(&peer, &protocol_id)
             .map_err(map_driver_error)?;
         // The binding knows this connection now, so the carry must not
         // elide its events, its end above all.
-        self.carry.mark_connection_seen(conn_id.as_u64());
-        Ok(OpenStreamResult {
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-        })
+        self.carry.mark_connection_seen(stream.conn_id().as_u64());
+        Ok(stream.into())
     }
 
     /// Sends one payload (see `P2pEndpoint::send_stream`): `true` once every
@@ -381,16 +370,11 @@ impl<T: Transport> Host<T> {
         data: Vec<u8>,
         now: Now,
     ) -> Result<bool, FfiError> {
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        writes
-            .write(
-                endpoint.at(now),
-                ConnectionId::new(conn_id),
-                StreamId::new(stream_id),
-                data,
-            )
-            .map(|progress| progress == WriteProgress::Accepted)
-            .map_err(map_write_error)
+        send_whole(
+            self.endpoint()?.at(now),
+            stream_key(conn_id, stream_id),
+            data,
+        )
     }
 
     /// Half-closes a stream's write side, after any held tail.
@@ -400,26 +384,18 @@ impl<T: Transport> Host<T> {
         stream_id: u64,
         now: Now,
     ) -> Result<(), FfiError> {
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        writes
-            .close_write(
-                endpoint.at(now),
-                ConnectionId::new(conn_id),
-                StreamId::new(stream_id),
-            )
-            .map_err(map_write_error)
+        self.endpoint()?
+            .at(now)
+            .close_stream_write(stream_key(conn_id, stream_id))
+            .map_err(map_driver_error)
     }
 
-    /// Resets a stream, forgetting its held tail once accepted.
+    /// Resets a stream, dropping its held tail once the reset is accepted.
     pub fn reset_stream(&mut self, conn_id: u64, stream_id: u64, now: Now) -> Result<(), FfiError> {
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        endpoint
+        self.endpoint()?
             .at(now)
-            .reset_stream(conn_id, stream_id)
-            .map_err(map_driver_error)?;
-        writes.forget(conn_id, stream_id);
-        Ok(())
+            .reset_stream(stream_key(conn_id, stream_id))
+            .map_err(map_driver_error)
     }
 
     /// Resets and forgets a stream, dropping its events still carried (see
@@ -431,9 +407,9 @@ impl<T: Transport> Host<T> {
         now: Now,
     ) -> Result<(), FfiError> {
         let (raw_conn, raw_stream) = (conn_id, stream_id);
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        let abandoned = endpoint.at(now).abandon_stream(conn_id, stream_id);
+        let stream = stream_key(conn_id, stream_id);
+        let endpoint = self.lifecycle.live()?;
+        let abandoned = endpoint.at(now).abandon_stream(stream);
         if abandoned.is_err() && !self.carry.holds_stream_close(raw_conn, raw_stream) {
             return abandoned.map_err(map_driver_error);
         }
@@ -441,11 +417,10 @@ impl<T: Transport> Host<T> {
         // Never drained, so never acknowledged: after a reset this is moot,
         // and a stream closed on a live connection is released by it.
         if dropped_data > 0 {
-            match endpoint.stream_consumed(conn_id, stream_id, dropped_data) {
+            match endpoint.stream_consumed(stream, dropped_data) {
                 Ok(()) | Err(_) => {}
             }
         }
-        writes.forget(conn_id, stream_id);
         Ok(())
     }
 
@@ -527,24 +502,7 @@ impl<T: Transport> Host<T> {
     }
 
     fn endpoint(&mut self) -> Result<&mut HostEndpoint<T>, FfiError> {
-        Ok(&mut self.lifecycle.live()?.endpoint)
-    }
-
-    /// Converts one batch: each event's held write is followed first, so a
-    /// Writable that settles a write reports it right after the event.
-    fn convert(&mut self, batch: Vec<EndpointEvent>, now: Now) -> Vec<P2pEvent> {
-        let Ok(Live { endpoint, writes }) = self.lifecycle.live() else {
-            return Vec::new();
-        };
-        let mut converted = Vec::with_capacity(batch.len());
-        for event in batch {
-            let settled = writes
-                .observe(endpoint.at(now), &event)
-                .map(write_accepted_event);
-            converted.extend(convert_endpoint_event(event));
-            converted.extend(settled);
-        }
-        converted
+        self.lifecycle.live()
     }
 
     /// Ingests one batch, following the listen set, and returns whether to
@@ -563,7 +521,7 @@ impl<T: Transport> Host<T> {
     /// `EndpointClosed`.
     fn shut_down(&mut self, now: Now, failure: Option<P2pEvent>) -> bool {
         let endpoint = match core::mem::replace(&mut self.lifecycle, Lifecycle::Stopped) {
-            Lifecycle::Created(live) | Lifecycle::Running(live) => Some(live.endpoint),
+            Lifecycle::Created(endpoint) | Lifecycle::Running(endpoint) => Some(endpoint),
             Lifecycle::Stopped => None,
         };
         let failed = failure.is_some();

@@ -12,7 +12,7 @@ use alloc::{string::String, vec::Vec};
 use minip2p_core::platform::Now;
 use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{DriverError, IdentifyMessage};
-use minip2p_transport::{ConnectionId, StreamId, Transport};
+use minip2p_transport::{ConnectionId, StreamKey, Transport};
 
 #[cfg(feature = "_peer-book")]
 use crate::KnownPeer;
@@ -23,6 +23,7 @@ use crate::ReservationInfo;
 use crate::engine::Engine;
 use crate::platform::Platform;
 use crate::platform::sealed::Sealed;
+use crate::writes::{SendError, SendOutcome};
 use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
 
 /// The engine an endpoint on platform `P` drives.
@@ -51,7 +52,7 @@ pub(crate) type EngineOf<P> =
 /// documented there.
 ///
 /// Applications correlate events by the IDs they carry (a [`ConnectId`], a
-/// [`ConnectionId`], a [`StreamId`]) and dispatch unrelated events while
+/// [`ConnectionId`], a [`StreamKey`]) and dispatch unrelated events while
 /// they wait for a particular one.
 ///
 /// Dropping an endpoint disconnects its established peers, best effort, so
@@ -159,7 +160,9 @@ pub struct CloseReport {
     /// Empty means no tracked teardown remains, not that peers acknowledged
     /// it.
     pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
-    /// Events queued before the close and those its teardown produced.
+    /// Events queued before the close and those its teardown produced,
+    /// ending with a [`EndpointEvent::StreamWriteAborted`] for every write
+    /// [`Endpoint::send_stream`] still held.
     pub events: Vec<EndpointEvent>,
     /// Every transport or swarm failure: each disconnect, and a failed
     /// drive. An mDNS goodbye that could not be sent is an
@@ -246,13 +249,10 @@ impl<P: Platform> Endpoint<P> {
     /// connection is a no-op. Streams of protocols registered with
     /// [`Self::add_protocol`] are acknowledged as their data is pulled, and
     /// must not be acknowledged here too.
-    pub fn stream_consumed(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        bytes: usize,
-    ) -> Result<(), DriverError> {
-        self.engine.core.ack_stream(conn_id, stream_id, bytes)
+    pub fn stream_consumed(&mut self, stream: StreamKey, bytes: usize) -> Result<(), DriverError> {
+        self.engine
+            .core
+            .ack_stream(stream.conn_id(), stream.stream_id(), bytes)
     }
 
     /// Admits one Connection attempt and returns its [`ConnectId`].
@@ -455,101 +455,144 @@ impl<P: Platform> Endpoint<P> {
     /// fail early with
     /// [`SwarmError::RemoteDoesNotSupport`](minip2p_swarm::SwarmError::RemoteDoesNotSupport).
     ///
-    /// Returns the connection and stream ids. Stream ids are only unique per
-    /// connection, so every later stream operation takes both. The open ends
-    /// in exactly one terminal: [`EndpointEvent::StreamReady`], or an error
-    /// event naming the stream (see [`crate::SwarmErrorKind`]) when
-    /// negotiation fails, the peer closes the stream first, or the
-    /// negotiation deadline (`SwarmTimeouts::negotiation_ms`, set with the
-    /// builder's `timeouts`) passes. That deadline starts when the transport
-    /// reports `StreamOpened`, so a QUIC open still waiting for the peer's
-    /// stream credit is not timed. A closed or replaced connection ends it
-    /// with its own event.
+    /// Returns the stream's [`StreamKey`], which every later stream
+    /// operation takes. The open ends in exactly one terminal:
+    /// [`EndpointEvent::StreamReady`], or an error event naming the stream
+    /// (see [`crate::SwarmErrorKind`]) when negotiation fails, the peer
+    /// closes the stream first, or the negotiation deadline
+    /// (`SwarmTimeouts::negotiation_ms`, set with the builder's `timeouts`)
+    /// passes. That deadline starts when the transport reports
+    /// `StreamOpened`, so a QUIC open still waiting for the peer's stream
+    /// credit is not timed. A closed or replaced connection ends it with its
+    /// own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
-    ) -> Result<(ConnectionId, StreamId), DriverError> {
+    ) -> Result<StreamKey, DriverError> {
         let now = self.now();
-        self.engine
-            .core
-            .open_stream(peer_id, protocol_id, now.monotonic_ms)
+        let (conn_id, stream_id) =
+            self.engine
+                .core
+                .open_stream(peer_id, protocol_id, now.monotonic_ms)?;
+        Ok(StreamKey::new(conn_id, stream_id))
     }
 
-    /// Sends bytes on a negotiated application stream, named by the
-    /// connection and stream ids [`Self::open_stream`] or
-    /// [`EndpointEvent::StreamReady`] gave; the peer is the connection's.
+    /// Sends a whole payload on a negotiated application stream, queueing
+    /// what the stream cannot accept yet.
     ///
-    /// Accepts as much of `data` as the stream can queue (ADR 0012), and
-    /// `Ok(())` means every byte was accepted locally, not delivered. When
-    /// not every byte fit it returns [`DriverError::Full`]: **a prefix may
-    /// already have been accepted, and only `unsent` is yours.** Hold it,
-    /// wait for [`EndpointEvent::StreamWritable`] for the stream, and send it
-    /// again. Full is retryable ([`DriverError::is_retryable`]), never a
-    /// fault, so `?` on this call silently drops the tail:
+    /// The stream is named by the key [`Self::open_stream`] or
+    /// [`EndpointEvent::StreamReady`] gave; the peer is its connection's.
+    /// `Ok(())` means every byte was accepted or queued, not delivered. The
+    /// endpoint resends queued bytes as the stream drains and reports
+    /// [`EndpointEvent::StreamWriteAccepted`] once all of them are accepted,
+    /// or [`EndpointEvent::StreamWriteAborted`] if the stream or its
+    /// connection ends first. Writes behind queued bytes are queued whole, so
+    /// bytes leave in call order; check [`Self::is_write_pending`] to tell
+    /// whether this one was.
     ///
-    /// ```rust,ignore
-    /// endpoint.send_stream(conn_id, stream_id, payload)?; // loses `unsent` on Full
-    /// ```
-    ///
-    /// [`StreamWriter`](crate::StreamWriter) holds the tail, resends it on
-    /// Writable, and defers a write-side close behind it, which is what most
-    /// applications want.
+    /// Queued bytes count against the endpoint's write budget (the builder's
+    /// `write_budget`, [`DEFAULT_WRITE_BUDGET`](crate::DEFAULT_WRITE_BUDGET)
+    /// by default), admitted per whole payload: one that does not fit what is
+    /// left fails with [`SendError::OverBudget`] and one larger than the
+    /// whole budget with [`SendError::TooLarge`], and after a deferred
+    /// [`Self::close_stream_write`] a write fails with
+    /// [`SendError::Closing`]. Each hands the payload back, unsent. With a
+    /// budget of `0` use [`Self::try_send_stream`].
     ///
     /// Fails with
     /// [`SwarmError::StreamNotFound`](minip2p_swarm::SwarmError::StreamNotFound)
-    /// if `conn_id` is no longer the connection holding the stream (for
+    /// if the key's connection is no longer the one holding the stream (for
     /// example after `ConnectionReplaced`), so a write never reaches a
     /// same-numbered stream on a newer connection, and with
     /// [`TransportError::ConnectionNotFound`](minip2p_transport::TransportError::ConnectionNotFound)
     /// once nothing names the connection any more.
-    /// [`DriverError::is_stream_gone`] covers both. The other stream
-    /// operations behave the same.
+    /// [`SendError::is_stream_gone`] covers both. The other stream operations
+    /// behave the same.
     pub fn send_stream(
         &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         data: impl Into<Bytes>,
-    ) -> Result<(), DriverError> {
+    ) -> Result<(), SendError> {
         let now = self.now();
-        self.engine
-            .send_stream(conn_id, stream_id, data.into(), now)
+        self.engine.send_stream(stream, data.into(), now)
+    }
+
+    /// Sends what the stream accepts now and hands back the rest, without
+    /// queueing anything.
+    ///
+    /// Accepts as much of `data` as the stream can queue (ADR 0012).
+    /// [`SendOutcome::Full`] means a prefix may already have been accepted,
+    /// and only `unsent` is yours: hold it, wait for
+    /// [`EndpointEvent::StreamWritable`] for the stream, and send it again.
+    /// Full is an outcome, not an error, so `?` never drops it, and the
+    /// outcome is `#[must_use]`. While [`Self::send_stream`] holds bytes for
+    /// the stream this accepts nothing, keeping bytes in order, and its
+    /// `StreamWritable` follows [`EndpointEvent::StreamWriteAccepted`] once
+    /// the queue drained. After a [`Self::close_stream_write`] deferred
+    /// behind queued bytes it fails with `SwarmError::WriteClosed`, since no
+    /// `StreamWritable` follows a FIN.
+    ///
+    /// Errors as [`Self::send_stream`]'s driver errors do.
+    pub fn try_send_stream(
+        &mut self,
+        stream: StreamKey,
+        data: impl Into<Bytes>,
+    ) -> Result<SendOutcome, DriverError> {
+        let now = self.now();
+        self.engine.try_send_stream(stream, data.into(), now)
+    }
+
+    /// Whether [`Self::send_stream`] holds bytes (or a deferred FIN) for the
+    /// stream that it has not finished yet.
+    pub fn is_write_pending(&self, stream: StreamKey) -> bool {
+        self.engine.writes.is_pending(stream)
+    }
+
+    /// Whether a [`Self::close_stream_write`] is deferred behind bytes
+    /// [`Self::send_stream`] still holds for the stream; further writes are
+    /// refused as [`SendError::Closing`].
+    pub fn is_write_closing(&self, stream: StreamKey) -> bool {
+        self.engine.writes.is_closing(stream)
+    }
+
+    /// Bytes [`Self::send_stream`] holds across every stream, as charged
+    /// against the write budget.
+    pub fn queued_write_bytes(&self) -> usize {
+        self.engine.writes.held_bytes()
     }
 
     /// Half-closes the local write side of an application stream.
     ///
-    /// The FIN follows every byte the stream accepted; a tail you hold after
-    /// a Full is not among them.
-    /// [`StreamWriter::close_write`](crate::StreamWriter::close_write) waits
-    /// for its own pending tail first.
-    pub fn close_stream_write(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), DriverError> {
+    /// The FIN follows every byte the stream accepted and every byte
+    /// [`Self::send_stream`] queued: behind queued bytes it is deferred,
+    /// sent once they are accepted (just before their
+    /// [`EndpointEvent::StreamWriteAccepted`]), and later writes are
+    /// refused. A tail you hold yourself after a
+    /// [`try_send_stream`](Self::try_send_stream) Full is not among them.
+    pub fn close_stream_write(&mut self, stream: StreamKey) -> Result<(), DriverError> {
         let now = self.now();
-        self.engine.close_stream_write(conn_id, stream_id, now)
+        self.engine.close_stream_write(stream, now)
     }
 
-    /// Abruptly resets an application stream.
-    pub fn reset_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), DriverError> {
+    /// Abruptly resets an application stream. Bytes [`Self::send_stream`]
+    /// still held for it are dropped, with an
+    /// [`EndpointEvent::StreamWriteAborted`].
+    pub fn reset_stream(&mut self, stream: StreamKey) -> Result<(), DriverError> {
         let now = self.now();
-        self.engine.reset_stream(conn_id, stream_id, now)
+        self.engine.reset_stream(stream, now)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
     ///
     /// Unlike [`Self::reset_stream`], this also discards matching events
-    /// already queued by the endpoint (a failed [`Self::poll`] keeps them)
-    /// and suppresses later data, EOF, and close events for the stream.
-    /// Abandoning a live stream again is a no-op. A stream the peer has
-    /// already closed has nothing left to reset: it is abandoned (and its
-    /// undelivered data acknowledged) only while its
-    /// [`EndpointEvent::StreamClosed`] is undelivered, and fails with
+    /// already queued by the endpoint (a failed [`Self::poll`] keeps them),
+    /// and the bytes [`Self::send_stream`] held for it, and suppresses later
+    /// data, EOF, close and write-queue events for the stream. Abandoning a
+    /// live stream again is a no-op. A stream the peer has already closed has
+    /// nothing left to reset: it is abandoned (and its undelivered data
+    /// acknowledged) only while its [`EndpointEvent::StreamClosed`] is
+    /// undelivered, and fails with
     /// [`SwarmError::StreamNotFound`](minip2p_swarm::SwarmError::StreamNotFound)
     /// after that, including on a second call.
     ///
@@ -557,13 +600,9 @@ impl<P: Platform> Endpoint<P> {
     /// needs no queued event: the endpoint and swarm drop what they hold for
     /// it and the transport settles it, giving up the bytes it delivered so
     /// they no longer hold the connection's slot (ADR 0012).
-    pub fn abandon_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), DriverError> {
+    pub fn abandon_stream(&mut self, stream: StreamKey) -> Result<(), DriverError> {
         let now = self.now();
-        self.engine.abandon_stream(conn_id, stream_id, now)
+        self.engine.abandon_stream(stream, now)
     }
 
     /// Runs one drive batch without blocking and returns every queued event.

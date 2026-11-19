@@ -63,16 +63,14 @@ pub fn spawn_sink<M: Send + 'static>(
         on_event(endpoint, &event);
         match event {
             EndpointEvent::StreamReady {
-                stream_id,
+                stream,
                 protocol_id,
                 initiated_locally: false,
                 ..
             } if protocol_id == protocol => {
-                streams.insert(stream_id);
+                streams.insert(stream);
             }
-            EndpointEvent::StreamData {
-                stream_id, data, ..
-            } if streams.contains(&stream_id) => {
+            EndpointEvent::StreamData { stream, data, .. } if streams.contains(&stream) => {
                 count += data.len() as u64;
                 let total = total.load(Ordering::Acquire);
                 assert!(count <= total, "sink received more than the transfer");
@@ -125,12 +123,11 @@ pub fn transfer<M>(
     while ready < pending.len() {
         assert!(Instant::now() < deadline, "stream negotiation timed out");
         if let Some(EndpointEvent::StreamReady {
-            conn_id,
-            stream_id,
+            stream,
             initiated_locally: true,
             ..
         }) = next_event(client, Duration::from_millis(10))
-            && pending.contains(&(conn_id, stream_id))
+            && pending.contains(&stream)
         {
             ready += 1;
         }
@@ -173,10 +170,8 @@ pub fn transfer<M>(
         // no use for the outcome or any event.
         let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     };
-    for (conn, stream) in pending {
-        client
-            .close_stream_write(conn, stream)
-            .expect("close write");
+    for stream in pending {
+        client.close_stream_write(stream).expect("close write");
     }
     (start, end)
 }

@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p::{
-    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
-    WaitDeadline,
+    Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamKey, WaitDeadline,
 };
 
 const ECHO: &str = "/minip2p/bench/echo/1";
@@ -89,44 +88,32 @@ impl EchoServer {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            let mut streams = HashSet::<(PeerId, ConnectionId, StreamId)>::new();
+            let mut streams = HashSet::<(PeerId, StreamKey)>::new();
             while !worker_stop.load(Ordering::Relaxed) {
                 let event = next_event(&mut endpoint, Duration::from_millis(5));
                 match event {
                     Some(EndpointEvent::StreamReady {
                         peer_id,
-                        conn_id,
-                        stream_id,
+                        stream,
                         protocol_id,
                         initiated_locally: false,
                     }) if protocol_id == ECHO => {
-                        streams.insert((peer_id, conn_id, stream_id));
+                        streams.insert((peer_id, stream));
                     }
                     Some(EndpointEvent::StreamData {
                         peer_id,
-                        conn_id,
-                        stream_id,
+                        stream,
                         data,
-                    }) if streams.contains(&(peer_id, conn_id, stream_id)) => {
-                        endpoint
-                            .send_stream(conn_id, stream_id, data)
-                            .expect("echo");
+                    }) if streams.contains(&(peer_id, stream)) => {
+                        endpoint.send_stream(stream, data).expect("echo");
                     }
-                    Some(EndpointEvent::StreamRemoteWriteClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    }) if streams.contains(&(peer_id, conn_id, stream_id)) => {
-                        endpoint
-                            .close_stream_write(conn_id, stream_id)
-                            .expect("close echo");
+                    Some(EndpointEvent::StreamRemoteWriteClosed { peer_id, stream })
+                        if streams.contains(&(peer_id, stream)) =>
+                    {
+                        endpoint.close_stream_write(stream).expect("close echo");
                     }
-                    Some(EndpointEvent::StreamClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    }) => {
-                        streams.remove(&(peer_id, conn_id, stream_id));
+                    Some(EndpointEvent::StreamClosed { peer_id, stream }) => {
+                        streams.remove(&(peer_id, stream));
                     }
                     _ => {}
                 }
@@ -187,8 +174,7 @@ impl Crossed {
             pending.push(streams);
         }
         let deadline = Instant::now() + TIMEOUT;
-        let mut received =
-            vec![HashMap::<(ConnectionId, StreamId), Vec<u8>>::new(); self.clients.len()];
+        let mut received = vec![HashMap::<StreamKey, Vec<u8>>::new(); self.clients.len()];
         while pending.iter().any(|streams| !streams.is_empty()) {
             assert!(Instant::now() < deadline, "crossed echo timeout");
             for (index, (client, _)) in self.clients.iter_mut().enumerate() {
@@ -197,36 +183,27 @@ impl Crossed {
                 };
                 match event {
                     EndpointEvent::StreamReady {
-                        conn_id,
-                        stream_id,
+                        stream,
                         protocol_id,
                         initiated_locally: true,
                         ..
                     } if protocol_id == ECHO
                         && pending
                             .get(index)
-                            .is_some_and(|streams| streams.contains(&(conn_id, stream_id))) =>
+                            .is_some_and(|streams| streams.contains(&stream)) =>
                     {
-                        client
-                            .send_stream(conn_id, stream_id, payload.clone())
-                            .expect("send");
-                        client
-                            .close_stream_write(conn_id, stream_id)
-                            .expect("close write");
+                        client.send_stream(stream, payload.clone()).expect("send");
+                        client.close_stream_write(stream).expect("close write");
                     }
-                    EndpointEvent::StreamData {
-                        conn_id,
-                        stream_id,
-                        data,
-                        ..
-                    } if pending
-                        .get(index)
-                        .is_some_and(|streams| streams.contains(&(conn_id, stream_id))) =>
+                    EndpointEvent::StreamData { stream, data, .. }
+                        if pending
+                            .get(index)
+                            .is_some_and(|streams| streams.contains(&stream)) =>
                     {
                         let bytes = received
                             .get_mut(index)
                             .expect("client receive map")
-                            .entry((conn_id, stream_id))
+                            .entry(stream)
                             .or_default();
                         bytes.extend_from_slice(&data);
                         assert!(
@@ -238,7 +215,7 @@ impl Crossed {
                             pending
                                 .get_mut(index)
                                 .expect("client pending set")
-                                .remove(&(conn_id, stream_id));
+                                .remove(&stream);
                         }
                     }
                     _ => {}
@@ -293,43 +270,34 @@ impl Pair {
             match next_event(&mut self.client, deadline).expect("echo timeout") {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     protocol_id,
                     initiated_locally: true,
                 } if peer_id == self.peer
                     && protocol_id == ECHO
-                    && pending.contains_key(&(conn_id, stream_id)) =>
+                    && pending.contains_key(&stream) =>
                 {
                     let end = payload.len().min(32 * 1024);
                     self.client
                         .send_stream(
-                            conn_id,
-                            stream_id,
+                            stream,
                             payload.get(..end).expect("first payload chunk").to_vec(),
                         )
                         .expect("send");
-                    pending
-                        .get_mut(&(conn_id, stream_id))
-                        .expect("pending stream")
-                        .0 = end;
+                    pending.get_mut(&stream).expect("pending stream").0 = end;
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     data,
-                } if peer_id == self.peer && pending.contains_key(&(conn_id, stream_id)) => {
-                    let (sent, response) = pending
-                        .get_mut(&(conn_id, stream_id))
-                        .expect("pending stream");
+                } if peer_id == self.peer && pending.contains_key(&stream) => {
+                    let (sent, response) = pending.get_mut(&stream).expect("pending stream");
                     response.extend_from_slice(&data);
                     if response.len() == *sent && *sent < payload.len() {
                         let end = payload.len().min(*sent + 32 * 1024);
                         self.client
                             .send_stream(
-                                conn_id,
-                                stream_id,
+                                stream,
                                 payload
                                     .get(*sent..end)
                                     .expect("next payload chunk")
@@ -340,10 +308,8 @@ impl Pair {
                     }
                     if response.len() == payload.len() {
                         assert_eq!(*response, payload);
-                        self.client
-                            .close_stream_write(conn_id, stream_id)
-                            .expect("close write");
-                        pending.remove(&(conn_id, stream_id));
+                        self.client.close_stream_write(stream).expect("close write");
+                        pending.remove(&stream);
                     }
                 }
                 _ => {}

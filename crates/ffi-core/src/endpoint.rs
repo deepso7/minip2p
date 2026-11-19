@@ -8,16 +8,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, BindError, ConnectionId, Endpoint, EndpointBuilder, EndpointOptionsError,
-    GossipsubConfig, MdnsConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, QuicBindError,
-    ReservationPolicy, StreamId, TransportError, WaitHandle,
+    BeaconConfig, BindError, Endpoint, EndpointBuilder, EndpointOptionsError, GossipsubConfig,
+    MdnsConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, QuicBindError,
+    ReservationPolicy, TransportError, WaitHandle,
 };
 
 use crate::limits::{Bound, resolve_limits};
 use crate::{
     ConfigCapability, DriverStats, EndpointConfig, EventCarry, EventDoorbell, FfiError,
     IdentifyInfo, KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes,
-    map_driver_error, map_gossipsub_error, parse_direct_peer_addr, parse_peer_id,
+    map_driver_error, map_gossipsub_error, parse_direct_peer_addr, parse_peer_id, stream_key,
 };
 
 /// Parses the listen addresses; `None` keeps the QUIC dual-stack defaults.
@@ -153,22 +153,15 @@ pub(crate) struct EndpointState {
     pub(crate) published_peers: Vec<PeerId>,
 }
 
-/// The endpoint with the unsent tails of the bindings' stream writes, which
-/// can be large and are owed to its streams, so they are released with it.
-pub(crate) struct Live {
-    pub(crate) endpoint: Endpoint,
-    pub(crate) writes: minip2p::StreamWriter,
-}
-
 pub(crate) enum Lifecycle {
     /// Bound and accepting commands; no driver yet.
-    Created(Live),
+    Created(Endpoint),
     /// The driver is running.
-    Running(Live),
+    Running(Endpoint),
     /// Shutdown has begun. The driver holds `live` until it leaves its loop,
     /// then takes it to close within `close_timeout` (at once after a failure).
     Stopping {
-        live: Option<Live>,
+        live: Option<Endpoint>,
         close_timeout: Duration,
     },
     /// The endpoint is released.
@@ -177,7 +170,7 @@ pub(crate) enum Lifecycle {
 
 impl Lifecycle {
     /// The live endpoint while it accepts commands: created or running.
-    fn accepting(&mut self) -> Result<&mut Live, FfiError> {
+    fn accepting(&mut self) -> Result<&mut Endpoint, FfiError> {
         match self {
             Self::Created(live) | Self::Running(live) => Ok(live),
             Self::Stopping { .. } | Self::Stopped => Err(FfiError::Stopped),
@@ -233,7 +226,8 @@ impl P2pEndpoint {
             .timeouts(config.timeouts.map(Into::into).unwrap_or_default())
             .quic_limits(limits.quic)
             .tcp_config(limits.tcp)
-            .circuit_limits(limits.circuit);
+            .circuit_limits(limits.circuit)
+            .write_budget(crate::BINDING_WRITE_BUDGET);
         // The binding acknowledges stream data as its reader consumes it
         // (`stream_consumed`), not as this driver pulls the event.
         for protocol in config.protocols {
@@ -321,10 +315,7 @@ impl P2pEndpoint {
         Ok(Arc::new(Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(EndpointState {
-                    lifecycle: Lifecycle::Created(Live {
-                        endpoint,
-                        writes: crate::stream_writer(),
-                    }),
+                    lifecycle: Lifecycle::Created(endpoint),
                     driver_thread_id: None,
                     doorbell_thread_id: None,
                     published_peers: Vec::new(),
@@ -568,7 +559,7 @@ impl P2pEndpoint {
         let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .stream_consumed(ConnectionId::new(conn_id), StreamId::new(stream_id), bytes)
+                .stream_consumed(stream_key(conn_id, stream_id), bytes)
                 .map_err(map_driver_error)
         })
     }
@@ -581,7 +572,7 @@ impl P2pEndpoint {
     ) -> Result<crate::OpenStreamResult, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
-            let (conn_id, stream_id) = endpoint
+            let stream = endpoint
                 .open_stream(&peer, &protocol_id)
                 .map_err(map_driver_error)?;
             // The binding knows this connection now, so the carry must not
@@ -589,11 +580,8 @@ impl P2pEndpoint {
             self.shared
                 .lock_events()
                 .carry
-                .mark_connection_seen(conn_id.as_u64());
-            Ok(crate::OpenStreamResult {
-                conn_id: conn_id.as_u64(),
-                stream_id: stream_id.as_u64(),
-            })
+                .mark_connection_seen(stream.conn_id().as_u64());
+            Ok(stream.into())
         })
     }
 
@@ -601,8 +589,8 @@ impl P2pEndpoint {
     /// connection and stream ids.
     ///
     /// Returns `true` when the stream accepted every byte. Returns `false`
-    /// when it accepted only part: ffi-core holds the rest, resends it as the
-    /// stream drains, and emits [`P2pEvent::StreamWriteAccepted`] once all of
+    /// when it accepted only part: the endpoint holds the rest, resends it as
+    /// the stream drains, and emits [`P2pEvent::StreamWriteAccepted`] once all of
     /// it has been accepted. Until then the stream takes no other write
     /// ([`FfiError::Backpressure`]); a `StreamWriteStopped`, `StreamClosed`,
     /// or connection end instead means the held bytes were dropped.
@@ -617,16 +605,8 @@ impl P2pEndpoint {
         stream_id: u64,
         data: Vec<u8>,
     ) -> Result<bool, FfiError> {
-        self.with_state_mut(|endpoint, writes| {
-            writes
-                .write(
-                    endpoint,
-                    ConnectionId::new(conn_id),
-                    StreamId::new(stream_id),
-                    data,
-                )
-                .map(|progress| progress == minip2p::WriteProgress::Accepted)
-                .map_err(crate::map_write_error)
+        self.with_endpoint_mut(|endpoint| {
+            crate::send_whole(endpoint, stream_key(conn_id, stream_id), data)
         })
     }
 
@@ -635,28 +615,22 @@ impl P2pEndpoint {
     /// The FIN follows a pending write's held bytes, and later writes are
     /// refused.
     pub fn close_stream_write(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
-        self.with_state_mut(|endpoint, writes| {
-            writes
-                .close_write(
-                    endpoint,
-                    ConnectionId::new(conn_id),
-                    StreamId::new(stream_id),
-                )
-                .map_err(crate::map_write_error)
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .close_stream_write(stream_key(conn_id, stream_id))
+                .map_err(map_driver_error)
         })
     }
 
     /// Resets an application stream while retaining later close events.
+    ///
+    /// A held tail is dropped only once the Endpoint accepts the reset, so a
+    /// rejected call (a stale connection id) cannot lose a pending write.
     pub fn reset_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        // Forget the tail only once the Endpoint accepted the request, so a
-        // rejected call (a stale connection id) cannot lose a pending write.
-        self.with_state_mut(|endpoint, writes| {
+        self.with_endpoint_mut(|endpoint| {
             endpoint
-                .reset_stream(conn_id, stream_id)
-                .map_err(map_driver_error)?;
-            writes.forget(conn_id, stream_id);
-            Ok(())
+                .reset_stream(stream_key(conn_id, stream_id))
+                .map_err(map_driver_error)
         })
     }
 
@@ -670,11 +644,12 @@ impl P2pEndpoint {
     /// only while its `StreamClosed` is undrained, here or in the Endpoint.
     pub fn abandon_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
         let (raw_conn, raw_stream) = (conn_id, stream_id);
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        // Forget the tail only once the request is accepted, so a rejected
-        // call (a stale connection id) cannot lose a pending write.
-        self.with_state_mut(|endpoint, writes| {
-            let abandoned = endpoint.abandon_stream(conn_id, stream_id);
+        let stream = stream_key(conn_id, stream_id);
+        // The Endpoint drops a held tail only once it accepts the request,
+        // so a rejected call (a stale connection id) cannot lose a pending
+        // write.
+        self.with_endpoint_mut(|endpoint| {
+            let abandoned = endpoint.abandon_stream(stream);
             let mut events = self.shared.lock_events();
             let accepted =
                 abandoned.is_ok() || events.carry.holds_stream_close(raw_conn, raw_stream);
@@ -687,11 +662,10 @@ impl P2pEndpoint {
             // settlement this is moot, and a stream closed on a live
             // connection is released by it.
             if dropped_data > 0 {
-                match endpoint.stream_consumed(conn_id, stream_id, dropped_data) {
+                match endpoint.stream_consumed(stream, dropped_data) {
                     Ok(()) | Err(_) => {}
                 }
             }
-            writes.forget(conn_id, stream_id);
             Ok(())
         })
     }
@@ -897,25 +871,16 @@ impl P2pEndpoint {
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
-        Ok(operation(&state.lifecycle.accepting()?.endpoint))
+        Ok(operation(state.lifecycle.accepting()?))
     }
 
     fn with_endpoint_mut<T>(
         &self,
         operation: impl FnOnce(&mut Endpoint) -> Result<T, FfiError>,
     ) -> Result<T, FfiError> {
-        self.with_state_mut(|endpoint, _| operation(endpoint))
-    }
-
-    /// Like [`Self::with_endpoint_mut`], with the pending stream writes.
-    fn with_state_mut<T>(
-        &self,
-        operation: impl FnOnce(&mut Endpoint, &mut minip2p::StreamWriter) -> Result<T, FfiError>,
-    ) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
-        let Live { endpoint, writes } = state.lifecycle.accepting()?;
-        operation(endpoint, writes)
+        operation(state.lifecycle.accepting()?)
     }
 }
 
@@ -1333,7 +1298,6 @@ mod tests {
             .lifecycle
             .accepting()
             .expect("endpoint")
-            .endpoint
             .wait(Duration::from_millis(20))
             .expect("wait");
         assert!(
@@ -1835,7 +1799,6 @@ mod tests {
             .lifecycle
             .accepting()
             .expect("endpoint")
-            .endpoint
             .wait(Duration::from_millis(20))
             .expect("wait");
         assert!(!matches!(
@@ -2434,7 +2397,6 @@ mod tests {
                 .lifecycle
                 .accepting()
                 .expect("endpoint")
-                .endpoint
                 .wait(Duration::from_secs(5))
                 .expect("wait");
             assert!(matches!(outcome, minip2p::EndpointWaitOutcome::Interrupted));

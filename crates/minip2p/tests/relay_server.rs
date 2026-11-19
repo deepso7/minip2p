@@ -181,7 +181,7 @@ fn exercise_relay(
         "NAT-only client must not advertise HOP"
     );
 
-    let (conn, stream) = initiator
+    let stream = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream");
     let payload = b"bidirectional payload through Endpoint relay server".to_vec();
@@ -194,20 +194,17 @@ fn exercise_relay(
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    stream_id,
+                    stream: ready,
                     initiated_locally: true,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => {
-                    initiator
-                        .send_stream(conn, stream, payload.clone())
-                        .unwrap();
+                } if peer_id == responder_peer && ready == stream => {
+                    initiator.send_stream(stream, payload.clone()).unwrap();
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    stream_id,
+                    stream: from,
                     data,
-                    ..
-                } if peer_id == responder_peer && stream_id == stream => {
+                } if peer_id == responder_peer && from == stream => {
                     echoed = Some(data);
                 }
                 _ => {}
@@ -217,22 +214,18 @@ fn exercise_relay(
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     initiated_locally: false,
                     protocol_id,
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some((conn_id, stream_id));
+                    responder_stream = Some(stream);
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     data,
-                } if peer_id == initiator_peer
-                    && Some((conn_id, stream_id)) == responder_stream =>
-                {
-                    responder.send_stream(conn_id, stream_id, data).unwrap();
+                } if peer_id == initiator_peer && Some(stream) == responder_stream => {
+                    responder.send_stream(stream, data).unwrap();
                 }
                 _ => {}
             }
@@ -330,7 +323,7 @@ fn tcp_clients_exchange_payload_through_tcp_relay_endpoint() {
 mod bulk {
     use std::collections::BTreeMap;
 
-    use minip2p::{Bytes, CircuitCloseReason, Error, RelayServerConfig, StreamId};
+    use minip2p::{Bytes, CircuitCloseReason, RelayServerConfig, SendOutcome, StreamKey};
 
     use super::endpoint_support::is_stranger_handshake_failure;
     use super::*;
@@ -346,7 +339,7 @@ mod bulk {
 
     /// One inner stream's sender, holding its unsent tail across a Full.
     struct BulkSender {
-        stream: StreamId,
+        stream: StreamKey,
         offset: usize,
         tail: Option<Bytes>,
         writable: bool,
@@ -382,12 +375,10 @@ mod bulk {
                 .collect::<Vec<u8>>(),
         );
         let mut senders = Vec::new();
-        let mut conn_id = None;
         for _ in 0..BULK_STREAMS {
-            let (conn, stream) = writer
+            let stream = writer
                 .open_stream(&reader_peer, ECHO_PROTOCOL)
                 .expect("open bulk stream");
-            conn_id = Some(conn);
             senders.push(BulkSender {
                 stream,
                 offset: 0,
@@ -396,9 +387,8 @@ mod bulk {
                 closed: false,
             });
         }
-        let conn_id = conn_id.unwrap();
 
-        let mut received: BTreeMap<StreamId, Vec<u8>> = BTreeMap::new();
+        let mut received: BTreeMap<StreamKey, Vec<u8>> = BTreeMap::new();
         let mut finished = 0;
         let deadline = Instant::now() + Duration::from_secs(60);
         for turn in 0.. {
@@ -416,17 +406,19 @@ mod bulk {
                     })
                 });
                 match data {
-                    Some(data) => match writer.send_stream(conn_id, sender.stream, data) {
-                        Ok(()) => {}
-                        Err(Error::Full { unsent, .. }) => {
+                    Some(data) => match writer
+                        .try_send_stream(sender.stream, data)
+                        .expect("send failed")
+                    {
+                        SendOutcome::Accepted => {}
+                        SendOutcome::Full { unsent } => {
                             sender.tail = Some(unsent);
                             sender.writable = false;
                         }
-                        other => other.expect("send failed"),
                     },
                     None if !sender.closed => {
                         writer
-                            .close_stream_write(conn_id, sender.stream)
+                            .close_stream_write(sender.stream)
                             .expect("close write");
                         sender.closed = true;
                     }
@@ -435,9 +427,9 @@ mod bulk {
             }
             while let Some(event) = writer.next_event(Duration::from_millis(1)).unwrap() {
                 match event {
-                    EndpointEvent::StreamReady { stream_id, .. }
-                    | EndpointEvent::StreamWritable { stream_id, .. } => {
-                        if let Some(sender) = senders.iter_mut().find(|s| s.stream == stream_id) {
+                    EndpointEvent::StreamReady { stream, .. }
+                    | EndpointEvent::StreamWritable { stream, .. } => {
+                        if let Some(sender) = senders.iter_mut().find(|s| s.stream == stream) {
                             sender.writable = true;
                         }
                     }
@@ -451,14 +443,11 @@ mod bulk {
             if turn % READER_EVERY == 0 {
                 while let Some(event) = reader.next_event(Duration::ZERO).unwrap() {
                     match event {
-                        EndpointEvent::StreamData {
-                            stream_id, data, ..
-                        } => received
-                            .entry(stream_id)
-                            .or_default()
-                            .extend_from_slice(&data),
-                        EndpointEvent::StreamRemoteWriteClosed { stream_id, .. } => {
-                            let bytes = received.get(&stream_id).map_or(0, Vec::len);
+                        EndpointEvent::StreamData { stream, data, .. } => {
+                            received.entry(stream).or_default().extend_from_slice(&data)
+                        }
+                        EndpointEvent::StreamRemoteWriteClosed { stream, .. } => {
+                            let bytes = received.get(&stream).map_or(0, Vec::len);
                             assert_eq!(bytes, BULK_PER_STREAM, "the FIN follows the last byte");
                             finished += 1;
                         }
