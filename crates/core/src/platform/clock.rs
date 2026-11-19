@@ -118,6 +118,43 @@ impl<C: Clock + ?Sized> Clock for &mut C {
     }
 }
 
+/// A clock that reads whatever sample its owner last [`set`](Self::set):
+/// for hosts that take one time sample per drive iteration themselves (a
+/// browser's `performance.now()`, a deterministic simulation) and hand it
+/// to a component that samples a [`Clock`].
+///
+/// The [`Clock`] contract is the caller's to keep: set a `monotonic_ms`
+/// that never decreases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualClock {
+    now: Now,
+}
+
+impl ManualClock {
+    /// A clock reading `now` until the next [`set`](Self::set).
+    pub const fn new(now: Now) -> Self {
+        Self { now }
+    }
+
+    /// Makes `now` the sample every later [`Clock::now`] returns.
+    pub fn set(&mut self, now: Now) {
+        self.now = now;
+    }
+}
+
+impl Default for ManualClock {
+    /// Starts at monotonic zero with no wall clock.
+    fn default() -> Self {
+        Self::new(Now::from_millis(0))
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&mut self) -> Now {
+        self.now
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

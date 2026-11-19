@@ -20,9 +20,10 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "discovery")]
 use minip2p::{BeaconConfig, GossipsubError};
 use minip2p::{
-    ConnectOutcome, ConnectionId, Deadline, DiscoveryEvent, Ed25519Keypair, Endpoint,
-    EndpointEvent, EntropySource, Multiaddr, Now, PeerAddr, PeerId, SmoltcpConfig,
-    SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
+    ConnectOutcome, ConnectionId, Deadline, DiscoveryEvent, Ed25519Keypair, EndpointEvent,
+    EntropySource, ManualClock, Multiaddr, Now, PeerAddr, PeerId, PortableEndpointBuilder,
+    SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig,
+    TcpTransport,
 };
 use minip2p_core::platform::EntropyError;
 
@@ -127,7 +128,7 @@ impl Device for VirtualDevice {
 
 type Provider = SmoltcpTcpProvider<VirtualDevice>;
 type Transport = TcpTransport<Provider, CountingEntropy>;
-type Portable = minip2p::PortableEndpoint<Transport, CountingEntropy>;
+type Portable = minip2p::PortableEndpoint<Transport, CountingEntropy, ManualClock>;
 
 fn identity(seed: u8) -> Ed25519Keypair {
     Ed25519Keypair::from_secret_key_bytes([seed; 32])
@@ -167,10 +168,14 @@ fn transport_on_stack(
 }
 
 fn endpoint(device: VirtualDevice, cidr: &str, identity: &Ed25519Keypair, seed: u8) -> Portable {
-    Endpoint::portable(identity, CountingEntropy(seed.wrapping_add(1)))
-        .protocol(PROTOCOL)
-        .build(transport(device, cidr, identity.clone(), seed))
-        .expect("portable endpoint builds")
+    PortableEndpointBuilder::new(
+        identity,
+        CountingEntropy(seed.wrapping_add(1)),
+        ManualClock::default(),
+    )
+    .protocol(PROTOCOL)
+    .build(transport(device, cidr, identity.clone(), seed))
+    .expect("portable endpoint builds")
 }
 
 #[test]
@@ -187,19 +192,23 @@ fn portable_autonat_builds_without_relay_state() {
     )
     .expect("valid AutoNAT peer address");
 
-    let mut endpoint = Endpoint::portable(&local, CountingEntropy(122))
-        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .autonat_server(server_addr)
-        .build()
-        .expect("portable AutoNAT endpoint builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(122), ManualClock::default())
+            .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+            .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+            .autonat_server(server_addr)
+            .build()
+            .expect("portable AutoNAT endpoint builds");
 
     assert_eq!(endpoint.reachability(), minip2p::ReachabilityState::Unknown);
     assert_eq!(endpoint.stats().bound_addresses.len(), 1);
 
     let now = Now::from_millis(0);
-    endpoint.poll(now).expect("AutoNAT schedules its probe");
-    endpoint.poll(now).expect("scheduled probe drives TCP");
+    endpoint
+        .at(now)
+        .poll()
+        .expect("AutoNAT schedules its probe");
+    endpoint.at(now).poll().expect("scheduled probe drives TCP");
     assert!(
         !wire.is_quiet(),
         "AutoNAT must dial its configured server after receiving listen addresses"
@@ -220,18 +229,20 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
     )
     .expect("valid AutoNAT peer address");
 
-    let mut endpoint = Endpoint::portable(&local, CountingEntropy(142))
-        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .autonat_server(server_addr)
-        .build()
-        .expect("portable AutoNAT endpoint builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(142), ManualClock::default())
+            .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+            .autonat_server(server_addr)
+            .build()
+            .expect("portable AutoNAT endpoint builds");
 
     // No listener yet: there are no dial-back addresses to probe, so the
     // endpoint must stay quiet no matter how long the host idles.
     let mut now_ms = 0;
     for _ in 0..100 {
         endpoint
-            .poll(Now::from_millis(now_ms))
+            .at(Now::from_millis(now_ms))
+            .poll()
             .expect("poll without listeners");
         assert!(wire.is_quiet(), "no listen address means no AutoNAT dial");
         now_ms += 100;
@@ -239,7 +250,7 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
 
     // A post-build listen must reach the agent too.
     endpoint
-        .listen(
+        .listen_on(
             &format!("/ip4/{DIALER_IP}/tcp/4001")
                 .parse()
                 .expect("valid listen address"),
@@ -248,7 +259,8 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
 
     for _ in 0..100 {
         endpoint
-            .poll(Now::from_millis(now_ms))
+            .at(Now::from_millis(now_ms))
+            .poll()
             .expect("poll after listen");
         if !wire.is_quiet() {
             return;
@@ -288,12 +300,10 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
     let listen: Multiaddr = format!("/ip4/{LISTENER_IP}/tcp/4001")
         .parse()
         .expect("valid listen address");
-    let bound = listener.listen(&listen).expect("listener binds");
+    let bound = listener.listen_on(&listen).expect("listener binds");
     dialer
-        .connect(
-            PeerAddr::new(bound, listener_peer).expect("valid peer address"),
-            Now::from_millis(0),
-        )
+        .at(Now::from_millis(0))
+        .connect(PeerAddr::new(bound, listener_peer).expect("valid peer address"))
         .expect("connect starts");
 
     let mut now_ms = 0;
@@ -305,17 +315,18 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
 
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        dialer_events.extend(dialer.poll(now).expect("dialer polls"));
-        listener_events.extend(listener.poll(now).expect("listener polls"));
+        dialer_events.extend(dialer.at(now).poll().expect("dialer polls"));
+        listener_events.extend(listener.at(now).poll().expect("listener polls"));
 
         if has_ready(&dialer_events, &listener_peer)
             && has_ready(&listener_events, &dialer_peer)
             && !ping_started
         {
-            dialer.ping(&listener_peer, now).expect("ping starts");
+            dialer.at(now).ping(&listener_peer).expect("ping starts");
             stream = Some(
                 dialer
-                    .open_stream(&listener_peer, PROTOCOL, now)
+                    .at(now)
+                    .open_stream(&listener_peer, PROTOCOL)
                     .expect("application stream opens"),
             );
             ping_started = true;
@@ -330,10 +341,12 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
             })
         {
             dialer
-                .send_stream(conn_id, stream_id, PAYLOAD.to_vec(), now)
+                .at(now)
+                .send_stream(conn_id, stream_id, PAYLOAD.to_vec())
                 .expect("payload sends");
             dialer
-                .close_stream_write(conn_id, stream_id, now)
+                .at(now)
+                .close_stream_write(conn_id, stream_id)
                 .expect("write side closes");
             payload_sent = true;
         }
@@ -363,8 +376,8 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
 
         if wire.is_quiet() {
             let deadline = Deadline::earliest_opt(
-                dialer.next_deadline(now),
-                listener.next_deadline(now),
+                dialer.at(now).next_deadline(),
+                listener.at(now).next_deadline(),
             )
             .unwrap_or_else(|| {
                 panic!(
@@ -402,18 +415,19 @@ fn portable_connect_settles_over_smoltcp_tcp() {
     let listen: Multiaddr = format!("/ip4/{LISTENER_IP}/tcp/4001")
         .parse()
         .expect("valid listen address");
-    let bound = listener.listen(&listen).expect("listener binds");
+    let bound = listener.listen_on(&listen).expect("listener binds");
     let target = PeerAddr::new(bound, listener_peer).expect("valid peer address");
     let id = dialer
-        .connect(target, Now::from_millis(0))
+        .at(Now::from_millis(0))
+        .connect(target)
         .expect("connect admitted");
 
     let mut now_ms = 0;
     let mut dialer_events = Vec::new();
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        dialer_events.extend(dialer.poll(now).expect("dialer polls"));
-        listener.poll(now).expect("listener polls");
+        dialer_events.extend(dialer.at(now).poll().expect("dialer polls"));
+        listener.at(now).poll().expect("listener polls");
         if dialer_events.iter().any(|event| {
             matches!(
                 event,
@@ -428,15 +442,115 @@ fn portable_connect_settles_over_smoltcp_tcp() {
             return;
         }
         if wire.is_quiet() {
-            let deadline =
-                Deadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
-                    .unwrap_or_else(|| {
-                        panic!("embedded connect wedged\n  dialer: {dialer_events:?}")
-                    });
+            let deadline = Deadline::earliest_opt(
+                dialer.at(now).next_deadline(),
+                listener.at(now).next_deadline(),
+            )
+            .unwrap_or_else(|| panic!("embedded connect wedged\n  dialer: {dialer_events:?}"));
             now_ms = now_ms.max(deadline.as_millis());
         }
     }
     panic!("portable connect did not settle\n  dialer: {dialer_events:?}");
+}
+
+/// Dropping or closing a connected portable endpoint sends its close: the
+/// smoltcp provider owns the stack, so the teardown's final transport polls
+/// put the FIN on the wire and the remote sees the connection end.
+#[test]
+fn dropping_a_portable_endpoint_closes_its_smoltcp_connections() {
+    remote_sees_teardown(|endpoint, _| drop(endpoint));
+}
+
+#[test]
+fn closing_a_portable_endpoint_closes_its_smoltcp_connections() {
+    remote_sees_teardown(|endpoint, _| drop(endpoint.close()));
+}
+
+/// An application that disconnected the peer and already saw its
+/// `ConnectionClosed` may drop at once: the close still reaches the wire.
+#[test]
+fn dropping_after_a_seen_disconnect_still_sends_the_close() {
+    remote_sees_teardown(|mut endpoint, peer| {
+        endpoint.disconnect(&peer).expect("disconnect");
+        let closed = (0..MAX_STEPS).any(|_| {
+            endpoint.poll().expect("poll").iter().any(
+                |event| matches!(event, EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == peer),
+            )
+        });
+        assert!(closed, "the local close was reported");
+        drop(endpoint);
+    });
+}
+
+fn remote_sees_teardown(teardown: impl FnOnce(Portable, PeerId)) {
+    let wire = Wire::default();
+    let dialer_identity = identity(5);
+    let listener_identity = identity(6);
+    let dialer_peer = dialer_identity.peer_id();
+    let listener_peer = listener_identity.peer_id();
+    let mut dialer = endpoint(
+        wire.dialer_device(),
+        &format!("{DIALER_IP}/24"),
+        &dialer_identity,
+        31,
+    );
+    let mut listener = endpoint(
+        wire.listener_device(),
+        &format!("{LISTENER_IP}/24"),
+        &listener_identity,
+        41,
+    );
+    let listen: Multiaddr = format!("/ip4/{LISTENER_IP}/tcp/4001")
+        .parse()
+        .expect("valid listen address");
+    let bound = listener.listen_on(&listen).expect("listener binds");
+    let target = PeerAddr::new(bound, listener_peer).expect("valid peer address");
+    dialer
+        .at(Now::from_millis(0))
+        .connect(target)
+        .expect("connect admitted");
+
+    let mut now_ms = 0;
+    let mut connected = false;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        dialer.at(now).poll().expect("dialer polls");
+        listener.at(now).poll().expect("listener polls");
+        if dialer.connection_id(&listener_peer).is_some()
+            && listener.connection_id(&dialer_peer).is_some()
+        {
+            connected = true;
+            break;
+        }
+        if wire.is_quiet()
+            && let Some(deadline) = Deadline::earliest_opt(
+                dialer.at(now).next_deadline(),
+                listener.at(now).next_deadline(),
+            )
+        {
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    assert!(connected, "the peers did not connect");
+    let now = Now::from_millis(now_ms);
+
+    teardown(dialer, listener_peer);
+    // The clock stays put, so only the dialer's close can end the
+    // connection here, never an idle timeout.
+    let closed = (0..MAX_STEPS).any(|_| {
+        listener
+            .at(now)
+            .poll()
+            .expect("listener polls")
+            .iter()
+            .any(|event| {
+                matches!(event, EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == dialer_peer)
+            })
+    });
+    assert!(
+        closed,
+        "the listener never saw the torn-down dialer's close"
+    );
 }
 
 /// The host reconfigures a wildcard listener's interface through a stack
@@ -455,20 +569,25 @@ fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
         31,
     );
     let listener_stack = stack(wire.listener_device(), &format!("{LISTENER_IP}/24"));
-    let mut listener = Endpoint::portable(&listener_identity, CountingEntropy(42))
-        .protocol(PROTOCOL)
-        .build(transport_on_stack(
-            listener_stack.clone(),
-            listener_identity.clone(),
-            41,
-        ))
-        .expect("listener builds");
+    let mut listener = PortableEndpointBuilder::new(
+        &listener_identity,
+        CountingEntropy(42),
+        ManualClock::default(),
+    )
+    .protocol(PROTOCOL)
+    .build(transport_on_stack(
+        listener_stack.clone(),
+        listener_identity.clone(),
+        41,
+    ))
+    .expect("listener builds");
     listener
-        .listen(&"/ip4/0.0.0.0/tcp/4001".parse().expect("wildcard"))
+        .listen_on(&"/ip4/0.0.0.0/tcp/4001".parse().expect("wildcard"))
         .expect("listener binds the wildcard");
     for now_ms in 0..3 {
         listener
-            .poll(Now::from_millis(now_ms))
+            .at(Now::from_millis(now_ms))
+            .poll()
             .expect("warm the cache");
     }
 
@@ -490,13 +609,14 @@ fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
     )
     .expect("peer address");
     dialer
-        .connect(target, Now::from_millis(3))
+        .at(Now::from_millis(3))
+        .connect(target)
         .expect("admitted");
     let mut now_ms = 3;
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        dialer.poll(now).expect("dialer polls");
-        listener.poll(now).expect("listener polls");
+        dialer.at(now).poll().expect("dialer polls");
+        listener.at(now).poll().expect("listener polls");
         if let Some(info) = dialer.peer_info(&listener_peer) {
             assert!(
                 info.listen_addrs.contains(&added.to_bytes()),
@@ -505,9 +625,11 @@ fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
             return;
         }
         if wire.is_quiet() {
-            let deadline =
-                Deadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
-                    .expect("connect wedged");
+            let deadline = Deadline::earliest_opt(
+                dialer.at(now).next_deadline(),
+                listener.at(now).next_deadline(),
+            )
+            .expect("connect wedged");
             now_ms = now_ms.max(deadline.as_millis());
         }
     }
@@ -528,22 +650,24 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         enable_ipv6: false,
         ..SmoltcpMdnsConfig::default()
     };
-    let a_builder = Endpoint::portable(&a_identity, CountingEntropy(40))
-        .smoltcp(a_stack)
-        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .mdns()
-        .mdns_carrier_config(carrier.clone());
+    let a_builder =
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(40), ManualClock::default())
+            .smoltcp(a_stack)
+            .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+            .mdns()
+            .mdns_carrier_config(carrier.clone());
     #[cfg(feature = "discovery")]
     let a_builder = a_builder.gossipsub().discovery();
     let mut a = a_builder
         .protocol(PROTOCOL)
         .build()
         .expect("a embedded endpoint builds");
-    let b_builder = Endpoint::portable(&b_identity, CountingEntropy(50))
-        .smoltcp(b_stack)
-        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .mdns()
-        .mdns_carrier_config(carrier);
+    let b_builder =
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(50), ManualClock::default())
+            .smoltcp(b_stack)
+            .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+            .mdns()
+            .mdns_carrier_config(carrier);
     #[cfg(feature = "discovery")]
     let b_builder = b_builder.gossipsub().discovery();
     let mut b = b_builder
@@ -557,8 +681,8 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
     let mut ping_started = false;
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        a_events.extend(a.poll(now).expect("a polls"));
-        b_events.extend(b.poll(now).expect("b polls"));
+        a_events.extend(a.at(now).poll().expect("a polls"));
+        b_events.extend(b.at(now).poll().expect("b polls"));
 
         let a_discovered = a_events.iter().any(|event| {
             matches!(event,
@@ -583,7 +707,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
                 if peer_id == &a_peer)
         });
         if a_ready && b_ready && !ping_started {
-            a.ping(&b_peer, now).expect("mDNS-discovered peer pings");
+            a.at(now).ping(&b_peer).expect("mDNS-discovered peer pings");
             ping_started = true;
         }
         let ping_finished = a_events.iter().any(|event| {
@@ -614,8 +738,9 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         }
 
         if wire.is_quiet() {
-            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
-                .unwrap_or_else(|| panic!("mDNS endpoints wedged"));
+            let deadline =
+                Deadline::earliest_opt(a.at(now).next_deadline(), b.at(now).next_deadline())
+                    .unwrap_or_else(|| panic!("mDNS endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }
     }
@@ -630,30 +755,34 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
     let a_identity = identity(61);
     let b_identity = identity(62);
     let b_peer = b_identity.peer_id();
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(70))
-        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .gossipsub()
-        .build()
-        .expect("a endpoint builds");
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(80))
-        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
-        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .gossipsub()
-        .build()
-        .expect("b endpoint builds");
-    a.subscribe(TOPIC, Now::from_millis(0))
+    let mut a =
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(70), ManualClock::default())
+            .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+            .gossipsub()
+            .build()
+            .expect("a endpoint builds");
+    let mut b =
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(80), ManualClock::default())
+            .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
+            .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+            .gossipsub()
+            .build()
+            .expect("b endpoint builds");
+    a.at(Now::from_millis(0))
+        .subscribe(TOPIC)
         .expect("a subscribes");
-    b.subscribe(TOPIC, Now::from_millis(0))
+    b.at(Now::from_millis(0))
+        .subscribe(TOPIC)
         .expect("b subscribes");
-    a.connect(
-        PeerAddr::new(
-            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
-            b_peer,
+    a.at(Now::from_millis(0))
+        .connect(
+            PeerAddr::new(
+                format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
+                b_peer,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-        Now::from_millis(0),
-    )
-    .expect("connect starts");
+        .expect("connect starts");
 
     let mut now_ms = 0;
     let mut published = false;
@@ -661,14 +790,16 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
     let mut b_events = Vec::new();
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        a_events.extend(a.poll(now).expect("a polls"));
-        b_events.extend(b.poll(now).expect("b polls"));
+        a_events.extend(a.at(now).poll().expect("a polls"));
+        b_events.extend(b.at(now).poll().expect("b polls"));
         let remote_subscribed = a_events.iter().any(|event| {
             matches!(event, EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer, topic })
                 if peer == &b_peer && topic == TOPIC)
         });
         if remote_subscribed && !published {
-            a.publish(TOPIC, PAYLOAD, now).expect("message publishes");
+            a.at(now)
+                .publish(TOPIC, PAYLOAD)
+                .expect("message publishes");
             published = true;
         }
         if b_events.iter().any(|event| {
@@ -678,8 +809,9 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
             return;
         }
         if wire.is_quiet() {
-            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
-                .unwrap_or_else(|| panic!("pubsub endpoints wedged"));
+            let deadline =
+                Deadline::earliest_opt(a.at(now).next_deadline(), b.at(now).next_deadline())
+                    .unwrap_or_else(|| panic!("pubsub endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }
     }
@@ -691,26 +823,27 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
 fn signed_discovery_reserves_its_pubsub_topic() {
     const RESERVED: &str = "/minip2p/test/reserved-discovery";
     let identity = identity(83);
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(84))
-        .smoltcp(stack(
-            Wire::default().dialer_device(),
-            &format!("{DIALER_IP}/24"),
-        ))
-        .gossipsub()
-        .discovery_config(BeaconConfig {
-            topic: RESERVED.into(),
-            ..BeaconConfig::default()
-        })
-        .build()
-        .expect("discovery endpoint builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(84), ManualClock::default())
+            .smoltcp(stack(
+                Wire::default().dialer_device(),
+                &format!("{DIALER_IP}/24"),
+            ))
+            .gossipsub()
+            .discovery_config(BeaconConfig {
+                topic: RESERVED.into(),
+                ..BeaconConfig::default()
+            })
+            .build()
+            .expect("discovery endpoint builds");
     let now = Now::from_millis(0);
 
     assert!(matches!(
-        endpoint.unsubscribe(RESERVED, now),
+        endpoint.at(now).unsubscribe(RESERVED),
         Err(GossipsubError::DiscoveryTopicReserved)
     ));
     assert!(matches!(
-        endpoint.publish(RESERVED, b"not a beacon", now),
+        endpoint.at(now).publish(RESERVED, b"not a beacon"),
         Err(GossipsubError::DiscoveryTopicReserved)
     ));
 }
@@ -723,37 +856,39 @@ fn signed_beacons_populate_discovery_without_mdns() {
     let b_identity = identity(92);
     let a_peer = a_identity.peer_id();
     let b_peer = b_identity.peer_id();
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(100))
-        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .gossipsub()
-        .discovery()
-        .build()
-        .expect("a endpoint builds");
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(110))
-        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
-        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .gossipsub()
-        .discovery()
-        .build()
-        .expect("b endpoint builds");
-    a.connect(
-        PeerAddr::new(
-            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
-            b_peer,
+    let mut a =
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(100), ManualClock::default())
+            .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+            .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+            .gossipsub()
+            .discovery()
+            .build()
+            .expect("a endpoint builds");
+    let mut b =
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(110), ManualClock::default())
+            .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
+            .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+            .gossipsub()
+            .discovery()
+            .build()
+            .expect("b endpoint builds");
+    a.at(Now::from_millis(0))
+        .connect(
+            PeerAddr::new(
+                format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
+                b_peer,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-        Now::from_millis(0),
-    )
-    .expect("bootstrap dial starts");
+        .expect("bootstrap dial starts");
 
     let mut now_ms = 0;
     let mut a_events = Vec::new();
     let mut b_events = Vec::new();
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
-        a_events.extend(a.poll(now).expect("a polls"));
-        b_events.extend(b.poll(now).expect("b polls"));
+        a_events.extend(a.at(now).poll().expect("a polls"));
+        b_events.extend(b.at(now).poll().expect("b polls"));
         let a_saw_b = a_events.iter().any(|event| {
             matches!(event, EndpointEvent::Discovery(DiscoveryEvent::PeerDiscovered {
                 peer, source: minip2p::DiscoverySource::SignedBeacon, ..
@@ -778,8 +913,9 @@ fn signed_beacons_populate_discovery_without_mdns() {
             return;
         }
         if wire.is_quiet() {
-            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
-                .unwrap_or_else(|| panic!("discovery endpoints wedged"));
+            let deadline =
+                Deadline::earliest_opt(a.at(now).next_deadline(), b.at(now).next_deadline())
+                    .unwrap_or_else(|| panic!("discovery endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }
     }

@@ -354,8 +354,8 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
         .expect("quic listen address")
         .bind()
         .expect("bind client");
-    let wake = client.poll.wake_handle();
-    client.resolver = super::dial::Resolver::with_lookup(move || wake.wake(), lookup);
+    let wake = client.platform.poll.wake_handle();
+    client.platform.resolver = super::dial::Resolver::with_lookup(move || wake.wake(), lookup);
 
     // One long wait on an idle endpoint: without an early start, the
     // lookup would begin only once the sleep ended at this deadline.

@@ -46,6 +46,6 @@ fn two_endpoints_discover_and_connect_without_bootstrap() {
 
     assert!(a.known_peers().iter().any(|known| known.peer == b_peer));
     assert!(b.known_peers().iter().any(|known| known.peer == a_peer));
-    a.shutdown().expect("a sends goodbyes");
-    b.shutdown().expect("b sends goodbyes");
+    a.shutdown_mdns().expect("a sends goodbyes");
+    b.shutdown_mdns().expect("b sends goodbyes");
 }

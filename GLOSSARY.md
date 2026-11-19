@@ -60,7 +60,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Capability**: An optional protocol agent an endpoint can run beside Identify and ping: AutoNAT, relay, relay server, pubsub, discovery, or mDNS. A capability is _built_ when its Cargo feature is on and _configured_ when the endpoint's builder turns it on; it runs only when both hold. _Avoid_: feature (that is the Cargo flag)
 
-**Endpoint setup**: The one place that turns an endpoint's configuration into running capabilities over the shared engine: it validates capability config, registers their protocols, and installs their agents, the same way for the std `Endpoint` and `PortableEndpoint`. The std endpoint adds only OS resources around it (clock, readiness poll, sockets, the name resolver, certificates); the engine routes the resolver's answers to Connection attempts and parked NAT dials. _Avoid_: assembly, wiring
+**Endpoint platform**: The host-specific part of an endpoint: where its time comes from, which transports and entropy it runs over, whether names are resolved, and whether it can block waiting. The std platform owns all of these through the operating system; the portable one takes them from the caller. Everything else an endpoint does is the same on every platform. _Avoid_: backend, runtime, std/portable endpoint (as two types)
+
+**Endpoint setup**: The one place that turns an endpoint's configuration into running capabilities over the shared engine: it validates capability config, registers their protocols, and installs their agents, the same way on every Endpoint platform. The std platform adds only operating-system resources around it; the engine routes the resolver's answers to Connection attempts and parked NAT dials. _Avoid_: assembly, wiring
 
 **Circuit**: The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path. _Avoid_: connection (until that upgrade finishes)
 

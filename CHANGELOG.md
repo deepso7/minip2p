@@ -4,6 +4,18 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### One `Endpoint<P>` for std and portable hosts
+
+The std `Endpoint` and `PortableEndpoint` are now one type, `Endpoint<P>`, generic over its platform ([ADR 0029](docs/adr/0029-one-endpoint-generic-over-its-platform.md)): `Endpoint` (`Endpoint<StdPlatform>`) is unchanged for std callers apart from the renames below, and `PortableEndpoint<T, E, C>` is `Endpoint<Portable<T, E, C>>`. Every shared method is the same method on both.
+
+- **Portable endpoints sample a `Clock` instead of taking `now` per call.** `PortableEndpointBuilder::new(&identity, entropy)` becomes `new(&identity, entropy, clock)`, and `Endpoint::portable(..)` is removed: use `PortableEndpointBuilder::new`. Methods drop their `now` argument (`poll()`, `connect(target)`, `send_stream(conn, stream, data)`, `next_deadline()`, ...). To keep supplying samples yourself, pass `ManualClock::default()` and call through `at`: `endpoint.poll(now)` becomes `endpoint.at(now).poll()`. `PortableEndpoint` and `SmoltcpEndpointBuilder` gain the clock type parameter; `SmoltcpEndpoint<D, E, C>` names the smoltcp build.
+- **Portable `listen(&addr)` is `listen_on(&addr)`**; std `listen()` still reports the first bound address.
+- **Portable `shutdown(now) -> ShutdownReport` is `close() -> CloseReport`**, the std report: `ShutdownReport` is removed, and the new `outcome` is `Failed` after a failed final drive, `DeadlineExpired` when connections were left tracked, else `Drained`. Dropping a portable endpoint now disconnects its peers, best effort, as a std one does.
+- **Std `shutdown()` (mDNS goodbyes) is `shutdown_mdns()`**, and is on portable endpoints too.
+- **`PortableEndpointStats` is `EndpointStats`**, and `stats()` is on std endpoints too, as are `discovery_now_ms` and every other formerly portable- or std-only shared getter.
+- **`StreamWriter::write_at`, `close_write_at` and `observe_at` are removed**: `write`, `close_write` and `observe` take any `&mut Endpoint<P>`.
+- **`RelayServerControlError`, `Error` and the stream operations are unchanged**; portable methods return `DriverError` as before (`minip2p::Error` is the same type).
+
 ### `PeerId` and `Path` are `Copy`; `ConnectionReplaced` carries both paths
 
 - **`PeerId` and `Path` derive `Copy`**: drop `.clone()` calls on them (clippy's `clone_on_copy` flags them).
@@ -24,6 +36,8 @@ The public identity now vouches for each node's backbone key ([ADR 0028](docs/ad
 `AutoNatServer` now matches an IPv4-mapped IPv6 address (`/ip6/::ffff:a.b.c.d`) to the IPv4 address it maps, on either the observed address or a candidate, so a request a dual-stack listener used to refuse with `E_DIAL_REFUSED` is forwarded; no migration is needed.
 
 ### Portable shutdown returns a report
+
+(Since superseded: the consuming portable call is now `close() -> CloseReport`, see above.)
 
 `PortableEndpoint::shutdown(now)` returns a `ShutdownReport { events, errors, unfinished }` instead of `Result<Vec<EndpointEvent>, DriverError>`, so a failed disconnect or final drive no longer discards the final events: `errors` lists every disconnect and final-drive `DriverError` (mDNS goodbye failures stay `EndpointEvent::MdnsFailed` in `events`), and `unfinished` the connections still tracked when the transport is dropped. Replace `shutdown(now)?` by binding the report (`let report = endpoint.shutdown(now);`), checking `report.errors` and `report.unfinished`, then using `report.events`. In `@minip2p/web`, a close now delivers those events even after a failed shutdown, followed by `endpointClosed` carrying the real `unfinished` connections; its `outcome` is `Failed` if the shutdown hit any error, else `DeadlineExpired` (not `Drained`) when the one-pass close left connections tracked, as std `close_within(Duration::ZERO)` reports, else `Drained`.
 

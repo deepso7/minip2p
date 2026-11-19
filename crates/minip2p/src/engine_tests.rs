@@ -22,8 +22,10 @@ use minip2p_transport::{
     TransportEvent,
 };
 
+#[cfg(feature = "std")]
+use crate::Endpoint;
 use crate::names::{Expander, Expansion, NameAnswers, name_of};
-use crate::{ConnectOutcome, Endpoint, EndpointEvent};
+use crate::{ConnectOutcome, EndpointEvent, ManualClock, PortableEndpointBuilder};
 
 struct CountingEntropy(u8);
 
@@ -176,12 +178,13 @@ fn assert_lifecycle_before_settled(events: &[EndpointEvent], peer: &PeerId) {
 fn portable_batches_report_lifecycle_before_connect_settled() {
     let identity = Ed25519Keypair::from_secret_key_bytes([31; 32]);
     let peer = Ed25519Keypair::from_secret_key_bytes([32; 32]).peer_id();
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .build(FlashTransport::default())
-        .expect("builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .build(FlashTransport::default())
+            .expect("builds");
     let now = Now::from_millis(0);
-    endpoint.connect(target(&peer), now).expect("admitted");
-    let events = endpoint.poll(now).expect("poll");
+    endpoint.at(now).connect(target(&peer)).expect("admitted");
+    let events = endpoint.at(now).poll().expect("poll");
     assert_lifecycle_before_settled(&events, &peer);
 }
 
@@ -299,12 +302,14 @@ fn portable_routes_late_nat_events_before_the_final_drain() {
         identity.clone(),
         CountingEntropy(9),
     );
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .nat_config(forced_relay(&relay))
-        .build_with_circuits(transport)
-        .expect("builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .nat_config(forced_relay(&relay))
+            .build_with_circuits(transport)
+            .expect("builds");
     let id = endpoint
-        .connect(peer, Now::from_millis(0))
+        .at(Now::from_millis(0))
+        .connect(peer)
         .expect("admitted");
     assert_late_nat_events_settle_in_order(&mut endpoint.engine, id, &peer);
 }
@@ -327,10 +332,11 @@ fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
         ..FlashTransport::default()
     };
     let identity = Ed25519Keypair::from_secret_key_bytes([46; 32]);
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .relay_server()
-        .build(transport)
-        .expect("a relay server builds over any transport");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .relay_server()
+            .build(transport)
+            .expect("a relay server builds over any transport");
     let rejections = |events: &[EndpointEvent]| {
         events
             .iter()
@@ -346,11 +352,11 @@ fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
             .count()
     };
     assert_eq!(
-        rejections(&endpoint.poll(Now::from_millis(0)).expect("poll")),
+        rejections(&endpoint.at(Now::from_millis(0)).poll().expect("poll")),
         1
     );
     assert_eq!(
-        rejections(&endpoint.poll(Now::from_millis(1)).expect("poll")),
+        rejections(&endpoint.at(Now::from_millis(1)).poll().expect("poll")),
         0
     );
 }
@@ -364,7 +370,8 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     const PROTOCOL: &str = "/engine/bulk/1";
     // Each side names the other as its AutoNAT server; neither serves
     // AutoNAT, so the NAT agent is live but its probes go nowhere.
-    let configure = |builder: crate::PortableEndpointBuilder<CountingEntropy>, server: PeerAddr| {
+    let configure = |builder: crate::PortableEndpointBuilder<CountingEntropy, ManualClock>,
+                     server: PeerAddr| {
         let builder = builder.protocol(PROTOCOL);
         #[cfg(feature = "discovery")]
         let builder = builder.discovery();
@@ -385,24 +392,36 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     };
     let a_addr = address("/ip4/192.0.2.1/udp/4001/quic-v1", &a_identity);
     let b_addr = address("/ip4/192.0.2.2/udp/4002/quic-v1", &b_identity);
-    let mut a = configure(Endpoint::portable(&a_identity, CountingEntropy(0)), b_addr)
-        .build(a_transport)
-        .expect("a");
-    let mut b = configure(Endpoint::portable(&b_identity, CountingEntropy(1)), a_addr)
-        .build(b_transport)
-        .expect("b");
+    let mut a = configure(
+        PortableEndpointBuilder::new(&a_identity, CountingEntropy(0), ManualClock::default()),
+        b_addr,
+    )
+    .build(a_transport)
+    .expect("a");
+    let mut b = configure(
+        PortableEndpointBuilder::new(&b_identity, CountingEntropy(1), ManualClock::default()),
+        a_addr,
+    )
+    .build(b_transport)
+    .expect("b");
     let b_peer = b_identity.peer_id();
     let clock = core::cell::Cell::new(0);
-    let tick = |a: &mut crate::PortableEndpoint<_, _>, b: &mut crate::PortableEndpoint<_, _>| {
+    let tick = |a: &mut crate::PortableEndpoint<_, _, ManualClock>,
+                b: &mut crate::PortableEndpoint<_, _, ManualClock>| {
         clock.set(clock.get() + 1);
         let now = Now::from_millis(clock.get());
-        (a.poll(now).expect("a"), b.poll(now).expect("b"), now)
+        (
+            a.at(now).poll().expect("a"),
+            b.at(now).poll().expect("b"),
+            now,
+        )
     };
     while !a.is_peer_ready(&b_peer) {
         tick(&mut a, &mut b);
     }
     let (conn, stream) = a
-        .open_stream(&b_peer, PROTOCOL, Now::from_millis(clock.get()))
+        .at(Now::from_millis(clock.get()))
+        .open_stream(&b_peer, PROTOCOL)
         .expect("open");
     let (mut a_ready, mut b_ready) = (false, false);
     while !(a_ready && b_ready) {
@@ -417,7 +436,8 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     }
     let now = Now::from_millis(clock.get());
     for chunk in 0..8u8 {
-        a.send_stream(conn, stream, vec![chunk; 16], now)
+        a.at(now)
+            .send_stream(conn, stream, vec![chunk; 16])
             .expect("send");
     }
 
@@ -429,7 +449,7 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     assert!(b.engine.discovery.is_some(), "discovery driver is live");
     let passes = b.engine.stats.capability_passes;
     let refreshes = b.engine.stats.address_refreshes;
-    let events = b.poll(now).expect("b receives");
+    let events = b.at(now).poll().expect("b receives");
     let chunks = events
         .iter()
         .filter(|event| matches!(event, EndpointEvent::StreamData { .. }))
@@ -474,14 +494,15 @@ fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
     let identity = Ed25519Keypair::from_secret_key_bytes([44; 32]);
     let transport = FlashTransport::default();
     let carrier_polls = Arc::new(Mutex::new(0));
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .mdns(
-            IdleCarrier(Arc::clone(&carrier_polls)),
-            minip2p_mdns::MdnsConfig::default(),
-        )
-        .build(transport.clone())
-        .expect("builds");
-    endpoint.poll(Now::from_millis(0)).expect("poll");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .mdns(
+                IdleCarrier(Arc::clone(&carrier_polls)),
+                minip2p_mdns::MdnsConfig::default(),
+            )
+            .build(transport.clone())
+            .expect("builds");
+    endpoint.at(Now::from_millis(0)).poll().expect("poll");
     assert_eq!(transport.polls(), 2, "once before and once after the tick");
     assert!(
         *carrier_polls.lock().unwrap_or_else(PoisonError::into_inner) > 0,
@@ -496,20 +517,21 @@ fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
 #[test]
 fn portable_capabilities_compose_over_a_plain_transport() {
     let identity = Ed25519Keypair::from_secret_key_bytes([45; 32]);
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .discovery()
-        .mdns(
-            IdleCarrier(Arc::new(Mutex::new(0))),
-            minip2p_mdns::MdnsConfig::default(),
-        )
-        .peer_discovery_config(crate::PeerDiscoveryConfig::default())
-        .build(FlashTransport::default())
-        .expect("builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .discovery()
+            .mdns(
+                IdleCarrier(Arc::new(Mutex::new(0))),
+                minip2p_mdns::MdnsConfig::default(),
+            )
+            .peer_discovery_config(crate::PeerDiscoveryConfig::default())
+            .build(FlashTransport::default())
+            .expect("builds");
     let now = Now::from_millis(0);
-    endpoint.poll(now).expect("poll");
-    assert!(endpoint.subscribe("app-topic", now).expect("gossipsub"));
+    endpoint.at(now).poll().expect("poll");
+    assert!(endpoint.at(now).subscribe("app-topic").expect("gossipsub"));
     assert!(matches!(
-        endpoint.unsubscribe(crate::DISCOVERY_TOPIC, now),
+        endpoint.at(now).unsubscribe(crate::DISCOVERY_TOPIC),
         Err(crate::GossipsubError::DiscoveryTopicReserved)
     ));
     assert!(endpoint.known_peers().is_empty());
@@ -521,7 +543,7 @@ fn portable_capabilities_compose_over_a_plain_transport() {
 #[cfg(not(feature = "mdns"))]
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy>>();
+    assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy, ManualClock>>();
 };
 
 /// A transport whose dials stay in flight until the test scripts their
@@ -619,7 +641,7 @@ impl Transport for ScriptedTransport {
 /// test says otherwise.
 #[cfg(feature = "autonat")]
 struct RelayLegFixture {
-    endpoint: crate::PortableEndpoint<ScriptedTransport, CountingEntropy>,
+    endpoint: crate::PortableEndpoint<ScriptedTransport, CountingEntropy, ManualClock>,
     transport: ScriptedTransport,
     relay: PeerAddr,
     peer: PeerId,
@@ -643,9 +665,10 @@ impl RelayLegFixture {
         .expect("relay");
         let peer = Ed25519Keypair::from_secret_key_bytes([seed + 2; 32]).peer_id();
         let transport = ScriptedTransport::default();
-        let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-            .build(transport.clone())
-            .expect("builds");
+        let mut endpoint =
+            PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+                .build(transport.clone())
+                .expect("builds");
         let config = minip2p_nat::NatConfig {
             relays: vec![relay.clone()],
             force_relay,
@@ -718,8 +741,8 @@ impl RelayLegFixture {
 fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
     let mut f = RelayLegFixture::new(60, true);
     let now = Now::from_millis(0);
-    let id = f.endpoint.connect(f.peer, now).expect("admitted");
-    f.endpoint.poll(now).expect("poll");
+    let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
+    f.endpoint.at(now).poll().expect("poll");
     let relay_dial = f.relay_dial();
     assert!(
         f.endpoint.engine.connect.is_pending(id),
@@ -741,8 +764,13 @@ fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
     // wakes the cancelled leg.
     f.transport
         .connect(relay_dial, f.relay.transport().clone(), f.relay.peer_id());
-    let mut events = f.endpoint.poll(now).expect("poll");
-    events.extend(f.endpoint.poll(Now::from_millis(60_000)).expect("poll"));
+    let mut events = f.endpoint.at(now).poll().expect("poll");
+    events.extend(
+        f.endpoint
+            .at(Now::from_millis(60_000))
+            .poll()
+            .expect("poll"),
+    );
     assert!(
         matches!(
             RelayLegFixture::terminals(&events, id).as_slice(),
@@ -768,7 +796,7 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
     // DCUtR on: a circuit stays provisional until the deadline settles it.
     let mut f = RelayLegFixture::new(63, false);
     let now = Now::from_millis(0);
-    let id = f.endpoint.connect(f.peer, now).expect("admitted");
+    let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
     f.relay_dial();
     let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("circuit");
     f.transport.connect(
@@ -783,7 +811,8 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
     // answers Identify here, is still inside `IDENTIFY_TIMEOUT_MS` then.
     let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
     f.endpoint
-        .poll(Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS - 1_000))
+        .at(Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS - 1_000))
+        .poll()
         .expect("poll");
     assert!(
         f.endpoint.engine.connect.is_pending(id),
@@ -793,8 +822,8 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
     // The deadline settles the attempt on the circuit; a cancel arriving
     // before that terminal is drained finds nothing pending.
     f.endpoint.engine.expire_attempts(deadline);
-    f.endpoint.cancel_connect(id, deadline);
-    let events = f.endpoint.poll(deadline).expect("poll");
+    f.endpoint.at(deadline).cancel_connect(id);
+    let events = f.endpoint.at(deadline).poll().expect("poll");
     assert!(
         matches!(
             RelayLegFixture::terminals(&events, id).as_slice(),
@@ -821,11 +850,11 @@ fn an_admission_that_settles_at_once_attaches_no_leg() {
         "/ip4/192.0.2.60/tcp/4001".parse().expect("addr"),
         &f.peer,
     );
-    f.endpoint.poll(now).expect("poll");
+    f.endpoint.at(now).poll().expect("poll");
 
-    let id = f.endpoint.connect(f.peer, now).expect("admitted");
-    let mut events = f.endpoint.poll(now).expect("poll");
-    events.extend(f.endpoint.poll(Now::from_millis(1_000)).expect("poll"));
+    let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
+    let mut events = f.endpoint.at(now).poll().expect("poll");
+    events.extend(f.endpoint.at(Now::from_millis(1_000)).poll().expect("poll"));
     assert!(
         matches!(
             RelayLegFixture::terminals(&events, id).as_slice(),
@@ -854,7 +883,8 @@ fn a_connect_failed_after_the_attempt_settled_is_dropped() {
     let mut f = RelayLegFixture::new(69, true);
     let id = f
         .endpoint
-        .connect(f.peer, Now::from_millis(0))
+        .at(Now::from_millis(0))
+        .connect(f.peer)
         .expect("admitted");
     f.relay_dial();
     let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
@@ -878,7 +908,7 @@ fn a_connect_failed_after_the_attempt_settled_is_dropped() {
         reason: "late".into(),
     });
     engine.settle(deadline);
-    let events = f.endpoint.poll(deadline).expect("poll");
+    let events = f.endpoint.at(deadline).poll().expect("poll");
     assert!(
         matches!(
             RelayLegFixture::terminals(&events, id).as_slice(),
@@ -937,7 +967,7 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
     let now = Now::from_millis(0);
     let peer = f.peer;
     observe(&mut f, peer);
-    f.endpoint.poll(now).expect("poll");
+    f.endpoint.at(now).poll().expect("poll");
     // The book's dial is the first attempt the endpoint admitted.
     let id = crate::ConnectId::from_u64(1);
     assert!(f.endpoint.engine.connect.is_pending(id));
@@ -947,7 +977,7 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
         &mut f,
         Ed25519Keypair::from_secret_key_bytes([90; 32]).peer_id(),
     );
-    let events = f.endpoint.poll(now).expect("poll");
+    let events = f.endpoint.at(now).poll().expect("poll");
     assert!(!f.endpoint.engine.connect.is_pending(id));
     assert!(
         f.transport.closed(relay_dial),
@@ -1010,9 +1040,10 @@ fn named(host_addr: &str, peer: &PeerId) -> PeerAddr {
 fn an_answer_after_the_attempt_deadline_leaves_it_timed_out() {
     let identity = Ed25519Keypair::from_secret_key_bytes([40; 32]);
     let peer = Ed25519Keypair::from_secret_key_bytes([41; 32]).peer_id();
-    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
-        .build(FlashTransport::default())
-        .expect("builds");
+    let mut endpoint =
+        PortableEndpointBuilder::new(&identity, CountingEntropy(0), ManualClock::default())
+            .build(FlashTransport::default())
+            .expect("builds");
     let mut names = FakeNames::default();
     let engine = &mut endpoint.engine;
     let id = engine.connect(

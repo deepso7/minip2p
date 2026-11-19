@@ -8,7 +8,7 @@ cargo add minip2p-rs
 
 The package is named `minip2p-rs` on crates.io and its library target remains `minip2p`, so application imports stay concise:
 
-This crate provides the existing batteries-included std `Endpoint` and a caller-driven portable endpoint behind the same entry point.
+This crate provides one `Endpoint`: batteries-included on std, and caller-driven over any transport and clock on the portable platform, with the same methods on both.
 
 ```rust
 let mut endpoint = minip2p::Endpoint::builder()
@@ -75,19 +75,21 @@ Every dial goes through `connect` and its attempt policy, on the std and the por
 
 ## Portable endpoint
 
-There are two endpoint types over one engine: the std `Endpoint` above, and `PortableEndpoint<T, E>`, which runs over any `Transport` with no clock, sockets, or executor. Both drive the same batches and emit the same event stream in the same order (see the event loop section below). Disable default features for `no_std + alloc`, then provide identity, entropy, and a transport explicitly:
+There is one endpoint type, `Endpoint<P>`, generic over the platform `P` that supplies what differs between hosts: the clock, the transports, Name resolution, and (on std) the blocking wait (ADR 0029). The std `Endpoint` above is `Endpoint<StdPlatform>`, the default. `PortableEndpoint<T, E, C>` is `Endpoint<Portable<T, E, C>>`: it runs over any `Transport` `T` with no sockets or executor, drawing entropy from `E` and time from the host's `Clock` `C`, which every call samples once. Every method both share (`connect`, `poll`, the stream operations, `ping`, pubsub, the state getters, ...) is the same method, so they drive the same batches and emit the same event stream in the same order (see the event loop section below). Disable default features for `no_std + alloc`, then provide identity, entropy, a clock, and a transport explicitly:
 
 ```rust,ignore
-let mut endpoint = minip2p::Endpoint::portable(&identity, entropy)
+let mut endpoint = minip2p::PortableEndpointBuilder::new(&identity, entropy, clock)
     .agent_version("my-device/0.1.0")
     .protocol("/myapp/1.0.0")
     .build(transport)?;
 
-let events = endpoint.poll(now)?;
-let deadline = endpoint.next_deadline(now);
+let events = endpoint.poll()?;
+let deadline = endpoint.next_deadline();
 ```
 
-The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)`, which runs one final drive and returns a `ShutdownReport` with its events, every error, and the connections still tracked when the transport is dropped (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the report's events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
+A host that takes its own time sample each turn passes a `ManualClock` and sets it with `at`: `endpoint.at(now).poll()?`, `endpoint.at(now).send_stream(..)`.
+
+The portable endpoint supports listening (`listen_on(addr)` and `listen_all()`), Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `close()`, which runs up to two final drives (the second sends the closes the first ran; a failed one stops there) and returns the same `CloseReport` type as std `close_within`: its events, every error, and the connections still tracked when the transport is dropped (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the report's events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). There is no access to the raw swarm: every dial goes through `connect`.
 
 ### Capabilities
 
@@ -119,7 +121,7 @@ cargo add minip2p-rs --no-default-features --features smoltcp,discovery
 `.smoltcp(stack)` turns the builder into a `SmoltcpEndpointBuilder` that installs TCP (and mDNS, when asked) on one shared `SmoltcpStack` and builds an ordinary `PortableEndpoint` over a `SmoltcpTransport`. TCP and mDNS on the stack come with `smoltcp`; `pubsub` adds `.gossipsub()` and `discovery` signed `.discovery()`:
 
 ```rust,ignore
-let mut endpoint = Endpoint::portable(&identity, entropy)
+let mut endpoint = PortableEndpointBuilder::new(&identity, entropy, clock)
     .smoltcp(stack.clone())
     .listen("/ip4/0.0.0.0/tcp/4001")
     .mdns()
@@ -128,12 +130,12 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `discovery_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll(now)` advances every enabled service and `next_deadline(now)` folds their timelines.
+Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `discovery_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll()` advances every enabled service and `next_deadline()` folds their timelines.
 
 Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `autonat`, configure trusted servers, and read the latest verdict from the same caller-driven endpoint. A verdict needs a quorum of distinct servers (3 of the last 5 by default), and a public one reports only addresses that quorum confirms, so with fewer than three reachable servers reachability stays Unknown:
 
 ```rust,ignore
-let mut endpoint = Endpoint::portable(&identity, entropy)
+let mut endpoint = PortableEndpointBuilder::new(&identity, entropy, clock)
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
     .autonat_server(server_a)
@@ -141,19 +143,19 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .autonat_server(server_c)
     .build()?;
 
-for event in endpoint.poll(now)? {
+for event in endpoint.poll()? {
     // ReachabilityChanged is emitted once enough distinct servers agree.
     // Handle that and ordinary endpoint events here.
 }
 let reachability = endpoint.reachability();
 ```
 
-Once at least one TCP listen address exists, the first due `poll(now)` starts a probe by dialing the configured server. Successful exchanges emit `EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
+Once at least one TCP listen address exists, the first due `poll()` starts a probe by dialing the configured server. Successful exchanges emit `EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
 
 With `smoltcp` and `relay`, the smoltcp builder wraps its TCP transport in a `CircuitTransport` itself, so a relay just works. This one connects only through the relay:
 
 ```rust,ignore
-let mut endpoint = Endpoint::portable(&identity, entropy)
+let mut endpoint = PortableEndpointBuilder::new(&identity, entropy, clock)
     .smoltcp(stack)
     .nat_config(NatConfig {
         force_relay: true,
@@ -163,9 +165,9 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .relay(relay_addr)
     .build()?;
 
-let connect = endpoint.connect(&remote_peer, now)?;
+let connect = endpoint.connect(&remote_peer)?;
 while endpoint.path(&remote_peer).is_none() {
-    for event in endpoint.poll(now)? {
+    for event in endpoint.poll()? {
         // Handle EndpointEvent::Nat and ordinary endpoint events.
     }
 }
@@ -190,7 +192,7 @@ With the `tcp` feature, chain a `/tcp` listen address the same way. Connect to a
 
 The IP family is chosen by the address too: an `/ip4` or `/ip6` candidate is dialed as written, and a `/dns*` candidate is resolved and dialed once per family it answers with (`/dns4` / `/dns6` keep to one). The endpoint owns name resolution and never blocks on it: `connect` returns at once, each distinct name is looked up on a background thread, and the answer joins the attempt's race on a later `wait`/`poll` while `/ip4`/`/ip6` candidates and the relay leg are already running. A failed lookup is a failed candidate whose reason names the host; the attempt deadline covers the lookup, and a late answer is dropped. At most 32 distinct names are looked up at once; past that a candidate fails with a reason saying so. Configured relay and AutoNAT server addresses may name a host too and are resolved the same way. The transports themselves accept only `/ip4` and `/ip6` and reject `/dns*`, so direct transport users resolve names themselves. A finished lookup wakes a blocked `wait` through the swarm's wake-only handle, so it is applied at once and never reported as `Interrupted`.
 
-Dropping a std `Endpoint` (or `Endpoint::close`) disconnects established peers. `close` drains for up to `DEFAULT_CLOSE_TIMEOUT` (500 ms) and `close_within(timeout)` picks the deadline (`Duration::ZERO` tears down at once); the deadline bounds teardown time, not delivery of accepted writes. The returned `CloseReport` says how the drain ended (`CloseOutcome::Drained`, `DeadlineExpired`, or `Failed`) and lists, in `unfinished`, each connection still tracked (pending dials included) with its peer when known. That does not cover `kill -9` or a hard partition; those still wait for the QUIC idle timeout. Portable endpoints use explicit `shutdown(now)`.
+Dropping a std `Endpoint` (or `Endpoint::close`) disconnects established peers. `close` drains for up to `DEFAULT_CLOSE_TIMEOUT` (500 ms) and `close_within(timeout)` picks the deadline (`Duration::ZERO` tears down at once); the deadline bounds teardown time, not delivery of accepted writes. The returned `CloseReport` says how the drain ended (`CloseOutcome::Drained`, `DeadlineExpired`, or `Failed`) and lists, in `unfinished`, each connection still tracked (pending dials included) with its peer when known. That does not cover `kill -9` or a hard partition; those still wait for the QUIC idle timeout. Dropping a portable endpoint disconnects too; its consuming `close()` runs up to two final drives (the second sends the closes the first ran; a failed one stops there) and returns the same `CloseReport` type.
 
 With the `relay` feature, an endpoint holding a QUIC relay reservation sends a ping every `NatConfig::reservation_keep_alive_interval_ms` to stop an idle relay connection from reaching that timeout. The default is 15 seconds. Keep the interval below `QuicLimits::idle_timeout_ms`; setting it to `0` disables the automatic pings. TCP reservations do not send them. Each successful automatic ping emits the ordinary `EndpointEvent::PingRttMeasured` event.
 
@@ -299,7 +301,7 @@ A `?` on `send_stream` drops the tail:
 endpoint.send_stream(conn_id, stream_id, chunk)?; // a Full here loses `unsent`
 ```
 
-`StreamWriter` does the holding for you on either endpoint (on a `PortableEndpoint`, through `write_at`, `close_write_at` and `observe_at`, which take your `Now`): one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
+`StreamWriter` does the holding for you on any endpoint, through `write`, `close_write` and `observe`: one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
 
 ```rust,ignore
 use minip2p::{StreamWriter, WriteProgress};
@@ -323,7 +325,7 @@ Relay bridges are promoted through end-to-end Noise and Yamux before `NatEvent::
 
 With the `discovery` feature, `.discovery()` enables signed pubsub presence beacons, a bounded TTL address book, and caller-driven automatic connects, through the NAT connect race when `autonat` or `relay` is built too. It implies the `pubsub` feature. Applications can inspect `known_peers`, handle `EndpointEvent::Discovery` from `wait`, pass a validated `BeaconConfig` to select a room-scoped topic, and use `PeerDiscoveryConfig` for shared book and dial policy. Unsigned discovery beacons are always rejected even if unsigned application pubsub messages are allowed.
 
-With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and handle the same `EndpointEvent::Discovery` events used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. An mDNS socket failure while running is `EndpointEvent::MdnsFailed { error }`, reported once per change in failure state: mDNS keeps retrying (every `MDNS_FAILURE_RETRY`, 100 ms) and emits `EndpointEvent::MdnsRecovered` once a retry succeeds. Call `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; it returns the first goodbye that could not be sent (also queued as a final `MdnsFailed`). `close`/`close_within` and drop send the same goodbyes best-effort; `close` reports a failed one only as an `MdnsFailed` in its `CloseReport`'s events.
+With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and handle the same `EndpointEvent::Discovery` events used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. An mDNS socket failure while running is `EndpointEvent::MdnsFailed { error }`, reported once per change in failure state: mDNS keeps retrying (every `MDNS_FAILURE_RETRY`, 100 ms) and emits `EndpointEvent::MdnsRecovered` once a retry succeeds. Call `Endpoint::shutdown_mdns()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; it returns the first goodbye that could not be sent (also queued as a final `MdnsFailed`). `close`/`close_within` and drop send the same goodbyes best-effort; `close` reports a failed one only as an `MdnsFailed` in its `CloseReport`'s events.
 
 Discovery source timestamps use a driver-private monotonic epoch. Compute their ages from `Endpoint::discovery_now_ms()`; an independently created `Instant` does not share that origin.
 

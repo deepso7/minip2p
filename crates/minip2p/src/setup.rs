@@ -3,7 +3,7 @@
 //! same way for the std `Endpoint` and [`crate::PortableEndpoint`].
 //!
 //! A builder only records intent in [`Capabilities`]. [`validate`] applies
-//! every default against the [`Platform`] (the NAT base, the merged relay and
+//! every default against the [`PlatformCaps`] (the NAT base, the merged relay and
 //! AutoNAT lists, NAT for discovered peers) and checks the result before any
 //! socket opens; [`install`] then registers each capability's protocols
 //! on the swarm and installs its agent. A capability's protocols are
@@ -105,7 +105,7 @@ pub(crate) struct RelayServerSetup {
 
 /// What the endpoint's platform offers its capabilities.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Platform {
+pub(crate) struct PlatformCaps {
     /// Whether the endpoint runs DCUtR hole punching: only the std endpoint
     /// with QUIC does.
     #[cfg_attr(
@@ -133,7 +133,7 @@ pub(crate) struct Platform {
 /// [`install`].
 pub(crate) struct Validated {
     capabilities: Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
     /// The relay server's agent, built (and its announce addresses checked)
     /// while validating.
     #[cfg(feature = "relay-server")]
@@ -274,7 +274,7 @@ impl From<RelayServerConfigError> for SetupError {
 )]
 pub(crate) fn validate(
     mut capabilities: Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
     local_peer: &PeerId,
 ) -> Result<Validated, SetupError> {
     #[cfg(feature = "pubsub")]
@@ -329,7 +329,7 @@ pub(crate) fn validate(
 #[cfg(feature = "autonat")]
 fn resolve_nat(
     capabilities: &mut Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
 ) -> Result<Option<NatConfig>, NatConfigError> {
     let relays = core::mem::take(&mut capabilities.relays);
     let autonat_servers = core::mem::take(&mut capabilities.autonat_servers);
@@ -367,7 +367,7 @@ fn merge_unique(base: Vec<PeerAddr>, added: Vec<PeerAddr>) -> Vec<PeerAddr> {
 
 /// Rejects NAT configuration that cannot run on `platform`.
 #[cfg(feature = "autonat")]
-fn validate_nat(config: &NatConfig, platform: Platform) -> Result<(), NatConfigError> {
+fn validate_nat(config: &NatConfig, platform: PlatformCaps) -> Result<(), NatConfigError> {
     let relays = !config.relays.is_empty();
     if !relays && config.force_relay {
         Err(NatConfigError::ForceRelayWithoutRelay)

@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamId,
-    StreamWriteError, StreamWriter, WriteAccepted, WriteProgress,
+    ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, ManualClock,
+    PeerAddr, PortableEndpointBuilder, StreamId, StreamWriteError, StreamWriter, WriteAccepted,
+    WriteProgress,
 };
 use minip2p_core::platform::{Clock, StdClock, StdEntropy};
 
@@ -231,13 +232,14 @@ fn a_write_past_the_budget_is_refused_before_anything_is_sent() {
 type Portable = minip2p::PortableEndpoint<
     minip2p::TcpTransport<minip2p_tcp::StdTcpProvider, StdEntropy>,
     StdEntropy,
+    ManualClock,
 >;
 
 fn bind_portable() -> Portable {
     let key = Ed25519Keypair::generate();
     let transport =
         minip2p::TcpTransport::new(minip2p_tcp::StdTcpProvider::new(), key.clone(), StdEntropy);
-    Endpoint::portable(&key, StdEntropy)
+    PortableEndpointBuilder::new(&key, StdEntropy, ManualClock::default())
         .protocol(PROTOCOL)
         .build(transport)
         .expect("build portable endpoint")
@@ -250,28 +252,32 @@ fn a_portable_endpoint_finishes_a_held_write_and_the_deferred_fin() {
     let mut writer = bind_portable();
     let reader_addr = PeerAddr::new(
         reader
-            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
+            .listen_on(&"/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
             .expect("reader listens"),
         *reader.peer_id(),
     )
     .expect("reader address");
     let (reader_peer, writer_peer) = (*reader.peer_id(), *writer.peer_id());
-    writer.connect(reader_addr, clock.now()).expect("connect");
+    writer
+        .at(clock.now())
+        .connect(reader_addr)
+        .expect("connect");
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {
         assert!(Instant::now() < deadline, "peers never became ready");
         let now = clock.now();
-        writer.poll(now).expect("writer polls");
-        reader.poll(now).expect("reader polls");
+        writer.at(now).poll().expect("writer polls");
+        reader.at(now).poll().expect("reader polls");
     }
     let (conn_id, stream_id) = writer
-        .open_stream(&reader_peer, PROTOCOL, clock.now())
+        .at(clock.now())
+        .open_stream(&reader_peer, PROTOCOL)
         .expect("open stream");
     'negotiate: loop {
         assert!(Instant::now() < deadline, "stream never negotiated");
         let now = clock.now();
-        reader.poll(now).expect("reader polls");
-        for event in writer.poll(now).expect("writer polls") {
+        reader.at(now).poll().expect("reader polls");
+        for event in writer.at(now).poll().expect("writer polls") {
             if matches!(event, EndpointEvent::StreamReady { stream_id: id, .. } if id == stream_id)
             {
                 break 'negotiate;
@@ -283,19 +289,13 @@ fn a_portable_endpoint_finishes_a_held_write_and_the_deferred_fin() {
     let payload = payload();
     assert_eq!(
         streams
-            .write_at(
-                &mut writer,
-                conn_id,
-                stream_id,
-                payload.clone(),
-                clock.now()
-            )
+            .write(writer.at(clock.now()), conn_id, stream_id, payload.clone())
             .expect("write"),
         WriteProgress::Pending,
         "a write past the send caps is held"
     );
     streams
-        .close_write_at(&mut writer, conn_id, stream_id, clock.now())
+        .close_write(writer.at(clock.now()), conn_id, stream_id)
         .expect("close write");
 
     let (mut accepted, mut received) = (Vec::new(), Vec::new());
@@ -306,10 +306,10 @@ fn a_portable_endpoint_finishes_a_held_write_and_the_deferred_fin() {
             received.len()
         );
         let now = clock.now();
-        for event in writer.poll(now).expect("writer polls") {
-            accepted.extend(streams.observe_at(&mut writer, &event, now));
+        for event in writer.at(now).poll().expect("writer polls") {
+            accepted.extend(streams.observe(writer.at(now), &event));
         }
-        for event in reader.poll(now).expect("reader polls") {
+        for event in reader.at(now).poll().expect("reader polls") {
             match event {
                 EndpointEvent::StreamData { data, .. } => received.extend_from_slice(&data),
                 EndpointEvent::StreamRemoteWriteClosed { .. } => break 'transfer,
