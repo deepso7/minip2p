@@ -3,9 +3,10 @@
 //! See `examples/peer/README.md` for usage examples.
 //!
 //! This file is the tiny dispatch layer: parse argv via [`cli`], then hand
-//! off to `modes::run_listen` or `modes::run_dial`. Both runners drive the
-//! NAT traversal agent, so the same two subcommands work on loopback,
-//! across the open internet, and between two NATed hosts via a relay.
+//! off to `modes::run_listen`, `modes::run_dial` or `modes::run_id`. Every
+//! runner drives the NAT traversal agent, so the same subcommands work on
+//! loopback, across the open internet, and between two NATed hosts via a
+//! relay.
 
 mod cli;
 mod modes;
@@ -40,5 +41,10 @@ fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             count,
             options,
         } => modes::run_dial(target, relay, count, options),
+        Mode::Id {
+            target,
+            relay,
+            options,
+        } => modes::run_id(target, relay, options),
     }
 }

@@ -22,7 +22,7 @@ use minip2p_example_common::{
     circuit_addr, load_keypair, local_dialable_peer_addr, path_name, print_nat_event,
 };
 
-use crate::cli::{DialTarget, RunOptions, print_event};
+use crate::cli::{DialTarget, RunOptions, print_event, print_identify};
 
 /// An echo stream: its connection and its id.
 type EchoStream = (ConnectionId, StreamId);
@@ -451,16 +451,7 @@ pub fn run_dial(
     count: Option<u64>,
     options: RunOptions,
 ) -> Result<(), Box<dyn Error>> {
-    // The circuit target's relay leads the list; --relay adds a fallback.
-    let mut relays: Vec<PeerAddr> = Vec::new();
-    if let DialTarget::Circuit { relay, .. } = &target {
-        relays.push(relay.clone());
-    }
-    if let Some(extra) = relay
-        && !relays.iter().any(|r| r.peer_id() == extra.peer_id())
-    {
-        relays.push(extra);
-    }
+    let relays = relays_for(&target, relay);
 
     let mut endpoint = build_endpoint("dial", &relays, &options)?;
     // Listening seeds the agent's bound addresses — the local half of the
@@ -491,7 +482,7 @@ pub fn run_dial(
         }
     };
 
-    let path = wait_for_path(&mut endpoint, connect_id)?;
+    let path = wait_for_path("dial", &mut endpoint, connect_id)?;
     println!(
         "[dial] path-established path={} elapsed={}ms elapsed-us={}",
         path_name(&path),
@@ -515,11 +506,109 @@ pub fn run_dial(
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
 }
 
+/// The NAT agent's relay list for a target: the circuit target's own relay
+/// leads, and `--relay` adds a fallback unless it is already that relay.
+fn relays_for(target: &DialTarget, relay: Option<PeerAddr>) -> Vec<PeerAddr> {
+    let mut relays: Vec<PeerAddr> = Vec::new();
+    if let DialTarget::Circuit { relay, .. } = target {
+        relays.push(relay.clone());
+    }
+    if let Some(extra) = relay
+        && !relays.iter().any(|r| r.peer_id() == extra.peer_id())
+    {
+        relays.push(extra);
+    }
+    relays
+}
+
+/// Connects to `target`, waits for its Identify, prints it, and exits.
+///
+/// The one-shot counterpart to [`run_dial`]: no echo stream and no ping
+/// loop, so it answers "what is on the other end of this address" against
+/// any implementation, including a foreign one, and is usable in a script.
+/// Identify is read back from `peer_readiness` rather than caught as an
+/// event, so the result is printed whether or not the event arrived while
+/// an earlier wait was draining the queue.
+pub fn run_id(
+    target: DialTarget,
+    relay: Option<PeerAddr>,
+    options: RunOptions,
+) -> Result<(), Box<dyn Error>> {
+    let relays = relays_for(&target, relay);
+
+    let mut endpoint = build_endpoint("id", &relays, &options)?;
+    // Listening seeds the agent's bound addresses, so a circuit target can
+    // still upgrade to a direct path before Identify lands.
+    endpoint
+        .listen_all()
+        .map_err(|e| format!("listen failed: {e}"))?;
+    println!("[id] us={}", endpoint.peer_id());
+
+    let start = Instant::now();
+    let (peer, connect_id) = match &target {
+        DialTarget::Circuit { peer, .. } => {
+            let relay = relays
+                .first()
+                .ok_or("circuit target has no relay configured")?;
+            println!("[id] target={peer} via-relay={}", relay.peer_id());
+            let id = endpoint
+                .connect(peer)
+                .map_err(|e| format!("connect failed: {e}"))?;
+            (peer.clone(), id)
+        }
+        DialTarget::Direct(addr) => {
+            println!("[id] target={addr}");
+            let id = endpoint
+                .connect(addr)
+                .map_err(|e| format!("connect failed: {e}"))?;
+            (addr.peer_id().clone(), id)
+        }
+    };
+
+    let path = wait_for_path("id", &mut endpoint, connect_id)?;
+    println!(
+        "[id] path-established path={} elapsed={}ms",
+        path_name(&path),
+        start.elapsed().as_millis()
+    );
+
+    let deadline = Instant::now() + SETUP_DEADLINE;
+    while !endpoint.is_peer_ready(&peer) {
+        match endpoint
+            .wait(deadline)
+            .map_err(|e| format!("waiting for identify: {e}"))?
+        {
+            // The Identify result is this command's answer and is printed
+            // once below, from `peer_readiness`. Echoing the event here as
+            // well would print it twice.
+            EndpointWaitOutcome::Event(event) => {
+                if !matches!(event, EndpointEvent::IdentifyReceived { .. }) {
+                    print_event("id", &event);
+                }
+            }
+            EndpointWaitOutcome::Deadline => {
+                return Err("identify never completed".into());
+            }
+            _ => {}
+        }
+    }
+
+    let (conn_id, info) = endpoint
+        .peer_readiness(&peer)
+        .ok_or("peer became unready before its Identify could be read")?;
+    print_identify("id", &peer, &conn_id, info);
+    Ok(())
+}
+
 /// Waits for the attempt's first usable path (the provisional relayed one,
 /// when that lands first), printing unrelated events as they arrive. An
 /// attempt that settles connected without a path event reports the path it
 /// settled on; a failed or cancelled one ends the run.
-fn wait_for_path(endpoint: &mut Endpoint, connect_id: ConnectId) -> Result<Path, Box<dyn Error>> {
+fn wait_for_path(
+    role: &str,
+    endpoint: &mut Endpoint,
+    connect_id: ConnectId,
+) -> Result<Path, Box<dyn Error>> {
     let deadline = Instant::now() + CONNECT_DEADLINE;
     loop {
         match endpoint
@@ -534,7 +623,7 @@ fn wait_for_path(endpoint: &mut Endpoint, connect_id: ConnectId) -> Result<Path,
             EndpointWaitOutcome::Event(
                 event @ EndpointEvent::ConnectSettled { connect_id: id, .. },
             ) if id == connect_id => {
-                print_event("dial", &event);
+                print_event(role, &event);
                 return match event {
                     EndpointEvent::ConnectSettled {
                         outcome: ConnectOutcome::Connected { path, .. },
@@ -543,7 +632,7 @@ fn wait_for_path(endpoint: &mut Endpoint, connect_id: ConnectId) -> Result<Path,
                     _ => Err("no path to the target".into()),
                 };
             }
-            EndpointWaitOutcome::Event(event) => print_event("dial", &event),
+            EndpointWaitOutcome::Event(event) => print_event(role, &event),
             EndpointWaitOutcome::Deadline => return Err("no path to the target".into()),
             _ => {}
         }

@@ -3,7 +3,9 @@
 //! Spawns `minip2p-peer listen`, parses its `bound=` line from stdout,
 //! then spawns `minip2p-peer dial <addr> --count 3` and asserts the dialer
 //! exits successfully after a direct path, three pongs with an
-//! unbroken seq sequence, and a complete summary. Both processes are
+//! unbroken seq sequence, and a complete summary. A second test runs
+//! `minip2p-peer id <addr>` against the same listener and asserts the
+//! one-shot prints a real Identify result and exits 0. Both processes are
 //! killed on drop so a panicking assertion doesn't leave a listener bound
 //! to a UDP port on the test host.
 
@@ -80,6 +82,76 @@ fn listen_and_dial_complete_counted_ping_run() {
     assert!(
         !stderr.contains("direct channel setup failed"),
         "direct dial retried its echo stream setup; stderr:\n{stderr}",
+    );
+
+    // Listener is killed on drop.
+}
+
+#[test]
+fn id_prints_the_listener_identify_and_exits() {
+    let bin = env!("CARGO_BIN_EXE_minip2p-peer");
+
+    let mut listener = KillOnDrop(
+        Command::new(bin)
+            .arg("listen")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn listener"),
+    );
+
+    let listener_stdout = listener.0.stdout.take().expect("listener stdout is piped");
+    let peer_addr = read_bound_line(listener_stdout, TEST_DEADLINE)
+        .expect("listener should print a 'bound=...' line");
+
+    let probe = Command::new(bin)
+        .arg("id")
+        .arg(&peer_addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn id");
+
+    let output =
+        wait_with_deadline(probe, TEST_DEADLINE).expect("id should exit within the test deadline");
+
+    assert!(
+        output.status.success(),
+        "id exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "path-established path=direct",
+        "[id] identify peer=",
+        // The agent string and the echo protocol come from the listener's
+        // own Identify payload, so this is the remote's answer and not
+        // something the prober could have printed from its own config.
+        "agent=minip2p-peer/0.1.0",
+        "/minip2p/echo/1",
+        // A standard libp2p protocol in the advertised set: what makes the
+        // same command useful against a foreign implementation.
+        "/ipfs/ping/1.0.0",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.contains(needle)),
+            "id stdout should contain '{needle}'; got:\n{stdout}",
+        );
+    }
+
+    // Exactly one Identify line: the result is read back from
+    // `peer_readiness` rather than echoed from the event, so a one-shot
+    // never prints its answer twice.
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|l| l.contains("[id] identify peer="))
+            .count(),
+        1,
+        "id should print exactly one identify line; got:\n{stdout}",
     );
 
     // Listener is killed on drop.
