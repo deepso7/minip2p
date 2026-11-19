@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -354,7 +355,10 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     // as the connection's token.
                     let mut endpoint = connection.endpoint(Some(peer));
                     endpoint.set_token(ConnectionToken::new(handshake_hash));
-                    TransportEvent::Connected { id, endpoint }
+                    TransportEvent::Connected {
+                        id,
+                        endpoint: Box::new(endpoint),
+                    }
                 }
                 SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
                     id,
@@ -640,7 +644,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         );
         self.pending.push_back(TransportEvent::IncomingConnection {
             id,
-            endpoint: ConnectionEndpoint::new(remote),
+            endpoint: Box::new(ConnectionEndpoint::new(remote)),
         });
         self.drive_connection(id, SecureMuxSession::start);
     }

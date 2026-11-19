@@ -2,6 +2,7 @@
 //! types, and the private work counters.
 
 use crate::ConnectionCloseReason;
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -63,7 +64,10 @@ impl Transport for FlashTransport {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         queue.push_back(TransportEvent::Connected {
             id,
-            endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), *addr.peer_id()),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                addr.transport().clone(),
+                *addr.peer_id(),
+            )),
         });
         queue.push_back(TransportEvent::Closed {
             id,
@@ -585,7 +589,7 @@ impl ScriptedTransport {
     fn connect(&self, id: ConnectionId, remote: Multiaddr, peer: &PeerId) {
         self.script().queue.push_back(TransportEvent::Connected {
             id,
-            endpoint: ConnectionEndpoint::with_peer_id(remote, *peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(remote, *peer)),
         });
     }
 }

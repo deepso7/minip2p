@@ -775,11 +775,11 @@ mod tests {
                 event_batches: VecDeque::from([
                     vec![TransportEvent::Connected {
                         id: original,
-                        endpoint: endpoint(),
+                        endpoint: Box::new(endpoint()),
                     }],
                     vec![TransportEvent::Connected {
                         id: replacement,
-                        endpoint: endpoint(),
+                        endpoint: Box::new(endpoint()),
                     }],
                 ]),
                 next_stream: 1,
@@ -885,7 +885,7 @@ mod tests {
             Self {
                 events: VecDeque::from([TransportEvent::Connected {
                     id: ConnectionId::new(1),
-                    endpoint,
+                    endpoint: Box::new(endpoint),
                 }]),
                 open_calls: 0,
                 fail_on_call,
@@ -992,12 +992,12 @@ mod tests {
         let transport = IdleTransport {
             initial_events: vec![TransportEvent::Connected {
                 id: ConnectionId::new(1),
-                endpoint: ConnectionEndpoint::with_peer_id(
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                     "/ip4/198.51.100.4/udp/4001/quic-v1"
                         .parse()
                         .expect("endpoint"),
                     Ed25519Keypair::generate().peer_id(),
-                ),
+                )),
             }],
             ..IdleTransport::default()
         };
@@ -1335,7 +1335,10 @@ mod tests {
         // events are buffered when the first is delivered.
         swarm.core_mut().transport_mut().event_batches[1].push(TransportEvent::Connected {
             id: other,
-            endpoint: ConnectionEndpoint::with_peer_id(Multiaddr::new(), other_peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                Multiaddr::new(),
+                other_peer,
+            )),
         });
 
         let _ = swarm.poll().expect("original connection poll");
@@ -1671,10 +1674,10 @@ mod tests {
         fn event(id: u64) -> TransportEvent {
             TransportEvent::Connected {
                 id: ConnectionId::new(id),
-                endpoint: ConnectionEndpoint::with_peer_id(
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
                     Multiaddr::new(),
                     Ed25519Keypair::generate().peer_id(),
-                ),
+                )),
             }
         }
     }
@@ -1888,7 +1891,7 @@ mod tests {
             Self {
                 events: VecDeque::from([TransportEvent::Connected {
                     id: ConnectionId::new(1),
-                    endpoint,
+                    endpoint: Box::new(endpoint),
                 }]),
                 negotiators: BTreeMap::new(),
                 next_stream: 1,
@@ -2275,7 +2278,7 @@ mod tests {
             Self {
                 events: VecDeque::from([TransportEvent::Connected {
                     id: ConnectionId::new(1),
-                    endpoint,
+                    endpoint: Box::new(endpoint),
                 }]),
                 negotiators: BTreeMap::new(),
                 next_stream: 1,

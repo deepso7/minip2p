@@ -147,10 +147,10 @@ fn proofs_completing_in_the_poll_that_replaces_the_connection_promote_nothing() 
     let (first, second) = (conn(1), conn(2));
     let connected = |id| TransportEvent::Connected {
         id,
-        endpoint: ConnectionEndpoint::with_peer_id(
+        endpoint: Box::new(ConnectionEndpoint::with_peer_id(
             "/ip4/192.0.2.7/udp/19877/quic-v1".parse().expect("address"),
             remote.peer_id(),
-        ),
+        )),
     };
     swarm.transport_mut().events.push_back(connected(first));
     drive(&mut swarm, &mut agent, 0);

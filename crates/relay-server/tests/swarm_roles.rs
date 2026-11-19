@@ -114,10 +114,10 @@ fn relay_server_registers_hop_and_stop_with_directional_swarm_roles() {
     let transport = swarm.transport_mut();
     transport.events.push_back(TransportEvent::Connected {
         id: conn_id,
-        endpoint: ConnectionEndpoint::with_peer_id(
+        endpoint: Box::new(ConnectionEndpoint::with_peer_id(
             "/ip4/192.0.2.1/tcp/4001".parse().unwrap(),
             peer,
-        ),
+        )),
     });
     transport
         .events

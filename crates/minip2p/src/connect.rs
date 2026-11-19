@@ -1563,6 +1563,7 @@ impl ConnectEngine {
 #[cfg(test)]
 mod tests {
     use crate::ConnectionCloseReason;
+    use alloc::boxed::Box;
     use alloc::collections::VecDeque;
     use alloc::vec;
     use core::net::{IpAddr, Ipv4Addr};
@@ -1686,7 +1687,10 @@ mod tests {
         fn push_connected(&mut self, id: ConnectionId, peer: PeerId, remote: PeerAddr) {
             self.events.push_back(TransportEvent::Connected {
                 id,
-                endpoint: ConnectionEndpoint::with_peer_id(remote.transport().clone(), peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                    remote.transport().clone(),
+                    peer,
+                )),
             });
         }
 
@@ -1700,8 +1704,10 @@ mod tests {
         ) {
             let mut endpoint = ConnectionEndpoint::with_peer_id(remote.transport().clone(), peer);
             endpoint.set_token(ConnectionToken::new([token; 32]));
-            self.events
-                .push_back(TransportEvent::Connected { id, endpoint });
+            self.events.push_back(TransportEvent::Connected {
+                id,
+                endpoint: Box::new(endpoint),
+            });
         }
 
         /// A circuit through a fixed test relay, as the circuit transport
@@ -1713,7 +1719,7 @@ mod tests {
             ]);
             self.events.push_back(TransportEvent::Connected {
                 id,
-                endpoint: ConnectionEndpoint::with_peer_id(remote, peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(remote, peer)),
             });
         }
 

@@ -951,6 +951,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "mdns"))]
+    use alloc::boxed::Box;
     use alloc::{rc::Rc, vec, vec::Vec};
     use core::cell::Cell;
     use minip2p_core::platform::EntropyError;
@@ -1334,11 +1336,14 @@ mod tests {
             events: vec![
                 TransportEvent::Connected {
                     id: circuit,
-                    endpoint: ConnectionEndpoint::with_peer_id(circuit_addr.clone(), peer),
+                    endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                        circuit_addr.clone(),
+                        peer,
+                    )),
                 },
                 TransportEvent::IncomingConnection {
                     id: direct,
-                    endpoint: ConnectionEndpoint::new(direct_addr.clone()),
+                    endpoint: Box::new(ConnectionEndpoint::new(direct_addr.clone())),
                 },
             ],
             local_address: direct_addr.clone(),
@@ -1377,7 +1382,7 @@ mod tests {
             .events
             .push(TransportEvent::Connected {
                 id: direct,
-                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(direct_addr, peer)),
             });
         endpoint.at(Now::from_millis(1)).poll().expect("poll");
         assert_eq!(endpoint.connection_info(circuit), None, "replaced");
@@ -1416,7 +1421,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: circuit,
-                endpoint: ConnectionEndpoint::with_peer_id(circuit_addr, peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(circuit_addr, peer)),
             }],
             local_address: direct_addr.clone(),
             next_stream_id: 0,
@@ -1443,7 +1448,7 @@ mod tests {
             .events
             .push(TransportEvent::Connected {
                 id: direct,
-                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(direct_addr, peer)),
             });
         let events = endpoint.at(Now::from_millis(2)).poll().expect("poll");
 
@@ -1587,7 +1592,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(address.clone(), remote)),
             }],
             local_address: address.clone(),
             next_stream_id: 0,
@@ -1640,7 +1645,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(address.clone(), remote)),
             }],
             local_address: address,
             next_stream_id: 0,
@@ -1699,7 +1704,7 @@ mod tests {
         let transport = RecordingTransport {
             events: vec![TransportEvent::Connected {
                 id: ConnectionId::new(1),
-                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
+                endpoint: Box::new(ConnectionEndpoint::with_peer_id(address.clone(), remote)),
             }],
             local_address: address,
             next_stream_id: 0,

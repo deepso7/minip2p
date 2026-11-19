@@ -134,15 +134,18 @@ impl InMemoryTransport {
         let [first_queue, second_queue] = &mut queues;
         first_queue.push_back(TransportEvent::Connected {
             id: connection,
-            endpoint: ConnectionEndpoint::with_peer_id(b_addr.clone(), remote_peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                b_addr.clone(),
+                remote_peer,
+            )),
         });
         second_queue.push_back(TransportEvent::IncomingConnection {
             id: connection,
-            endpoint: ConnectionEndpoint::new(a_addr.clone()),
+            endpoint: Box::new(ConnectionEndpoint::new(a_addr.clone())),
         });
         second_queue.push_back(TransportEvent::Connected {
             id: connection,
-            endpoint: ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer)),
         });
         let shared = Rc::new(RefCell::new(InMemoryLink {
             queues,

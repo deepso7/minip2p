@@ -82,6 +82,7 @@ Each item here is gated on measuring first so we only take on complexity that pa
 
 1. **Box cold/large event variants.**
    - Measure `size_of::<TransportEvent>()`, `size_of::<SwarmEvent>()`, and `size_of::<EndpointEvent>()`, then box infrequent large variants (`IdentifyMessage`, `ConnectOutcome`, `ConnectionEndpoint`, `PeerReady` protocol lists) and benchmark `endpoint_throughput` / `endpoint_ping_load`.
+   - **Results.** On 64-bit, `TransportEvent` was 248 bytes, `SwarmEvent` 272, and `EndpointEvent` 272 (280 with every feature); the hot `StreamData` variants are 56 / 136 / 136. Boxing every cold variant brought each enum down to its hot size, but `endpoint_throughput` and `endpoint_ping_load` showed no measurable throughput or allocation change: run-to-run noise dominates. Only the `TransportEvent` boxing was kept (`endpoint: Box<ConnectionEndpoint>`, `previous_peer_id: Option<Box<PeerId>>`, 248 -> 56 bytes, pinned by a size test): it is the transport-facing seam, where nested patterns are rare. `SwarmEvent` and `EndpointEvent` stay unboxed, because their size is driven by `ConnectionReplaced`'s two `Path`s and the `Nat` payload, and boxing those (and `ConnectOutcome`, `GossipsubEvent`, `RelayServerEvent`) breaks the nested patterns applications write, such as `ConnectionReplaced { old_path: Path::Relayed { .. }, .. }`, `Nat(NatEvent::RelayReserved { .. })` and `outcome: ConnectOutcome::Connected { .. }`, which works against this plan's DX goal for no measured gain.
 
 2. **WASM size audit (`twiggy top`) before changing `crates/web`.**
    - Profile `minip2p_web_bg.wasm` with `twiggy top` and `twiggy dominators` to see what actually drives the ~3.6 MB size.
@@ -92,6 +93,7 @@ Each item here is gated on measuring first so we only take on complexity that pa
 
 3. **Zero-alloc `poll(&mut self, now, out: &mut Vec<_>)` (only if benchmarks justify it).**
    - Idle ticks already do not allocate (`Vec::new()` is zero-alloc), and changing `Transport::poll` touches every transport and ~10 test transports. Profile active throughput allocations first (`endpoint_throughput`, `endpoint_ping_load`) before committing to the trait break.
+   - **Results.** Counted with temporary allocation counters on the `Vec`s that `TransportSet::poll` and `SwarmCore::poll` return, during `endpoint_throughput` (tcp, quic, relayed), those `Vec`s account for 1.5–12% of all allocations, depending on the case. That is not worth breaking `Transport::poll` across every transport and test transport, so the trait stays as it is. A possible cheap follow-up: when `TransportSet` has a single member, hand that member's `Vec` through instead of copying it into a new one.
 
 ### 5. Internal maintainability (non-breaking)
 

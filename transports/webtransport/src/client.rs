@@ -833,7 +833,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         };
         self.events.push(TransportEvent::Connected {
             id,
-            endpoint: conn.endpoint.clone(),
+            endpoint: Box::new(conn.endpoint.clone()),
         });
     }
 
