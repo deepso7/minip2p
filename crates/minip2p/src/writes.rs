@@ -13,6 +13,7 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
+use bytes::BytesMut;
 use minip2p_core::{Bytes, PeerId, retain_slice};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamKey, Transport};
@@ -274,12 +275,16 @@ impl WriteQueue {
         if let Some((last, last_counted)) = chunks.back_mut()
             && last.len() + tail.len() <= COALESCE_LIMIT
         {
-            let mut merged = Vec::with_capacity(last.len() + tail.len());
-            merged.extend_from_slice(last);
+            // Grown in place while the queue owns the buffer alone, so a run
+            // of tiny appends is amortized, not a copy of the chunk each.
+            let mut merged = match core::mem::take(last).try_into_mut() {
+                Ok(owned) => owned,
+                Err(shared) => BytesMut::from(&shared[..]),
+            };
             merged.extend_from_slice(&tail);
             self.held = self.held - *last_counted + merged.len();
             *last_counted = merged.len();
-            *last = Bytes::from(merged);
+            *last = merged.freeze();
         } else {
             self.held += counted;
             chunks.push_back((tail, counted));
