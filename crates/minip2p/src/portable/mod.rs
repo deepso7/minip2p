@@ -1585,6 +1585,57 @@ mod tests {
         assert_eq!(report.unfinished, vec![(conn_id, Some(remote))]);
     }
 
+    /// A clock that advances on every read, counting the reads.
+    struct CountingClock {
+        reads: Rc<Cell<u64>>,
+    }
+
+    impl Clock for CountingClock {
+        fn now(&mut self) -> Now {
+            self.reads.set(self.reads.get() + 1);
+            Now::from_millis(self.reads.get())
+        }
+    }
+
+    /// `poll` and the whole of `close` (its `Drop` included, after a failed
+    /// final drive left the peer connected) each sample the clock once.
+    #[test]
+    fn poll_and_close_each_sample_the_clock_once() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([15; 32]);
+        let remote = Ed25519Keypair::from_secret_key_bytes([16; 32]).peer_id();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+        let transport = RecordingTransport {
+            events: vec![TransportEvent::Connected {
+                id: ConnectionId::new(1),
+                endpoint: ConnectionEndpoint::with_peer_id(address.clone(), remote),
+            }],
+            local_address: address,
+            next_stream_id: 0,
+            closed: Rc::new(Cell::new(false)),
+            broken: false,
+        };
+        let reads = Rc::new(Cell::new(0));
+        let mut endpoint = PortableEndpointBuilder::new(
+            &identity,
+            ZeroEntropy,
+            CountingClock {
+                reads: reads.clone(),
+            },
+        )
+        .build(transport)
+        .expect("portable endpoint configuration is valid");
+
+        let before = reads.get();
+        endpoint.poll().expect("connected");
+        assert_eq!(reads.get(), before + 1, "poll samples once");
+        endpoint.engine.core.transport_mut().broken = true;
+
+        let before = reads.get();
+        let report = endpoint.close();
+        assert!(!report.unfinished.is_empty(), "the peer survives the drive");
+        assert_eq!(reads.get(), before + 1, "close and its Drop sample once");
+    }
+
     #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
     #[test]
     fn smoltcp_shutdown_returns_gossipsub_events_still_in_the_agent() {

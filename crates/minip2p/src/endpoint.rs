@@ -56,7 +56,12 @@ pub(crate) type EngineOf<P> =
 ///
 /// Dropping an endpoint disconnects its established peers, best effort, so
 /// a listener is not left on an idle timeout; `close` reports what that
-/// teardown did. Neither helps after `kill -9` or a hard partition.
+/// teardown did. Neither helps after `kill -9` or a hard partition. On a
+/// [`Portable`](crate::Portable) platform a drop can only ask the transport
+/// to close: a transport whose stack the host drives (smoltcp) sends those
+/// closes only when it is polled again, which a dropped endpoint never is.
+/// To notify peers there, [`disconnect`](Self::disconnect) them and keep
+/// polling until their `ConnectionClosed` before closing the endpoint.
 ///
 /// # State snapshots
 ///
