@@ -413,14 +413,19 @@ impl Endpoint {
         }
     }
 
-    /// Drives the endpoint until every accepted write and FIN has gone out
+    /// Drives the endpoint until nothing accepted is pending
     /// ([`Endpoint::has_pending_writes`] is `false`), or `deadline` passes,
     /// and returns which: `true` when drained.
     ///
-    /// For a short-lived sender: `send_stream`, `close_stream_write`, then
-    /// `flush`, then `close`, and the peer gets every byte and the FIN.
-    /// Over QUIC a FIN counts as gone once the peer acknowledged it, so the
-    /// peer must be driving its endpoint for the flush to finish. Returns
+    /// Drained means every byte and FIN the endpoint accepted has been
+    /// handed to the transport, and every FIN on a direct QUIC or TCP stream
+    /// has been sent (over QUIC, acknowledged by the peer, so the peer must
+    /// be driving its endpoint for the flush to finish). Bytes on a stream
+    /// left open are best effort: handed to QUIC, which may still hold them
+    /// for congestion control. Over a relayed connection the FIN is handed
+    /// to the relay, without waiting for its acknowledgement. To deliver
+    /// everything, close the write side before flushing: `send_stream`,
+    /// `close_stream_write`, `flush`, then `close`. Returns
     /// `true` at once when nothing is pending; a passed deadline still
     /// drives once. Events the drive produces stay queued for the next
     /// [`wait`](Self::wait) or [`poll`](Endpoint::poll), and an interrupt

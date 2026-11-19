@@ -883,7 +883,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
     }
 
     /// The platform is done with `handle`'s FIN: it closed the write side,
-    /// or a stop ended it.
+    /// or a stop or reset ended it.
     fn write_closed(&mut self, handle: StreamHandle) {
         for conn in self.connections.values_mut() {
             if conn.closing.remove(&handle) {
@@ -894,6 +894,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
 
     fn on_reset(&mut self, handle: StreamHandle) {
         let Some((id, noise)) = self.owner(handle) else {
+            // A stream retired once both halves closed may still have its
+            // FIN with the platform; the reset ends that wait.
+            self.write_closed(handle);
             return;
         };
         if noise {

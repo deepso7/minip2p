@@ -21,6 +21,8 @@ class FakeStream {
   #reads: ReadableByteStreamController | undefined;
   #writes: WritableStreamDefaultController | undefined;
   closedWrite = false;
+  /** The sink's close fails without a WebTransport stream code. */
+  failClose = false;
   aborted = false;
   abortReason: unknown;
   cancelled = false;
@@ -41,6 +43,9 @@ class FakeStream {
         this.abortReason = reason;
       },
       close: () => {
+        if (this.failClose) {
+          throw new TypeError("close failed");
+        }
         this.closedWrite = true;
       },
       start: (controller) => {
@@ -360,6 +365,18 @@ describe("JsIo", () => {
     expect(() => io.write(stream, new Uint8Array([2]))).toThrow(
       /not writable/u
     );
+  });
+
+  test("a close the browser rejects without a stream code ends the write side as a stop", async () => {
+    const { events, fake, io, stream } = await openedStream();
+    fake.failClose = true;
+
+    io.closeWrite(stream);
+    await flush();
+
+    // Otherwise the FIN would stay pending with the session still open.
+    expect(fake.closedWrite).toBe(false);
+    expect(events()).toEqual([{ code: 0, kind: "stopSending", stream }]);
   });
 
   test("a reset carries its code through Chrome's WebTransportError, and never throws into Rust", async () => {

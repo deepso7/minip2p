@@ -593,10 +593,16 @@ impl<P: Platform> Endpoint<P> {
     /// deferred FIN [`Self::send_stream`] holds, or stream output the
     /// transport has not finished sending.
     ///
-    /// Over TCP output counts until the socket has taken it. Over QUIC it
-    /// counts until the engine has sent it, and a stream's FIN until the
-    /// peer has acknowledged every byte and the FIN. The std `flush` and a
-    /// portable endpoint's `flush` drive the endpoint until this is `false`.
+    /// `false` means every byte and FIN the endpoint accepted has been
+    /// handed to the transport, and every FIN on a direct QUIC or TCP stream
+    /// has been sent: over TCP taken by the socket, over QUIC acknowledged
+    /// by the peer (which covers every byte before it). Bytes on a stream
+    /// left open are best effort: handed to QUIC, which may still hold them
+    /// for congestion control. Over a relayed connection the FIN is handed
+    /// to the relay, without waiting for its acknowledgement. To deliver
+    /// everything, close the write side before flushing. The std `flush`
+    /// and a portable endpoint's `flush` drive the endpoint until this is
+    /// `false`.
     pub fn has_pending_writes(&self) -> bool {
         !self.engine.writes.is_empty() || self.engine.core.transport().has_pending_writes()
     }

@@ -14,7 +14,9 @@
  *   write never views wasm memory, and caps each stream's in-flight bytes;
  *   each accepted write reports exactly one `writeCompleted` with its own
  *   length, and a write the browser rejects reports nothing. `closeWrite`
- *   reports one `writeClosed` once the close resolves (after every write).
+ *   reports one `writeClosed` once the close resolves (after every write),
+ *   or, if it rejects, one `stopSending` (code 0 unless the error has one)
+ *   unless a stop, reset or session end already reported the write side.
  * - Reads are pulled: `grantRead` is additive, at most one read is
  *   outstanding per stream, and `data` never exceeds what was granted.
  * - Handles are never reused, and events for a reset stream or an ended
@@ -281,8 +283,21 @@ export class JsIo {
           stream.writeEnded = true;
           this.#retireIfDone(streamId, stream);
         },
-        // Stopped or reset: `writer.closed` or the reset covers it.
-        () => {}
+        // A stop `writer.closed` already reported, a local reset or an
+        // ended session report themselves; anything else would leave the
+        // FIN pending for good, so it ends the write side as a stop.
+        (error: unknown) => {
+          if (stream.dead || stream.writeEnded) {
+            return;
+          }
+          stream.writeEnded = true;
+          this.#push({
+            code: peerStreamCode(error) ?? 0,
+            kind: "stopSending",
+            stream: streamId,
+          });
+          this.#retireIfDone(streamId, stream);
+        }
       );
     });
   }

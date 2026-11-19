@@ -1014,3 +1014,39 @@ fn a_fin_stays_pending_until_the_platform_reports_it_closed() {
     poll(&mut client);
     assert!(!client.has_pending_writes());
 }
+
+#[test]
+fn a_reset_after_both_halves_closed_ends_the_wait_for_the_fin() {
+    let mut client = client(WebTransportLimits::default());
+    let conn = connect(&mut client);
+    let (stream, handle) = open(&mut client, &conn);
+    client.io_mut().hold_closes = true;
+    client.close_stream_write(conn.id, stream).expect("fin");
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::Fin { stream: handle });
+    assert_eq!(
+        poll(&mut client),
+        [
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn.id,
+                stream_id: stream
+            },
+            TransportEvent::StreamClosed {
+                id: conn.id,
+                stream_id: stream
+            }
+        ]
+    );
+    // Both halves closed, nothing unacknowledged: the stream is retired,
+    // with its FIN still with the platform.
+    assert!(client.has_pending_writes());
+
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: handle,
+        code: 0,
+    });
+    assert!(poll(&mut client).is_empty());
+    assert!(!client.has_pending_writes());
+}

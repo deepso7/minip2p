@@ -81,7 +81,8 @@ pub enum IoEvent {
     WriteCompleted { stream: StreamHandle, bytes: usize },
     /// A [`WebTransportIo::close_write`] resolved: the FIN, after every
     /// accepted write, is the platform's to deliver. A stream stopped or
-    /// reset first reports that instead.
+    /// reset first reports that instead, and a close the platform rejects
+    /// reports [`IoEvent::StopSending`] (code 0 when it carries none).
     WriteClosed { stream: StreamHandle },
 }
 

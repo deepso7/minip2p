@@ -187,11 +187,19 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
     /// transport's readiness; flushing again without polling spins.
     ///
     /// ```ignore
-    /// while !endpoint.flush()? && clock.now() < give_up_at {
+    /// // `give_up_at` is a `Deadline` on the endpoint's clock.
+    /// while !endpoint.flush()? && !give_up_at.is_expired_at(clock.now()) {
     ///     for event in endpoint.poll()? {
     ///         handle(event);
     ///     }
-    ///     wait_until(endpoint.next_deadline()); // or transport readiness
+    ///     // `poll` drives too, and may have sent the last of it.
+    ///     if !endpoint.has_pending_writes() {
+    ///         break;
+    ///     }
+    ///     // Wake for the endpoint (or transport readiness), but never past
+    ///     // the caller's own deadline.
+    ///     let wake = endpoint.next_deadline().map_or(give_up_at, |at| at.min(give_up_at));
+    ///     wait_until(wake);
     /// }
     /// ```
     pub fn flush(&mut self) -> Result<bool, DriverError> {

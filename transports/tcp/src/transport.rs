@@ -928,15 +928,19 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         self.forget(&connection);
         self.by_socket.remove(&connection.socket);
 
+        // Whether the socket already took everything (a flushed connection):
+        // then only the `GoAway` can be left over, and it is best effort.
+        let drained = connection.outbound.is_empty() && !connection.session.has_pending_write();
         // A connection still negotiating has no Yamux session to shut down, so
         // `go_away` refuses and the socket is aborted instead.
         let announced = connection.session.go_away(0).is_ok();
         let flushed = announced && self.pump_and_flush(&mut connection).is_ok();
-        // Anything still buffered would be discarded by the FIN, so only a
-        // fully drained socket can be closed gracefully.
+        // Anything else still buffered would be discarded by the FIN, so
+        // only a socket left with at most the `GoAway` closes gracefully; a
+        // socket too full for the `GoAway` still delivers what it took.
         let graceful = flushed
-            && connection.outbound.is_empty()
-            && !connection.session.has_pending_write()
+            && (drained
+                || (connection.outbound.is_empty() && !connection.session.has_pending_write()))
             && self.provider.close_write(connection.socket).is_ok();
         if !graceful {
             self.provider.abort(connection.socket);

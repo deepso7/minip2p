@@ -559,17 +559,21 @@ fn a_local_close_retracts_queued_writables() {
 }
 
 #[test]
-fn bytes_the_congestion_window_holds_back_still_count_as_pending() {
+fn a_fin_behind_bytes_the_engine_holds_stays_pending_until_acknowledged() {
     let mut server = server_with_queue(1 << 20);
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
     let raw = open_streams(&mut server, &mut peer, &[b"hi"])[0];
+    let _ = peer.read(raw);
+    let stream = StreamId::new(raw);
 
-    // Far past the initial congestion window, on a stream left open: the
-    // engine takes it all, but without the peer's acknowledgements most of
-    // it stays in the engine.
+    // Far past the initial congestion window, then the FIN: the engine
+    // takes it all, but without the peer's acknowledgements most of it
+    // stays in the engine. Only the FIN's acknowledgement says it left.
+    const LEN: usize = 256 * 1024;
     server
-        .send_stream(id, StreamId::new(raw), Bytes::from(vec![7; 256 * 1024]))
+        .send_stream(id, stream, Bytes::from(vec![7; LEN]))
         .expect("send");
+    server.close_stream_write(id, stream).expect("fin");
     for _ in 0..3 {
         server.poll(now()).expect("poll");
     }
@@ -578,19 +582,28 @@ fn bytes_the_congestion_window_holds_back_still_count_as_pending() {
         0,
         "the engine took it all"
     );
-    assert!(
-        server.has_pending_writes(),
-        "the engine still holds most of it"
-    );
+    assert!(server.has_pending_writes(), "the FIN is not acknowledged");
 
+    let (mut received, mut fin) = (0, false);
     let start = Instant::now();
     while server.has_pending_writes() {
         assert!(start.elapsed() < Duration::from_secs(20), "never drained");
         std::thread::sleep(Duration::from_millis(1));
         peer.pump();
         server.poll(now()).expect("poll");
-        let _ = peer.read(raw);
+        let (data, done) = peer.read(raw);
+        received += data.len();
+        fin |= done;
     }
+    // Drained means acknowledged: the peer has every byte and the FIN.
+    for _ in 0..3 {
+        peer.pump();
+        let (data, done) = peer.read(raw);
+        received += data.len();
+        fin |= done;
+    }
+    assert_eq!(received, LEN);
+    assert!(fin);
 }
 
 #[test]

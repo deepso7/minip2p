@@ -558,6 +558,52 @@ fn closing_a_socket_that_cannot_flush_aborts_instead_of_truncating() {
 }
 
 #[test]
+fn closing_a_flushed_socket_too_full_for_the_go_away_still_half_closes() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The last bytes and FIN reach the socket, which then has no room left:
+    // the `GoAway` cannot follow, but aborting would discard what it took.
+    pair.dialer
+        .send_stream(id, stream, Bytes::from_static(b"last"))
+        .expect("send");
+    pair.dialer.close_stream_write(id, stream).expect("fin");
+    let _ = pair.dialer.poll(Now::from_millis(0)).expect("flush");
+    assert!(!pair.dialer.has_pending_writes(), "the socket took it all");
+    let full = pair.dialer.provider().bytes_in_flight_to_peer();
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(full));
+    let (close_writes, aborts) = (
+        pair.dialer.provider().close_write_calls(),
+        pair.dialer.provider().abort_calls(),
+    );
+
+    pair.dialer.close(id).expect("close");
+    assert_eq!(pair.dialer.provider().close_write_calls(), close_writes + 1);
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts);
+
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let received: Vec<u8> = listener_events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(received, b"last");
+    assert!(
+        listener_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { .. })),
+        "the FIN arrives: {listener_events:?}"
+    );
+}
+
+#[test]
 fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
     let mut pair = upgraded_pair();
     let id = pair.connection;

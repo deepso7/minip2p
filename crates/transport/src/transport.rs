@@ -236,11 +236,13 @@ pub trait Transport {
     ///
     /// What counts is everything the transport itself still holds: bytes
     /// queued behind a full send buffer or a peer's flow-control window, and
-    /// frames not yet handed to the socket. A transport that can also tell
-    /// when the peer has acknowledged a stream's end counts a FIN until then
-    /// (QUIC does: a finished stream is pending until the peer has
-    /// acknowledged every byte and the FIN). Bytes on a stream left open
-    /// count once the transport has sent them, acknowledged or not.
+    /// frames not yet handed to the socket or protocol engine. A transport
+    /// that can also tell when the peer has acknowledged a stream's end
+    /// counts a FIN until then (QUIC does: a finished stream is pending
+    /// until the peer has acknowledged every byte and the FIN). Bytes on a
+    /// stream left open are best effort: they stop counting once handed on,
+    /// though an engine (QUIC's congestion control) may still hold them. To
+    /// deliver everything, close the write side before flushing.
     ///
     /// Hosts drive the transport until this is `false` before closing
     /// connections, so a short-lived sender does not cut off its last
