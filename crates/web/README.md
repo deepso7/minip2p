@@ -31,11 +31,11 @@ The build uses the workspace's `wasm-release` profile (`opt-level = "z"`, LTO, o
 
 Sizes of `minip2p_web_bg.wasm` (gzip `-9`, brotli `11`):
 
-| Build                            | Raw       | gzip    | brotli  |
-| -------------------------------- | --------- | ------- | ------- |
-| default (`pubsub`)               | 1,438,574 | 409,111 | 308,935 |
-| `--no-default-features`          | 1,242,962 | 361,525 | 274,749 |
-| default, `MINIP2P_WASM_NAMES=1`  | 3,813,658 | 585,219 | 404,338 |
+| Build                           | Raw       | gzip    | brotli  |
+| ------------------------------- | --------- | ------- | ------- |
+| default (`pubsub`)              | 1,438,574 | 409,111 | 308,935 |
+| `--no-default-features`         | 1,242,962 | 361,525 | 274,749 |
+| default, `MINIP2P_WASM_NAMES=1` | 3,813,658 | 585,219 | 404,338 |
 
 The default `pubsub` feature compiles in Gossipsub. Without it (`cargo build -p minip2p-web --no-default-features …`, then `wasm-bindgen` as `bindings/ts/web/scripts/build-wasm.mjs` runs it), the generated JavaScript glue is the same, `subscribe`, `unsubscribe` and `publish` refuse with `NotPermitted`, and `allowUnsigned` is rejected as `InvalidConfig`. That build suits apps that use only streams and relays. The published `@minip2p/web` package keeps `pubsub`.
 
