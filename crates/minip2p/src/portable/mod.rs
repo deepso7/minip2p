@@ -3,7 +3,6 @@ extern crate alloc;
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::string::String;
-#[cfg(any(feature = "smoltcp", feature = "relay-server"))]
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -170,6 +169,26 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
     pub fn next_deadline(&mut self) -> Option<Deadline> {
         let now = self.now();
         self.engine.next_deadline(now)
+    }
+
+    /// Drives queued writes and FINs one batch further onto the wire and
+    /// returns whether none is left ([`Endpoint::has_pending_writes`]).
+    ///
+    /// Never blocks: a host that is about to close, or to stop driving the
+    /// endpoint, calls it until it returns `true` or its own deadline
+    /// passes, waiting on [`Self::next_deadline`] (and its transport's
+    /// readiness) in between. Returns `true` at once, without a drive, when
+    /// nothing is pending. Events the drive produced stay queued for the
+    /// next [`poll`](Endpoint::poll) or [`close`](Endpoint::close); an error
+    /// discards nothing either.
+    pub fn flush(&mut self) -> Result<bool, DriverError> {
+        if !self.has_pending_writes() {
+            return Ok(true);
+        }
+        let now = self.now();
+        let names = crate::platform::sealed::Sealed::names(&mut self.platform);
+        self.engine.drive(now, names)?;
+        Ok(!self.has_pending_writes())
     }
 
     /// [`Endpoint::close`] on a portable platform; see its docs.

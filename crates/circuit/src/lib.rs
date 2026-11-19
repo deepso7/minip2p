@@ -1110,6 +1110,17 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         Ok(self.drain_pending_events())
     }
 
+    /// A circuit's ciphertext the bridge refused, or its session still
+    /// holding output, or the inner transport's own pending writes (which
+    /// carry the circuits' bridges too).
+    fn has_pending_writes(&self) -> bool {
+        self.inner.has_pending_writes()
+            || self
+                .circuits
+                .values()
+                .any(|circuit| circuit.bridge_tail.is_some() || circuit.session.has_unsent_writes())
+    }
+
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
             // Buffered circuit events are due regardless of what the host's

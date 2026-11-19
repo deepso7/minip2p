@@ -184,6 +184,11 @@ impl WriteQueue {
         self.held
     }
 
+    /// Whether no stream has bytes or a deferred FIN held.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     /// Whether the stream has queued bytes (or a FIN behind them).
     pub(crate) fn is_pending(&self, stream: StreamKey) -> bool {
         self.streams.contains_key(&stream)

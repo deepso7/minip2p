@@ -1499,6 +1499,18 @@ impl Transport for QuicTransport {
         Ok(std::mem::take(&mut self.pending_events))
     }
 
+    /// Datagrams waiting on socket writability, or, on a connection that
+    /// is not closing, stream bytes or FINs still queued, output a service
+    /// left unfinished, or a FIN its peer has not acknowledged yet (see
+    /// [`Transport::has_pending_writes`]).
+    fn has_pending_writes(&self) -> bool {
+        self.sockets.iter().any(Socket::has_pending)
+            || self
+                .connections
+                .values()
+                .any(QuicConnection::has_pending_writes)
+    }
+
     fn next_deadline(&self) -> Option<Deadline> {
         // Events buffered outside a poll -- `listen`, `open_stream`,
         // `send_stream`, `close_stream_write` and `reset_stream` all queue

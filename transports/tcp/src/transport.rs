@@ -982,6 +982,16 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         Ok(self.drain_pending_events())
     }
 
+    /// Bytes the socket has not taken yet, or a session still holding
+    /// frames or window-blocked stream bytes. What the socket took is the
+    /// operating system's (or the provider's stack's) to deliver.
+    fn has_pending_writes(&self) -> bool {
+        self.connections.values().any(|connection| {
+            !connection.outbound.is_empty()
+                || (connection.linked && connection.session.has_unsent_writes())
+        })
+    }
+
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
             // Buffered events are due regardless of what the host's clock

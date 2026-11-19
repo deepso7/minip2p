@@ -717,6 +717,14 @@ impl YamuxSession {
         !self.control_due.is_empty() || !self.sendable.is_empty()
     }
 
+    /// Whether accepted stream bytes or a `FIN` are still waiting to be
+    /// framed: a frame [`has_frames`](Self::has_frames) would hand out now,
+    /// or bytes held back by the peer's window. What a host drains before
+    /// closing the session.
+    pub fn has_unsent(&self) -> bool {
+        self.total_buffered_send != 0 || self.has_frames()
+    }
+
     /// Returns the number of currently tracked streams.
     #[cfg(test)]
     pub fn stream_count(&self) -> usize {

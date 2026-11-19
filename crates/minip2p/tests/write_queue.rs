@@ -326,28 +326,38 @@ fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
         .close_stream_write(stream)
         .expect("close write");
 
-    let (mut accepted, mut received) = (0, Vec::new());
-    'transfer: loop {
+    // `flush` drives the writer without handing out its events: they are
+    // all still there for the poll after it.
+    let (mut received, mut fin) = (Vec::new(), false);
+    let mut flushed = false;
+    while !flushed || !fin {
         assert!(
             Instant::now() < deadline,
             "transfer stalled at {} bytes",
             received.len()
         );
         let now = clock.now();
-        for event in writer.at(now).poll().expect("writer polls") {
-            if matches!(event, EndpointEvent::StreamWriteAccepted { stream: s, .. } if s == stream)
-            {
-                accepted += 1;
-            }
+        if !flushed {
+            flushed = writer.at(now).flush().expect("writer flushes");
         }
         for event in reader.at(now).poll().expect("reader polls") {
             match event {
                 EndpointEvent::StreamData { data, .. } => received.extend_from_slice(&data),
-                EndpointEvent::StreamRemoteWriteClosed { .. } => break 'transfer,
+                EndpointEvent::StreamRemoteWriteClosed { .. } => fin = true,
                 _ => {}
             }
         }
     }
+    assert!(!writer.has_pending_writes());
+    let accepted = writer
+        .at(clock.now())
+        .poll()
+        .expect("writer polls")
+        .iter()
+        .filter(|event| {
+            matches!(event, EndpointEvent::StreamWriteAccepted { stream: s, .. } if *s == stream)
+        })
+        .count();
     assert_eq!(accepted, 1, "the queued write completes exactly once");
     assert!(
         received == payload,

@@ -413,6 +413,36 @@ impl Endpoint {
         }
     }
 
+    /// Drives the endpoint until every accepted write and FIN has gone out
+    /// ([`Endpoint::has_pending_writes`] is `false`), or `deadline` passes,
+    /// and returns which: `true` when drained.
+    ///
+    /// For a short-lived sender: `send_stream`, `close_stream_write`, then
+    /// `flush`, then `close`, and the peer gets every byte and the FIN.
+    /// Over QUIC a FIN counts as gone once the peer acknowledged it, so the
+    /// peer must be driving its endpoint for the flush to finish. Returns
+    /// `true` at once when nothing is pending; a passed deadline still
+    /// drives once. Events the drive produces stay queued for the next
+    /// [`wait`](Self::wait) or [`poll`](Endpoint::poll), and an interrupt
+    /// from a [`WaitHandle`] does not end the flush (the next `wait`
+    /// reports it). `close_within` flushes first, within its own timeout.
+    pub fn flush(&mut self, deadline: impl Into<WaitDeadline>) -> Result<bool, Error> {
+        let deadline = deadline.into();
+        while self.has_pending_writes() {
+            self.harvest(Duration::ZERO)?;
+            let now = self.now();
+            self.drive(now)?;
+            if !self.has_pending_writes() {
+                break;
+            }
+            if deadline.has_passed() {
+                return Ok(false);
+            }
+            self.block(deadline)?;
+        }
+        Ok(true)
+    }
+
     /// Runs one engine batch, with Name resolution as candidate expansion.
     fn drive(&mut self, now: Now) -> Result<(), Error> {
         self.engine.drive(now, &mut self.platform.resolver)
@@ -520,15 +550,17 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Disconnects established peers, waits up to `timeout` until no
-    /// connection is tracked, and consumes the endpoint. A dial still
-    /// pending is tracked: the drain waits for it to fail, or to establish
-    /// and then be disconnected.
+    /// Flushes accepted writes, disconnects established peers, waits up to
+    /// `timeout` until no connection is tracked, and consumes the endpoint.
+    /// A dial still pending is tracked: the drain waits for it to fail, or
+    /// to establish and then be disconnected.
     ///
-    /// The deadline bounds teardown time only, not delivery of accepted
-    /// writes: QUIC discards queued writes and TCP may abort. With
-    /// [`Duration::ZERO`] this is an immediate best-effort teardown: one
-    /// pass disconnects and hands over what is already queued. Running out
+    /// First it [`flush`](Self::flush)es, within the same `timeout`, so
+    /// bytes and FINs the endpoint accepted go out before the connections
+    /// close; what is still pending when the deadline passes is lost (QUIC
+    /// discards it and TCP may abort). With [`Duration::ZERO`] this is an
+    /// immediate best-effort teardown: one pass flushes once, disconnects,
+    /// and hands over what is already queued. Running out
     /// the deadline is [`CloseOutcome::DeadlineExpired`], not an error, and
     /// [`CloseReport::unfinished`] lists what was still tracked.
     ///
@@ -555,6 +587,12 @@ impl Endpoint {
         #[cfg(feature = "mdns")]
         drop(self.shutdown_mdns());
         let drain_by = std::time::Instant::now() + timeout;
+        // Accepted writes go out before the connections close. A failed
+        // flush is the drain's failure; teardown still runs.
+        if let Err(error) = self.flush(drain_by) {
+            report.errors.push(error);
+            report.outcome = CloseOutcome::Failed;
+        }
         loop {
             let now = self.now();
             report.errors.extend(self.disconnect_established(now));

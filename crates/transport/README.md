@@ -115,6 +115,8 @@ impl Transport for MyTransport {
 
 `local_addresses_revision` lets the swarm cache the address list Identify advertises. Return a counter that advances whenever `local_addresses` may report something different -- a new listener, or an interface address a wildcard listener answers on -- and never goes backwards (`TransportSet` adds its members' counters). The default, `None`, makes the swarm re-read `local_addresses` on every poll, which is always correct.
 
+`has_pending_writes` reports whether stream bytes or FINs the transport accepted are still on their way out: queued behind a full send buffer or a flow-control window, or not yet handed to the socket. A transport that knows when the peer acknowledged a stream's end counts its FIN until then (QUIC does). Hosts drive the transport until it is `false` before closing connections (`Endpoint::flush`, and `close_within` first thing). The default, `false`, suits a transport that writes through at once.
+
 `send_datagram` is the one method most adapters should leave alone. It sends a single packet outside any connection, which is what DCUtR's simultaneous open needs before a connection exists to carry one, and the default answer is `TransportError::Unsupported` — the honest one for a stream transport, which has nowhere to put a lone packet. Callers read that as "not available here" rather than as a failed send.
 
 ## Time

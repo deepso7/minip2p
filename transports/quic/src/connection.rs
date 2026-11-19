@@ -227,6 +227,10 @@ pub(crate) struct QuicConnection {
     caps: SendCaps,
     /// Streams whose last write was Full and that want a `StreamWritable`.
     writable_armed: BTreeSet<u64>,
+    /// Streams whose FIN the engine took but whose bytes and FIN the peer
+    /// has not all acknowledged yet (the engine's `Finished`): still being
+    /// delivered, so [`Self::has_pending_writes`] counts them.
+    unacked_fins: BTreeSet<u64>,
     /// Streams that spent their receive budget with input still waiting in
     /// the engine. The engine raises `Readable` only when data arrives, so
     /// `ack_stream` rescans these.
@@ -298,6 +302,7 @@ impl QuicConnection {
                 limits.control_stream_reserve_bytes,
             ),
             writable_armed: BTreeSet::new(),
+            unacked_fins: BTreeSet::new(),
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
             timeout: None,
@@ -384,6 +389,15 @@ impl QuicConnection {
 
     /// Whether the last service left work that needs another without any
     /// packet or timer to prompt it.
+    /// Whether accepted stream output is still on its way: bytes or FINs
+    /// queued here, output the socket pushed back, or a FIN the peer has not
+    /// acknowledged yet. Bytes on a stream left open count once the engine
+    /// took them. A closing connection has dropped its writes.
+    pub(crate) fn has_pending_writes(&self) -> bool {
+        !self.is_closing()
+            && (!self.send_queues.is_empty() || !self.unacked_fins.is_empty() || self.unfinished)
+    }
+
     pub(crate) fn is_unfinished(&self) -> bool {
         self.unfinished
     }
@@ -548,6 +562,7 @@ impl QuicConnection {
             // it out in turn, rather than to the stream it names.
             Event::Stream(StreamEvent::Writable { .. }) => {}
             Event::Stream(StreamEvent::Finished { id }) => {
+                self.unacked_fins.remove(&u64::from(id));
                 if let Some(wt) = self.wt.as_mut() {
                     wt.on_send_done(u64::from(id));
                 }
@@ -1023,6 +1038,7 @@ impl QuicConnection {
     /// reported as the WebTransport code it carries; any other passes
     /// through unchanged.
     fn on_stopped(&mut self, raw: u64, error_code: VarInt, events: &mut Vec<TransportEvent>) {
+        self.unacked_fins.remove(&raw);
         match self.conn.send_stream(engine_stream(raw)).reset(error_code) {
             Ok(()) | Err(_) => {}
         }
@@ -1325,6 +1341,7 @@ impl QuicConnection {
         self.stream_state_mut(stream_id)?;
         self.drop_send_queue(raw);
         self.writable_armed.remove(&raw);
+        self.unacked_fins.remove(&raw);
         self.gated.remove(&raw);
         // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
@@ -1486,6 +1503,7 @@ impl QuicConnection {
         self.send_order.clear();
         self.pending_write_bytes = 0;
         self.writable_armed.clear();
+        self.unacked_fins.clear();
     }
 
     /// Pushes queued writes into the engine, round-robin: each stream in turn
@@ -1529,7 +1547,9 @@ impl QuicConnection {
             };
             if front.fin {
                 match self.conn.send_stream(stream).finish() {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        self.unacked_fins.insert(raw);
+                    }
                     Err(FinishError::Stopped(error_code)) => {
                         self.on_stopped(raw, error_code, events);
                         return progressed;

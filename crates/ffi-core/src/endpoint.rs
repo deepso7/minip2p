@@ -425,9 +425,9 @@ impl P2pEndpoint {
     /// A running driver then closes the endpoint, draining for up to
     /// `timeout_ms` (`0` tears down at once, best effort), and reports how
     /// that went as its last event, [`P2pEvent::EndpointClosed`](crate::P2pEvent::EndpointClosed);
-    /// [`P2pEndpoint::wait_stopped`] returns once it has. The deadline
-    /// bounds teardown time only, not delivery of accepted writes: QUIC
-    /// discards queued writes and TCP may abort. Only the first `stop`
+    /// [`P2pEndpoint::wait_stopped`] returns once it has. The drain flushes
+    /// accepted writes and FINs first, within the same deadline; what is
+    /// still unsent when it passes is lost. Only the first `stop`
     /// sets the deadline. A never-started endpoint is released at once, with
     /// no event.
     ///

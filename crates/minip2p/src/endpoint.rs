@@ -586,6 +586,18 @@ impl<P: Platform> Endpoint<P> {
         self.engine.writes.is_closing(stream)
     }
 
+    /// Whether accepted writes are still on their way out: bytes or a
+    /// deferred FIN [`Self::send_stream`] holds, or stream output the
+    /// transport has not finished sending.
+    ///
+    /// Over TCP output counts until the socket has taken it. Over QUIC it
+    /// counts until the engine has sent it, and a stream's FIN until the
+    /// peer has acknowledged every byte and the FIN. The std `flush` and a
+    /// portable endpoint's `flush` drive the endpoint until this is `false`.
+    pub fn has_pending_writes(&self) -> bool {
+        !self.engine.writes.is_empty() || self.engine.core.transport().has_pending_writes()
+    }
+
     /// Bytes [`Self::send_stream`] holds across every stream, as charged
     /// against the write budget.
     pub fn queued_write_bytes(&self) -> usize {

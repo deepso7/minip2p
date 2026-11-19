@@ -149,7 +149,7 @@ endpoint.close();
 3. stops the endpoint, letting native disconnect peers and drain for up to `timeoutMs` (`0` tears down at once, best effort);
 4. once the drain finishes, invokes each `onClose` observer once and resolves with the same report.
 
-The deadline bounds teardown time only, not delivery of accepted writes: QUIC discards queued writes and TCP may abort. The report is `{ reason, outcome?, unfinished }`. `reason` is the `EndpointCloseReason`: `"close"`, or `"driverFailed"` (with `error`) when the native driver failed and the endpoint tore down at once. `outcome` (only for `"close"`) is `Drained`, `DeadlineExpired` (running out is not an error), or `Failed` (driving the transports failed and ended the drain early). `unfinished` lists the peers whose connections were still tracked when the drain ended; empty means no tracked teardown remains, not that peers acknowledged it. The Promise never rejects.
+Native first flushes the bytes and FINs it already accepted, within the same deadline; what is still unsent when it passes is lost (QUIC discards it and TCP may abort). The report is `{ reason, outcome?, unfinished }`. `reason` is the `EndpointCloseReason`: `"close"`, or `"driverFailed"` (with `error`) when the native driver failed and the endpoint tore down at once. `outcome` (only for `"close"`) is `Drained`, `DeadlineExpired` (running out is not an error), or `Failed` (driving the transports failed and ended the drain early). `unfinished` lists the peers whose connections were still tracked when the drain ended; empty means no tracked teardown remains, not that peers acknowledged it. The Promise never rejects.
 
 ```ts
 endpoint.onClose((report) => {

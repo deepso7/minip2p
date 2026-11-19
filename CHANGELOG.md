@@ -4,6 +4,14 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### `flush`, and close flushes first
+
+A short-lived sender can now wait for its last bytes and FIN to leave before it closes ([ADR 0032](docs/adr/0032-flush-and-flush-before-close.md)).
+
+- **New `Endpoint::flush(deadline) -> Result<bool, Error>` (std)** drives the endpoint until every accepted write and FIN has gone out, or the deadline passes, and returns whether it drained; **`flush() -> Result<bool, DriverError>` on a portable endpoint** drives one batch and returns the same, for the host to repeat. **`has_pending_writes()`** reports it without driving. Replace a `for _ in 0..16 { endpoint.wait(Duration::ZERO)?; }` loop before exit with `endpoint.flush(Duration::from_secs(2))?`, or just `close()`.
+- **`close_within(timeout)` (and `close()`, and the bindings' stop and close) flush first, within the same timeout.** Writes that used to be discarded at close now arrive; `close_within(Duration::ZERO)` runs one flush drive first.
+- **`Transport` gains `has_pending_writes(&self) -> bool`**, defaulting to `false`. QUIC, TCP, WebTransport, `TransportSet` and `CircuitTransport` implement it; an out-of-tree transport that buffers writes should too. `YamuxSession::has_unsent` and `SecureMuxSession::has_unsent_writes` report what a session still holds.
+
 ### Protocol handles
 
 Each registered application protocol now has a `ProtocolId`, a `Copy` handle numbered by the endpoint ([ADR 0031](docs/adr/0031-interned-protocol-handles.md)). The TypeScript SDKs and the binding events are unchanged.

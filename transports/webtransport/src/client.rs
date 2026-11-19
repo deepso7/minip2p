@@ -1299,6 +1299,18 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         Ok(mem::take(&mut self.events))
     }
 
+    /// Bytes not yet reported written by the platform, or a FIN still
+    /// queued behind them.
+    fn has_pending_writes(&self) -> bool {
+        self.connections.values().any(|session| {
+            session.pending != 0
+                || session
+                    .streams
+                    .values()
+                    .any(|stream| stream.write == Write::FinQueued)
+        })
+    }
+
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.events.is_empty() {
             return Some(Deadline::IMMEDIATE);

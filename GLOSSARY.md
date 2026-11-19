@@ -130,6 +130,8 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Write queue**: The Endpoint's bounded holder of the unsent tails of `send_stream` writes, in call order per stream, within a byte budget shared by every stream (`write_budget`; `0` opts out). It resends them on Writable, sends a deferred write-side close behind them, and reports `StreamWriteAccepted` once they are all accepted (never delivered) or `StreamWriteAborted` when their stream or connection ends first. `try_send_stream` bypasses it. The FFI core and the web host use the same one (ADR 0030). _Avoid_: stream writer, buffered stream
 
+**Flush**: Driving an endpoint until every write and FIN it accepted has gone out (`has_pending_writes()` is false), or a deadline passes. Gone out means taken by the socket over TCP, and over QUIC sent by the engine, with a FIN acknowledged by the peer. `close_within` flushes before it disconnects (ADR 0032). Distinct from delivery to the peer's application. _Avoid_: drain (that is close's teardown wait)
+
 **Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 
 **Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, and after its connection ends, so stream churn cannot grow retained receive data. Acknowledging or abandoning its bytes still settles it after the connection is gone. _Avoid_: zombie stream, lingering stream
