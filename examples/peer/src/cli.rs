@@ -18,7 +18,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use minip2p::{ConnectOutcome, EndpointEvent, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p::{
+    ConnectOutcome, ConnectionId, EndpointEvent, IdentifyMessage, Multiaddr, PeerAddr, PeerId,
+    Protocol,
+};
 use minip2p_example_common::{CliError, print_nat_event};
 
 /// The modes the CLI dispatches to.
@@ -280,6 +283,31 @@ fn require_supported_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result
     }
 }
 
+/// Prints one Identify result in the CLI's one-line format.
+///
+/// Shared by [`print_event`] and `id`, which reads the same message back
+/// from `Endpoint::peer_readiness` rather than catching the event, so both
+/// paths cannot drift into printing different fields.
+pub fn print_identify(
+    role: &str,
+    peer_id: &PeerId,
+    conn_id: &ConnectionId,
+    info: &IdentifyMessage,
+) {
+    let agent = info.agent_version.as_deref().unwrap_or("?");
+    let nprotos = info.protocols.len();
+    let protocols = format_protocols(&info.protocols);
+    let observed = info
+        .observed_addr
+        .as_deref()
+        .and_then(|bytes| Multiaddr::from_bytes(bytes).ok())
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "?".into());
+    println!(
+        "[{role}] identify peer={peer_id} conn={conn_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
+    );
+}
+
 /// Prints an [`EndpointEvent`] in the CLI's one-event-per-line format.
 ///
 /// `role` is the tag shown in brackets at the start of the line
@@ -301,20 +329,7 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
             peer_id,
             conn_id,
             info,
-        } => {
-            let agent = info.agent_version.as_deref().unwrap_or("?");
-            let nprotos = info.protocols.len();
-            let protocols = format_protocols(&info.protocols);
-            let observed = info
-                .observed_addr
-                .as_deref()
-                .and_then(|bytes| Multiaddr::from_bytes(bytes).ok())
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "?".into());
-            println!(
-                "[{role}] identify peer={peer_id} conn={conn_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
-            );
-        }
+        } => print_identify(role, peer_id, conn_id, info),
         EndpointEvent::PeerReady {
             peer_id,
             conn_id,
