@@ -116,6 +116,10 @@ impl SendError {
     }
 }
 
+/// Appends that fit in the last queued chunk up to this size are copied into
+/// it rather than queued as chunks of their own.
+const COALESCE_LIMIT: usize = 16 * 1024;
+
 /// One stream's queued bytes, oldest first.
 struct Held {
     peer_id: PeerId,
@@ -256,16 +260,30 @@ impl WriteQueue {
                 }
             },
         };
-        self.held += counted;
-        self.streams
+        let chunks = &mut self
+            .streams
             .entry(stream)
             .or_insert_with(|| Held {
                 peer_id,
                 chunks: VecDeque::new(),
                 close_after: false,
             })
-            .chunks
-            .push_back((tail, counted));
+            .chunks;
+        // Small appends join the last chunk, so a slow reader's tiny writes
+        // cost their bytes, not one queue entry each.
+        if let Some((last, last_counted)) = chunks.back_mut()
+            && last.len() + tail.len() <= COALESCE_LIMIT
+        {
+            let mut merged = Vec::with_capacity(last.len() + tail.len());
+            merged.extend_from_slice(last);
+            merged.extend_from_slice(&tail);
+            self.held = self.held - *last_counted + merged.len();
+            *last_counted = merged.len();
+            *last = Bytes::from(merged);
+        } else {
+            self.held += counted;
+            chunks.push_back((tail, counted));
+        }
         Ok(())
     }
 
@@ -478,6 +496,35 @@ mod tests {
             )),
             Err(SendError::Closing { .. })
         ));
+    }
+
+    #[test]
+    fn tiny_appends_join_the_last_chunk() {
+        let stream = StreamKey::new(ConnectionId::new(1), StreamId::new(1));
+        let peer_id = Ed25519Keypair::from_secret_key_bytes([1; 32]).peer_id();
+        let mut queue = WriteQueue::new(1 << 20);
+        queue
+            .send(stream, peer_id, Bytes::from(vec![0; 4]), |data| {
+                Err(DriverError::Full {
+                    conn_id: stream.conn_id(),
+                    stream_id: stream.stream_id(),
+                    unsent: data,
+                })
+            })
+            .expect("queued");
+        for byte in 1..=200u8 {
+            queue
+                .send(stream, peer_id, Bytes::from(vec![byte]), |_| {
+                    panic!("a queued stream is not sent to")
+                })
+                .expect("appended");
+        }
+        let chunks = &queue.streams[&stream].chunks;
+        assert_eq!(chunks.len(), 1, "200 one-byte appends share one chunk");
+        assert_eq!(queue.held_bytes(), 204);
+        let (bytes, _) = &chunks[0];
+        assert_eq!(bytes[..4], [0; 4]);
+        assert_eq!(bytes[4..], (1..=200u8).collect::<Vec<_>>()[..]);
     }
 
     #[test]

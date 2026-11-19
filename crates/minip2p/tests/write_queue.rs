@@ -422,3 +422,38 @@ fn a_bare_write_waiting_on_writable_is_woken_after_the_queue_drains() {
     }
     assert!(!unsent.is_empty());
 }
+
+/// A write-side close between the queue's completion and the wakeup it
+/// forwards drops that wakeup: no Writable asks for a resend after the FIN.
+#[test]
+fn a_close_after_the_queue_drains_drops_the_stale_wakeup() {
+    let mut reader = bind(0);
+    let mut writer = bind(2 * PAYLOAD);
+    let stream = open(&mut writer, &mut reader);
+
+    let SendOutcome::Full { .. } = writer.try_send_stream(stream, payload()).expect("try") else {
+        panic!("a write past the send caps is not accepted whole");
+    };
+    writer.send_stream(stream, payload()).expect("queued");
+
+    let deadline = Instant::now() + BACKSTOP;
+    let mut closed = false;
+    let mut remote_closed = false;
+    while !remote_closed {
+        assert!(Instant::now() < deadline, "the FIN never arrived");
+        if let Some(EndpointEvent::StreamRemoteWriteClosed { .. }) = next(&mut reader) {
+            remote_closed = true;
+        }
+        match next(&mut writer) {
+            Some(EndpointEvent::StreamWriteAccepted { stream: s, .. }) if s == stream => {
+                writer.close_stream_write(stream).expect("close");
+                closed = true;
+            }
+            Some(EndpointEvent::StreamWritable { stream: s, .. }) if s == stream => {
+                assert!(!closed, "a Writable followed the FIN");
+            }
+            _ => {}
+        }
+    }
+    assert!(closed);
+}

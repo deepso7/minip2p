@@ -351,9 +351,20 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             stream.stream_id(),
             now.monotonic_ms,
         )?;
-        // No Writable follows a FIN, so none can clear a waiting bare writer.
+        // No Writable follows a FIN, so none can clear a waiting bare writer,
+        // and one still queued here is stale.
         self.writes.unwant_writable(stream);
+        self.drop_queued_writable(&peer_id, stream);
         Ok(())
+    }
+
+    /// Drops a `StreamWritable` still queued for `stream`, whose write side
+    /// just ended: it would tell the application to resend after the FIN.
+    fn drop_queued_writable(&mut self, peer_id: &PeerId, stream: StreamKey) {
+        self.events.retain(|event| {
+            !(matches!(event, EndpointEvent::StreamWritable { .. })
+                && event.matches_stream(peer_id, stream))
+        });
     }
 
     /// Resets an application stream, aborting what the write queue held.
@@ -365,6 +376,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             stream.stream_id(),
             now.monotonic_ms,
         )?;
+        self.drop_queued_writable(&peer_id, stream);
         self.events.extend(self.writes.forget(stream));
         Ok(())
     }
