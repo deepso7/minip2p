@@ -50,7 +50,10 @@
 //! longer, and at least 32 MiB; an explicit value is used as given, which is
 //! what makes the sub-Mbit profiles finish). The profile is any
 //! `<rate>k_<rtt>ms`, `<rate>m_<rtt>ms` or `<rate>g_<rtt>ms`, such as
-//! `100m_300ms` or `64k_400ms`.
+//! `100m_300ms` or `64k_400ms`. A profile too slow to finish a QUIC
+//! handshake inside the setup timeout is rejected by name before any
+//! measurement starts, rather than failing a setup assertion part-way
+//! through one; at a 400 ms RTT that floor is around 3 kbit/s.
 //!
 //! An MB here is 2^20 bytes.
 
@@ -188,6 +191,33 @@ fn invalid(message: &str) -> ! {
     std::process::exit(2)
 }
 
+/// Bytes a QUIC handshake puts on the wire in the worst case a sweep
+/// measures: a padded 1,200-byte Initial each way, twice, because the
+/// `retry` sweep makes the client send its Initial again after the Retry.
+const HANDSHAKE_BYTES: u64 = 4 * 1_200;
+
+/// Rejects a profile too slow to finish a handshake inside
+/// [`SETUP_TIMEOUT`], which every setup wait asserts against.
+///
+/// Sub-Mbit profiles are nameable since the `k` rate suffix, and far
+/// enough down the range serialization alone outruns that timeout however
+/// healthy the link. Saying so up front beats a `handshake timed out`
+/// assertion firing part-way through a measurement.
+fn reject_if_setup_cannot_finish(profile: Profile) {
+    let budget = SETUP_TIMEOUT.as_secs_f64() - 2.0 * profile.rtt.as_secs_f64();
+    let serialize = HANDSHAKE_BYTES as f64 * 8.0 / profile.rate_bits_per_s as f64;
+    if budget <= 0.0 || serialize >= budget {
+        invalid(&format!(
+            "{} cannot finish a handshake inside the {} s setup timeout: {HANDSHAKE_BYTES} \
+             handshake bytes take {serialize:.1} s at this rate, and two round trips leave \
+             {:.1} s of the budget. Use a faster profile.",
+            profile.name(),
+            SETUP_TIMEOUT.as_secs(),
+            budget.max(0.0),
+        ));
+    }
+}
+
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).map_or(default, |value| {
         value
@@ -208,6 +238,7 @@ fn run_sweep(sweep: &str) {
     let profile = Profile::named(&profile_name)
         .unwrap_or_else(|| invalid(&format!("unknown MINIP2P_RTT_PROFILE {profile_name}")));
     let runs = env_or("MINIP2P_RTT_RUNS", 5_usize);
+    reject_if_setup_cannot_finish(profile);
     if sweep == "retry" {
         retry(profile, runs);
         return;
