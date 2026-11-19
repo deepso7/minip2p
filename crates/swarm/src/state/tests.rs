@@ -2854,9 +2854,11 @@ fn replacement_resets_stale_ping_stream() {
     let actions = drain_actions(&mut core);
 
     assert!(
-        actions.iter().any(
-            |action| matches!(action, Action::OpenStream { conn_id, .. } if *conn_id == newer_conn)
-        ),
+        actions.iter().any(|action| matches!(
+            action,
+            Action::OpenStream { conn_id, target: ProtocolKind::Ping, .. }
+                if *conn_id == newer_conn
+        )),
         "ping should negotiate a fresh stream on the active connection, got {actions:?}"
     );
     assert!(
@@ -2906,9 +2908,11 @@ fn replacement_requeues_pending_ping_open() {
     let actions = drain_actions(&mut core);
 
     assert!(
-        actions.iter().any(
-            |action| matches!(action, Action::OpenStream { conn_id, .. } if *conn_id == newer_conn)
-        ),
+        actions.iter().any(|action| matches!(
+            action,
+            Action::OpenStream { conn_id, target: ProtocolKind::Ping, .. }
+                if *conn_id == newer_conn
+        )),
         "pending ping should be re-opened on the active connection, got {actions:?}"
     );
 }
