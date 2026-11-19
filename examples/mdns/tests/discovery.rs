@@ -32,11 +32,14 @@ fn two_instances_discover_each_other() {
     let mut a = spawn();
     let mut b = spawn();
 
-    // Drain both children's stdout on their own threads, so neither can
-    // block on a full pipe while the deadline below is what actually
-    // bounds the test.
-    let a_stdout = drain(&mut a);
-    let b_stdout = drain(&mut b);
+    // Drain *both* streams of both children, each on its own thread:
+    // neither can then block on a full pipe while the deadline below is
+    // what actually bounds the test, and a startup failure's reason —
+    // which goes to stderr — survives into the assertion message.
+    let a_stdout = drain(a.stdout.take());
+    let a_stderr = drain(a.stderr.take());
+    let b_stdout = drain(b.stdout.take());
+    let b_stderr = drain(b.stderr.take());
 
     let deadline = Instant::now() + TEST_DEADLINE;
     let a_status = wait_by(&mut a, deadline);
@@ -44,16 +47,21 @@ fn two_instances_discover_each_other() {
 
     let a_out = a_stdout.recv().unwrap_or_default();
     let b_out = b_stdout.recv().unwrap_or_default();
+    let a_err = a_stderr.recv().unwrap_or_default();
+    let b_err = b_stderr.recv().unwrap_or_default();
 
-    for (name, status, out) in [("a", a_status, &a_out), ("b", b_status, &b_out)] {
+    for (name, status, out, err) in [
+        ("a", a_status, &a_out, &a_err),
+        ("b", b_status, &b_out, &b_err),
+    ] {
         assert!(
             status.is_some(),
-            "instance {name} outlived the {TEST_DEADLINE:?} deadline; stdout:\n{out}",
+            "instance {name} outlived the {TEST_DEADLINE:?} deadline;\nstdout:\n{out}\nstderr:\n{err}",
         );
         let status = status.expect("checked immediately above");
         assert!(
             status.success(),
-            "instance {name} exited non-zero: {status:?}\nstdout:\n{out}",
+            "instance {name} exited non-zero: {status:?}\nstdout:\n{out}\nstderr:\n{err}",
         );
     }
 
@@ -85,14 +93,18 @@ fn two_instances_discover_each_other() {
     }
 }
 
-/// Takes `child`'s piped stdout and reads it to a `String` on its own
-/// thread, so a full pipe cannot deadlock the deadline below.
-fn drain(child: &mut Child) -> mpsc::Receiver<String> {
-    let mut stdout = child.stdout.take().expect("stdout is piped");
+/// Reads one of a child's piped streams to a `String` on its own thread,
+/// so a full pipe cannot deadlock the wait below. Every piped stream needs
+/// one of these: an undrained pipe blocks the child just as surely whether
+/// it is stdout or stderr.
+fn drain<R: Read + Send + 'static>(stream: Option<R>) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
+    let Some(mut stream) = stream else {
+        return rx;
+    };
     thread::spawn(move || {
         let mut buf = String::new();
-        drop(stdout.read_to_string(&mut buf));
+        drop(stream.read_to_string(&mut buf));
         drop(tx.send(buf));
     });
     rx
