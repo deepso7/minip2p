@@ -217,6 +217,7 @@ fn exercise_relay(
                     stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream);
                 }

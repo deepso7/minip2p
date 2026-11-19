@@ -982,7 +982,9 @@ impl WebTransportIo for FuzzWtIo {
         Ok(accepted)
     }
 
-    fn close_write(&mut self, _stream: StreamHandle) {}
+    fn close_write(&mut self, stream: StreamHandle) {
+        self.events.push_back(IoEvent::WriteClosed { stream });
+    }
 
     fn reset(&mut self, stream: StreamHandle, _code: u8) {
         if let Some(state) = self.streams.get_mut(&stream.0) {

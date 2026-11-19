@@ -367,6 +367,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                     stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream);
                 }
@@ -621,6 +622,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                     stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream);
                 }

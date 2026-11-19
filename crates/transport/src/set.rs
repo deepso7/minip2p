@@ -465,6 +465,12 @@ impl Transport for TransportSet {
             .collect()
     }
 
+    fn has_pending_writes(&self) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.transport.has_pending_writes())
+    }
+
     /// The members' counters added up, plus the member count: members are
     /// only ever added and each counter only advances, so the sum moves
     /// whenever any member's addresses may have. `None` as soon as one

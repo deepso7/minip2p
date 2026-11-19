@@ -117,6 +117,31 @@ match event {
 }
 ```
 
+## Dispatch by protocol handle
+
+Each registered protocol has a `ProtocolId`, a `Copy` handle numbered by the endpoint. Look it up once and compare it with `StreamReady`'s `protocol` instead of comparing strings; `open_stream` takes the handle too:
+
+```rust
+use minip2p::EndpointEvent;
+
+let echo = node.protocol_id(ECHO_PROTOCOL).expect("registered on the builder");
+// `add_protocol` returns the handle of what it registers.
+let chat = node.add_protocol("/my-app/chat/1.0.0")?;
+
+match event {
+    EndpointEvent::StreamReady { stream, protocol, .. } if protocol == echo => {
+        echo_streams.insert(stream);
+    }
+    EndpointEvent::StreamReady { stream, protocol, .. } if protocol == chat => {
+        start_chat(stream);
+    }
+    _ => {}
+}
+let stream = node.open_stream(&peer_id, chat)?;
+```
+
+A handle belongs to the endpoint that issued it: peers number their protocols independently, and `protocol_name(id)` gives the string back. `StreamReady` keeps the string `protocol_id` as well.
+
 ## Write backpressure
 
 A stream accepts only as much as it can queue, so a slow reader slows the writer instead of tearing the connection down. `send_stream(stream, data)` takes anything that converts into `Bytes` and handles the rest for you: what the stream cannot take yet waits in the endpoint's bounded write queue, is resent as the stream drains, and `close_stream_write` sends its FIN only behind it. Later writes on the same stream queue behind earlier ones, in order.

@@ -353,6 +353,14 @@ impl SecureMuxSession {
             || matches!(&self.phase, Phase::Ready { yamux, .. } if yamux.has_frames())
     }
 
+    /// Whether the session still holds output: what
+    /// [`has_pending_write`](Self::has_pending_write) reports, or stream
+    /// bytes Yamux holds back behind the peer's window.
+    pub fn has_unsent_writes(&self) -> bool {
+        !self.writes.is_empty()
+            || matches!(&self.phase, Phase::Ready { yamux, .. } if yamux.has_unsent())
+    }
+
     /// Every substream holding delivered bytes not yet acknowledged, open or
     /// closed, with how many.
     ///

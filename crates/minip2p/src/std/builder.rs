@@ -1122,7 +1122,14 @@ pub(super) fn build_endpoint(
             u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
         )
         .timeouts(options.timeouts);
+    // Numbered in registration order, like the portable builder's.
+    let mut protocols = crate::protocols::ProtocolTable::default();
     for protocol in options.protocols {
+        if protocols.intern(&protocol).is_err() {
+            return Err(BindError::Invariant {
+                reason: crate::protocols::TABLE_FULL,
+            });
+        }
         builder = builder.protocol(protocol);
     }
     let mut acks = StreamAcks::default();
@@ -1165,6 +1172,7 @@ pub(super) fn build_endpoint(
         acks,
     );
     engine.writes = WriteQueue::new(options.write_budget);
+    engine.protocols = protocols;
     setup::install(
         &mut engine,
         capabilities,
@@ -1180,12 +1188,6 @@ pub(super) fn build_endpoint(
             reason: "a validated relay mesh has no relay server",
         })?;
         relay_server.backbone = Some(bind_backbone(mesh, agent_version, timeouts, &mut poll)?);
-    }
-    // Relay and AutoNAT server addresses may name a host; the endpoint
-    // resolves those off the driver, like Connection-attempt candidates.
-    #[cfg(feature = "autonat")]
-    if let Some(nat) = engine.nat.as_mut() {
-        nat.park_named_dials();
     }
     Ok(Endpoint {
         engine,

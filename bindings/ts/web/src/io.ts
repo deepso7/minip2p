@@ -13,7 +13,10 @@
  * - `write` copies what it accepts before returning, so a queued browser
  *   write never views wasm memory, and caps each stream's in-flight bytes;
  *   each accepted write reports exactly one `writeCompleted` with its own
- *   length, and a write the browser rejects reports nothing.
+ *   length, and a write the browser rejects reports nothing. `closeWrite`
+ *   reports one `writeClosed` once the close resolves (after every write),
+ *   or, if it rejects, one `stopSending` (code 0 unless the error has one)
+ *   unless a stop, reset or session end already reported the write side.
  * - Reads are pulled: `grantRead` is additive, at most one read is
  *   outstanding per stream, and `data` never exceeds what was granted.
  * - Handles are never reused, and events for a reset stream or an ended
@@ -69,7 +72,8 @@ export type IoEvent =
       readonly kind: "writeCompleted";
       readonly stream: number;
       readonly bytes: number;
-    };
+    }
+  | { readonly kind: "writeClosed"; readonly stream: number };
 
 /** The part of a browser `WebTransport` that `JsIo` uses. */
 export type WebTransportSession = Pick<
@@ -266,18 +270,34 @@ export class JsIo {
     return accepted;
   }
 
-  /** Finishes the write side after every accepted write. */
+  /** Finishes the write side after every accepted write; `writeClosed` follows. */
   closeWrite(streamId: number): void {
     quietly(() => {
       const stream = this.#streams.get(streamId);
       // Resolves once every accepted write has resolved, and been reported.
       stream?.writer?.close().then(
         () => {
+          if (!stream.dead) {
+            this.#push({ kind: "writeClosed", stream: streamId });
+          }
           stream.writeEnded = true;
           this.#retireIfDone(streamId, stream);
         },
-        // Stopped or reset: `writer.closed` or the reset covers it.
-        () => {}
+        // A stop `writer.closed` already reported, a local reset or an
+        // ended session report themselves; anything else would leave the
+        // FIN pending for good, so it ends the write side as a stop.
+        (error: unknown) => {
+          if (stream.dead || stream.writeEnded) {
+            return;
+          }
+          stream.writeEnded = true;
+          this.#push({
+            code: peerStreamCode(error) ?? 0,
+            kind: "stopSending",
+            stream: streamId,
+          });
+          this.#retireIfDone(streamId, stream);
+        }
       );
     });
   }
@@ -399,10 +419,11 @@ export class JsIo {
   ): void {
     stream.writer = bidi.writable.getWriter();
     stream.reader = chunkReader(bidi.readable);
-    // The peer's STOP_SENDING errors the write side.
+    // The peer's STOP_SENDING errors the write side. A rejected
+    // `closeWrite` rejects this too, after its own handler reported it.
     stream.writer.closed.catch((error: unknown) => {
       const code = peerStreamCode(error);
-      if (!stream.dead && code !== undefined) {
+      if (!stream.dead && !stream.writeEnded && code !== undefined) {
         stream.writeEnded = true;
         this.#push({ code, kind: "stopSending", stream: id });
         this.#retireIfDone(id, stream);

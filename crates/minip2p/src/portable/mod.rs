@@ -3,7 +3,6 @@ extern crate alloc;
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::string::String;
-#[cfg(any(feature = "smoltcp", feature = "relay-server"))]
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -172,6 +171,58 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
         self.engine.next_deadline(now)
     }
 
+    /// Drives queued writes and FINs one batch further onto the wire and
+    /// returns whether none is left ([`Endpoint::has_pending_writes`]).
+    ///
+    /// Never blocks: a host that is about to close, or to stop driving the
+    /// endpoint, calls it until it returns `true` or its own deadline
+    /// passes. Returns `true` at once, without a drive, when nothing is
+    /// pending. Events the drive produced stay queued for the next
+    /// [`poll`](Endpoint::poll) or [`close`](Endpoint::close); an error
+    /// discards nothing either.
+    ///
+    /// Drained is not delivered: bytes a peer's stop or reset, or
+    /// a connection failure, discarded no longer count as pending, so a flush
+    /// can succeed over them. The loss is reported, at best, by the event
+    /// that ended the stream or connection:
+    /// [`EndpointEvent::StreamWriteAborted`] (the write queue's bytes dropped),
+    /// [`EndpointEvent::StreamWriteStopped`] (the peer stopped reading),
+    /// [`EndpointEvent::StreamClosed`] (the peer reset the stream), or
+    /// [`EndpointEvent::ConnectionClosed`]. A stop that arrives after the
+    /// stream's `StreamClosed` ends its FIN's wait with no further event.
+    /// Only an application-level acknowledgement proves delivery.
+    ///
+    /// Queued events keep [`Self::next_deadline`] immediate, so between
+    /// attempts the host must [`poll`](Endpoint::poll) (handling or
+    /// dropping what it returns) before it waits on that deadline and its
+    /// transport's readiness; flushing again without polling spins.
+    ///
+    /// ```ignore
+    /// // `give_up_at` is a `Deadline` on the endpoint's clock.
+    /// while !endpoint.flush()? && !give_up_at.is_expired_at(clock.now()) {
+    ///     for event in endpoint.poll()? {
+    ///         handle(event);
+    ///     }
+    ///     // `poll` drives too, and may have sent the last of it.
+    ///     if !endpoint.has_pending_writes() {
+    ///         break;
+    ///     }
+    ///     // Wake for the endpoint (or transport readiness), but never past
+    ///     // the caller's own deadline.
+    ///     let wake = endpoint.next_deadline().map_or(give_up_at, |at| at.min(give_up_at));
+    ///     wait_until(wake);
+    /// }
+    /// ```
+    pub fn flush(&mut self) -> Result<bool, DriverError> {
+        if !self.has_pending_writes() {
+            return Ok(true);
+        }
+        let now = self.now();
+        let names = crate::platform::sealed::Sealed::names(&mut self.platform);
+        self.engine.drive(now, names)?;
+        Ok(!self.has_pending_writes())
+    }
+
     /// [`Endpoint::close`] on a portable platform; see its docs.
     pub(crate) fn close_portable(mut self) -> CloseReport {
         // One sample for the whole teardown (and the `Drop` after it), as
@@ -318,6 +369,9 @@ impl From<SetupError> for PortableBuildError {
 /// run relays. AutoNAT alone needs nothing from the transport.
 pub struct PortableEndpointBuilder<E, C> {
     swarm: SwarmBuilder,
+    /// The application protocols `protocol` registered, in order: the
+    /// order their handles number them in.
+    protocols: Vec<String>,
     identity: Ed25519Keypair,
     entropy: E,
     clock: C,
@@ -335,6 +389,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     pub fn new(identity: &Ed25519Keypair, entropy: E, clock: C) -> Self {
         Self {
             swarm: SwarmBuilder::new(identity),
+            protocols: Vec::new(),
             identity: identity.clone(),
             entropy,
             clock,
@@ -354,6 +409,8 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
 
     /// Registers an application stream protocol.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        let protocol_id = protocol_id.into();
+        self.protocols.push(protocol_id.clone());
         self.swarm = self.swarm.protocol(protocol_id);
         self
     }
@@ -560,6 +617,9 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         let core = self.swarm.build_core(transport, self.entropy)?;
         let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
         engine.writes = WriteQueue::new(self.write_budget);
+        for protocol in &self.protocols {
+            engine.protocols.intern(protocol)?;
+        }
         setup::install(
             &mut engine,
             validated,
@@ -590,6 +650,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         SmoltcpEndpointBuilder {
             portable: PortableEndpointBuilder {
                 swarm: self.swarm,
+                protocols: self.protocols,
                 identity: self.identity,
                 entropy: entropy.clone(),
                 clock: self.clock,

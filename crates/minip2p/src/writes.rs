@@ -184,6 +184,11 @@ impl WriteQueue {
         self.held
     }
 
+    /// Whether no stream has bytes or a deferred FIN held.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     /// Whether the stream has queued bytes (or a FIN behind them).
     pub(crate) fn is_pending(&self, stream: StreamKey) -> bool {
         self.streams.contains_key(&stream)
@@ -358,7 +363,9 @@ impl WriteQueue {
         }
         match event {
             SwarmEvent::StreamWritable {
-                conn_id, stream_id, ..
+                peer_id,
+                conn_id,
+                stream_id,
             } => {
                 let stream = StreamKey::new(*conn_id, *stream_id);
                 if !self.is_pending(stream) {
@@ -368,7 +375,10 @@ impl WriteQueue {
                 let mut follow: Vec<EndpointEvent> =
                     self.retry(core, stream, now_ms).into_iter().collect();
                 if !follow.is_empty() && self.wake.remove(&stream) {
-                    follow.push(event.clone().into());
+                    follow.push(EndpointEvent::StreamWritable {
+                        peer_id: *peer_id,
+                        stream,
+                    });
                 }
                 (true, follow)
             }

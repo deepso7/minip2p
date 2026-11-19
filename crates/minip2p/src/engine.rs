@@ -81,6 +81,7 @@ use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
 use crate::names::Expander;
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
+use crate::protocols::ProtocolTable;
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
 #[cfg(feature = "relay-server")]
@@ -120,6 +121,8 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     acks: StreamAcks,
     /// Bytes `send_stream` queued that their streams have not accepted yet.
     pub(crate) writes: WriteQueue,
+    /// The application protocols' handles (ADR 0031).
+    pub(crate) protocols: ProtocolTable,
     /// The Endpoint event stream: queued output the application has not
     /// pulled yet.
     pub(crate) events: VecDeque<EndpointEvent>,
@@ -158,6 +161,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             connect: ConnectEngine::new(connect_deadline_ms),
             acks,
             writes: WriteQueue::default(),
+            protocols: ProtocolTable::default(),
             events: VecDeque::new(),
             caller_external_addresses: Vec::new(),
             nat: LegProvider::default(),
@@ -443,8 +447,10 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     pub(crate) fn add_manual_ack_protocol(
         &mut self,
         protocol_id: String,
-    ) -> Result<(), DriverError> {
+    ) -> Result<crate::ProtocolId, DriverError> {
+        self.protocols.check_room(&protocol_id)?;
         self.core.add_protocol(protocol_id.clone())?;
+        let id = self.protocols.intern(&protocol_id)?;
         let queued = self.events.iter().filter_map(|event| match event {
             EndpointEvent::StreamReady {
                 stream,
@@ -464,7 +470,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         });
         let already_ready: Vec<_> = queued.chain(buffered).collect();
         self.acks.set_manual(protocol_id, already_ready);
-        Ok(())
+        Ok(id)
     }
 
     /// Takes the next queued event, acknowledging its stream data (ADR
@@ -823,7 +829,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             self.writes
                 .observe(&mut self.core, &event, now.monotonic_ms);
         if !consumed && !writable_claimed {
-            self.events.push_back(event.into());
+            self.events
+                .push_back(EndpointEvent::from_swarm(event, &mut self.protocols));
         }
         self.events.extend(follow);
         // NAT output reaches the Connection engine in step with the swarm

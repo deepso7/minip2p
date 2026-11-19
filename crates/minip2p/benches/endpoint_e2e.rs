@@ -97,6 +97,7 @@ impl EchoServer {
                         stream,
                         protocol_id,
                         initiated_locally: false,
+                        ..
                     }) if protocol_id == ECHO => {
                         streams.insert((peer_id, stream));
                     }
@@ -273,6 +274,7 @@ impl Pair {
                     stream,
                     protocol_id,
                     initiated_locally: true,
+                    ..
                 } if peer_id == self.peer
                     && protocol_id == ECHO
                     && pending.contains_key(&stream) =>

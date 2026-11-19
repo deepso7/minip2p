@@ -1349,9 +1349,11 @@ export class Minip2pBase {
    * at once, then has native disconnect peers and drain for up to
    * `timeoutMs` (default 500; `0` tears down at once, best effort). Resolves
    * with the close report once the drain finished, after `onClose`
-   * observers ran; it never rejects. The deadline bounds teardown time only,
-   * not delivery of accepted writes: QUIC discards queued writes and TCP may
-   * abort. Idempotent: a later call returns the same promise, including
+   * observers ran; it never rejects. The native bindings (Node.js, React
+   * Native) flush the bytes and FINs they already accepted first, within
+   * the same deadline; what is still unsent when it passes is lost. The
+   * browser ignores `timeoutMs` and ends every session at once, without a
+   * flush. Idempotent: a later call returns the same promise, including
    * after a driver failure closed the endpoint.
    */
   close(

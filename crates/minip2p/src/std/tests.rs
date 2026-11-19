@@ -2770,12 +2770,18 @@ fn abandoning_a_closed_stream_acks_data_left_in_the_endpoint_queue() {
             Some(event @ SwarmEvent::StreamData { stream_id, .. })
                 if stream_id == stream.stream_id() =>
             {
-                reader.engine.events.push_back(event.into());
+                reader.engine.events.push_back(EndpointEvent::from_swarm(
+                    event,
+                    &mut reader.engine.protocols,
+                ));
             }
             Some(event @ SwarmEvent::StreamClosed { stream_id, .. })
                 if stream_id == stream.stream_id() =>
             {
-                reader.engine.events.push_back(event.into());
+                reader.engine.events.push_back(EndpointEvent::from_swarm(
+                    event,
+                    &mut reader.engine.protocols,
+                ));
                 break;
             }
             _ => {}

@@ -96,6 +96,7 @@ mod tests {
         EndpointEvent::StreamReady {
             peer_id: peer(),
             stream: key(stream),
+            protocol: crate::protocols::ProtocolTable::default().for_event(protocol_id),
             protocol_id: protocol_id.into(),
             initiated_locally: false,
         }

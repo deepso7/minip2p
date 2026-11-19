@@ -21,6 +21,8 @@ class FakeStream {
   #reads: ReadableByteStreamController | undefined;
   #writes: WritableStreamDefaultController | undefined;
   closedWrite = false;
+  /** What the sink's close throws, if it fails. */
+  closeFailure: Error | undefined;
   aborted = false;
   abortReason: unknown;
   cancelled = false;
@@ -41,6 +43,9 @@ class FakeStream {
         this.abortReason = reason;
       },
       close: () => {
+        if (this.closeFailure !== undefined) {
+          throw this.closeFailure;
+        }
         this.closedWrite = true;
       },
       start: (controller) => {
@@ -347,15 +352,42 @@ describe("JsIo", () => {
     await flush();
     expect(events()).toEqual([{ kind: "fin", stream }]);
 
-    // The write still in flight is reported, then the stream is gone.
+    // The write still in flight is reported, then the close, then the
+    // stream is gone.
     fake.completeWrite();
     await flush();
 
     expect(fake.closedWrite).toBe(true);
-    expect(events()).toEqual([{ bytes: 1, kind: "writeCompleted", stream }]);
+    expect(events()).toEqual([
+      { bytes: 1, kind: "writeCompleted", stream },
+      { kind: "writeClosed", stream },
+    ]);
     expect(() => io.write(stream, new Uint8Array([2]))).toThrow(
       /not writable/u
     );
+  });
+
+  test("a close the browser rejects without a stream code ends the write side as a stop", async () => {
+    const { events, fake, io, stream } = await openedStream();
+    fake.closeFailure = new TypeError("close failed");
+
+    io.closeWrite(stream);
+    await flush();
+
+    // Otherwise the FIN would stay pending with the session still open.
+    expect(fake.closedWrite).toBe(false);
+    expect(events()).toEqual([{ code: 0, kind: "stopSending", stream }]);
+  });
+
+  test("a close rejected with a stream code reports one stop while the read side is open", async () => {
+    const { events, fake, io, stream } = await openedStream();
+    fake.closeFailure = peerStreamError(7);
+
+    // Both `close()` and `writer.closed` reject with the coded error.
+    io.closeWrite(stream);
+    await flush();
+
+    expect(events()).toEqual([{ code: 7, kind: "stopSending", stream }]);
   });
 
   test("a reset carries its code through Chrome's WebTransportError, and never throws into Rust", async () => {

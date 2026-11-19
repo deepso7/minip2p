@@ -62,6 +62,7 @@ impl RelayMachine {
                 stream,
                 protocol_id,
                 initiated_locally,
+                ..
             } if protocol_id == HOP_PROTOCOL_ID && !initiated_locally => {
                 self.hop_buffers.entry((peer_id, stream)).or_default();
             }
@@ -70,6 +71,7 @@ impl RelayMachine {
                 stream,
                 protocol_id,
                 initiated_locally,
+                ..
             } if protocol_id == STOP_PROTOCOL_ID && initiated_locally => {
                 let key = (peer_id, stream);
                 let bytes = self

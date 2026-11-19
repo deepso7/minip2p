@@ -34,6 +34,7 @@ mod names;
 mod nat;
 mod platform;
 mod portable;
+mod protocols;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 #[cfg(all(feature = "relay-server", feature = "quic"))]
@@ -48,6 +49,7 @@ mod stream_conns;
 mod writes;
 
 pub use portable::*;
+pub use protocols::{ProtocolId, ProtocolRef};
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
 #[cfg(all(feature = "relay-server", feature = "quic"))]

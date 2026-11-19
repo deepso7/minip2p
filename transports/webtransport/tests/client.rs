@@ -56,6 +56,9 @@ struct FakeIo {
     connects: Vec<(String, Vec<Multihash>)>,
     streams: BTreeMap<u64, FakeStream>,
     closed_sessions: Vec<u64>,
+    /// `close_write` waits for [`Self::write_closed`] instead of reporting
+    /// the close at once.
+    hold_closes: bool,
     events: VecDeque<IoEvent>,
 }
 
@@ -67,6 +70,7 @@ impl FakeIo {
             connects: Vec::new(),
             streams: BTreeMap::new(),
             closed_sessions: Vec::new(),
+            hold_closes: false,
             events: VecDeque::new(),
         }
     }
@@ -93,6 +97,14 @@ impl FakeIo {
             stream: handle,
             bytes,
         });
+    }
+
+    /// Reports `handle`'s FIN closed, as the browser's `writer.close()`
+    /// resolving.
+    fn write_closed(&mut self, handle: StreamHandle) {
+        assert!(self.stream(handle).fin, "close_write first");
+        self.events
+            .push_back(IoEvent::WriteClosed { stream: handle });
     }
 
     /// Delivers `len` bytes on `handle`, which must have been granted.
@@ -152,6 +164,9 @@ impl WebTransportIo for FakeIo {
 
     fn close_write(&mut self, stream: StreamHandle) {
         self.stream(stream).fin = true;
+        if !self.hold_closes {
+            self.write_closed(stream);
+        }
     }
 
     fn reset(&mut self, stream: StreamHandle, _code: u8) {
@@ -195,6 +210,7 @@ fn poll(client: &mut Client) -> Vec<TransportEvent> {
 struct Conn {
     id: ConnectionId,
     session: SessionHandle,
+    noise: StreamHandle,
 }
 
 /// Dials a fake server and answers the Noise handshake as it would.
@@ -268,7 +284,7 @@ fn connect_to(client: &mut Client, transport: &str, offered: Option<Vec<Multihas
         matches!(events.as_slice(), [TransportEvent::Connected { id: got, .. }] if *got == id),
         "{events:?}"
     );
-    Conn { id, session }
+    Conn { id, session, noise }
 }
 
 fn small_limits() -> WebTransportLimits {
@@ -975,4 +991,82 @@ fn stop_sending_on_a_pending_noise_stream_fails_the_handshake() {
     assert_eq!(poll(&mut client), []);
     assert_eq!(client.io_mut().stream(noise).written.len(), 10);
     assert_eq!(client.next_deadline(), None);
+}
+
+#[test]
+fn a_fin_stays_pending_until_the_platform_reports_it_closed() {
+    let mut client = client(WebTransportLimits::default());
+    let conn = connect(&mut client);
+    let (stream, handle) = open(&mut client, &conn);
+    assert!(!client.has_pending_writes());
+    client.io_mut().hold_closes = true;
+    client.close_stream_write(conn.id, stream).expect("fin");
+    poll(&mut client);
+    assert!(
+        client.io_mut().stream(handle).fin,
+        "the FIN is with the platform"
+    );
+    assert!(
+        client.has_pending_writes(),
+        "its close has not resolved yet"
+    );
+
+    client.io_mut().write_closed(handle);
+    poll(&mut client);
+    assert!(!client.has_pending_writes());
+}
+
+#[test]
+fn a_reset_after_both_halves_closed_ends_the_wait_for_the_fin() {
+    let mut client = client(WebTransportLimits::default());
+    let conn = connect(&mut client);
+    let (stream, handle) = open(&mut client, &conn);
+    client.io_mut().hold_closes = true;
+    client.close_stream_write(conn.id, stream).expect("fin");
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::Fin { stream: handle });
+    assert_eq!(
+        poll(&mut client),
+        [
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn.id,
+                stream_id: stream
+            },
+            TransportEvent::StreamClosed {
+                id: conn.id,
+                stream_id: stream
+            }
+        ]
+    );
+    // Both halves closed, nothing unacknowledged: the stream is retired,
+    // with its FIN still with the platform.
+    assert!(client.has_pending_writes());
+
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: handle,
+        code: 0,
+    });
+    assert!(poll(&mut client).is_empty());
+    assert!(!client.has_pending_writes());
+}
+
+/// A reset of the Noise stream once the session is up ends the platform's
+/// wait for its FIN, as on any other stream.
+#[test]
+fn a_reset_noise_stream_ends_the_wait_for_its_fin() {
+    let mut client = client(WebTransportLimits::default());
+    client.io_mut().hold_closes = true;
+    let conn = connect(&mut client);
+    assert!(
+        client.has_pending_writes(),
+        "the Noise FIN waits for the platform"
+    );
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: conn.noise,
+        code: 0,
+    });
+    poll(&mut client);
+    assert!(!client.has_pending_writes());
 }

@@ -4,6 +4,28 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### `flush`, and close flushes first
+
+A short-lived sender can now wait for its last bytes and FIN to leave before it closes ([ADR 0032](docs/adr/0032-flush-and-flush-before-close.md)).
+
+- **New `Endpoint::flush(deadline) -> Result<bool, Error>` (std)** drives the endpoint until every accepted write and FIN has gone out, or the deadline passes, and returns whether it drained; **`flush() -> Result<bool, DriverError>` on a portable endpoint** drives one batch and returns the same, for the host to repeat. **`has_pending_writes()`** reports it without driving. Replace a `for _ in 0..16 { endpoint.wait(Duration::ZERO)?; }` loop before exit with `endpoint.flush(Duration::from_secs(2))?`, or just `close()`.
+- **What a flush guarantees:** every byte and FIN the endpoint accepted has been handed to the transport, and every FIN on a direct QUIC or TCP stream has been sent (over QUIC, acknowledged by the peer). Bytes on a stream left open are best effort (QUIC may still hold them for congestion control), and over a relayed connection the FIN is handed to the relay without waiting for its acknowledgement. To deliver everything, close the write side before flushing.
+- **Std `close_within(timeout)` (and std `close()`, and the native bindings' stop and close) flush first, within the same timeout.** Writes that used to be discarded at close now arrive, within the flush guarantee (bytes on a stream left open and FINs over a relay are best effort); `close_within(Duration::ZERO)` runs one flush drive first. A portable `close()` does not flush and aborts what the write queue still holds: call `flush()` (polling between attempts) until it returns `true`, then `close()`.
+- **`Transport` gains `has_pending_writes(&self) -> bool`**, defaulting to `false`. QUIC, TCP, WebTransport, `TransportSet` and `CircuitTransport` implement it; an out-of-tree transport that buffers writes should too. `YamuxSession::has_unsent` and `SecureMuxSession::has_unsent_writes` report what a session still holds.
+
+### Protocol handles
+
+Each registered application protocol now has a `ProtocolId`, a `Copy` handle numbered by the endpoint ([ADR 0031](docs/adr/0031-interned-protocol-handles.md)). The TypeScript SDKs and the binding events are unchanged.
+
+- **`StreamReady` gains `protocol: ProtocolId`**, beside the unchanged `protocol_id: String`. Patterns that list its fields without `..` add `protocol` or `..`. Compare it with a handle from the new `protocol_id(&str) -> Option<ProtocolId>`; `protocol_name(id) -> Option<&str>` gives the string back.
+- **`add_protocol` and `add_manual_ack_protocol` return `Result<ProtocolId, DriverError>`** instead of `Result<(), _>`; `?` and `.expect(..)` callers are unaffected.
+- **`open_stream` takes `impl Into<ProtocolRef>`**: a `&str`, `&String` or `ProtocolId`. Existing calls compile unchanged.
+- **`EndpointEvent` no longer implements `From<SwarmEvent>`.** It was the engine's conversion, which now names the protocol's handle.
+
+### A portable `connect(peer_id)` dials a named relay itself
+
+A portable endpoint (the browser's, through `@minip2p/web`) refused relay and AutoNAT server addresses that name a host (`/dns/relay.example.com/udp/443/quic-v1/webtransport/p2p/…`) with "named address … must be resolved before dialing", so `connect(peerId)` settled `NoUsableRoute` unless the app had dialed the relay first, and reservations on such a relay never started. The relay leg now hands the named address to the transport, as `connect` already did for a named candidate. Drop the pre-dial: `await endpoint.connect(RELAY); await endpoint.connect(peer)` becomes `await endpoint.connect(peer)`.
+
 ### Stream keys, safe partial writes, and an Endpoint-owned write queue
 
 Endpoint streams are named by one `StreamKey`, a partial write can no longer be dropped by `?`, and the Endpoint holds unsent tails itself, so `StreamWriter` is gone ([ADR 0030](docs/adr/0030-stream-keys-and-an-endpoint-owned-write-queue.md)). The TypeScript SDKs and the binding events are unchanged.
