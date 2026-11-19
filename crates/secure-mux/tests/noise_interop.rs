@@ -32,7 +32,7 @@ fn responder_completes_pinned_rust_libp2p_initiator_transcript() {
         identity: Ed25519Keypair::from_secret_key_bytes(array("responder_identity_secret")),
         static_secret: array("responder_static_secret"),
         ephemeral_secret: array("responder_ephemeral_secret"),
-        expected_peer: Some(expected_peer.clone()),
+        expected_peer: Some(expected_peer),
         local_extensions: None,
     });
     responder.start().unwrap();

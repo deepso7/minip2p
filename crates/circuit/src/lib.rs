@@ -165,10 +165,8 @@ impl Circuit {
     }
 
     fn endpoint(&self, peer: Option<PeerId>) -> ConnectionEndpoint {
-        let address = Multiaddr::from_protocols(vec![
-            Protocol::P2p(self.relay.clone()),
-            Protocol::P2pCircuit,
-        ]);
+        let address =
+            Multiaddr::from_protocols(vec![Protocol::P2p(self.relay), Protocol::P2pCircuit]);
         match peer {
             Some(peer) => ConnectionEndpoint::with_peer_id(address, peer),
             None => ConnectionEndpoint::new(address),
@@ -337,7 +335,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             identity: self.identity.clone(),
             static_secret,
             ephemeral_secret,
-            expected_peer: Some(adoption.remote_peer.clone()),
+            expected_peer: Some(adoption.remote_peer),
             yamux: self.limits.yamux.clone(),
         });
         let circuit = Circuit {
@@ -637,7 +635,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     }
 
     fn record_direct(&mut self, id: ConnectionId, peer: PeerId) {
-        if let Some(previous) = self.direct_by_conn.insert(id, peer.clone())
+        if let Some(previous) = self.direct_by_conn.insert(id, peer)
             && previous != peer
             && let Some(ids) = self.direct_by_peer.get_mut(&previous)
         {
@@ -646,10 +644,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 self.direct_by_peer.remove(&previous);
             }
         }
-        self.direct_by_peer
-            .entry(peer.clone())
-            .or_default()
-            .insert(id);
+        self.direct_by_peer.entry(peer).or_default().insert(id);
         let losers: Vec<_> = self
             .circuits
             .iter()
@@ -1496,7 +1491,7 @@ mod tests {
         let b_identity = identity(2);
         let a_peer = a_identity.peer_id();
         let b_peer = b_identity.peer_id();
-        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay, relay);
         let inner_conn = inner_a.connection_id();
         let mut a =
             CircuitTransport::with_limits(inner_a, a_identity, CounterEntropy(10), limits.clone())
@@ -1514,8 +1509,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: b_peer.clone(),
+                relay,
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -1527,7 +1522,7 @@ mod tests {
                 inner_conn,
                 bridge_stream: bridge,
                 relay,
-                remote_peer: a_peer.clone(),
+                remote_peer: a_peer,
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -1564,7 +1559,7 @@ mod tests {
         let b_identity = identity(2);
         let a_peer = a_identity.peer_id();
         let b_peer = b_identity.peer_id();
-        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay, relay);
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(
             CloseObservingTransport::new(inner_a),
@@ -1581,8 +1576,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: b_peer.clone(),
+                relay,
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -1594,7 +1589,7 @@ mod tests {
                 inner_conn,
                 bridge_stream: bridge,
                 relay,
-                remote_peer: a_peer.clone(),
+                remote_peer: a_peer,
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2013,7 +2008,7 @@ mod tests {
         let b_identity = identity(2);
         let a_peer = a_identity.peer_id();
         let b_peer = b_identity.peer_id();
-        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay, relay);
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
@@ -2026,8 +2021,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: b_peer.clone(),
+                relay,
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2049,7 +2044,7 @@ mod tests {
             inner_conn,
             bridge_stream: bridge,
             relay,
-            remote_peer: a_peer.clone(),
+            remote_peer: a_peer,
             role: CircuitRole::Responder,
             pending_data: Bytes::from(first_write[..split].to_vec()),
             unsent_prefix: Bytes::new(),
@@ -2077,7 +2072,7 @@ mod tests {
         let b_identity = identity(2);
         let a_peer = a_identity.peer_id();
         let b_peer = b_identity.peer_id();
-        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay, relay);
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
@@ -2092,8 +2087,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: b_peer.clone(),
+                relay,
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::new(),
                 unsent_prefix: prefix.clone(),
@@ -2119,7 +2114,7 @@ mod tests {
             inner_conn,
             bridge_stream: bridge,
             relay,
-            remote_peer: a_peer.clone(),
+            remote_peer: a_peer,
             role: CircuitRole::Responder,
             pending_data: Bytes::from(handshake.to_vec()),
             unsent_prefix: Bytes::new(),
@@ -2137,7 +2132,7 @@ mod tests {
         let b_identity = identity(2);
         let a_peer = a_identity.peer_id();
         let b_peer = b_identity.peer_id();
-        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay, relay);
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity.clone(), CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
@@ -2173,7 +2168,7 @@ mod tests {
             identity: a_identity,
             static_secret: [11; 32],
             ephemeral_secret: [12; 32],
-            expected_peer: Some(b_peer.clone()),
+            expected_peer: Some(b_peer),
             local_extensions: None,
         });
         scripted_noise.start().expect("scripted Noise start");
@@ -2188,8 +2183,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: a_peer.clone(),
+                relay,
+                remote_peer: a_peer,
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(pending_data),
                 unsent_prefix: Bytes::new(),
@@ -2212,7 +2207,7 @@ mod tests {
                 inner_conn,
                 bridge_stream: bridge,
                 relay,
-                remote_peer: b_peer.clone(),
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2415,8 +2410,8 @@ mod tests {
             .adopt_bridge(BridgeAdoption {
                 inner_conn: ConnectionId::new(1),
                 bridge_stream: bridge,
-                relay: relay.clone(),
-                remote_peer: b_peer.clone(),
+                relay,
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2429,7 +2424,7 @@ mod tests {
                 inner_conn: ConnectionId::new(1),
                 bridge_stream: bridge,
                 relay: identity(8).peer_id(),
-                remote_peer: b_peer.clone(),
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2442,7 +2437,7 @@ mod tests {
                 inner_conn: ConnectionId::new(1),
                 bridge_stream: bridge,
                 relay,
-                remote_peer: b_peer.clone(),
+                remote_peer: b_peer,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -2973,7 +2968,7 @@ mod tests {
         let relay = identity(9).peer_id();
         let local = identity(1);
         let remote = identity(2).peer_id();
-        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay.clone());
+        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
         let mut transport = CircuitTransport::new(inner, local, CounterEntropy(1));
         assert_eq!(
             transport.adopt_bridge(BridgeAdoption {
@@ -2996,7 +2991,7 @@ mod tests {
         let local = identity(1);
         let remote = identity(2).peer_id();
         let relay = identity(9).peer_id();
-        let (inner, _) = InMemoryTransport::pair(local.peer_id(), remote.clone());
+        let (inner, _) = InMemoryTransport::pair(local.peer_id(), remote);
         let mut direct_first = CircuitTransport::new(inner, local, CounterEntropy(1));
         let _ = direct_first
             .poll(Now::from_millis(0))
@@ -3005,8 +3000,8 @@ mod tests {
             direct_first.adopt_bridge(BridgeAdoption {
                 inner_conn: ConnectionId::new(1),
                 bridge_stream: StreamId::new(1),
-                relay: relay.clone(),
-                remote_peer: remote.clone(),
+                relay,
+                remote_peer: remote,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
@@ -3063,7 +3058,7 @@ mod tests {
         // the backstop that keeps the invariant — no established circuit to a
         // peer that already has a direct connection — from resting on it.
         let direct = ConnectionId::new(2);
-        a.direct_by_conn.insert(direct, b_peer.clone());
+        a.direct_by_conn.insert(direct, b_peer);
         a.direct_by_peer.entry(b_peer).or_default().insert(direct);
 
         // B's encrypted Yamux confirmation is already queued, so this poll is
@@ -3084,7 +3079,7 @@ mod tests {
         let local = identity(1);
         let remote = identity(2).peer_id();
         let relay = identity(9).peer_id();
-        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay.clone());
+        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
         let mut transport = CircuitTransport::new(inner, local, FailingEntropy);
         let _ = transport
             .poll(Now::from_millis(0))

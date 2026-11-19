@@ -74,7 +74,7 @@ impl RelayMachine {
                 protocol_id,
                 initiated_locally,
             } if protocol_id == STOP_PROTOCOL_ID && initiated_locally => {
-                let key = (peer_id.clone(), conn_id, stream_id);
+                let key = (peer_id, conn_id, stream_id);
                 let bytes = self
                     .pending_stops
                     .get(&key)
@@ -217,9 +217,9 @@ impl RelayMachine {
                         let (stop_conn, stop_stream) = endpoint
                             .open_stream(&target, STOP_PROTOCOL_ID)
                             .map_err(|e| format!("open STOP stream to {target}: {e}"))?;
-                        let stop_key = (target.clone(), stop_conn, stop_stream);
+                        let stop_key = (target, stop_conn, stop_stream);
                         let connect_bytes = self.protocol.drain_stop_bytes_for(&target);
-                        self.hop_to_stop.insert(key.clone(), stop_key.clone());
+                        self.hop_to_stop.insert(key, stop_key);
                         self.pending_stops.insert(
                             stop_key,
                             PendingStop {
@@ -288,7 +288,7 @@ impl RelayMachine {
                 .send_stream(pending.hop.1, pending.hop.2, stop_trailing)
                 .map_err(|e| format!("forward pipelined responder bytes: {e}"))?;
         }
-        self.bridges.insert(pending.hop.clone(), key.clone());
+        self.bridges.insert(pending.hop, key);
         self.bridges.insert(key, pending.hop);
         self.trace.push("bridge active".into());
         Ok(())

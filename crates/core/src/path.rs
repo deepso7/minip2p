@@ -8,7 +8,7 @@ use crate::PeerId;
 /// Connection replacement does not carry the old connection's Path over.
 ///
 /// Ranking: [`Path::Direct`] ≈ [`Path::Punched`] > [`Path::Relayed`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Path {
     /// A direct connection we dialed or accepted.

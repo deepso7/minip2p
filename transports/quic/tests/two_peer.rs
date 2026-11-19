@@ -548,7 +548,7 @@ fn webtransport_dials_are_unsupported_and_listens_need_a_webtransport_socket() {
     };
     let target = PeerAddr::new(
         webtransport(server_addr.transport()),
-        server_addr.peer_id().clone(),
+        *server_addr.peer_id(),
     )
     .expect("peer addr");
 

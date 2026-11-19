@@ -207,9 +207,7 @@ impl IdentifyProtocol {
             .get(&peer_id)
             .is_some_and(|state| state.outbound_stream.is_some())
         {
-            return Err(IdentifyError::StreamAlreadyRegistered {
-                peer_id: peer_id.clone(),
-            });
+            return Err(IdentifyError::StreamAlreadyRegistered { peer_id });
         }
 
         // libp2p's Identify spec prescribes multicodec-based binary
@@ -250,13 +248,10 @@ impl IdentifyProtocol {
         }
         let data = encode_frame(&encoded);
 
-        self.peers
-            .entry(peer_id.clone())
-            .or_default()
-            .outbound_stream = Some(stream_id);
+        self.peers.entry(peer_id).or_default().outbound_stream = Some(stream_id);
 
         self.actions.push_back(IdentifyAction::Send {
-            peer_id: peer_id.clone(),
+            peer_id,
             stream_id,
             data,
         });
@@ -295,7 +290,7 @@ impl IdentifyProtocol {
             // The bytes are refused before they are buffered: nothing legal
             // can still be growing towards one identify message.
             self.events.push_back(IdentifyEvent::Error {
-                peer_id: peer_id.clone(),
+                peer_id,
                 stream_id,
                 error: alloc::format!("identify message rejected: {fault}"),
             });
@@ -327,12 +322,9 @@ impl IdentifyProtocol {
         };
 
         self.events.push_back(match merge_parts(&mut frames) {
-            Ok(info) => IdentifyEvent::Received {
-                peer_id: peer_id.clone(),
-                info,
-            },
+            Ok(info) => IdentifyEvent::Received { peer_id, info },
             Err(error) => IdentifyEvent::Error {
-                peer_id: peer_id.clone(),
+                peer_id,
                 stream_id,
                 error,
             },
@@ -382,14 +374,14 @@ impl IdentifyProtocol {
         }
 
         if let Some(state) = self.peers.remove(old_peer_id) {
-            self.peers.insert(new_peer_id.clone(), state);
+            self.peers.insert(*new_peer_id, state);
         }
 
         for event in &mut self.events {
             match event {
                 IdentifyEvent::Received { peer_id, .. } | IdentifyEvent::Error { peer_id, .. } => {
                     if peer_id == old_peer_id {
-                        *peer_id = new_peer_id.clone();
+                        *peer_id = *new_peer_id;
                     }
                 }
             }
@@ -496,7 +488,7 @@ mod tests {
         let stream_id = StreamId::new(1);
 
         identify
-            .register_outbound_stream(peer.clone(), stream_id, None, &[])
+            .register_outbound_stream(peer, stream_id, None, &[])
             .expect("register outbound");
 
         assert!(matches!(
@@ -524,8 +516,8 @@ mod tests {
         let peer = sample_peer();
         let stream = StreamId::new(3);
 
-        initiator.register_inbound_stream(peer.clone(), stream);
-        initiator.on_stream_data(peer.clone(), stream, data);
+        initiator.register_inbound_stream(peer, stream);
+        initiator.on_stream_data(peer, stream, data);
         initiator.on_stream_remote_write_closed(peer, stream);
         initiator.poll_events()
     }
@@ -588,15 +580,15 @@ mod tests {
         let mut identify = IdentifyProtocol::new(sample_config());
         let peer = sample_peer();
         let stream = StreamId::new(4);
-        identify.register_inbound_stream(peer.clone(), stream);
+        identify.register_inbound_stream(peer, stream);
 
-        identify.on_stream_data(peer.clone(), stream, &more_than_every_part());
+        identify.on_stream_data(peer, stream, &more_than_every_part());
         let actions = identify.poll_actions();
 
         assert_eq!(
             actions,
             vec![IdentifyAction::ResetStream {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 stream_id: stream,
             }]
         );
@@ -728,7 +720,7 @@ mod tests {
         });
         let peer = sample_peer();
         assert!(matches!(
-            identify.register_outbound_stream(peer.clone(), StreamId::new(1), None, &[]),
+            identify.register_outbound_stream(peer, StreamId::new(1), None, &[]),
             Err(IdentifyError::MessageTooLarge { .. })
         ));
 
@@ -771,7 +763,7 @@ mod tests {
                     .unwrap(),
             ];
         identify
-            .register_outbound_stream(peer.clone(), stream, None, &listen_addrs)
+            .register_outbound_stream(peer, stream, None, &listen_addrs)
             .unwrap();
         let actions = identify.poll_actions();
 
@@ -852,7 +844,7 @@ mod tests {
 
         // Responder emits the framed bytes.
         responder
-            .register_outbound_stream(i_peer.clone(), stream, None, &[])
+            .register_outbound_stream(i_peer, stream, None, &[])
             .unwrap();
         let actions = responder.poll_actions();
         let mut framed = Vec::new();
@@ -864,9 +856,9 @@ mod tests {
 
         // Initiator receives byte-for-byte and decodes after the remote
         // half-close.
-        initiator.register_inbound_stream(r_peer.clone(), stream);
-        initiator.on_stream_data(r_peer.clone(), stream, &framed);
-        initiator.on_stream_remote_write_closed(r_peer.clone(), stream);
+        initiator.register_inbound_stream(r_peer, stream);
+        initiator.on_stream_data(r_peer, stream, &framed);
+        initiator.on_stream_remote_write_closed(r_peer, stream);
 
         let events = initiator.poll_events();
         assert_eq!(events.len(), 1);

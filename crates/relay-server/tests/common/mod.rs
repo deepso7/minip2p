@@ -99,7 +99,9 @@ impl FakeSwarm {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 self.connect(peer_id, *conn_id);
             }
-            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+            SwarmEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } => {
                 self.remote_addrs.remove(old);
                 self.connect(peer_id, *new);
             }
@@ -117,7 +119,7 @@ impl FakeSwarm {
 
     /// Makes `conn` `peer`'s current connection.
     pub fn connect(&mut self, peer: &PeerId, conn: ConnectionId) {
-        self.connections.insert(peer.clone(), conn);
+        self.connections.insert(*peer, conn);
         self.remote_addrs
             .entry(conn)
             .or_insert_with(|| maddr(DEFAULT_REMOTE_ADDR));
@@ -162,13 +164,13 @@ impl RelaySwarm for FakeSwarm {
             _ => None,
         };
         self.calls.push(Call::Open {
-            peer: peer.clone(),
+            peer: *peer,
             protocol_id: protocol_id.into(),
             opened,
         });
         opened.ok_or_else(|| {
             RelaySwarmError(DriverError::Swarm(SwarmError::NotConnected {
-                peer_id: peer.clone(),
+                peer_id: *peer,
             }))
         })
     }
@@ -182,7 +184,7 @@ impl RelaySwarm for FakeSwarm {
     ) -> Result<(), RelaySwarmError> {
         if self.failing_sends.contains(&stream) {
             self.calls.push(Call::Send {
-                peer: peer.clone(),
+                peer: *peer,
                 stream,
                 data: data.to_vec(),
                 accepted: 0,
@@ -203,7 +205,7 @@ impl RelaySwarm for FakeSwarm {
             None => data.len(),
         };
         self.calls.push(Call::Send {
-            peer: peer.clone(),
+            peer: *peer,
             stream,
             data: data.to_vec(),
             accepted,
@@ -229,7 +231,7 @@ impl RelaySwarm for FakeSwarm {
         _now_ms: u64,
     ) -> Result<(), RelaySwarmError> {
         self.calls.push(Call::Close {
-            peer: peer.clone(),
+            peer: *peer,
             stream,
         });
         if self.failing_closes.contains(&stream) {
@@ -247,7 +249,7 @@ impl RelaySwarm for FakeSwarm {
         _now_ms: u64,
     ) -> Result<(), RelaySwarmError> {
         self.calls.push(Call::Reset {
-            peer: peer.clone(),
+            peer: *peer,
             stream,
         });
         Ok(())
@@ -260,7 +262,7 @@ impl RelaySwarm for FakeSwarm {
         _now_ms: u64,
     ) -> Result<(), RelaySwarmError> {
         self.calls.push(Call::CloseConnection {
-            peer: peer.clone(),
+            peer: *peer,
             conn_id,
         });
         Ok(())
@@ -349,7 +351,7 @@ impl Node {
     pub fn establish_as(&mut self, peer: &PeerId, conn_id: ConnectionId, is_circuit: bool) {
         self.handle_event(
             &SwarmEvent::ConnectionEstablished {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id,
             },
             is_circuit,
@@ -367,9 +369,11 @@ impl Node {
     ) {
         self.handle_event(
             &SwarmEvent::ConnectionReplaced {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 old,
                 new,
+                old_path: minip2p_core::Path::Direct,
+                new_path: minip2p_core::Path::Direct,
             },
             new_is_circuit,
             at(now_ms),
@@ -379,7 +383,7 @@ impl Node {
     pub fn close_connection(&mut self, peer: &PeerId, conn_id: ConnectionId, now_ms: u64) {
         self.handle_event(
             &SwarmEvent::ConnectionClosed {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id,
                 reason: minip2p_swarm::ConnectionCloseReason::Local,
             },
@@ -392,7 +396,7 @@ impl Node {
     pub fn hop_ready(&mut self, peer: &PeerId, stream: StreamKey, now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamReady {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
                 protocol_id: HOP_PROTOCOL_ID.into(),
@@ -407,7 +411,7 @@ impl Node {
     pub fn stop_ready(&mut self, peer: &PeerId, stream: StreamKey, now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamReady {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
                 protocol_id: STOP_PROTOCOL_ID.into(),
@@ -436,7 +440,7 @@ impl Node {
     pub fn data(&mut self, peer: &PeerId, stream: StreamKey, data: &[u8], now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamData {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
                 data: Bytes::copy_from_slice(data),
@@ -453,7 +457,7 @@ impl Node {
     pub fn half_close(&mut self, peer: &PeerId, stream: StreamKey, now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamRemoteWriteClosed {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
             },
@@ -465,7 +469,7 @@ impl Node {
     pub fn stream_closed(&mut self, peer: &PeerId, stream: StreamKey, now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamClosed {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
             },
@@ -477,7 +481,7 @@ impl Node {
     pub fn writable(&mut self, peer: &PeerId, stream: StreamKey, now: Now) -> bool {
         self.handle_event(
             &SwarmEvent::StreamWritable {
-                peer_id: peer.clone(),
+                peer_id: *peer,
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
             },

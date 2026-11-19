@@ -33,7 +33,7 @@ pub struct ClientSwarm {
 impl ClientSwarm {
     pub fn new(relay: &PeerId, circuit: ConnectionId) -> Self {
         Self {
-            relay: relay.clone(),
+            relay: *relay,
             connected: false,
             protocols: None,
             next_stream: StreamId::new(0),
@@ -141,7 +141,7 @@ pub fn establish_relay_session(
     agent.handle_event(
         swarm,
         &SwarmEvent::ConnectionEstablished {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id: CLIENT_RELAY_CONN,
         },
         false,
@@ -152,7 +152,7 @@ pub fn establish_relay_session(
     agent.handle_event(
         swarm,
         &SwarmEvent::PeerReady {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id: CLIENT_RELAY_CONN,
             protocols,
         },
@@ -171,7 +171,7 @@ pub fn ready_client_hop(
     agent.handle_event(
         swarm,
         &SwarmEvent::StreamReady {
-            peer_id: relay.clone(),
+            peer_id: *relay,
             conn_id: CLIENT_RELAY_CONN,
             stream_id,
             protocol_id: minip2p_nat::HOP_PROTOCOL_ID.to_owned(),

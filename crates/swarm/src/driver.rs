@@ -770,7 +770,7 @@ mod tests {
 
     impl ReplacementTransport {
         fn new(peer_id: PeerId, original: ConnectionId, replacement: ConnectionId) -> Self {
-            let endpoint = || ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id.clone());
+            let endpoint = || ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
             Self {
                 event_batches: VecDeque::from([
                     vec![TransportEvent::Connected {
@@ -1274,7 +1274,7 @@ mod tests {
         let remote_peer = Ed25519Keypair::generate().peer_id();
         let original = ConnectionId::new(41);
         let replacement = ConnectionId::new(42);
-        let mut swarm = replacement_swarm(remote_peer.clone(), original, replacement);
+        let mut swarm = replacement_swarm(remote_peer, original, replacement);
 
         let first = swarm.poll().expect("original connection poll");
         assert!(matches!(
@@ -1330,12 +1330,12 @@ mod tests {
         let original = ConnectionId::new(61);
         let replacement = ConnectionId::new(62);
         let other = ConnectionId::new(63);
-        let mut swarm = replacement_swarm(remote_peer.clone(), original, replacement);
+        let mut swarm = replacement_swarm(remote_peer, original, replacement);
         // The replacement's batch also connects an unrelated peer, so two
         // events are buffered when the first is delivered.
         swarm.core_mut().transport_mut().event_batches[1].push(TransportEvent::Connected {
             id: other,
-            endpoint: ConnectionEndpoint::with_peer_id(Multiaddr::new(), other_peer.clone()),
+            endpoint: ConnectionEndpoint::with_peer_id(Multiaddr::new(), other_peer),
         });
 
         let _ = swarm.poll().expect("original connection poll");
@@ -1414,7 +1414,7 @@ mod tests {
             .state
             .events
             .push_back(SwarmEvent::ConnectionEstablished {
-                peer_id: peer_id.clone(),
+                peer_id,
                 conn_id: ConnectionId::new(1),
             });
 
@@ -1437,11 +1437,11 @@ mod tests {
             .state
             .events
             .push_back(SwarmEvent::ConnectionEstablished {
-                peer_id: target_peer_id.clone(),
+                peer_id: target_peer_id,
                 conn_id: ConnectionId::new(1),
             });
         swarm.core.state.events.push_back(SwarmEvent::PeerReady {
-            peer_id: target_peer_id.clone(),
+            peer_id: target_peer_id,
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
@@ -1688,7 +1688,7 @@ mod tests {
             .state
             .events
             .push_back(SwarmEvent::ConnectionEstablished {
-                peer_id: peer_id.clone(),
+                peer_id,
                 conn_id: ConnectionId::new(1),
             });
         swarm.core.state.events.push_back(SwarmEvent::PeerReady {
@@ -1728,11 +1728,11 @@ mod tests {
             .state
             .events
             .push_back(SwarmEvent::ConnectionEstablished {
-                peer_id: peer_id.clone(),
+                peer_id,
                 conn_id: ConnectionId::new(1),
             });
         swarm.core.state.events.push_back(SwarmEvent::PeerReady {
-            peer_id: peer_id.clone(),
+            peer_id,
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
@@ -1772,7 +1772,7 @@ mod tests {
             protocols: vec![protocol.into()],
             public_key: keypair.public_key().encode_protobuf(),
         };
-        let transport = FailingUserOpenTransport::connected(remote_peer.clone(), fail_on_call);
+        let transport = FailingUserOpenTransport::connected(*remote_peer, fail_on_call);
         let mut swarm = Swarm::new(
             transport,
             identify,
@@ -2016,7 +2016,7 @@ mod tests {
             protocols: vec![protocol.into()],
             public_key: keypair.public_key().encode_protobuf(),
         };
-        let transport = FailingSendTransport::connected(remote_peer.clone(), protocol);
+        let transport = FailingSendTransport::connected(remote_peer, protocol);
         let mut swarm = Swarm::new(
             transport,
             identify,
@@ -2105,7 +2105,7 @@ mod tests {
     /// can assert restoration order after `run_until` skips it.
     fn indexed_stream_data(peer_id: &PeerId, index: u64) -> SwarmEvent {
         SwarmEvent::StreamData {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(index),
             data: Bytes::from(vec![0u8; 8]),
@@ -2198,7 +2198,7 @@ mod tests {
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
         swarm.core.state.events.push_back(SwarmEvent::PeerReady {
-            peer_id: peer_id.clone(),
+            peer_id,
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
@@ -2389,7 +2389,7 @@ mod tests {
             public_key: keypair.public_key().encode_protobuf(),
         };
         let clock = Arc::new(TestClock::default());
-        let transport = NeverRespondTransport::connected(remote_peer.clone());
+        let transport = NeverRespondTransport::connected(remote_peer);
         let mut swarm = Swarm::with_clock(
             transport,
             identify,

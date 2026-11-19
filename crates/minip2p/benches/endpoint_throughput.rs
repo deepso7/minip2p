@@ -211,7 +211,7 @@ fn direct(listen: &str) -> Vec<String> {
     let target_addr = target.listen().expect("target listens");
     let mut client = bind_on(Endpoint::builder().protocol(PROTOCOL), listen);
     client.connect(&target_addr).expect("connect");
-    let peer = target_addr.peer_id().clone();
+    let peer = *target_addr.peer_id();
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let mut ready = false;
     while !ready {
@@ -226,10 +226,10 @@ fn direct(listen: &str) -> Vec<String> {
     let (case, roles) = if listen.contains("/tcp/") {
         ("tcp", Roles::new(Vec::new()))
     } else {
-        let client_peer = client.peer_id().clone();
+        let client_peer = *client.peer_id();
         (
             "quic",
-            Roles::new(vec![("client", client_peer), ("target", peer.clone())]),
+            Roles::new(vec![("client", client_peer), ("target", peer)]),
         )
     };
     let (_sink, sink) = spawn_sink(target, &client, roles.clone());
@@ -252,9 +252,9 @@ fn relayed() -> Vec<String> {
         }
     });
     let roles = Roles::new(vec![
-        ("client", client.peer_id().clone()),
-        ("target", target_peer.clone()),
-        ("relay", relay_addr.peer_id().clone()),
+        ("client", *client.peer_id()),
+        ("target", target_peer),
+        ("relay", *relay_addr.peer_id()),
     ]);
     let (_sink, sink) = spawn_sink(target, &client, roles.clone());
     let timing = transfer(&mut client, &target_peer, &sink, &roles);

@@ -51,7 +51,7 @@ impl BenchSwarm {
     fn apply(&mut self, event: &SwarmEvent) {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                self.connections.insert(peer_id.clone(), *conn_id);
+                self.connections.insert(*peer_id, *conn_id);
             }
             SwarmEvent::ConnectionClosed {
                 peer_id, conn_id, ..
@@ -159,7 +159,7 @@ fn populated_agent() -> (RelayServerAgent, BenchSwarm, SwarmEvent, Now) {
         let conn_id = ConnectionId::new(index + 1);
         let stream_id = StreamId::new(1);
         let established = SwarmEvent::ConnectionEstablished {
-            peer_id: peer.clone(),
+            peer_id: peer,
             conn_id,
         };
         swarm.apply(&established);
@@ -314,7 +314,7 @@ fn establish(scale: &mut Scale, peer_id: &PeerId, conn_id: ConnectionId, now: No
     scale.swarm.remote_addrs.insert(conn_id, address);
     scale.handle(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             conn_id,
         },
         now,
@@ -339,7 +339,7 @@ fn hop_frame(kind: HopMessageType, peer: Option<&PeerId>) -> Vec<u8> {
 
 fn stream_ready(peer_id: &PeerId, stream: StreamKey, outbound: bool) -> SwarmEvent {
     SwarmEvent::StreamReady {
-        peer_id: peer_id.clone(),
+        peer_id: *peer_id,
         conn_id: stream.conn_id,
         stream_id: stream.stream_id,
         protocol_id: if outbound {
@@ -358,7 +358,7 @@ fn open_hop(scale: &mut Scale, peer_id: &PeerId, stream: StreamKey, now: Now) {
 
 fn stream_data(peer_id: &PeerId, stream: StreamKey, data: Vec<u8>) -> SwarmEvent {
     SwarmEvent::StreamData {
-        peer_id: peer_id.clone(),
+        peer_id: *peer_id,
         conn_id: stream.conn_id,
         stream_id: stream.stream_id,
         data: Bytes::from(data),

@@ -181,7 +181,7 @@ fn rebuild(
             IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
         }];
         expanded.extend_from_slice(rest);
-        let target = PeerAddr::new(Multiaddr::from_protocols(expanded), addr.peer_id().clone())
+        let target = PeerAddr::new(Multiaddr::from_protocols(expanded), *addr.peer_id())
             .map_err(|error| invalid(format!("resolved address was not a peer addr: {error}")))?;
         targets.push(target);
     }

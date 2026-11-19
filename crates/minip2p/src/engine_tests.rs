@@ -61,10 +61,7 @@ impl Transport for FlashTransport {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         queue.push_back(TransportEvent::Connected {
             id,
-            endpoint: ConnectionEndpoint::with_peer_id(
-                addr.transport().clone(),
-                addr.peer_id().clone(),
-            ),
+            endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), *addr.peer_id()),
         });
         queue.push_back(TransportEvent::Closed {
             id,
@@ -130,11 +127,7 @@ impl minip2p_transport::PollSource for FlashTransport {
 }
 
 fn target(peer: &PeerId) -> PeerAddr {
-    PeerAddr::new(
-        "/ip4/192.0.2.9/tcp/4001".parse().expect("addr"),
-        peer.clone(),
-    )
-    .expect("target")
+    PeerAddr::new("/ip4/192.0.2.9/tcp/4001".parse().expect("addr"), *peer).expect("target")
 }
 
 fn position(events: &[EndpointEvent], matches: impl Fn(&EndpointEvent) -> bool) -> usize {
@@ -251,7 +244,7 @@ fn assert_late_nat_events_settle_in_order<T: Transport, E: EntropySource, M: sup
     });
     nat.push_event(NatEvent::ConnectFailed {
         connect_id,
-        peer: peer.clone(),
+        peer: *peer,
         error: NatError::DialFailed("relay refused".into()),
     });
     engine.settle(Now::from_millis(1));
@@ -291,7 +284,7 @@ fn std_routes_late_nat_events_before_the_final_drain() {
         Endpoint::builder().nat_config(forced_relay(&relay)),
         FlashTransport::default(),
     );
-    let id = endpoint.connect(peer.clone()).expect("admitted");
+    let id = endpoint.connect(peer).expect("admitted");
     assert_late_nat_events_settle_in_order(&mut endpoint.engine, id, &peer);
 }
 
@@ -311,7 +304,7 @@ fn portable_routes_late_nat_events_before_the_final_drain() {
         .build_with_circuits(transport)
         .expect("builds");
     let id = endpoint
-        .connect(peer.clone(), Now::from_millis(0))
+        .connect(peer, Now::from_millis(0))
         .expect("admitted");
     assert_late_nat_events_settle_in_order(&mut endpoint.engine, id, &peer);
 }
@@ -570,7 +563,7 @@ impl ScriptedTransport {
     fn connect(&self, id: ConnectionId, remote: Multiaddr, peer: &PeerId) {
         self.script().queue.push_back(TransportEvent::Connected {
             id,
-            endpoint: ConnectionEndpoint::with_peer_id(remote, peer.clone()),
+            endpoint: ConnectionEndpoint::with_peer_id(remote, *peer),
         });
     }
 }
@@ -664,7 +657,7 @@ impl RelayLegFixture {
         };
         let mut nat = crate::nat::NatDriver::new(
             minip2p_nat::NatAgent::new(identity.peer_id(), config),
-            vec![(relay.peer_id().clone(), relay.transport().clone())],
+            vec![(*relay.peer_id(), relay.transport().clone())],
             7,
         );
         nat.park_named_dials();
@@ -725,7 +718,7 @@ impl RelayLegFixture {
 fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
     let mut f = RelayLegFixture::new(60, true);
     let now = Now::from_millis(0);
-    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    let id = f.endpoint.connect(f.peer, now).expect("admitted");
     f.endpoint.poll(now).expect("poll");
     let relay_dial = f.relay_dial();
     assert!(
@@ -775,13 +768,13 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
     // DCUtR on: a circuit stays provisional until the deadline settles it.
     let mut f = RelayLegFixture::new(63, false);
     let now = Now::from_millis(0);
-    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    let id = f.endpoint.connect(f.peer, now).expect("admitted");
     f.relay_dial();
     let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("circuit");
     f.transport.connect(
         circuit,
         Multiaddr::from_protocols(vec![
-            minip2p_core::Protocol::P2p(f.relay.peer_id().clone()),
+            minip2p_core::Protocol::P2p(*f.relay.peer_id()),
             minip2p_core::Protocol::P2pCircuit,
         ]),
         &f.peer,
@@ -830,7 +823,7 @@ fn an_admission_that_settles_at_once_attaches_no_leg() {
     );
     f.endpoint.poll(now).expect("poll");
 
-    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    let id = f.endpoint.connect(f.peer, now).expect("admitted");
     let mut events = f.endpoint.poll(now).expect("poll");
     events.extend(f.endpoint.poll(Now::from_millis(1_000)).expect("poll"));
     assert!(
@@ -861,7 +854,7 @@ fn a_connect_failed_after_the_attempt_settled_is_dropped() {
     let mut f = RelayLegFixture::new(69, true);
     let id = f
         .endpoint
-        .connect(f.peer.clone(), Now::from_millis(0))
+        .connect(f.peer, Now::from_millis(0))
         .expect("admitted");
     f.relay_dial();
     let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
@@ -942,7 +935,7 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
             );
     };
     let now = Now::from_millis(0);
-    let peer = f.peer.clone();
+    let peer = f.peer;
     observe(&mut f, peer);
     f.endpoint.poll(now).expect("poll");
     // The book's dial is the first attempt the endpoint admitted.
@@ -1008,7 +1001,7 @@ impl Expander for FakeNames {
 }
 
 fn named(host_addr: &str, peer: &PeerId) -> PeerAddr {
-    PeerAddr::new(host_addr.parse().expect("addr"), peer.clone()).expect("peer addr")
+    PeerAddr::new(host_addr.parse().expect("addr"), *peer).expect("peer addr")
 }
 
 /// Expiry runs before answers: a failed lookup answered in the batch that
@@ -1117,7 +1110,7 @@ fn an_answer_for_a_nat_dial_no_longer_wanted_is_dropped() {
     let mut names = FakeNames::default();
     let now = Now::from_millis(0);
     let engine = &mut f.endpoint.engine;
-    let id = engine.connect(f.peer.clone().into(), &mut names, now);
+    let id = engine.connect(f.peer.into(), &mut names, now);
     engine.drive(now, &mut names).expect("drive");
     assert_eq!(names.lookups, ["relay.test"]);
 
@@ -1137,7 +1130,7 @@ fn a_nat_dial_cancelled_before_expansion_starts_no_lookup() {
     let mut names = FakeNames::default();
     let now = Now::from_millis(0);
     let engine = &mut f.endpoint.engine;
-    let id = engine.connect(f.peer.clone().into(), &mut names, now);
+    let id = engine.connect(f.peer.into(), &mut names, now);
     engine.cancel_connect(id, now);
     engine.drive(now, &mut names).expect("drive");
     assert!(names.lookups.is_empty(), "{:?}", names.lookups);

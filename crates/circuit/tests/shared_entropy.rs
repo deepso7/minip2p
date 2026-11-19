@@ -31,7 +31,7 @@ impl EntropySource for BoardRng {
 fn one_entropy_adapter_serves_the_circuit_and_tcp_transports() {
     let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
     let peer = identity.peer_id();
-    let (inner, _remote) = InMemoryTransport::pair(peer.clone(), peer.clone());
+    let (inner, _remote) = InMemoryTransport::pair(peer, peer);
     let rng = BoardRng(0);
 
     let circuit = CircuitTransport::new(inner, identity.clone(), rng);

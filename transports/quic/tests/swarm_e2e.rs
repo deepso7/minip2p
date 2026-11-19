@@ -102,7 +102,7 @@ fn swarm_ping_roundtrip_with_auto_identify() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     // Set up client and dial -- no ConnectionId ceremony, no `now_ms` plumbing.
     let mut client = make_swarm(Ed25519Keypair::generate());
@@ -197,12 +197,12 @@ fn inbound_connection_does_not_collide_with_later_outbound_dial() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("middle listen");
-    let middle_peer_id = middle_addr.peer_id().clone();
+    let middle_peer_id = *middle_addr.peer_id();
     let outbound_addr = outbound_peer
         .core_mut()
         .listen_on_bound_addr()
         .expect("outbound listen");
-    let outbound_peer_id = outbound_addr.peer_id().clone();
+    let outbound_peer_id = *outbound_addr.peer_id();
 
     inbound_peer
         .core_mut()
@@ -263,7 +263,7 @@ fn swarm_user_protocol_round_trip() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client
@@ -360,7 +360,7 @@ fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client
@@ -415,7 +415,7 @@ fn identify_exchange_carries_observed_addr() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client.core_mut().dial(&peer_addr).expect("dial");
@@ -464,7 +464,7 @@ fn rapid_ping_calls_do_not_open_duplicate_streams() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client.core_mut().dial(&peer_addr).expect("dial");
@@ -533,7 +533,7 @@ fn ping_completes_while_stuck_application_streams_fill_the_send_queue() {
         .core_mut()
         .listen_on_bound_addr()
         .expect("server listen");
-    let server_peer_id = peer_addr.peer_id().clone();
+    let server_peer_id = *peer_addr.peer_id();
 
     // Two stuck streams fill the application share; the reserve is left.
     let keypair = Ed25519Keypair::generate();

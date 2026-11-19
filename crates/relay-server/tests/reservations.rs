@@ -47,7 +47,7 @@ fn a_reservation_commits_once_its_success_reply_is_taken() {
     let now = Now::new(10, 1_000);
     node.handle_event(
         &minip2p_swarm::SwarmEvent::ConnectionEstablished {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: stream.conn_id,
         },
         false,
@@ -646,7 +646,7 @@ fn reservation_addresses_truncate_to_a_wire_prefix() {
         .take(reservation.addrs.len())
         .map(|address| {
             let mut address = address.clone();
-            address.push(Protocol::P2p(local.clone()));
+            address.push(Protocol::P2p(local));
             address.to_bytes()
         })
         .collect();

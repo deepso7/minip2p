@@ -61,7 +61,7 @@ fn deliver_then_close(
 ) -> (ConnectionId, StreamId) {
     let (mut writer, connected) = dial(reader, reader_addr, writer);
     assert!(connected, "a free slot admits the peer");
-    let reader_peer = reader.peer_id().clone();
+    let reader_peer = *reader.peer_id();
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) {
         assert!(Instant::now() < deadline, "never ready");

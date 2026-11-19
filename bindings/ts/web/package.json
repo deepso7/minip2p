@@ -48,6 +48,7 @@
       "types": "./dist/manual.d.ts",
       "default": "./dist/manual.js"
     },
+    "./wasm": "./wasm/minip2p_web_bg.wasm",
     "./package.json": "./package.json"
   },
   "publishConfig": {

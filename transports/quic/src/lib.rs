@@ -786,7 +786,7 @@ impl QuicTransport {
         self.local_addresses()
             .into_iter()
             .map(|addr| {
-                PeerAddr::new(addr.clone(), peer_id.clone())
+                PeerAddr::new(addr.clone(), peer_id)
                     .map_err(|error| TransportError::LocalPeerAddr { addr, error })
             })
             .collect()
@@ -847,7 +847,7 @@ impl QuicTransport {
         };
         let tls = self
             .tls
-            .client_config(Some(expected.clone()))
+            .client_config(Some(*expected))
             .map_err(|_no_tls13| unsupported())?;
         let crypto = QuicClientConfig::try_from(tls).map_err(|_no_quic_suite| unsupported())?;
         let mut config = ClientConfig::new(Arc::new(crypto));

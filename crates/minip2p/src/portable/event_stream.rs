@@ -4,7 +4,7 @@
 //! capability (NAT, Gossipsub, Discovery, mDNS, relay-server) transitions all
 //! leave through [`EndpointEvent`].
 
-use minip2p_core::{Bytes, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyFailure, IdentifyMessage, PingFailure, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
@@ -70,10 +70,16 @@ pub enum EndpointEvent {
     /// Every stream and pending open on `old` ends with it, without
     /// per-stream terminal events. Readiness belongs to a connection, so a
     /// fresh [`Self::PeerReady`] follows for `new` once it is identified.
+    ///
+    /// `old_path` and `new_path` are each connection's [`Path`]: a relayed
+    /// `old` replaced by a direct or punched `new` is the planned upgrade off
+    /// the relay, not a lost link.
     ConnectionReplaced {
         peer_id: PeerId,
         old: ConnectionId,
         new: ConnectionId,
+        old_path: Path,
+        new_path: Path,
     },
     /// Identify information received from a remote peer on `conn_id`, the
     /// connection it arrived on (fixed when the event was queued).
@@ -306,9 +312,19 @@ impl From<SwarmEvent> for EndpointEvent {
                 conn_id,
                 reason,
             },
-            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
-                Self::ConnectionReplaced { peer_id, old, new }
-            }
+            SwarmEvent::ConnectionReplaced {
+                peer_id,
+                old,
+                new,
+                old_path,
+                new_path,
+            } => Self::ConnectionReplaced {
+                peer_id,
+                old,
+                new,
+                old_path,
+                new_path,
+            },
             SwarmEvent::IdentifyReceived {
                 peer_id,
                 conn_id,

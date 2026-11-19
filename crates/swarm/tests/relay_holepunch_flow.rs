@@ -80,9 +80,7 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     ));
     assert_eq!(
         relay.events[0],
-        RelayEvent::ReservationStored {
-            peer: peer_b.clone()
-        }
+        RelayEvent::ReservationStored { peer: peer_b }
     );
 
     // ---- Step 2: A asks the relay to CONNECT it to B ----------------------

@@ -46,7 +46,7 @@ pub(crate) fn resolve_book_candidates(
 fn direct_candidates(addrs: &[Multiaddr], peer: &PeerId) -> Vec<PeerAddr> {
     select_direct_addrs(addrs, None, None)
         .into_iter()
-        .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
+        .filter_map(|addr| PeerAddr::new(addr, *peer).ok())
         .collect()
 }
 
@@ -292,7 +292,7 @@ impl DiscoveryDriver {
                             runtime,
                             ConnectAdmission {
                                 candidates: direct_candidates(&addrs, &peer),
-                                peer: peer.clone(),
+                                peer,
                                 allow_relay: source == DiscoverySource::SignedBeacon,
                                 // Every address the source announced, circuit
                                 // addresses included.
@@ -368,7 +368,7 @@ mod tests {
 
         driver.handle_mdns_event(
             MdnsEvent::PeerObserved {
-                peer: remote.clone(),
+                peer: remote,
                 addrs: vec![(addr.clone(), 1_000)],
             },
             0,
@@ -394,7 +394,7 @@ mod tests {
 
         driver.handle_mdns_event(
             MdnsEvent::ProtocolViolation {
-                peer: Some(remote.clone()),
+                peer: Some(remote),
                 reason: "invalid claim".into(),
             },
             1,
@@ -420,12 +420,12 @@ mod tests {
         );
         let remote = peer(2);
         let owned = ConnectId::from_u64(9);
-        driver.inflight.insert(owned, remote.clone());
+        driver.inflight.insert(owned, remote);
 
         let claimed = driver.claim_settled(
             &EndpointEvent::ConnectSettled {
                 connect_id: owned,
-                peer_id: remote.clone(),
+                peer_id: remote,
                 outcome: ConnectOutcome::Failed(crate::ConnectFailure::Timeout {
                     elapsed_ms: 30_000,
                     candidates: Vec::new(),

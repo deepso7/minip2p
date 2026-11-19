@@ -100,7 +100,7 @@ impl Backbone {
                 Err(error) => {
                     refused.push(RelayServerRuntimeError {
                         kind: RelayServerRuntimeErrorKind::Mesh,
-                        peer_id: Some(addr.peer_id().clone()),
+                        peer_id: Some(*addr.peer_id()),
                         detail: format!("dialing mesh member at {}: {error}", addr.transport()),
                     });
                     None
@@ -134,7 +134,7 @@ impl Backbone {
         self.core
             .listened_addrs()
             .iter()
-            .filter_map(|addr| PeerAddr::new(addr.clone(), own.clone()).ok())
+            .filter_map(|addr| PeerAddr::new(addr.clone(), *own).ok())
             .collect()
     }
 
@@ -178,7 +178,7 @@ impl Links {
         let mut links = BTreeMap::new();
         for addr in members.into_iter().filter(|addr| addr.peer_id() != own) {
             links
-                .entry(addr.peer_id().clone())
+                .entry(*addr.peer_id())
                 .or_insert_with(|| Link {
                     addrs: Vec::new(),
                     next: 0,
@@ -334,14 +334,14 @@ mod tests {
 
     fn established(peer: &PeerId, conn_id: ConnectionId) -> SwarmEvent {
         SwarmEvent::ConnectionEstablished {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id,
         }
     }
 
     fn closed(peer: &PeerId, conn_id: ConnectionId) -> SwarmEvent {
         SwarmEvent::ConnectionClosed {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id,
             reason: ConnectionCloseReason::TimedOut,
         }
@@ -365,7 +365,7 @@ mod tests {
         let v4 = member();
         let v6 = PeerAddr::new(
             "/ip6/::1/udp/19877/quic-v1".parse().expect("address"),
-            v4.peer_id().clone(),
+            *v4.peer_id(),
         )
         .expect("peer address");
         let mut links = links([v4.clone(), v6.clone()]);
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn a_verified_link_that_drops_is_redialed_after_one_second() {
         let addr = member();
-        let peer = addr.peer_id().clone();
+        let peer = *addr.peer_id();
         let mut links = links([addr.clone()]);
         // Two failures first, so the backoff has grown.
         for index in 0..2 {
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_connection_that_closes_unverified_is_a_failed_attempt() {
         let addr = member();
-        let peer = addr.peer_id().clone();
+        let peer = *addr.peer_id();
         let mut links = links([addr.clone()]);
         let mut now = 0;
         let mut delays = Vec::new();
@@ -464,9 +464,11 @@ mod tests {
         links.observe(&established(&peer, conn(7)), at(now));
         links.observe(
             &SwarmEvent::ConnectionReplaced {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 old: conn(7),
                 new: conn(8),
+                old_path: minip2p_core::Path::Direct,
+                new_path: minip2p_core::Path::Direct,
             },
             at(now),
         );
@@ -482,7 +484,7 @@ mod tests {
     #[test]
     fn a_simultaneous_dial_loser_triggers_no_extra_dial() {
         let addr = member();
-        let peer = addr.peer_id().clone();
+        let peer = *addr.peer_id();
 
         // Our dial loses to the member's: it reports `DialFailed` while the
         // winner is mid-proof.

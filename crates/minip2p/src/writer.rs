@@ -370,7 +370,7 @@ impl StreamWriter {
             }
         }
         Some(WriteAccepted {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             conn_id,
             stream_id,
         })

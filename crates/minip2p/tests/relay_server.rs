@@ -81,7 +81,7 @@ fn relayed_pair(
             .nat_config(config),
     );
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -105,8 +105,8 @@ fn relayed_pair(
             }),
     );
     initiator.listen().expect("initiator listens");
-    let initiator_peer = initiator.peer_id().clone();
-    let connect_id = initiator.connect(&responder_peer).expect("connect starts");
+    let initiator_peer = *initiator.peer_id();
+    let connect_id = initiator.connect(responder_peer).expect("connect starts");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut connected = false;
@@ -157,8 +157,8 @@ fn exercise_relay(
     bind_client: impl Fn(EndpointBuilder) -> Endpoint,
 ) {
     let mut pair = relayed_pair(relay, relay_addr, bind_client);
-    let initiator_peer = pair.initiator_peer.clone();
-    let responder_peer = pair.responder_peer.clone();
+    let initiator_peer = pair.initiator_peer;
+    let responder_peer = pair.responder_peer;
     let relay_addr = pair.relay_addr.clone();
     let initiator = &mut pair.initiator;
     let responder = &mut pair.responder;
@@ -257,7 +257,7 @@ fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
         .bind()
         .expect("bind relay");
     let bound = relay.bound_addresses().pop().expect("bound address");
-    let relay_addr = PeerAddr::new(bound, relay.peer_id().clone()).unwrap();
+    let relay_addr = PeerAddr::new(bound, *relay.peer_id()).unwrap();
     exercise_relay(relay, relay_addr, |builder| {
         builder
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -290,7 +290,7 @@ fn a_wildcard_only_relay_grants_reservations_and_relays_circuits() {
     let dialed = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
         .parse()
         .unwrap();
-    let relay_addr = PeerAddr::new(dialed, relay.peer_id().clone()).unwrap();
+    let relay_addr = PeerAddr::new(dialed, *relay.peer_id()).unwrap();
     exercise_relay(relay, relay_addr, |builder| {
         builder
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -374,7 +374,7 @@ mod bulk {
         });
         let writer = &mut pair.initiator;
         let reader = &mut pair.responder;
-        let reader_peer = pair.responder_peer.clone();
+        let reader_peer = pair.responder_peer;
 
         let payload = Bytes::from(
             (0..BULK_PER_STREAM)

@@ -678,17 +678,17 @@ fn link(profile: Profile, point: &Point) -> Linked {
     };
     let mut target = bind_on(builder(), listen);
     let target_addr = target.listen().expect("target listens");
-    let target_peer = target_addr.peer_id().clone();
+    let target_peer = *target_addr.peer_id();
     let (proxy_addr, up, down, proxy): (PeerAddr, _, _, Box<dyn Send>) = match point.transport {
         Transport::Quic => {
             let proxy = UdpProxy::spawn(socket_addr(&target_addr), profile);
-            let addr = PeerAddr::quic_v1(LOOPBACK, proxy.addr.port(), target_peer.clone());
+            let addr = PeerAddr::quic_v1(LOOPBACK, proxy.addr.port(), target_peer);
             let (up, down) = (Arc::clone(&proxy.up), Arc::clone(&proxy.down));
             (addr, up, down, Box::new(proxy))
         }
         Transport::Tcp => {
             let proxy = TcpProxy::spawn(socket_addr(&target_addr), profile);
-            let addr = PeerAddr::tcp(LOOPBACK, proxy.addr.port(), target_peer.clone());
+            let addr = PeerAddr::tcp(LOOPBACK, proxy.addr.port(), target_peer);
             let (up, down) = (Arc::clone(&proxy.up), Arc::clone(&proxy.down));
             (addr, up, down, Box::new(proxy))
         }
@@ -745,16 +745,12 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
         unloaded_rtt_ms,
         _proxy,
     } = link(profile, point);
-    let client_peer = client.peer_id().clone();
+    let client_peer = *client.peer_id();
     let pings = Arc::new(Mutex::new(Vec::new()));
     // Off while loss is counted, so the target goes quiet.
     let pinging = Arc::new(AtomicBool::new(true));
     let on_event = {
-        let (pings, pinging, client_peer) = (
-            Arc::clone(&pings),
-            Arc::clone(&pinging),
-            client_peer.clone(),
-        );
+        let (pings, pinging, client_peer) = (Arc::clone(&pings), Arc::clone(&pinging), client_peer);
         let mut next_ping = Instant::now();
         move |endpoint: &mut Endpoint, event: &EndpointEvent| {
             if let EndpointEvent::PingRttMeasured { rtt_ms, .. } = event {
@@ -948,7 +944,7 @@ fn handshake(profile: Profile, limits: QuicLimits) -> (Duration, Duration) {
         .connect(PeerAddr::quic_v1(
             LOOPBACK,
             proxy.addr.port(),
-            addr.peer_id().clone(),
+            *addr.peer_id(),
         ))
         .expect("connect");
     let mut connected = None;
@@ -983,7 +979,7 @@ fn concurrent_handshakes(
         .map(|_| {
             let proxy = UdpProxy::spawn(socket_addr(&addr), profile);
             let client = bind_on(Endpoint::builder(), "/ip4/127.0.0.1/udp/0/quic-v1");
-            let target = PeerAddr::quic_v1(LOOPBACK, proxy.addr.port(), addr.peer_id().clone());
+            let target = PeerAddr::quic_v1(LOOPBACK, proxy.addr.port(), *addr.peer_id());
             (proxy, client, target)
         })
         .collect();

@@ -186,11 +186,11 @@ fn bind_from(builder: EndpointBuilder) -> Endpoint {
 fn listener_reclaims_state_after_dialer_drop_without_disconnect() {
     let mut listener = bind_loopback();
     let listener_addr = listener.listen().expect("listener listens");
-    let listener_peer = listener.peer_id().clone();
+    let listener_peer = *listener.peer_id();
 
     for round in 0..CHURN_ROUNDS {
         let mut dialer = bind_loopback();
-        let dialer_peer = dialer.peer_id().clone();
+        let dialer_peer = *dialer.peer_id();
         dialer.connect(&listener_addr).expect("connect to listener");
 
         wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
@@ -206,10 +206,10 @@ fn listener_reclaims_state_after_dialer_drop_without_disconnect() {
 fn listener_reclaims_state_after_dialer_close() {
     let mut listener = bind_loopback();
     let listener_addr = listener.listen().expect("listener listens");
-    let listener_peer = listener.peer_id().clone();
+    let listener_peer = *listener.peer_id();
 
     let mut dialer = bind_loopback();
-    let dialer_peer = dialer.peer_id().clone();
+    let dialer_peer = *dialer.peer_id();
     dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
@@ -237,7 +237,7 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
     let listener_addr = listener.listen().expect("listener listens");
 
     let mut dialer = bind_loopback();
-    let dialer_peer = dialer.peer_id().clone();
+    let dialer_peer = *dialer.peer_id();
     dialer.connect(&listener_addr).expect("connect to listener");
 
     // Do not wait for Identify; the connection may still be handshaking.
@@ -258,7 +258,7 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
 fn close_drains_replacement_connection() {
     let mut listener = bind_from(short_window());
     let listener_addr = listener.listen().expect("listener listens");
-    let listener_peer = listener.peer_id().clone();
+    let listener_peer = *listener.peer_id();
 
     let dialer_key = Ed25519Keypair::generate();
     let mut dialer = short_window()
@@ -267,7 +267,7 @@ fn close_drains_replacement_connection() {
         .expect("quic listen address")
         .bind()
         .expect("bind first dialer");
-    let dialer_peer = dialer.peer_id().clone();
+    let dialer_peer = *dialer.peer_id();
     dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     outlive_race_window(&mut listener, &mut dialer);
@@ -315,7 +315,7 @@ fn close_drains_replacement_connection() {
 fn close_drains_pending_replacement_handshake() {
     let mut listener = bind_from(short_window());
     let listener_addr = listener.listen().expect("listener listens");
-    let listener_peer = listener.peer_id().clone();
+    let listener_peer = *listener.peer_id();
 
     let dialer_key = Ed25519Keypair::generate();
     let mut dialer = short_window()
@@ -324,7 +324,7 @@ fn close_drains_pending_replacement_handshake() {
         .expect("quic listen address")
         .bind()
         .expect("bind first dialer");
-    let dialer_peer = dialer.peer_id().clone();
+    let dialer_peer = *dialer.peer_id();
     dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     outlive_race_window(&mut listener, &mut dialer);

@@ -185,7 +185,7 @@ impl Relayed {
         let tick = Duration::from_millis(1);
 
         let mut target = peer(ReservationPolicy::Always);
-        let target_peer = target.peer_id().clone();
+        let target_peer = *target.peer_id();
         let deadline = Instant::now() + SETUP_TIMEOUT;
         loop {
             assert!(Instant::now() < deadline, "target reservation timed out");
@@ -199,8 +199,8 @@ impl Relayed {
         }
 
         let mut client = peer(ReservationPolicy::Never);
-        let client_peer = client.peer_id().clone();
-        let connect_id = client.connect(&target_peer).expect("relayed connect");
+        let client_peer = *client.peer_id();
+        let connect_id = client.connect(target_peer).expect("relayed connect");
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let (mut circuit, mut client_ready, mut target_ready) = (false, false, false);
         while !(circuit && client_ready && target_ready) {

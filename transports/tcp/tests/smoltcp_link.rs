@@ -307,7 +307,7 @@ fn upgraded_pair_on(wire: Wire, listener_ip: &str, dialer_ip: &str, prefix: u8) 
     let bound = listener
         .listen(&host_port(listener_ip, 0))
         .expect("listener binds");
-    let target = PeerAddr::new(bound, listener_peer.clone()).expect("dial target");
+    let target = PeerAddr::new(bound, listener_peer).expect("dial target");
     let connection = dialer.dial(&target).expect("dial starts");
 
     let mut dialer_events = Vec::new();

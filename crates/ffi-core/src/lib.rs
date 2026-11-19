@@ -89,7 +89,7 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
     let relay = parse_direct_peer_addr(&relay_addr)?;
     let target = parse_peer_id(&peer_id)?;
     let mut protocols = relay.transport().protocols().to_vec();
-    protocols.push(Protocol::P2p(relay.peer_id().clone()));
+    protocols.push(Protocol::P2p(*relay.peer_id()));
     protocols.push(Protocol::P2pCircuit);
     protocols.push(Protocol::P2p(target));
     Ok(Multiaddr::from_protocols(protocols).to_string())

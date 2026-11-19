@@ -63,7 +63,7 @@ fn connect_skips_webtransport_candidates_and_connects_over_quic_v1() {
         )
         .parse::<Multiaddr>()
         .expect("webtransport multiaddr"),
-        b_quic.peer_id().clone(),
+        *b_quic.peer_id(),
     )
     .expect("peer addr");
 

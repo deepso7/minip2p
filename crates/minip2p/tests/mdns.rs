@@ -30,8 +30,8 @@ fn two_endpoints_discover_and_connect_without_bootstrap() {
     let mut b = endpoint();
     a.listen().expect("a listens");
     b.listen().expect("b listens");
-    let a_peer = a.peer_id().clone();
-    let b_peer = b.peer_id().clone();
+    let a_peer = *a.peer_id();
+    let b_peer = *b.peer_id();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while !a.connected_peers().contains(&b_peer) || !b.connected_peers().contains(&a_peer) {

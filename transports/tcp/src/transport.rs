@@ -761,7 +761,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         let id = self.ids.peek().ok_or(TransportError::ResourceExhausted {
             resource: "tcp connection ids",
         })?;
-        let session = self.new_session(SessionRole::Initiator, Some(addr.peer_id().clone()))?;
+        let session = self.new_session(SessionRole::Initiator, Some(*addr.peer_id()))?;
 
         // Spend the id before the first failure that names it. `DialFailed`
         // carries this id, so handing it back for a later dial to reuse would

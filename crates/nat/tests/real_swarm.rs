@@ -120,7 +120,7 @@ fn the_bare_swarm_rejects_a_named_relay_dial() {
         PeerId::from_public_key_protobuf(b"relay"),
     )
     .expect("valid relay addr");
-    let local = swarm.local_peer_id().clone();
+    let local = *swarm.local_peer_id();
     let mut agent = NatAgent::new(local, nat_config(relay, ReservationPolicy::Never));
 
     let id = minip2p_core::ConnectId::from_u64(1);
@@ -144,7 +144,7 @@ fn a_reservation_and_a_connect_share_one_relay_dial() {
     let relay_peer = PeerId::from_public_key_protobuf(b"relay");
     let relay = PeerAddr::new(maddr("/ip4/203.0.113.1/udp/4001/quic-v1"), relay_peer)
         .expect("valid relay addr");
-    let local = swarm.local_peer_id().clone();
+    let local = *swarm.local_peer_id();
     let mut agent = NatAgent::new(local, nat_config(relay, ReservationPolicy::Always));
 
     agent.handle_tick(&mut swarm, Now::from_millis(0));
@@ -250,7 +250,7 @@ fn the_bare_swarm_resets_a_bridge_it_cannot_promote() {
     let local_key = Ed25519Keypair::from_secret_key_bytes([2; 32]);
     let relay_key = Ed25519Keypair::from_secret_key_bytes([3; 32]);
     let relay_peer = relay_key.peer_id();
-    let (local_io, relay_io) = InMemoryTransport::pair(local_key.peer_id(), relay_peer.clone());
+    let (local_io, relay_io) = InMemoryTransport::pair(local_key.peer_id(), relay_peer);
     let mut local = SwarmBuilder::new(&local_key)
         .protocol(HOP_PROTOCOL_ID)
         .build_core(local_io, ZeroEntropy)

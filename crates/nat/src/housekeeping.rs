@@ -285,7 +285,7 @@ impl Prober {
         let result = acquire::start(
             &server,
             AUTONAT_PROTOCOL_ID,
-            DialPurpose::Probe(server.peer_id().clone()),
+            DialPurpose::Probe(*server.peer_id()),
             deadline_ms,
             swarm,
             shared,
@@ -485,7 +485,7 @@ impl Prober {
                 false
             }
             Ok(Some(reachability)) => {
-                let server = flight.server.peer_id().clone();
+                let server = *flight.server.peer_id();
                 self.finish_flight(swarm, shared, now);
                 self.record_vote(server, &reachability, shared, now)
             }
@@ -546,7 +546,7 @@ impl Prober {
                 .votes
                 .iter()
                 .min_by_key(|(_, vote)| vote.seq)
-                .map(|(server, _)| server.clone())
+                .map(|(server, _)| *server)
                 .expect("the window is over a positive size");
             self.votes.remove(&oldest);
         }
@@ -804,7 +804,7 @@ impl ReservationManager {
                 self.begin_acquire(None, swarm, shared, now);
             }
             ResState::Reserved { info, conn, .. } if now.monotonic_ms >= info.renew_at_mono_ms => {
-                let renewing = Some((info.relay.clone(), *conn));
+                let renewing = Some((info.relay, *conn));
                 self.begin_acquire(renewing, swarm, shared, now);
             }
             ResState::Reserved {
@@ -840,7 +840,7 @@ impl ReservationManager {
         match core::mem::replace(&mut self.state, ResState::Idle) {
             ResState::Reserved { relay, .. } => {
                 shared.push_event(NatEvent::RelayReservationLost {
-                    relay: relay.peer_id().clone(),
+                    relay: *relay.peer_id(),
                 });
             }
             ResState::Acquiring {
@@ -895,7 +895,7 @@ impl ReservationManager {
         let result = acquire::start(
             &relay,
             HOP_PROTOCOL_ID,
-            DialPurpose::Reserve(relay.peer_id().clone()),
+            DialPurpose::Reserve(*relay.peer_id()),
             deadline_ms,
             swarm,
             shared,
@@ -1014,9 +1014,7 @@ impl ReservationManager {
             ResState::Reserved { relay, conn, .. }
                 if relay.peer_id() == peer && *conn == conn_id =>
             {
-                shared.push_event(NatEvent::RelayReservationLost {
-                    relay: peer.clone(),
-                });
+                shared.push_event(NatEvent::RelayReservationLost { relay: *peer });
                 self.back_off(shared, now);
             }
             ResState::Acquiring {
@@ -1055,9 +1053,7 @@ impl ReservationManager {
         self.renewal_lost_on(peer, old, shared);
         let (relay, renewing) = match &mut self.state {
             ResState::Reserved { relay, conn, .. } if relay.peer_id() == peer && *conn == old => {
-                shared.push_event(NatEvent::RelayReservationLost {
-                    relay: peer.clone(),
-                });
+                shared.push_event(NatEvent::RelayReservationLost { relay: *peer });
                 (relay.clone(), None)
             }
             ResState::Acquiring {
@@ -1177,7 +1173,7 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        let relay_peer = relay.peer_id().clone();
+        let relay_peer = *relay.peer_id();
         finish_stream(&relay_peer, conn, stream, swarm, shared, now);
 
         let default_ttl = shared.config.reservation_default_ttl_secs;
@@ -1200,7 +1196,7 @@ impl ReservationManager {
             _ => default_ttl,
         };
         let info = ReservationInfo {
-            relay: relay_peer.clone(),
+            relay: relay_peer,
             expires_unix_secs: expire_unix_secs,
             // The relay controls `expire`, so this conversion must not let a
             // large value wrap the monotonic renewal deadline.

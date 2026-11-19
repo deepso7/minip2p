@@ -93,10 +93,10 @@ fn fuzz_relay_mesh(data: &[u8]) {
     let split = data.first().map_or(0, |b| usize::from(*b)).min(data.len());
     let (head, tail) = data.split_at(split);
     let mut whole = mesh::Directory::new(4);
-    whole.stream_opened(member.clone(), 0u8);
+    whole.stream_opened(member, 0u8);
     let whole_input = whole.stream_data(&member, &0, data);
     let mut parts = mesh::Directory::new(4);
-    parts.stream_opened(member.clone(), 0u8);
+    parts.stream_opened(member, 0u8);
     let first = parts.stream_data(&member, &0, head);
     let parts_input = match first {
         mesh::DirectoryInput::Reset(_) => first,
@@ -222,14 +222,14 @@ fn fuzz_pubsub(data: &[u8]) {
         .expect("default gossipsub config");
     let _ = agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
         },
         0,
     );
     let _ = agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
@@ -237,7 +237,7 @@ fn fuzz_pubsub(data: &[u8]) {
     );
     let _ = agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.to_string(),
@@ -484,13 +484,13 @@ fn fuzz_circuit(data: &[u8]) {
     for role in [CircuitRole::Initiator, CircuitRole::Responder] {
         let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([5; 32]);
         let mut transport =
-            CircuitTransport::new(FuzzTransport::new(relay.clone()), identity, FixedEntropy);
+            CircuitTransport::new(FuzzTransport::new(relay), identity, FixedEntropy);
         let _ = transport.poll(Now::from_millis(0));
         let _ = transport.adopt_bridge(BridgeAdoption {
             inner_conn: ConnectionId::new(1),
             bridge_stream: StreamId::new(1),
-            relay: relay.clone(),
-            remote_peer: remote.clone(),
+            relay,
+            remote_peer: remote,
             role,
             pending_data: Bytes::copy_from_slice(&NOISE_SELECTION[..1]),
             unsent_prefix: Bytes::new(),
@@ -571,7 +571,7 @@ fn fuzz_discovery(data: &[u8]) {
     }
     book.observe_beacon(
         Observation {
-            peer: remote_peer.clone(),
+            peer: remote_peer,
             addrs: beacon_addrs,
         },
         1,
@@ -579,7 +579,7 @@ fn fuzz_discovery(data: &[u8]) {
 
     let ttl_ms = data.first().map_or(0, |byte| u64::from(*byte) * 8);
     book.observe_mdns(
-        remote_peer.clone(),
+        remote_peer,
         vec![(
             "/ip4/127.0.0.1/udp/4002/quic-v1"
                 .parse()
@@ -589,7 +589,7 @@ fn fuzz_discovery(data: &[u8]) {
         2,
     );
     let reason = core::str::from_utf8(data).unwrap_or("non-UTF-8 fuzz input");
-    book.report_violation(Some(remote_peer.clone()), DiscoverySource::Mdns, reason);
+    book.report_violation(Some(remote_peer), DiscoverySource::Mdns, reason);
     book.dial_failed(&remote_peer, reason, 3);
     if data.get(1).is_some_and(|byte| byte & 1 == 0) {
         book.peer_connected(&remote_peer, 4);
@@ -645,10 +645,10 @@ fn fuzz_identify(data: &[u8]) {
         protocols: vec!["/ipfs/id/1.0.0".into()],
         public_key: b"fuzz-public-key".to_vec(),
     });
-    identify.register_inbound_stream(peer_id.clone(), stream_id);
+    identify.register_inbound_stream(peer_id, stream_id);
     let (head, tail) = data.split_at(data.len() / 2);
     for chunk in [head, tail] {
-        identify.on_stream_data(peer_id.clone(), stream_id, chunk);
+        identify.on_stream_data(peer_id, stream_id, chunk);
     }
     // Closing the remote write side decodes the buffered length-prefixed
     // message.
@@ -812,8 +812,8 @@ fn fuzz_ping(data: &[u8]) {
     let mut ping = PingProtocol::new(PingConfig {
         request_timeout_ms: 10,
     });
-    ping.register_inbound_stream(peer.clone(), inbound);
-    let _ = ping.register_outbound_stream(peer.clone(), outbound);
+    ping.register_inbound_stream(peer, inbound);
+    let _ = ping.register_outbound_stream(peer, outbound);
     let _ = ping.send_ping(&peer, &SENT, 0);
     // Every payload sent back on the inbound stream, and whether the
     // outbound ping measured an RTT.

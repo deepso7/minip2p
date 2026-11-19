@@ -22,7 +22,7 @@ A native node serves browsers by listening on a `/…/quic-v1/webtransport` addr
 ## Loading the wasm
 
 - **`@minip2p/web`** loads its `.wasm` (resolved from `import.meta.url`, so bundlers emit it as an asset) with top-level `await`. Once the import resolves, `Minip2p.create` is synchronous, as in Node. Bundlers need an `es2022` target for the top-level `await`; Vite also needs `optimizeDeps.exclude: ["@minip2p/web"]` so pre-bundling keeps the package next to its `.wasm`.
-- **`@minip2p/web/manual`** exports the same API plus `initMinip2p({ wasm })` and fetches nothing at import: serve the `.wasm` yourself (a CDN, a strict CSP) and pass a URL, a `Response`, its bytes or a compiled `WebAssembly.Module`. `Minip2p.create` throws until `initMinip2p` has resolved.
+- **`@minip2p/web/manual`** exports the same API plus `initMinip2p({ wasm })` and fetches nothing at import: serve the `.wasm` yourself (a CDN, a strict CSP) and pass a URL, a `Response`, its bytes or a compiled `WebAssembly.Module`. `Minip2p.create` throws until `initMinip2p` has resolved. The package exports the `.wasm` as `@minip2p/web/wasm`, so a bundler can hand you its URL (Vite: `import wasm from "@minip2p/web/wasm?url"`).
 
 ## What works in a browser
 

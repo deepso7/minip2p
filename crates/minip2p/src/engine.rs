@@ -203,7 +203,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         names: &mut dyn Expander,
         now: Now,
     ) -> ConnectId {
-        let peer = target.peer_id().clone();
+        let peer = *target.peer_id();
         #[cfg(feature = "_peer-book")]
         let book = self.discovery.as_ref().map(|discovery| &discovery.book);
         #[cfg(feature = "_peer-book")]
@@ -509,7 +509,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// See `Endpoint::connection_info`.
     pub(crate) fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
-        let peer_id = self.core.connection_peer(conn_id)?.clone();
+        let peer_id = *self.core.connection_peer(conn_id)?;
         let ready_protocols = self
             .core
             .peer_readiness(&peer_id)
@@ -731,11 +731,20 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Feeds one swarm event to the Connection engine and the drivers, and
     /// queues it unless one of them claimed it. Its capability and
     /// Connection-attempt output follows at the end of the batch.
-    pub(crate) fn ingest(&mut self, event: SwarmEvent, now: Now) {
+    pub(crate) fn ingest(&mut self, mut event: SwarmEvent, now: Now) {
+        // The swarm reports a replaced connection's punch as Direct: refine
+        // `old` before NAT forgets its punch on this event...
+        if let SwarmEvent::ConnectionReplaced { old, old_path, .. } = &mut event {
+            *old_path = refine_punched(*old_path, is_punched(&self.nat, *old));
+        }
         let consumed = self
             .connect
             .observe(&event, &mut self.core, now.monotonic_ms)
             || self.ingest_into_drivers(&event, now);
+        // ...and `new` after NAT has recorded it.
+        if let SwarmEvent::ConnectionReplaced { new, new_path, .. } = &mut event {
+            *new_path = refine_punched(*new_path, is_punched(&self.nat, *new));
+        }
         if !consumed {
             self.events.push_back(event.into());
         }
@@ -1056,6 +1065,14 @@ fn path_of<T: Transport, E: EntropySource>(
         return circuit_relay(core, conn_id).map(|relay| Path::Relayed { relay });
     }
     Some(if punched { Path::Punched } else { Path::Direct })
+}
+
+/// A swarm-reported Direct path is Punched when NAT's hole punch made it.
+fn refine_punched(path: Path, punched: bool) -> Path {
+    match path {
+        Path::Direct if punched => Path::Punched,
+        path => path,
+    }
 }
 
 /// Appends the contributions `addresses` does not already hold, keeping

@@ -194,10 +194,7 @@ impl PeerDiscoveryAgent {
             return;
         }
         let before = self.book.get(&peer).map(|entry| self.view(entry));
-        let entry = self
-            .book
-            .entry(peer.clone())
-            .or_insert_with(PeerEntry::empty);
+        let entry = self.book.entry(peer).or_insert_with(PeerEntry::empty);
         let address_changed = entry
             .beacon
             .as_ref()
@@ -242,9 +239,7 @@ impl PeerDiscoveryAgent {
         }
 
         let before = self.book.get(&peer).map(|entry| self.view(entry));
-        self.book
-            .entry(peer.clone())
-            .or_insert_with(PeerEntry::empty);
+        self.book.entry(peer).or_insert_with(PeerEntry::empty);
 
         for (addr, ttl_ms) in normalized {
             let entry = self.book.get_mut(&peer).expect("entry inserted above");
@@ -323,7 +318,7 @@ impl PeerDiscoveryAgent {
 
     /// Reports that the swarm has a connection to a peer.
     pub fn peer_connected(&mut self, peer: &PeerId, _now_ms: u64) {
-        self.connected.insert(peer.clone());
+        self.connected.insert(*peer);
         if let Some(entry) = self.book.get_mut(peer) {
             entry.dial = DialState::Idle;
         }
@@ -467,9 +462,9 @@ impl PeerDiscoveryAgent {
                             continue;
                         };
                         let view = self.view(entry);
-                        self.reported.insert(peer.clone(), view.clone());
+                        self.reported.insert(peer, view.clone());
                         DiscoveryEvent::PeerDiscovered {
-                            peer: peer.clone(),
+                            peer,
                             addrs: view.merged,
                             source,
                         }
@@ -480,16 +475,16 @@ impl PeerDiscoveryAgent {
                             continue;
                         };
                         let view = self.view(entry);
-                        self.reported.insert(peer.clone(), view.clone());
+                        self.reported.insert(peer, view.clone());
                         DiscoveryEvent::PeerUpdated {
-                            peer: peer.clone(),
+                            peer,
                             addrs: view.merged,
                             source,
                         }
                     }
                     StateTransition::Expired => {
                         self.reported.remove(&peer);
-                        DiscoveryEvent::PeerExpired { peer: peer.clone() }
+                        DiscoveryEvent::PeerExpired { peer }
                     }
                 };
                 self.cleanup_pending_head(&peer);
@@ -544,7 +539,7 @@ impl PeerDiscoveryAgent {
         self.book
             .iter()
             .map(|(peer, entry)| KnownPeer {
-                peer: peer.clone(),
+                peer: *peer,
                 addrs: self.view(entry).merged,
                 beacon_addrs: entry
                     .beacon
@@ -624,7 +619,7 @@ impl PeerDiscoveryAgent {
                         *b_peer,
                     ))
             })
-            .map(|(peer, _)| peer.clone());
+            .map(|(peer, _)| *peer);
         let Some(candidate) = candidate else {
             return false;
         };
@@ -683,7 +678,7 @@ impl PeerDiscoveryAgent {
                 .charge(now_ms, self.config.mdns_dial_window_ms);
         }
         self.actions.push_back(DiscoveryAction::Dial {
-            peer: peer.clone(),
+            peer: *peer,
             addrs,
             source,
         });
@@ -701,7 +696,7 @@ impl PeerDiscoveryAgent {
         );
         if matches!(entry.dial, DialState::InFlight) || queued {
             self.actions
-                .push_back(DiscoveryAction::CancelDial { peer: peer.clone() });
+                .push_back(DiscoveryAction::CancelDial { peer: *peer });
         }
         self.mark_state(peer, DiscoverySource::Mdns);
     }
@@ -746,9 +741,9 @@ impl PeerDiscoveryAgent {
 
     fn pending_entry(&mut self, peer: &PeerId) -> &mut PendingPeer {
         if !self.pending.contains_key(peer) {
-            self.order.push_back(peer.clone());
+            self.order.push_back(*peer);
         }
-        self.pending.entry(peer.clone()).or_default()
+        self.pending.entry(*peer).or_default()
     }
 
     fn cleanup_pending_head(&mut self, peer: &PeerId) {
@@ -833,8 +828,8 @@ mod tests {
         });
         let remote = peer(2);
         assert!(agent.known_addrs(&remote).is_empty());
-        agent.observe_mdns(remote.clone(), vec![(addr(1), 100)], 0);
-        agent.observe_beacon(beacon(remote.clone(), vec![addr(2)]), 1);
+        agent.observe_mdns(remote, vec![(addr(1), 100)], 0);
+        agent.observe_beacon(beacon(remote, vec![addr(2)]), 1);
         assert_eq!(agent.known_addrs(&remote), vec![addr(2), addr(1)]);
         assert!(agent.known_addrs(&peer(3)).is_empty());
     }
@@ -843,8 +838,8 @@ mod tests {
     fn addressless_beacon_presence_survives_mdns_expiry() {
         let mut agent = agent(PeerDiscoveryConfig::default());
         let remote = peer(2);
-        agent.observe_mdns(remote.clone(), vec![(addr(1), 5)], 0);
-        agent.observe_beacon(beacon(remote.clone(), vec![]), 1);
+        agent.observe_mdns(remote, vec![(addr(1), 5)], 0);
+        agent.observe_beacon(beacon(remote, vec![]), 1);
         let known = &agent.known_peers()[0];
         assert_eq!(known.beacon_last_seen_ms, Some(1));
         assert_eq!(known.mdns_addrs, vec![addr(1)]);
@@ -865,7 +860,7 @@ mod tests {
         let mut agent = agent(config);
         let remote = peer(2);
         let candidate = addr(1);
-        agent.observe_mdns(remote.clone(), vec![(candidate.clone(), 100)], 0);
+        agent.observe_mdns(remote, vec![(candidate.clone(), 100)], 0);
         assert!(matches!(
             agent.poll_event(),
             Some(DiscoveryEvent::PeerDiscovered {
@@ -874,7 +869,7 @@ mod tests {
             })
         ));
 
-        agent.observe_beacon(beacon(remote.clone(), vec![candidate.clone()]), 1);
+        agent.observe_beacon(beacon(remote, vec![candidate.clone()]), 1);
         assert!(matches!(
             agent.poll_event(),
             Some(DiscoveryEvent::PeerUpdated {
@@ -902,7 +897,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let remote = peer(2);
-        agent.observe_mdns(remote.clone(), vec![(addr(1), 100)], 0);
+        agent.observe_mdns(remote, vec![(addr(1), 100)], 0);
         let _ = agent.poll_event();
         agent.observe_mdns(remote, vec![(addr(1), 200)], 1);
         assert!(agent.poll_event().is_none());
@@ -918,7 +913,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let remote = peer(2);
-        agent.observe_beacon(beacon(remote.clone(), vec![addr(1)]), 0);
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 0);
         agent.observe_mdns(remote, vec![(addr(2), 100)], 0);
         while agent.poll_event().is_some() {}
 
@@ -962,11 +957,11 @@ mod tests {
         let beacon_expires = peer(3);
         let disappears = peer(4);
 
-        agent.observe_beacon(beacon(mdns_expires.clone(), vec![addr(1)]), 1);
-        agent.observe_mdns(mdns_expires.clone(), vec![(addr(2), 5)], 0);
-        agent.observe_beacon(beacon(beacon_expires.clone(), vec![addr(3)]), 0);
-        agent.observe_mdns(beacon_expires.clone(), vec![(addr(4), 100)], 1);
-        agent.observe_mdns(disappears.clone(), vec![(addr(5), 5)], 0);
+        agent.observe_beacon(beacon(mdns_expires, vec![addr(1)]), 1);
+        agent.observe_mdns(mdns_expires, vec![(addr(2), 5)], 0);
+        agent.observe_beacon(beacon(beacon_expires, vec![addr(3)]), 0);
+        agent.observe_mdns(beacon_expires, vec![(addr(4), 100)], 1);
+        agent.observe_mdns(disappears, vec![(addr(5), 5)], 0);
         while agent.poll_event().is_some() {}
 
         agent.handle_tick(5);
@@ -1005,7 +1000,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let remote = peer(2);
-        agent.observe_mdns(remote.clone(), vec![(addr(1), 10), (addr(2), 20)], 0);
+        agent.observe_mdns(remote, vec![(addr(1), 10), (addr(2), 20)], 0);
         agent.observe_mdns(remote, vec![(addr(3), 30)], 0);
         let known = &agent.known_peers()[0];
         assert_eq!(known.mdns_addrs, vec![addr(2), addr(3)]);
@@ -1021,7 +1016,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let authenticated = peer(2);
-        agent.observe_beacon(beacon(authenticated.clone(), vec![]), 0);
+        agent.observe_beacon(beacon(authenticated, vec![]), 0);
         agent.observe_mdns(peer(3), vec![(addr(3), 100)], 1);
         assert_eq!(agent.known_peers()[0].peer, authenticated);
     }
@@ -1035,7 +1030,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let first = peer(2);
-        agent.observe_mdns(first.clone(), vec![(addr(1), 100)], 0);
+        agent.observe_mdns(first, vec![(addr(1), 100)], 0);
         assert!(matches!(
             agent.poll_action(),
             Some(DiscoveryAction::Dial { .. })
@@ -1044,7 +1039,7 @@ mod tests {
         agent.observe_mdns(first, vec![(addr(2), 100)], 2);
         assert!(agent.poll_action().is_none());
         let second = peer(3);
-        agent.observe_mdns(second.clone(), vec![(addr(3), 100)], 3);
+        agent.observe_mdns(second, vec![(addr(3), 100)], 3);
         assert!(matches!(
             agent.poll_action(),
             Some(DiscoveryAction::Dial { peer, .. }) if peer == second
@@ -1060,13 +1055,13 @@ mod tests {
     fn only_authenticated_address_change_clears_backoff() {
         let mut agent = agent(PeerDiscoveryConfig::default());
         let remote = peer(2);
-        agent.observe_mdns(remote.clone(), vec![(addr(1), 100)], 0);
+        agent.observe_mdns(remote, vec![(addr(1), 100)], 0);
         let _ = agent.poll_action();
         agent.dial_failed(&remote, "failed", 1);
 
-        agent.observe_mdns(remote.clone(), vec![(addr(2), 100)], 2);
+        agent.observe_mdns(remote, vec![(addr(2), 100)], 2);
         assert!(agent.poll_action().is_none());
-        agent.observe_beacon(beacon(remote.clone(), vec![]), 3);
+        agent.observe_beacon(beacon(remote, vec![]), 3);
         assert!(agent.poll_action().is_none());
         agent.observe_beacon(beacon(remote, vec![addr(1)]), 4);
         assert!(matches!(
@@ -1098,7 +1093,7 @@ mod tests {
         };
         let mut agent = agent(config);
         let remote = peer(2);
-        agent.observe_beacon(beacon(remote.clone(), vec![addr(1)]), 0);
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 0);
         let _ = agent.poll_action();
         agent.dial_failed(&remote, "failed", 0);
         agent.handle_tick(1);
@@ -1117,12 +1112,12 @@ mod tests {
         let mut agent = agent(config);
         let first = peer(250);
         let second = peer(2);
-        agent.observe_beacon(beacon(first.clone(), vec![]), 0);
+        agent.observe_beacon(beacon(first, vec![]), 0);
         assert!(matches!(
             agent.poll_event(),
             Some(DiscoveryEvent::PeerDiscovered { peer, .. }) if peer == first
         ));
-        agent.observe_beacon(beacon(second.clone(), vec![]), 1);
+        agent.observe_beacon(beacon(second, vec![]), 1);
         assert!(matches!(
             agent.poll_event(),
             Some(DiscoveryEvent::PeerExpired { peer }) if peer == first
@@ -1145,7 +1140,7 @@ mod tests {
         peers.sort();
         let initial = peers.split_off(peers.len() - 2);
         for remote in &initial {
-            agent.observe_beacon(beacon(remote.clone(), vec![]), 0);
+            agent.observe_beacon(beacon(*remote, vec![]), 0);
         }
         while agent.poll_event().is_some() {}
         assert_eq!(agent.reported.len(), 2);
@@ -1173,7 +1168,7 @@ mod tests {
         let mut agent = agent(config);
         for (index, remote) in (2..40).map(peer).enumerate() {
             let now = index as u64;
-            agent.observe_beacon(beacon(remote.clone(), vec![addr(index as u16 + 1)]), now);
+            agent.observe_beacon(beacon(remote, vec![addr(index as u16 + 1)]), now);
             let _ = agent.poll_action();
             agent.dial_failed(&remote, "failed", now);
             assert!(agent.pending.len() <= 1);
@@ -1188,12 +1183,12 @@ mod tests {
         let mut agent = agent(PeerDiscoveryConfig::default());
         let remote = peer(2);
         let candidate = addr(1);
-        agent.observe_mdns(remote.clone(), vec![(candidate.clone(), 100)], 0);
+        agent.observe_mdns(remote, vec![(candidate.clone(), 100)], 0);
 
         agent.reset_dials();
         assert!(agent.poll_action().is_none());
 
-        agent.observe_mdns(remote.clone(), vec![(candidate, 100)], 1);
+        agent.observe_mdns(remote, vec![(candidate, 100)], 1);
         assert!(matches!(
             agent.poll_action(),
             Some(DiscoveryAction::Dial {
