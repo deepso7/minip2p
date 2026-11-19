@@ -46,9 +46,11 @@ Without the goodbye that `expired` would wait out the record's TTL — two minut
 | `--key <path>` | persistent Ed25519 secret (hex), created on first use, so a restart keeps its peer id |
 | `--listen <multiaddr>` | explicit QUIC or TCP bind; default is dual-stack QUIC on UDP/0 |
 
+If the mDNS socket itself fails — no multicast route, a VPN capturing UDP 5353 — the run prints `mdns-failed` with the reason and `mdns-recovered` once a retry succeeds, so a broken network path is distinguishable from an empty one rather than just going quiet.
+
 ## A note on trust
 
-**mDNS claims are unauthenticated.** The addresses in a `discovered` line are what some host on the link said about itself, and nothing more — anyone on the same network can make such a claim. They become trustworthy only once a connection to that peer completes the Noise handshake and proves possession of the peer id's key, which is what `connected` reports.
+**mDNS claims are unauthenticated.** The addresses in a `discovered` line are what some host on the link said about itself, and nothing more — anyone on the same network can make such a claim. They become trustworthy only once a connection to that peer proves possession of the peer id's key, which is what `connected` reports: TLS 1.3 on the default QUIC path, or Noise XX if you bind TCP with `--listen /ip4/0.0.0.0/tcp/0`.
 
 That is why `--no-dial` exists: on a network you do not control, you may want to watch the book without acting on it. The defaults bound the damage either way — `PeerDiscoveryConfig` caps mDNS-triggered dials per peer and globally per window, and the book itself is bounded.
 
@@ -58,4 +60,4 @@ That is why `--no-dial` exists: on a network you do not control, you may want to
 just mdns-discovery
 ```
 
-Spawns two instances, waits for both to exit, and asserts each discovered the *other's* peer id. It is `#[ignore]`d by default because it needs real multicast delivery on UDP 5353, which CI containers and many VPN configurations do not provide — the same reason `crates/minip2p/tests/mdns.rs` is ignored.
+Spawns two instances, waits for both to exit under a real deadline — killing and failing rather than hanging if either outlives it — and asserts each discovered the *other's* peer id. It is `#[ignore]`d by default because it needs real multicast delivery on UDP 5353, which CI containers and many VPN configurations do not provide — the same reason `crates/minip2p/tests/mdns.rs` is ignored.

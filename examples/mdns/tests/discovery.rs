@@ -5,7 +5,10 @@
 //! UDP 5353, which CI containers and many VPN configurations do not give.
 //! Run it with `cargo test -p minip2p-mdns-demo -- --ignored`.
 
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Bounded run length handed to both instances, in seconds.
@@ -26,29 +29,34 @@ fn two_instances_discover_each_other() {
             .expect("spawn minip2p-mdns")
     };
 
-    let a = spawn();
-    let b = spawn();
+    let mut a = spawn();
+    let mut b = spawn();
 
-    let start = Instant::now();
-    let a = a.wait_with_output().expect("instance a exits");
-    let b = b.wait_with_output().expect("instance b exits");
-    assert!(
-        start.elapsed() < TEST_DEADLINE,
-        "instances outlived the test deadline"
-    );
+    // Drain both children's stdout on their own threads, so neither can
+    // block on a full pipe while the deadline below is what actually
+    // bounds the test.
+    let a_stdout = drain(&mut a);
+    let b_stdout = drain(&mut b);
 
-    for (name, out) in [("a", &a), ("b", &b)] {
+    let deadline = Instant::now() + TEST_DEADLINE;
+    let a_status = wait_by(&mut a, deadline);
+    let b_status = wait_by(&mut b, deadline);
+
+    let a_out = a_stdout.recv().unwrap_or_default();
+    let b_out = b_stdout.recv().unwrap_or_default();
+
+    for (name, status, out) in [("a", a_status, &a_out), ("b", b_status, &b_out)] {
         assert!(
-            out.status.success(),
-            "instance {name} exited non-zero: {:?}\nstdout:\n{}\nstderr:\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
+            status.is_some(),
+            "instance {name} outlived the {TEST_DEADLINE:?} deadline; stdout:\n{out}",
+        );
+        let status = status.expect("checked immediately above");
+        assert!(
+            status.success(),
+            "instance {name} exited non-zero: {status:?}\nstdout:\n{out}",
         );
     }
 
-    let a_out = String::from_utf8_lossy(&a.stdout);
-    let b_out = String::from_utf8_lossy(&b.stdout);
     let a_peer = peer_id(&a_out).expect("instance a prints its peer id");
     let b_peer = peer_id(&b_out).expect("instance b prints its peer id");
     assert_ne!(a_peer, b_peer, "ephemeral identities should differ");
@@ -74,6 +82,36 @@ fn two_instances_discover_each_other() {
             out.lines().any(|l| l.starts_with("[mdns] done ")),
             "instance {name} should print its shutdown summary; got:\n{out}",
         );
+    }
+}
+
+/// Takes `child`'s piped stdout and reads it to a `String` on its own
+/// thread, so a full pipe cannot deadlock the deadline below.
+fn drain(child: &mut Child) -> mpsc::Receiver<String> {
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        drop(stdout.read_to_string(&mut buf));
+        drop(tx.send(buf));
+    });
+    rx
+}
+
+/// Waits for `child` until `deadline`, then kills and reaps it. `None`
+/// means it had to be killed, which fails the test rather than hanging
+/// `just mdns-discovery` forever.
+fn wait_by(child: &mut Child, deadline: Instant) -> Option<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait().expect("waiting for instance") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            drop(child.kill());
+            drop(child.wait());
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

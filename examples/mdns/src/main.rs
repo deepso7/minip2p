@@ -13,8 +13,9 @@
 //!
 //! mDNS claims are unauthenticated: the addresses in a `discovered` line
 //! are what a host on the link said about itself, and nothing more. They
-//! become trustworthy only once a connection to that peer completes the
-//! Noise handshake, which is what `connected` reports.
+//! become trustworthy only once a connection to that peer authenticates
+//! its peer id — TLS 1.3 on the default QUIC path, Noise XX over TCP —
+//! which is what `connected` reports.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -226,6 +227,15 @@ fn print_event(event: &EndpointEvent, start: Instant) {
                 "[mdns] violation peer={peer} source={} reason={reason} suppressed={suppressed} t={t}",
                 source_name(source)
             );
+        }
+        // A failing mDNS socket reaches the application here, not as an
+        // error from `wait`, so without these a broken network path is
+        // indistinguishable from an empty one: the run just goes quiet.
+        EndpointEvent::MdnsFailed { error } => {
+            println!("[mdns] mdns-failed error={error} t={t}");
+        }
+        EndpointEvent::MdnsRecovered => {
+            println!("[mdns] mdns-recovered t={t}");
         }
         EndpointEvent::ConnectionEstablished { peer_id, .. } => {
             println!("[mdns] connected peer={peer_id} t={t}");
