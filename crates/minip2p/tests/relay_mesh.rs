@@ -57,8 +57,6 @@ impl Relay {
         let flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                // Long waits: only readiness, a scheduled timer or the
-                // stop interrupt end them.
                 if let EndpointWaitOutcome::Event(event) =
                     endpoint.wait(Duration::from_secs(60)).unwrap()
                 {
@@ -274,7 +272,6 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
         reservation_policy,
         ..NatConfig::default()
     };
-    // Alice reserves on node A; Bob reaches the mesh through node B.
     let mut alice = client(&a.public, no_punch(ReservationPolicy::Always));
     await_reservation(&mut alice, &a.public);
     let mut bob = client(&b.public, no_punch(ReservationPolicy::Never));
@@ -282,7 +279,6 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
     let bob_peer = *bob.peer_id();
     let conn = relayed(&mut bob, &mut alice, &[&a, &b]);
 
-    // Bob speaks first; Alice answers with bytes of her own on the stream.
     let stream = bob.open_stream(&alice_peer, ECHO_PROTOCOL).unwrap();
     assert_eq!(stream.conn_id(), conn);
     let (hello, reply) = (
@@ -290,8 +286,6 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
         b"hello back from alice".to_vec(),
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    // Stream data arrives in chunks: each side collects until the whole
-    // message is in.
     let (mut at_alice, mut received) = (Vec::new(), Vec::new());
     while received.len() < reply.len() {
         assert!(Instant::now() < deadline, "payload did not cross the mesh");
@@ -325,7 +319,6 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
     }
     assert_eq!(received, reply);
 
-    // Both nodes report the circuit as crossing the backbone.
     for (node, other) in [(&b, &a), (&a, &b)] {
         node.expect("forwarded circuit", Duration::from_secs(5), |event| {
             matches!(
@@ -359,7 +352,6 @@ fn each_node_reports_the_others_directory_size_once_synced() {
 #[test]
 fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
     let (a, b) = meshed_pair();
-    // Loopback is not global unicast: both sides must opt in to punch it.
     let punch = |reservation_policy| NatConfig {
         reservation_policy,
         allow_private_punch_targets: true,
@@ -369,8 +361,6 @@ fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
     await_reservation(&mut alice, &a.public);
     let mut bob = client(&b.public, punch(ReservationPolicy::Never));
     let alice_peer = *alice.peer_id();
-    // No candidates: the forwarded circuit is the only way in, so a direct
-    // connection can only come from the punch.
     let connect_id = bob.connect(alice_peer).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -429,15 +419,11 @@ fn an_idle_backbone_retransmits_and_redials_on_its_own_timers() {
         0,
         vec![backbone_addr(port_b, &key_b)],
     ));
-    // A's first dial is already out when B binds: its handshake reaches B
-    // on a retransmission.
     thread::sleep(Duration::from_millis(300));
     let bind_b = || Relay::spawn(bind_relay(&public, &key_b, port_b, Vec::new()));
     let b = bind_b();
     a.expect_member_up(&key_b.peer_id());
 
-    // B goes away and comes back on the same address: A sees the link
-    // drop and redials it after its backoff.
     b.stop();
     a.expect_member_down(&key_b.peer_id());
     let _b = bind_b();
@@ -453,7 +439,6 @@ fn a_node_under_another_public_identity_is_rejected() {
         0,
         Vec::new(),
     ));
-    // The stranger lists A, but runs under a public identity of its own.
     let stranger = Ed25519Keypair::generate();
     let c = Relay::spawn(bind_relay(
         &Ed25519Keypair::generate(),
@@ -462,8 +447,6 @@ fn a_node_under_another_public_identity_is_rejected() {
         vec![a.backbone.clone()],
     ));
 
-    // Whichever side judges the other's proof first refuses it and closes
-    // the connection; neither ever counts the other as a member.
     let deadline = Instant::now() + Duration::from_secs(20);
     let rejected = |event: &EndpointEvent, other: &PeerId| {
         assert!(
@@ -536,8 +519,6 @@ fn a_node_that_lists_the_existing_ones_joins_a_full_mesh() {
         );
     }
 
-    // One client reserved on each node; each pair of nodes forwards one
-    // circuit, its entry node naming the holding node.
     let nat = NatConfig {
         force_relay: true,
         dcutr: false,
@@ -569,7 +550,6 @@ fn a_node_that_lists_the_existing_ones_joins_a_full_mesh() {
 
 #[test]
 fn close_waits_for_a_pending_member_dial() {
-    // The member's port has no listener, so the backbone dial stays pending.
     let member = backbone_addr(free_udp_port(), &Ed25519Keypair::generate());
     let mut relay = bind_relay(
         &Ed25519Keypair::generate(),
@@ -577,7 +557,6 @@ fn close_waits_for_a_pending_member_dial() {
         0,
         vec![member],
     );
-    // The first drive dials every member.
     drop(relay.poll());
 
     let report = relay.close_within(Duration::from_millis(200));

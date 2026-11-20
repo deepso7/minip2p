@@ -89,9 +89,6 @@ impl Resolver {
         if self.in_flight.contains(host) {
             return Ok(());
         }
-        // A stalled resolver holds its thread until the OS gives up, so the
-        // number of lookup threads is capped rather than trusted to whatever
-        // candidates discovery or the application supplies.
         if self.running.load(Ordering::SeqCst) >= MAX_IN_FLIGHT_LOOKUPS {
             return Err(format!(
                 "not looking up {host}: {MAX_IN_FLIGHT_LOOKUPS} dns lookups are already in flight"
@@ -108,8 +105,6 @@ impl Resolver {
             .spawn(move || {
                 let answer = lookup(&name);
                 running.fetch_sub(1, Ordering::SeqCst);
-                // A closed channel means the endpoint is gone and nobody
-                // is waiting for this answer.
                 if answers.send((name, answer)).is_ok() {
                     wake();
                 }
@@ -181,9 +176,6 @@ mod tests {
 
     #[test]
     fn a_dns_component_is_resolved_as_a_name_and_not_as_an_address() {
-        // An IP literal in a `/dns` component is an address wearing a
-        // name's clothes; it is refused rather than taking the path meant for
-        // names.
         let mut resolver = Resolver::with_lookup(
             || {},
             Arc::new(|_| panic!("an IP literal must not be looked up")),
@@ -216,7 +208,6 @@ mod tests {
         let mut resolver = Resolver::with_lookup(
             || {},
             Arc::new(move |_: &str| {
-                // Held until the test ends, like a dead resolver.
                 match release_rx.lock().expect("lock").recv() {
                     Ok(()) | Err(_) => {}
                 }
@@ -240,7 +231,6 @@ mod tests {
             "a name already in flight still joins its lookup"
         );
 
-        // Finished lookups free their slots before their answers are taken.
         drop(release_tx);
         while resolver.running.load(Ordering::SeqCst) > 0 {
             std::thread::yield_now();

@@ -40,6 +40,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// A QUIC listen address in TEST-NET-1, never a local address, so binding it
+/// fails: a build refused before binding proves validation ran first.
+const UNBINDABLE_QUIC: &str = "/ip4/192.0.2.1/udp/0/quic-v1";
+
 /// Drives `endpoint` on a thread until the returned guard is dropped.
 ///
 /// A peer that is not being driven answers nothing, so anything asserting
@@ -72,7 +76,6 @@ impl Drop for Driven {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            // A test panic in the driver must not panic again while unwinding.
             drop(thread.join());
         }
     }

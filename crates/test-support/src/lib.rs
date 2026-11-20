@@ -73,7 +73,6 @@ impl InMemoryLink {
     /// since a push is new input.
     fn queue_mut(&mut self, side: LinkSide) -> &mut VecDeque<TransportEvent> {
         if let Some(waker) = side_value(&self.wakers, side) {
-            // A host that is gone has nobody left to wake.
             drop(waker.wake());
         }
         side_value_mut(&mut self.queues, side)
@@ -335,7 +334,6 @@ impl Transport for InMemoryTransport {
         self.ensure_connection(id)?;
         let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
-        // A reset abandons whatever this side has not acknowledged.
         side_value_mut(&mut shared.unacked, self.side).remove(&stream_id);
         let Some(stream) = shared.streams.get_mut(&stream_id) else {
             return Err(self.stream_not_found(stream_id));
@@ -398,7 +396,6 @@ impl Transport for InMemoryTransport {
                 id,
                 reason: ConnectionCloseReason::Local,
             });
-        // The far side sees an orderly close, as from a Yamux `GoAway`.
         shared.queue_mut(other).push_back(TransportEvent::Closed {
             id: self.connection,
             reason: ConnectionCloseReason::Remote { code: 0 },
@@ -437,7 +434,6 @@ impl Transport for InMemoryTransport {
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        // Queued events are due now; no clock sample needed to say so.
         (!self.shared.borrow().queue(self.side).is_empty()).then_some(Deadline::IMMEDIATE)
     }
 

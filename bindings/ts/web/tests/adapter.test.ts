@@ -116,7 +116,6 @@ describe("Web adapter", () => {
     endpoint.startConnect("12D3KooWPeer");
     endpoint.startConnect("12D3KooWPeer");
     await vi.advanceTimersByTimeAsync(0);
-    // Two commands coalesce into one burst that polls until the deadline.
     expect(native.pumps).toBe(3);
 
     await vi.advanceTimersByTimeAsync(49);
@@ -151,7 +150,6 @@ describe("Web adapter", () => {
     sessionCloses = 0;
     const endpoint = create();
     const native = fake();
-    // What a pending Rust dial leaves open in the browser.
     native.io.connect("https://192.0.2.1:4001/", []);
     native.trapOn = "ping";
 
@@ -179,7 +177,6 @@ describe("Web adapter", () => {
       reason: "close",
     });
     expect(reports).toMatchObject([{ outcome: "Failed", reason: "close" }]);
-    // The pump stopped with the release.
     const { pumps } = native;
     await vi.advanceTimersByTimeAsync(100);
     expect(native.pumps).toBe(pumps);
@@ -219,7 +216,6 @@ describe("Web adapter", () => {
     vi.useFakeTimers();
     const endpoint = create();
     const native = fake();
-    // The pump close runs arms one more deadline.
     native.pumpDelays = [0, 30];
 
     const closed = endpoint.close();
@@ -228,7 +224,6 @@ describe("Web adapter", () => {
     await closed;
     expect(native.frees).toBe(1);
     const { pumps } = native;
-    // That deadline no longer pumps the freed endpoint.
     await vi.advanceTimersByTimeAsync(100);
     expect(native.pumps).toBe(pumps);
   });

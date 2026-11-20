@@ -16,10 +16,6 @@ use crate::events::{IdentifyFailure, PingFailure, SwarmErrorKind, SwarmEvent};
 use super::{Action, FirstIdentify, ProtocolKind, SwarmState};
 
 impl SwarmState {
-    // -----------------------------------------------------------------------
-    // Negotiation deadlines
-    // -----------------------------------------------------------------------
-
     /// Gives up the outbound negotiations past their deadline: each is
     /// reported once and its stream reset, whose close then adds nothing.
     pub(super) fn expire_outbound_negotiations(&mut self, now_ms: u64) {
@@ -81,10 +77,6 @@ impl SwarmState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
-
     /// Whether the outbound stream for `target` on `conn_id` is bounded by
     /// its protocol's own deadline, which covers its negotiation too: a ping
     /// attempt's, or the connection's first Identify. The negotiation
@@ -99,10 +91,6 @@ impl SwarmState {
             _ => false,
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: multistream-select negotiation
-    // -----------------------------------------------------------------------
 
     /// Feeds an inbound negotiation. Returns how many bytes past it went to
     /// the application.
@@ -206,7 +194,6 @@ impl SwarmState {
                         || self.fail_ping_stream(&target, conn_id, PingFailure::Rejected) =>
                 {
                     self.outbound_negotiators.remove(&key);
-                    // A failed ping already queued this stream's reset.
                     if self.reset_pending.insert((conn_id, stream_id)) {
                         self.actions
                             .push_back(Action::ResetStream { conn_id, stream_id });
@@ -269,10 +256,6 @@ impl SwarmState {
                 *negotiated_protocol = Some(protocol);
                 false
             }
-            // Inbound listeners remain open after replying `na` so dialers
-            // can offer their next protocol on the same stream. Outbound
-            // dialers handle `NotAvailable` as terminal in
-            // `feed_outbound_negotiator` above.
             MultistreamOutput::NotAvailable => false,
             MultistreamOutput::ProtocolError { reason } => {
                 self.emit_error_for_stream(
@@ -303,16 +286,7 @@ impl SwarmState {
         }
 
         if protocol == IDENTIFY_PROTOCOL_ID {
-            // Populate Identify's observedAddr field with the transport
-            // address we recorded for this connection. The address is
-            // cached when TransportEvent::Connected /
-            // TransportEvent::IncomingConnection / PeerIdentityVerified
-            // arrives; a missing entry means the transport never reported an
-            // endpoint for this conn_id, in which case we legitimately
-            // can't fill observedAddr and the field is omitted.
             let observed_addr = self.conn_to_remote_addr.get(&conn_id).cloned();
-            // Snapshot of the transport's listening addresses at this
-            // moment; the core keeps `local_addresses` refreshed.
             let listen_addrs = self.local_addresses.clone();
             let responder_peer_id = peer_id;
             match self.identify.register_outbound_stream(
@@ -322,17 +296,10 @@ impl SwarmState {
                 &listen_addrs,
             ) {
                 Ok(()) => {
-                    // Only record ownership on success, so a rejected
-                    // registration doesn't leave the stream tracked here
-                    // with no owning handler.
                     self.insert_stream_owner(conn_id, stream_id, ProtocolKind::IdentifyResponder);
                     self.drain_identify_outputs();
                 }
                 Err(e) => {
-                    // Registration refused (e.g. identify already has a
-                    // responder stream for this peer). Don't leak the
-                    // underlying transport stream -- reset it so the
-                    // remote knows we're not going to respond.
                     self.emit_error(
                         SwarmErrorKind::IdentifyStreamRejected,
                         Some(responder_peer_id),

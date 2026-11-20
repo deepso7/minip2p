@@ -83,7 +83,6 @@ impl VarIntReader {
 mod tests {
     use super::*;
 
-    // RFC 9000 Appendix A.1 sample encodings.
     const SAMPLES: [(&[u8], u64); 4] = [
         (
             &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c],
@@ -102,7 +101,6 @@ mod tests {
             encode(value, &mut out).unwrap();
             assert_eq!(out, bytes);
         }
-        // A two-byte encoding of 37 is also valid on the wire.
         assert_eq!(decode(&[0x40, 0x25]), Some((37, 2)));
     }
 

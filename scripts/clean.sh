@@ -37,7 +37,6 @@ done
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$root"
 
-# Nested git checkouts and editor/agent state are not build products.
 skip=(
   -path './.git' -o
   -path './code-ref' -o
@@ -123,9 +122,6 @@ in_array() {
   return 1
 }
 
-# Keep paths in the array. Newline-delimited sort would split a filename
-# that contains a newline and could turn it into a deletion target outside
-# the repository.
 unique=()
 for path in "${paths[@]}"; do
   if in_array "$path" "${unique[@]+"${unique[@]}"}"; then

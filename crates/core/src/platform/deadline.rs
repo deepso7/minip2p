@@ -136,9 +136,6 @@ mod tests {
 
     #[test]
     fn never_reports_full_remaining_time_however_far_now_has_advanced() {
-        // A plain saturating subtraction would shrink this toward zero as time
-        // passes while `is_expired_at` still reported "not due", so a host
-        // idling for `millis_until` would wake early for no reason.
         for now in [0, 1, 1_000_000, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
             let now = Now::from_millis(now);
             assert_eq!(
@@ -160,7 +157,6 @@ mod tests {
             );
             assert_eq!(Deadline::IMMEDIATE.millis_until(now), 0);
         }
-        // Sorts ahead of any real deadline when folding subsystem deadlines.
         assert_eq!(
             Deadline::IMMEDIATE.earliest(Deadline::from_millis(5)),
             Deadline::IMMEDIATE
@@ -169,7 +165,6 @@ mod tests {
 
     #[test]
     fn remaining_time_saturates_at_zero() {
-        // Raw millis are read back as an instant, not a duration.
         let deadline = Deadline::from(100u64);
         assert_eq!(deadline.as_millis(), 100);
         assert_eq!(u64::from(deadline), 100);

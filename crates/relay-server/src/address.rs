@@ -151,8 +151,6 @@ fn normalize_addr(
             protocols.as_slice(),
             [_, Protocol::Udp(port), Protocol::QuicV1] if *port != 0
         )
-        // Whether a certhash belongs depends on the listener's certificate,
-        // which only the host knows: see `MissingCerthash`.
         || matches!(
             protocols.as_slice(),
             [_, Protocol::Udp(port), Protocol::QuicV1, Protocol::WebTransport, hashes @ ..]
@@ -188,7 +186,6 @@ mod tests {
         let webtransport = addr(
             "/ip4/192.0.2.1/udp/4002/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g",
         );
-        // A CA-certified listener's address carries no certhash.
         let ca_webtransport = addr("/dns/relay.example/udp/4002/quic-v1/webtransport");
         let mut tcp_with_peer = tcp.clone();
         tcp_with_peer.push(Protocol::P2p(local));

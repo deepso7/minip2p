@@ -177,9 +177,6 @@ fn relayed_chat_and_reservation_loss() {
                 if peer_id == &a_peer && topic == TOPIC
         )
     });
-    // A is the publisher below, so A's view of B's subscription is what decides
-    // whether the message is forwarded at all. Waiting only on B's view above
-    // lets A publish to nobody and leaves B waiting out the full timeout.
     a_log.wait_for(|event| {
         matches!(
             event,
@@ -203,10 +200,6 @@ fn relayed_chat_and_reservation_loss() {
     });
 
     drop(relay);
-    // Stopping the relay cannot signal an immediate close over UDP. The
-    // endpoint detects the dead relay through QUIC's 30-second idle timeout
-    // once keepalive pings go unanswered. The wider bound covers that wait
-    // and slower CI scheduling.
     b_log.wait_for_with_timeout(RELAY_LOSS_TIMEOUT, |event| {
         matches!(
             event,

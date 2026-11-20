@@ -70,8 +70,6 @@ fn connect_skips_webtransport_candidates_and_connects_over_quic_v1() {
     )
     .expect("peer addr");
 
-    // Alone, the WebTransport candidate fails as a candidate: refused
-    // before any dial.
     let outcome = settle(&mut a, &mut b, vec![b_webtransport.clone()]);
     let ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates, .. }) = outcome else {
         panic!("expected NoUsableRoute, got {outcome:?}");
@@ -85,7 +83,6 @@ fn connect_skips_webtransport_candidates_and_connects_over_quic_v1() {
         "{candidates:?}"
     );
 
-    // First among others, its refusal must not end the attempt.
     let outcome = settle(&mut a, &mut b, vec![b_webtransport, b_quic.clone()]);
     let ConnectOutcome::Connected { conn_id, .. } = outcome else {
         panic!("expected Connected, got {outcome:?}");
@@ -121,7 +118,6 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
         "one socket: {listen:?}"
     );
 
-    // A libp2p peer connects over quic-v1 ...
     let mut native = bind();
     let id = native.connect(vec![quic.clone()]).expect("connect");
     let deadline = Instant::now() + BACKSTOP;
@@ -146,7 +142,6 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
         let _ = server.next_event(Duration::from_millis(5)).expect("server");
     }
 
-    // ... and a WebTransport client over the same port.
     let key = Ed25519Keypair::generate();
     let mut client: SwarmCore<_, StdEntropy> = SwarmBuilder::new(&key)
         .build_core(
@@ -182,8 +177,6 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
         }
     }
 
-    // What the server sees and reports of the browser is a WebTransport
-    // address, which hole punching and NAT candidates never take.
     let info = server
         .connection_info(server_conn.expect("server connection"))
         .expect("connection info");
@@ -277,7 +270,6 @@ fn rotation_reports_the_new_listen_set_once_and_identify_carries_it() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
         .as_secs();
-    // The next real boundary, so libp2p certificates stay valid.
     let boundary = minip2p_tls::webtransport::next_boundary(unix_now);
     let mut seen = poll_at(&mut server, epoch, boundary - 5);
     let before = server.listen_all().expect("listen addrs");
@@ -287,7 +279,6 @@ fn rotation_reports_the_new_listen_set_once_and_identify_carries_it() {
         .expect("quic-v1")
         .clone();
 
-    // A native peer connected before the boundary.
     let mut native = bind();
     let advertised = identify_listen_addrs(
         &mut native,
@@ -299,7 +290,6 @@ fn rotation_reports_the_new_listen_set_once_and_identify_carries_it() {
     assert!(advertised.contains(webtransport_of(&before).transport()));
     assert!(listen_changes(&seen).is_empty(), "{seen:?}");
 
-    // One poll at the boundary reports the change, with `/p2p` kept.
     let events = poll_at(&mut server, epoch, boundary);
     let after = server.listen_all().expect("listen addrs");
     assert_eq!(listen_changes(&events), std::slice::from_ref(&after));
@@ -308,7 +298,6 @@ fn rotation_reports_the_new_listen_set_once_and_identify_carries_it() {
     assert_eq!(webtransport_of(&after).peer_id(), &key.peer_id());
     assert!(after.contains(&quic));
 
-    // After reconnecting, Identify carries the new set.
     native.disconnect(&key.peer_id()).expect("disconnect");
     let deadline = Instant::now() + BACKSTOP;
     while native.is_peer_ready(&key.peer_id()) || server.is_peer_ready(native.peer_id()) {

@@ -161,7 +161,6 @@ fn stalled_first_relay_hands_over_after_its_own_budget() {
     assert_eq!(dial_count_for(&actions, &w.a), 1);
     assert_eq!(dial_count_for(&actions, &w.b), 0);
 
-    // A never answers. It gets the whole 12 s relay budget, not a share.
     w.agent.handle_tick(at(11_999));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
     assert!(matches!(
@@ -240,8 +239,6 @@ fn a_relay_stalled_on_hop_status_reports_that_stage() {
     );
     drain_all_events(&mut w.agent);
 
-    // The relay never answers CONNECT; the attempt's 5 s deadline clips
-    // its budget and leaves no time for B.
     w.agent.handle_tick(at(5_000));
     assert!(matches!(
         drain_events(&mut w.agent).as_slice(),
@@ -268,8 +265,6 @@ fn the_relay_budget_is_clipped_by_a_shorter_caller_deadline() {
     let _ = start(&mut w.agent, 1, target, legs, at(0));
     drain_actions(&mut w.agent);
 
-    // The attempt gives up at 4 s, so A gets 4 s rather than 12 s and B
-    // is never tried.
     w.agent.handle_tick(at(3_999));
     assert!(drain_events(&mut w.agent).is_empty());
     w.agent.handle_tick(at(4_000));
@@ -351,7 +346,6 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
-    // Another connection to A lands and becomes ready; the leg opens HOP.
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             peer_id: w.a,
@@ -371,7 +365,6 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     );
     assert!(has_hop_open(&drain_actions(&mut w.agent)));
 
-    // The attempt's own dial to A fails afterwards.
     dial_failed(&mut w, a_dial, "replaced", 20);
     assert_eq!(
         dial_count_for(&drain_actions(&mut w.agent), &w.b),
@@ -388,7 +381,6 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
-    // Another connection to A lands; identify has not finished yet.
     w.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             peer_id: w.a,
@@ -439,8 +431,6 @@ fn no_reservation_at_first_relay_moves_to_the_next() {
 
 #[test]
 fn a_full_circuit_table_fails_the_leg_before_hop_connect() {
-    // #356: the circuit limit is local, so no other relay would do better:
-    // the whole leg fails with ResourceExhausted and CONNECT is never sent.
     let mut w = two_relays();
     w.agent.swarm.circuit_slots = NatConfig::default().max_circuits;
     let target = w.target;
@@ -560,8 +550,6 @@ fn an_adopted_circuit_whose_relay_times_out_closes_and_hands_over() {
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
     let a_circuit = promoted_circuit(&drain_actions(&mut w.agent));
 
-    // A's circuit never finishes its handshake within A's budget: it
-    // closes, and B is tried.
     w.agent.handle_tick(at(12_000));
     let actions = drain_actions(&mut w.agent);
     assert!(
@@ -599,8 +587,6 @@ fn a_peer_already_direct_disarms_the_relay_budget() {
     drain_actions(&mut w.agent);
     drain_all_events(&mut w.agent);
 
-    // The relay's budget has nothing left to bound: no relay timeout, no
-    // failure for a peer that is already direct.
     w.agent.handle_tick(at(12_000));
     assert!(drain_all_events(&mut w.agent).is_empty());
 }
@@ -657,7 +643,6 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
         })
         .expect("A's TCP address is tried next");
 
-    // Reached over TCP, A refuses: its addresses are spent, B is next.
     let (a, b) = (w.a, w.b);
     hop_exchange(&mut w, &a, tcp_conn, Status::NoReservation, 20);
     let actions = drain_actions(&mut w.agent);
@@ -667,7 +652,6 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
 
 #[test]
 fn a_relays_addresses_split_its_budget_not_the_next_relays() {
-    // A's second address is listed after B; it is still tried with A.
     let mut w = relays_with(|a, b| {
         vec![
             relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a),
@@ -679,8 +663,6 @@ fn a_relays_addresses_split_its_budget_not_the_next_relays() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     drain_actions(&mut w.agent);
 
-    // A never answers on either address; together they use A's 12 s, and
-    // B then gets its own.
     w.agent.handle_tick(at(6_000));
     w.agent.handle_tick(at(11_999));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
@@ -706,9 +688,6 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let quic_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
-    // The QUIC address's part (half of A's 12 s) elapses with the dial
-    // still in flight; the TCP entry waits on it rather than dialing A a
-    // second time.
     w.agent.handle_tick(at(6_000));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.a), 0);
 

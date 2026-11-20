@@ -262,10 +262,6 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    // A foreign runtime that hands over a `/tcp` listen address gets TCP. Parsing
-    // `/tcp` peers to dial while binding only QUIC would leave a device that
-    // has only TCP able to call out and never be called -- and the address it
-    // reported would name a socket it does not have.
     let a = P2pEndpoint::new(vec![31; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
     let b = P2pEndpoint::new(vec![32; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
     for endpoint in [&a, &b] {
@@ -377,9 +373,6 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
             ))
             .is_some()
     );
-    // B is the publisher, so B's view of A's subscription is what decides
-    // whether the message below is forwarded at all. Waiting only on A's view
-    // above lets B publish to nobody and leaves A waiting out the full timeout.
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(
@@ -565,7 +558,6 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
             .is_some()
     );
 
-    // Far past Yamux's 256 KiB stream cap, so native must hold the tail.
     let payload: Vec<u8> = (0..4 * 1024 * 1024_usize)
         .map(|i| (i % 251) as u8)
         .collect();
@@ -575,15 +567,10 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
         a.send_stream(conn_id, stream_id, vec![0]),
         Err(FfiError::Backpressure)
     ));
-    // Calls naming another connection are refused and leave the held tail
-    // alone.
     let stranger = conn_id + 1_000;
     assert!(a.reset_stream(stranger, stream_id).is_err());
-    // Abandoning a stream of a connection that is not live only settles
-    // whatever native still holds for it (ADR 0012): a no-op here.
     a.abandon_stream(stranger, stream_id)?;
     assert!(a.close_stream_write(stranger, stream_id).is_err());
-    // Requested while the tail is held, the FIN must still follow it.
     a.close_stream_write(conn_id, stream_id)?;
 
     assert!(
@@ -642,8 +629,6 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let protocol = "/minip2p/ffi-read-backpressure/1";
-    // Registered at build time on the reader, later on the writer: both
-    // take manual acknowledgement.
     let mut reader_config = config_on("/ip4/127.0.0.1/tcp/0");
     reader_config.protocols = vec![protocol.into()];
     let a = P2pEndpoint::new(vec![43; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
@@ -667,13 +652,13 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
             .is_some()
     );
     let opened = a.open_stream(b_peer.clone(), protocol.into())?;
-    // The default Yamux receive window.
-    let window = 256 * 1024;
-    let payload: Vec<u8> = (0..4 * window).map(|i| (i % 251) as u8).collect();
+    let default_yamux_window = 256 * 1024;
+    let payload: Vec<u8> = (0..4 * default_yamux_window)
+        .map(|i| (i % 251) as u8)
+        .collect();
     assert!(!a.send_stream(opened.conn_id, opened.stream_id, payload.clone())?);
     a.close_stream_write(opened.conn_id, opened.stream_id)?;
 
-    // Unconsumed, the reader is delivered one Yamux window and no more.
     let received = || {
         let events = b_log.events.lock().unwrap_or_else(PoisonError::into_inner);
         let mut received = Vec::new();
@@ -693,7 +678,7 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
         (received, stream)
     };
     let started = Instant::now();
-    while received().0.len() < window - 1024 {
+    while received().0.len() < default_yamux_window - 1024 {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the window never arrived"
@@ -702,7 +687,10 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
     }
     std::thread::sleep(Duration::from_millis(300));
     let (stalled, stream) = received();
-    assert!(stalled.len() <= window, "the sender stalls at one window");
+    assert!(
+        stalled.len() <= default_yamux_window,
+        "the sender stalls at one window"
+    );
     assert!(
         a_log
             .events
@@ -713,7 +701,6 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
         "the held write cannot settle"
     );
 
-    // Consuming what arrived resumes the transfer, and it completes.
     let (conn_id, stream_id) = stream.expect("data arrived");
     assert!(matches!(
         b.stream_consumed(conn_id, stream_id, stalled.len() as u64 + 1),

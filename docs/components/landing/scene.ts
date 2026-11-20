@@ -1,19 +1,4 @@
-// Plays a landing-page scene one step at a time, like a short video.
-//
-// The markup declares everything; this only moves a step counter:
-//   root [data-scene][data-durations="2600,2800"]  one duration (ms) per step
-//   [data-show="n"]                 on from step n
-//   [data-show="n"][data-hide="m"]  on for steps n to m - 1
-//   [data-goto="n"]                 jumps to step n (progress bar)
-//   [data-toggle]                   play, pause, or replay once ended
-// Live parts get `data-on` (plus `data-past` once their step is behind);
-// `[data-goto]` gets `data-state="done" | "current"`;
-// the root gets `data-playing` or `data-paused`, and `data-ended` at the end.
-// Without this script nothing is hidden (see the scenes' rules in theme.css),
-// so the markup reads as the finished frame.
 export const initScene = (root: HTMLElement) => {
-  // Without an observer the scene could never start, so leave it as the
-  // finished still frame rather than hiding its parts.
   if (!("IntersectionObserver" in window)) {
     return;
   }
@@ -27,7 +12,6 @@ export const initScene = (root: HTMLElement) => {
   let timer: number | undefined;
   let remaining = 0;
   let startedAt = 0;
-  // Paused by scrolling away rather than by the reader.
   let autoPaused = false;
 
   const render = () => {
@@ -37,7 +21,6 @@ export const initScene = (root: HTMLElement) => {
       const hide = Number(part.dataset.hide ?? Number.POSITIVE_INFINITY);
       const on = step >= show && step < hide;
       part.toggleAttribute("data-on", on);
-      // Parts from earlier steps stand finished, so only this step moves.
       part.toggleAttribute("data-past", on && show < step);
     }
     for (const goto of gotos) {
@@ -52,8 +35,6 @@ export const initScene = (root: HTMLElement) => {
     }
   };
 
-  // A jump replays the target step's motion, so clear every part first and
-  // force a reflow before switching the step on again.
   const renderFresh = () => {
     for (const el of [...parts, ...gotos]) {
       delete el.dataset.on;
@@ -68,7 +49,6 @@ export const initScene = (root: HTMLElement) => {
     root.toggleAttribute("data-playing", mode === "playing");
     root.toggleAttribute("data-paused", mode === "paused");
     root.toggleAttribute("data-ended", mode === "ended");
-    // The toggle's name follows the action it will take, like its icon.
     toggle?.setAttribute(
       "aria-label",
       { ended: "Replay", paused: "Play", playing: "Pause" }[mode]
@@ -103,7 +83,6 @@ export const initScene = (root: HTMLElement) => {
       setMode("playing");
       schedule(durations[step - 1]);
     } else {
-      // Play then runs this step for its full length.
       remaining = durations[step - 1];
       setMode(step === last ? "ended" : "paused");
     }
@@ -121,10 +100,8 @@ export const initScene = (root: HTMLElement) => {
   };
 
   root.toggleAttribute("data-scene-live", true);
-  // The first frame is the empty stage until the scene is seen.
   render();
 
-  // One listener for every control; each is found by its data attribute.
   root.addEventListener("click", (event) => {
     const control = (event.target as Element).closest<HTMLElement>(
       "[data-toggle], [data-goto]"
@@ -134,8 +111,6 @@ export const initScene = (root: HTMLElement) => {
     }
     autoPaused = false;
     if (control.dataset.goto) {
-      // A jump plays on from that step, like scrubbing a video, unless the
-      // reader asked for less motion: then it stays on the step they picked.
       goTo(Number(control.dataset.goto), !reducedMotion.matches);
     } else if (Object.hasOwn(root.dataset, "playing")) {
       pause();
@@ -146,11 +121,6 @@ export const initScene = (root: HTMLElement) => {
     }
   });
 
-  // Start when the stage itself is on screen (not just its footer);
-  // pause when it scrolls away and pick up again on return. A stage taller
-  // than the viewport (phone landscape) counts once it fills half the screen.
-  // A reader who asks for less motion gets the finished frame and steps
-  // through it by hand.
   const stage = root.querySelector("figure") ?? root;
   let seen = false;
   const observer = new IntersectionObserver(
@@ -176,8 +146,6 @@ export const initScene = (root: HTMLElement) => {
   );
   observer.observe(stage);
 
-  // An observer stays alive while it observes, so let the scene go when
-  // Blume's client router swaps the page out.
   document.addEventListener(
     "astro:before-swap",
     () => {

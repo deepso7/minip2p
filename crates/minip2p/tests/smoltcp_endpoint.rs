@@ -253,8 +253,6 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
             .build()
             .expect("portable AutoNAT endpoint builds");
 
-    // No listener yet: there are no dial-back addresses to probe, so the
-    // endpoint must stay quiet no matter how long the host idles.
     let mut now_ms = 0;
     for _ in 0..100 {
         endpoint
@@ -265,7 +263,6 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
         now_ms += 100;
     }
 
-    // A post-build listen must reach the agent too.
     endpoint
         .listen_on(
             &format!("/ip4/{DIALER_IP}/tcp/4001")
@@ -371,7 +368,6 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         let ping_finished = dialer_events.iter().any(|event| {
             matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. } if peer_id == &listener_peer)
         });
-        // Stream ids match across the two ends; connection ids need not.
         let payload_received = stream.is_some_and(|stream| {
             listener_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamData {
@@ -555,8 +551,6 @@ fn remote_sees_teardown(teardown: impl FnOnce(Portable, PeerId)) {
     let now = Now::from_millis(now_ms);
 
     teardown(dialer, listener_peer);
-    // The clock stays put, so only the dialer's close can end the
-    // connection here, never an idle timeout.
     let closed = (0..MAX_STEPS).any(|_| {
         listener
             .at(now)

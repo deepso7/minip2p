@@ -142,9 +142,6 @@ impl GossipsubDriver {
         swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) -> bool {
-        // A closing stream's mapping outlives this step: the agent
-        // acknowledges an unfinished frame it discards on close, and that
-        // ack needs the stream's connection.
         let closing = matches!(event, SwarmEvent::StreamClosed { .. });
         if !closing {
             self.stream_conns.observe(event);
@@ -236,10 +233,6 @@ impl GossipsubDriver {
                 stream_id,
                 data,
             } => {
-                // A synchronously rejected write must reach the agent:
-                // otherwise the stream's eventual close would commit work
-                // whose frame was never accepted. A Full keeps the frame in
-                // flight with its tail; the stream's Writable resends it.
                 let result = match self.stream_conns.get(&peer, stream_id) {
                     Some(conn_id) => {
                         match swarm.send_stream(&peer, conn_id, stream_id, data, now_ms) {
@@ -255,9 +248,6 @@ impl GossipsubDriver {
                 self.agent
                     .send_result(&peer, stream_id, token, result, now_ms);
             }
-            // A failed half-close after an accepted write is left to the
-            // send deadline / close machinery: the frame may well have
-            // been delivered, so failing the work here could double-report.
             GossipsubAction::CloseStreamWrite { peer, stream_id } => {
                 if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
                     match swarm.close_stream_write(&peer, conn_id, stream_id, now_ms) {
@@ -265,7 +255,6 @@ impl GossipsubDriver {
                     }
                 }
             }
-            // A stream already gone has nothing left to settle.
             GossipsubAction::AckStream {
                 peer,
                 stream_id,
@@ -278,8 +267,6 @@ impl GossipsubDriver {
                 }
             }
             GossipsubAction::ResetStream { peer, stream_id } => {
-                // A reset races ordinary teardown, so an already-closed
-                // stream is successful cleanup rather than a second error.
                 if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
                     match swarm.reset_stream(&peer, conn_id, stream_id, now_ms) {
                         Ok(()) | Err(_) => {}

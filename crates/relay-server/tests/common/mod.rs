@@ -2,8 +2,6 @@
 //! command the agent issues, and helpers that drive a [`RelayServerAgent`]
 //! through it with no I/O.
 
-// Each integration-test binary compiles its own copy of this module and
-// uses a different subset of the helpers.
 #![expect(
     dead_code,
     reason = "each integration test imports only the shared helpers it needs"

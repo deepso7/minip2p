@@ -937,7 +937,6 @@ export type P2pEvent =
       typeof P2pEvent_Tags.MdnsFailed,
       Minip2pNamedEventMap["mdnsFailed"]
     >
-  // A variant without fields has no `inner`, as both runtimes deliver it.
   | { readonly tag: typeof P2pEvent_Tags.MdnsRecovered }
   | RawEvent<
       typeof P2pEvent_Tags.DiscoveryProtocolViolation,

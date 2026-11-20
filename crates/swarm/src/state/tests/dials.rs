@@ -207,7 +207,6 @@ fn a_connection_that_fails_before_establishing_reports_a_transport_error() {
         })] if *failed == conn_id && detail.ends_with("timed out")
     ));
 
-    // Closing it ourselves is no failure.
     let closed = ConnectionId::new(92);
     feed(
         &mut core,
@@ -289,7 +288,6 @@ fn veto_survives_connected_then_peer_identity_verified() {
         "vetoed Connected must not establish; got {after_connected:?}"
     );
 
-    // Identity arrives after Connected already consumed the first veto check.
     feed(
         &mut core,
         TransportEvent::PeerIdentityVerified {
@@ -336,8 +334,6 @@ fn vetoed_establish_suppresses_transport_error_after_dial_failed() {
         "reject should DialFailed; got {after_reject:?}"
     );
 
-    // reject_pending_establish already reported the dial; a trailing
-    // Error before Closed must not leak a second SwarmEvent::Error.
     feed(
         &mut core,
         TransportEvent::Error {
@@ -398,8 +394,6 @@ fn ping_deadline_runs_from_the_ping_call_not_the_deferred_send() {
     core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 1_000)
         .expect("queue ping");
 
-    // Negotiation completing at 2_000 fires the queued payload; the
-    // timer still runs from the ping call.
     core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 2_000);
     assert_eq!(
         core.next_deadline(Now::from_millis(4_000)),
@@ -423,8 +417,6 @@ fn established_connections_lists_each_connected_peers_current_connection() {
             endpoint: Box::new(ConnectionEndpoint::with_peer_id(loopback_transport(), peer)),
         },
     );
-    // A late identity upgrade replaces the first connection; an
-    // unverified connection is not the peer's.
     feed(
         &mut core,
         TransportEvent::Connected {

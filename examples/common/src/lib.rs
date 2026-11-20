@@ -51,8 +51,6 @@ pub struct KillOnDrop(pub Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        // The child might already have exited; either outcome is complete
-        // cleanup, but always reap it before releasing the handle.
         match self.0.kill() {
             Ok(()) | Err(_) => {}
         }

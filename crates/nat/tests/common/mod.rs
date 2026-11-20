@@ -1,8 +1,6 @@
 //! Shared scripted-test harness: a fake clock, canned peers, and frame
 //! builders for driving a [`NatAgent`] with no I/O.
 
-// Each integration-test binary compiles its own copy of this module and
-// uses a different subset of the helpers.
 #![expect(
     dead_code,
     reason = "each integration test imports only the shared helpers it needs"

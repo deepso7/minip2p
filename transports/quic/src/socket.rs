@@ -113,7 +113,6 @@ impl Received {
     pub(crate) fn datagrams_in<'a>(&self, buf: &'a [u8]) -> impl Iterator<Item = BytesMut> + 'a {
         buf.get(self.offset..self.offset + self.len)
             .expect("UDP receive lengths fit their slots")
-            // A stride of 0 means one datagram, as in `datagram_count`.
             .chunks(match self.stride {
                 0 => usize::MAX,
                 stride => stride,

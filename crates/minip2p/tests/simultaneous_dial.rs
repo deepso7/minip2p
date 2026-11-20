@@ -93,7 +93,6 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
         drive(&mut b, &mut b_events);
     }
 
-    // A loser closed by the other side surfaces while the pings run.
     a.ping(&b_peer).expect("a pings");
     b.ping(&a_peer).expect("b pings");
     while !pinged(&a_events, &b_peer) || !pinged(&b_events, &a_peer) {
@@ -113,8 +112,6 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
             )),
             "the peer must never disconnect: {events:?}"
         );
-        // A losing dial completes as DialFailed, which the `connect` the
-        // winner already settled absorbs.
         assert!(
             !events
                 .iter()
@@ -126,8 +123,6 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
     assert_eq!(a.connected_peers(), std::slice::from_ref(&b_peer));
     assert_eq!(b.connected_peers(), std::slice::from_ref(&a_peer));
 
-    // Both keep the lower peer's dial: its remote end is the higher peer's
-    // listener, while the higher peer sees it from the lower one's dial port.
     let (lower, higher, higher_addr, lower_addr, higher_peer, lower_peer) = if a_peer < b_peer {
         (&a, &b, &b_addr, &a_addr, &b_peer, &a_peer)
     } else {
@@ -347,7 +342,6 @@ fn duplicate_candidates_run<T: Transport>(
         .at(clock.now())
         .connect(vec![b_addr.clone(), b_addr])
         .expect("a connects");
-    // Polls both once and returns the sample with what each surfaced.
     let mut drive = |a: &mut Portable<T>, b: &mut Portable<ReverseFirstTwo<T>>| {
         let now = clock.now();
         let a_new = a.at(now).poll().expect("a polls");
@@ -366,8 +360,6 @@ fn duplicate_candidates_run<T: Transport>(
         a_events.extend(a_new);
         b_events.extend(b_new);
     }
-    // A connection one side closed while the other kept it surfaces as a
-    // disconnect while the pings run.
     let (now, a_new, b_new) = drive(&mut a, &mut b);
     a_events.extend(a_new);
     b_events.extend(b_new);
@@ -383,9 +375,6 @@ fn duplicate_candidates_run<T: Transport>(
         b_events.extend(b_new);
     }
 
-    // A split shows only once each side has closed the connection the other
-    // kept: give the race time to settle, then both must still be connected
-    // and answer pings on whatever they kept.
     let settle_until = Instant::now() + Duration::from_millis(300);
     while Instant::now() < settle_until {
         let (_, a_new, b_new) = drive(&mut a, &mut b);
@@ -500,7 +489,6 @@ fn reconnect_after_silent_death(a_is_lower: bool) {
     }
     let dead = a.connection_id(&b_peer).expect("a connected");
 
-    // No close reaches A: its connection to B only times out much later.
     #[expect(
         clippy::mem_forget,
         reason = "dropping the endpoint would close its connections"

@@ -1,22 +1,9 @@
 #!/usr/bin/env bash
-# Job-start hook for the minip2p bench runner (ACTIONS_RUNNER_HOOK_JOB_STARTED).
-#
-# The runner runs this as the `runner` user before any workflow-controlled
-# step, container-action build, or job container. It admits only the trusted
-# Bench workflow: bench.yml from `main` (pull_request_target, workflow_dispatch,
-# schedule) or from a `v*` tag (release). Anything else is killed. Admitted jobs
-# then get leftover `bench-*` containers and images removed, the BuildKit cache
-# pruned, and a free-disk check.
 set -euo pipefail
 
 repo=deepso7/minip2p
 workflow="$repo/.github/workflows/bench.yml"
 
-# Kill the job's Runner.Worker and exit. Exiting non-zero alone is not enough:
-# the runner marks the job failed but still evaluates later steps' conditions,
-# so a hostile `if: always()` step would run as `runner`, which is in `docker`
-# and therefore root on this host. The listener reports the killed job as
-# failed and takes the next one.
 reject() {
   echo "minip2p-bench: refusing job: $*" >&2
   local pid=$PPID ppid comm argv0
@@ -28,8 +15,6 @@ reject() {
       kill -KILL "$pid"
       exit 1
     fi
-    # Field 4 of /proc/<pid>/stat is the parent PID. Strip through the last
-    # `)` first, since the command name in field 2 may contain spaces.
     ppid=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f2) || break
     [[ -n "$ppid" ]] || break
     pid=$ppid
@@ -55,8 +40,6 @@ case "$event" in
     ;;
 esac
 
-# The runner service does not wait for Docker, so the first job after a boot
-# can arrive before the daemon is up.
 deadline=$((SECONDS + 60))
 until timeout 10 docker info >/dev/null 2>&1; do
   if ((SECONDS >= deadline)); then
@@ -66,10 +49,6 @@ until timeout 10 docker info >/dev/null 2>&1; do
   sleep 2
 done
 
-# Leftovers from cancelled or killed runs. Each docker call is bounded so a
-# wedged daemon fails the job instead of hanging it, and its output is
-# captured first so a failure stops the hook (a process substitution would
-# swallow it).
 containers_out=$(timeout 30 docker ps -aq --filter 'name=^bench-')
 mapfile -t containers < <(printf '%s' "$containers_out" | grep . || true)
 if [[ ${#containers[@]} -gt 0 ]]; then
@@ -81,9 +60,6 @@ if [[ ${#images[@]} -gt 0 ]]; then
   timeout 120 docker image rm -f "${images[@]}" >/dev/null
 fi
 
-# Bound the BuildKit cache at 40 GB. Docker 28+ names the bound
-# --max-used-space; older CLIs only have --keep-storage, which newer ones
-# reinterpret as a reserved minimum.
 if timeout 30 docker builder prune --help | grep -q -- '--max-used-space'; then
   timeout 600 docker builder prune -f --max-used-space 40GB >/dev/null
 else

@@ -191,8 +191,6 @@ pub(crate) fn validate(options: &Options) -> Result<(), String> {
             return Err("--quic (quic) accepts at most one IPv4 and one IPv6 address".into());
         }
     }
-    // The Endpoint checks these too, but only once `service install` has
-    // replaced a working config. The builder call binds nothing.
     if !options.announce_addrs.is_empty() {
         Endpoint::builder()
             .relay_server_announce_addrs(options.announce_addrs.clone())
@@ -218,7 +216,6 @@ pub(crate) fn validate(options: &Options) -> Result<(), String> {
     }
     if let Some(mesh) = &options.mesh {
         check_mesh(&mesh.listen, &mesh.members)?;
-        // An ephemeral public identity can't be shared with the other nodes.
         if options.key_path.is_none() {
             return Err(
                 "the mesh needs a persistent identity (--key, or key in the config): every mesh node loads the same one"
@@ -246,7 +243,6 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
 
 /// Checks mesh settings the relay would only reject once bound.
 fn check_mesh(listen: &[SocketAddr], members: &[PeerAddr]) -> Result<(), String> {
-    // The backbone transport binds one socket per family.
     for ipv4 in [true, false] {
         let mut family = listen.iter().filter(|address| address.is_ipv4() == ipv4);
         if let Some(first) = family.next()

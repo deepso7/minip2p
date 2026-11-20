@@ -334,8 +334,6 @@ impl QuicConnection {
 
     /// Why the connection ended, for its `Closed`.
     pub(crate) fn close_reason(&self) -> ConnectionCloseReason {
-        // Every cause records itself; a connection drained without one was
-        // ended on our side.
         self.close_reason
             .clone()
             .unwrap_or(ConnectionCloseReason::Local)
@@ -355,7 +353,6 @@ impl QuicConnection {
     /// Runs a closed connection's close period out at once, so the engine
     /// drains it without waiting.
     pub(crate) fn expire(&mut self) {
-        // Closing stops every other timer, so the one left is the close.
         if let Some(close) = self.conn.poll_timeout() {
             self.conn.handle_timeout(close);
         }
@@ -459,8 +456,6 @@ impl QuicConnection {
     /// socket error the output hit, whose datagram was dropped as lost.
     pub(crate) fn service(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
         self.unfinished = true;
-        // The handshake deadline, before anything else runs. A Closing
-        // phase ends below, once this service's events are in.
         if !self.is_closing() {
             self.poll_wt_close(now);
         }
@@ -485,9 +480,6 @@ impl QuicConnection {
             }
             self.bind_pending_opens(now, cx.events);
             self.drain_send_queues(now, cx.events);
-            // Endpoint events (new connection ids, retirements, the final
-            // `Drained`) go out before the transmit below, so their output
-            // leaves in this service.
             while let Some(event) = self.conn.poll_endpoint_events() {
                 progressed = true;
                 if let Some(event) = cx.endpoint.handle_event(self.handle, event) {
@@ -500,7 +492,6 @@ impl QuicConnection {
             }
         }
         let failure = self.transmit(now, cx);
-        // The engine's timer, or an earlier WebTransport one.
         let wt = self.wt.as_ref().and_then(WtSession::poll_timeout);
         self.timeout = [self.conn.poll_timeout(), wt].into_iter().flatten().min();
         self.gc_closed_streams();
@@ -512,7 +503,6 @@ impl QuicConnection {
     fn transmit(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
         self.counters.flush();
         loop {
-            // Recomputed for every transmit: retained datagrams shrink it.
             let allowance = cx
                 .sockets
                 .for_addr(self.conn.remote_address())
@@ -529,7 +519,6 @@ impl QuicConnection {
                 cx.send_buf.get(..transmit.size),
                 cx.sockets.for_addr(transmit.destination),
             ) else {
-                // No socket of that family: lost, like any unroutable packet.
                 continue;
             };
             match socket.send(&transmit, contents) {
@@ -538,7 +527,6 @@ impl QuicConnection {
                     self.unfinished = true;
                     break;
                 }
-                // Stop rather than hammer a dead route within one service.
                 Err(error) => return Some(error),
             }
         }
@@ -560,8 +548,6 @@ impl QuicConnection {
                     None => self.scan(raw, cx.events),
                 }
             }
-            // New credit: the scheduler that runs after these events hands
-            // it out in turn, rather than to the stream it names.
             Event::Stream(StreamEvent::Writable { .. }) => {}
             Event::Stream(StreamEvent::Finished { id }) => {
                 self.unacked_fins.remove(&u64::from(id));
@@ -571,7 +557,6 @@ impl QuicConnection {
             }
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 let raw = u64::from(id);
-                // A stopped send half never reports `Finished`.
                 self.unacked_fins.remove(&raw);
                 if let Some(wt) = self.wt.as_mut()
                     && wt.on_stopped(&mut self.conn, raw, error_code)
@@ -584,11 +569,7 @@ impl QuicConnection {
             Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {
                 self.bind_pending_opens(now, cx.events);
             }
-            // Only WebTransport-serving sockets advertise DATAGRAM, and
-            // datagrams are not served there: drained and dropped.
             Event::DatagramReceived => while self.conn.datagrams().recv().is_some() {},
-            // Local unidirectional streams are never opened, and half-close
-            // is the adapter's own bookkeeping.
             Event::Stream(_) | Event::HandshakeDataReady | Event::DatagramsUnblocked => {}
         }
     }
@@ -619,22 +600,14 @@ impl QuicConnection {
                 );
                 return;
             };
-            // A browser's address: never a hole-punching candidate.
             let mut transport = self.endpoint.transport().clone();
             transport.push(Protocol::WebTransport);
             self.endpoint = ConnectionEndpoint::new(transport);
-            // Read now, after TLS: whatever certificate the handshake got,
-            // a context at least as new lists its hash. The handshake
-            // deadline runs from here, QUIC handshake completion.
             let mut wt = WtSession::new(
                 current_context(&config.context),
                 now,
                 config.handshake_timeout,
             );
-            // The CONNECT and Noise streams are the session's own, not
-            // application streams: the engine's peer bidi credit gets room
-            // for both on top of `max_streams_per_connection`, which the
-            // adapter goes on enforcing for application streams.
             self.reserve_wt_streams(2);
             wt.open_control(&mut self.conn);
             self.wt = Some(wt);
@@ -648,8 +621,6 @@ impl QuicConnection {
             return;
         };
         let mut token = [0u8; 32];
-        // Left unset rather than guessed if the exporter fails, as the
-        // transport contract asks.
         let token = self
             .conn
             .crypto_session()
@@ -705,7 +676,6 @@ impl QuicConnection {
                     if self.is_closing() {
                         continue;
                     }
-                    // Only the CONNECT stream stays the session's.
                     self.reserve_wt_streams(1);
                     self.authenticated(peer, Some(token), events);
                 }
@@ -718,7 +688,6 @@ impl QuicConnection {
                     if !self.surfaces_streams {
                         self.refuse_stream(engine_stream(raw));
                     } else if self.admit_remote_stream(raw, events) {
-                        // A stop the session took while it held the stream.
                         if let Some(error_code) = stopped {
                             self.on_stopped(raw, error_code, events);
                         }
@@ -765,7 +734,6 @@ impl QuicConnection {
     fn on_lost(&mut self, reason: &ConnectionError) {
         let reason = match reason {
             ConnectionError::LocallyClosed => ConnectionCloseReason::Local,
-            // HTTP/3's orderly close is minip2p's 0.
             ConnectionError::ApplicationClosed(close)
                 if self.wt.is_some() && close.error_code.into_inner() == code::H3_NO_ERROR =>
             {
@@ -783,7 +751,6 @@ impl QuicConnection {
         self.close_reason.get_or_insert(reason);
         self.end_writes();
         self.disarm_wt();
-        // `surfaces_streams` stays as it was: see its doc.
         self.state = ConnectionState::Closed;
     }
 
@@ -875,7 +842,6 @@ impl QuicConnection {
         if !self.surfaces_streams {
             return;
         }
-        // Nothing follows a stream's StreamClosed.
         let Some(room) = self
             .stream_states
             .get(&raw)
@@ -885,8 +851,6 @@ impl QuicConnection {
             return;
         };
         let stream = engine_stream(raw);
-        // The engine delivers `Opened` ahead of queued stream events, so a
-        // scan can meet a reset before the `Stopped` for the same stream.
         if let Ok(Some(error_code)) = self.conn.send_stream(stream).stopped() {
             self.on_stopped(raw, error_code, events);
             if self
@@ -905,7 +869,6 @@ impl QuicConnection {
             let take = room.min(held.len());
             room -= take;
             if take > 0 {
-                // A partial take is copied out, so it never pins the rest.
                 let data = if take == held.len() {
                     Bytes::from(mem::take(&mut held))
                 } else {
@@ -931,7 +894,6 @@ impl QuicConnection {
                 ReadEnd::Reset => Some(ScanEnd::Reset),
             };
             if let Some(end) = end {
-                // The engine's side of the stream ended while it was held.
                 self.gated.remove(&raw);
                 self.on_scan_end(raw, end, events);
                 return;
@@ -946,9 +908,6 @@ impl QuicConnection {
             let mut read = 0;
             let end = loop {
                 if room == 0 {
-                    // One terminal probe: a FIN or reset right behind the
-                    // window still surfaces, and data waiting keeps the
-                    // stream gated. Nothing is read.
                     break match chunks.next(0) {
                         Ok(Some(_)) | Err(ReadError::Blocked) => ScanEnd::Gated,
                         Ok(None) => ScanEnd::Finished,
@@ -966,8 +925,6 @@ impl QuicConnection {
                     Err(ReadError::Blocked) => break ScanEnd::Waiting,
                 }
             };
-            // Credit for what was read goes out with the service that
-            // follows every scan.
             let _credit_follows = chunks.finalize();
             (read, end)
         };
@@ -1023,8 +980,6 @@ impl QuicConnection {
                 self.note_stream_closed_if_finished(raw, events);
             }
             ScanEnd::Reset => {
-                // Reading the reset frees only the receive half; the peer's
-                // stream credit needs the send half freed too.
                 let code = self.stream_code();
                 match self.conn.send_stream(stream).reset(code) {
                     Ok(()) | Err(_) => {}
@@ -1076,9 +1031,7 @@ impl QuicConnection {
     /// Opens pending streams in the engine, in order, as peer credit allows,
     /// reporting each as `StreamOpened`.
     fn bind_pending_opens(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
-        // A closing connection opens nothing more.
         while !self.pending_opens.is_empty() && !self.is_closing() {
-            // A WebTransport session may also wait on the client's credit.
             if self.wt.as_ref().is_some_and(|wt| !wt.may_open_stream()) {
                 return;
             }
@@ -1093,7 +1046,6 @@ impl QuicConnection {
             };
             let raw = u64::from(stream);
             if raw != open.id {
-                // The adapter is the only opener, so ids follow its sequence.
                 self.fail_connection(
                     now,
                     format!("engine opened stream {raw} where {} was expected", open.id),
@@ -1138,9 +1090,6 @@ impl QuicConnection {
                 resource: "local QUIC bidirectional streams",
             });
         }
-        // Handed out now, opened in the engine (and reported as
-        // `StreamOpened`) by the next service once the peer grants credit;
-        // writes and FIN queue until then.
         let raw = self.next_local_bidi_stream_id;
         self.next_local_bidi_stream_id += 4;
         self.stream_states
@@ -1192,15 +1141,9 @@ impl QuicConnection {
         }
         let control = state.control;
 
-        // While any stream has bytes queued, this write takes its turn in the
-        // scheduler behind them, which also keeps the stream's own bytes in
-        // order; a stream not opened yet queues it all.
         let direct = if !self.send_queues.is_empty() || self.is_unbound(raw) {
             0
         } else {
-            // `write` copies only what the engine accepts: handing it a slice
-            // would pin the caller's whole allocation behind a small prefix.
-            // A WebTransport session's credit may cap it further.
             let room = self.wt.as_ref().map_or(usize::MAX, WtSession::data_room);
             let offer = data.get(..room).unwrap_or(&data);
             match self.conn.send_stream(engine_stream(raw)).write(offer) {
@@ -1278,7 +1221,6 @@ impl QuicConnection {
     ) {
         if let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) {
             state.control = control;
-            // A control stream may have room an application one lacked.
             self.wake_writable(events);
         }
     }
@@ -1347,12 +1289,9 @@ impl QuicConnection {
         self.writable_armed.remove(&raw);
         self.unacked_fins.remove(&raw);
         self.gated.remove(&raw);
-        // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
 
         if self.is_unbound(raw) {
-            // Not on the wire yet: done for the caller now, and reset in the
-            // engine when it opens, so the id sequence never diverges.
             if let Some(open) = self.pending_opens.iter_mut().find(|open| open.id == raw) {
                 open.reset_on_bind = true;
             }
@@ -1367,7 +1306,6 @@ impl QuicConnection {
             return Ok(());
         }
 
-        // A closed half is already done.
         self.reset_on_wire(raw, self.stream_code());
 
         let state = self.stream_state_mut(stream_id)?;
@@ -1433,7 +1371,6 @@ impl QuicConnection {
         for raw in bound {
             self.reset_on_wire(raw, code);
         }
-        // No send half is left, bound or not: an unbound stream never opens.
         for state in self.stream_states.values_mut() {
             state.local_write_closed = true;
         }
@@ -1568,9 +1505,6 @@ impl QuicConnection {
                     }
                 }
             } else {
-                // At most this turn's budget, and for caller bytes on a
-                // WebTransport session its credit; the whole write when it
-                // fits.
                 let room = match self.wt.as_ref() {
                     Some(wt) if !front.internal => budget.min(wt.data_room()),
                     _ => budget,
@@ -1580,7 +1514,6 @@ impl QuicConnection {
                 if len == 0 {
                     return progressed;
                 }
-                // Copies the accepted prefix, as in `send_stream`.
                 match self.conn.send_stream(stream).write(offer) {
                     Ok(0) => return progressed,
                     Ok(written) => {
@@ -1595,15 +1528,12 @@ impl QuicConnection {
                         budget -= written;
                         progressed = true;
                         if !front.bytes.is_empty() {
-                            // Out of credit, or out of this turn's budget.
                             if written < len {
                                 return progressed;
                             }
                             continue;
                         }
                     }
-                    // Out of flow-control credit or send window: the peer's
-                    // next MAX_* frame raises `Writable`, and a drain follows.
                     Err(WriteError::Blocked) => return progressed,
                     Err(WriteError::Stopped(error_code)) => {
                         self.on_stopped(raw, error_code, events);
@@ -1655,7 +1585,6 @@ impl QuicConnection {
             return;
         }
         for raw in mem::take(&mut self.writable_armed) {
-            // A write side that ended since never gets a Writable.
             let Some(state) = self
                 .stream_states
                 .get(&raw)
@@ -1715,7 +1644,6 @@ impl QuicConnection {
         self.disarm_wt();
         self.close_reason
             .get_or_insert(ConnectionCloseReason::Error(message));
-        // 1 is QUIC's INTERNAL_ERROR.
         self.conn.close(
             now,
             VarInt::from_u32(1),
@@ -1757,11 +1685,9 @@ impl QuicConnection {
     /// longer be delivered.
     fn note_stream_reset(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
         self.drop_send_queue(raw);
-        // A reset send half never reports `Finished`.
         self.unacked_fins.remove(&raw);
         self.disarm_writable(raw, events);
         self.gated.remove(&raw);
-        // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
         let Some(state) = self.stream_states.get_mut(&raw) else {
             return;

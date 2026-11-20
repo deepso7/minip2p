@@ -89,6 +89,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: python3 scripts/check-comments.py
       # Library-only checks, as a consumer builds the crate: the clippy rows
       # below use `--all-targets`, which unifies dev-dependency features in.
       - run: |

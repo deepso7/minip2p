@@ -147,7 +147,6 @@ impl DiscoveryDriver {
                 self.book
                     .report_violation(peer, DiscoverySource::Mdns, &reason);
             }
-            // The engine reports mDNS health to the application itself.
             MdnsEvent::Failed { .. } | MdnsEvent::Recovered => {}
         }
     }
@@ -270,8 +269,6 @@ impl DiscoveryDriver {
                     match action {
                         BeaconAction::PublishBeacon { topic, payload } => {
                             if let Some(pubsub) = pubsub.as_deref_mut() {
-                                // The beacon is periodic, so a refused local
-                                // publish is retried on its next tick.
                                 let _refused =
                                     pubsub.publish(&topic, payload, None, runtime, now_ms);
                             }
@@ -294,8 +291,6 @@ impl DiscoveryDriver {
                                 candidates: direct_candidates(&addrs, &peer),
                                 peer,
                                 allow_relay: source == DiscoverySource::SignedBeacon,
-                                // Every address the source announced, circuit
-                                // addresses included.
                                 targets: addrs,
                             },
                             names,

@@ -94,7 +94,6 @@ impl ProtocolTable {
     /// The handle for `name`, if the table holds it.
     pub(crate) fn id(&self, name: &str) -> Option<ProtocolId> {
         let index = self.names.iter().position(|known| known == name)?;
-        // The table never grows past `u16::MAX` names.
         u16::try_from(index).ok().map(ProtocolId)
     }
 

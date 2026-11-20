@@ -100,8 +100,6 @@ fn stagger_delays_the_relay_leg() {
     assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
 
-    // The stagger is the earliest pending deadline: absolute, so it is due
-    // exactly at 200 and an overdue read reports the same past value.
     let stagger = Some(Deadline::from_millis(200));
     assert_eq!(h.agent.next_deadline(at(0)), stagger);
     assert_eq!(h.agent.next_deadline(at(500)), stagger);
@@ -142,7 +140,7 @@ fn force_relay_skips_direct_dials_and_dcutr() {
     let open = drain_actions(&mut h.agent);
     let stream = opened_stream(&open);
     h.stream_ready(stream, at(20));
-    drain_actions(&mut h.agent); // HOP CONNECT
+    drain_actions(&mut h.agent);
     h.stream_data(stream, hop_status(Status::Ok), at(30));
 
     let promotion = drain_actions(&mut h.agent);
@@ -172,7 +170,6 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
         dcutr: false,
         ..NatConfig::default()
     });
-    // The direct leg keeps its head start: the relay waits out the stagger.
     let id = h.start(RACE, at(0));
     assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.relay), 0);
     assert_eq!(
@@ -184,7 +181,7 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
     h.relay_session_ready(at(210));
     let stream = opened_stream(&drain_actions(&mut h.agent));
     h.stream_ready(stream, at(220));
-    drain_actions(&mut h.agent); // HOP CONNECT
+    drain_actions(&mut h.agent);
     h.stream_data(stream, hop_status(Status::Ok), at(300));
 
     let promotion = drain_actions(&mut h.agent);
@@ -196,7 +193,6 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
             if *connect_id == id
     ));
     assert_eq!(h.agent.next_deadline(at(301)), None, "no upgrade budgets");
-    // Identify on the circuit offers DCUtR; still no round starts.
     h.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: target,
@@ -208,7 +204,6 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
     );
     let mut actions = drain_actions(&mut h.agent);
 
-    // A DCUtR stream from the target is refused, not answered.
     let stream = StreamId::new(9_002);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
@@ -238,7 +233,6 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
     );
     assert!(drain_events(&mut h.agent).is_empty(), "no upgrade timeout");
 
-    // The direct leg can still win the race.
     h.target_connected(at(60_001));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
@@ -303,8 +297,6 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
         at(303),
     );
 
-    // One failed round; the holder may still start the next one, so the
-    // attempt keeps its Relayed path and waits.
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
@@ -465,7 +457,7 @@ fn write_stop_resets_only_nat_owned_streams() {
 fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
-    drain_actions(&mut h.agent); // relay dial
+    drain_actions(&mut h.agent);
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
@@ -507,8 +499,6 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
 fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
-    // The swarm is ahead of the events NAT has handled: the relay's first
-    // connection was already replaced, and the replacement is ready.
     h.agent
         .swarm
         .make_ready(&h.relay, new, &[HOP_PROTOCOL_ID.into()]);
@@ -517,8 +507,6 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
     let stream = opened_stream(&actions);
 
-    // The buffered lifecycle catches up; none of it may end the work on
-    // `new` or start a second exchange.
     let relay = h.relay;
     for event in [
         SwarmEvent::ConnectionEstablished {
@@ -579,8 +567,6 @@ fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
     let first = h.start(RELAY_NOW, at(1));
     let stream = opened_stream(&drain_actions(&mut h.agent));
 
-    // The swarm is ahead: `old` was already replaced by a ready `new`, whose
-    // first stream reuses the id the first attempt holds on `old`.
     h.agent
         .swarm
         .make_ready(&relay, new, &[HOP_PROTOCOL_ID.into()]);
@@ -592,7 +578,6 @@ fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
         [Out::OpenStream { opened: Some((conn, s)), .. }] if *conn == new && *s == stream
     ));
 
-    // Ending the first attempt resets its stream on `old` only.
     h.agent.cancel(first, at(3));
     let actions = drain_actions(&mut h.agent);
     assert!(
@@ -635,8 +620,6 @@ fn a_stale_buffered_establishment_keeps_a_newer_relay_dial_gate() {
     h.start(RELAY_NOW, at(0));
     assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.relay), 1);
 
-    // An establishment the swarm has since closed again is delivered late:
-    // the relay is not connected, and the dial above is still in flight.
     h.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(7),
@@ -659,8 +642,6 @@ fn cancelling_keeps_a_dialed_relay_session_another_attempt_already_uses() {
     let first = h.start(RELAY_NOW, at(0));
     let dialed = dial_conn_for(&drain_actions(&mut h.agent), &h.relay);
 
-    // The swarm is ready on the dialed connection before NAT handles its
-    // buffered events, so a second attempt opens HOP on it at once.
     let relay = h.relay;
     h.agent
         .swarm
@@ -742,7 +723,6 @@ fn malformed_hop_response_fails_with_protocol_error() {
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent);
 
-    // A complete frame whose payload is not a valid HopMessage.
     h.stream_data(stream, vec![0x05, b'j', b'u', b'n', b'k', b'!'], at(30));
 
     let events = drain_events(&mut h.agent);
@@ -799,8 +779,6 @@ fn duplicate_direct_connection_does_not_double_report() {
     h.target_connected(at(50));
     assert_eq!(drain_events(&mut h.agent).len(), 1);
 
-    // A repeated establishment for the same peer adds nothing new.
-
     h.target_connected(at(60));
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(drain_actions(&mut h.agent).is_empty());
@@ -813,7 +791,6 @@ fn relay_timeout_fails_a_stalled_leg() {
     let actions = drain_actions(&mut h.agent);
     let dialed = dial_conn_for(&actions, &h.relay);
 
-    // The relay never answers.
     h.agent.handle_tick(at(11_999));
     assert!(drain_events(&mut h.agent).is_empty());
     h.agent.handle_tick(at(12_000));
@@ -872,7 +849,6 @@ fn inactive_leg_reports_direct_established() {
 #[test]
 fn identify_observed_addr_joins_dcutr_connect() {
     let mut h = Harness::with_relay(NatConfig::default());
-    // The relay's identify tells us our public mapping before any attempt.
     identify_observed(
         &mut h.agent,
         &h.relay.clone(),
@@ -893,9 +869,6 @@ fn identify_observed_addr_joins_dcutr_connect() {
 
 #[test]
 fn webtransport_addresses_never_become_punch_candidates() {
-    // What a WebTransport connection looks like to NAT: the shape a QUIC
-    // connection's endpoint takes once ALPN picks h3, here as a trusted
-    // reporter's observation of us and as one of our listen addresses.
     let observed_wt = "/ip4/203.0.113.77/udp/45678/quic-v1/webtransport";
     let listen_wt = "/ip4/198.51.100.5/udp/4500/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
     let mut h = Harness::with_relay(NatConfig::default());
@@ -912,7 +885,6 @@ fn latest_observation_per_reporter_wins() {
     let stale = "/ip4/203.0.113.77/udp/1111/quic-v1";
     let mut h = Harness::with_relay(NatConfig::default());
 
-    // Same reporter twice: only the fresh observation survives.
     let relay = h.relay;
     identify_observed(&mut h.agent, &relay, &maddr(stale), at(0));
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(1));
@@ -927,8 +899,6 @@ fn reporter_disconnect_drops_its_observation() {
     let departed = "/ip4/203.0.113.88/udp/2222/quic-v1";
     let mut h = Harness::with_relay(NatConfig::default());
 
-    // The relay reports a mapping, then its connection closes; the attempt
-    // reconnects the relay, but the stale observation must not come back.
     let relay = h.relay;
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
@@ -980,9 +950,6 @@ fn observed_addrs_from_untrusted_peers_are_ignored() {
     let attacker_chosen = "/ip4/198.51.100.200/udp/53/quic-v1";
     let mut h = Harness::with_relay(NatConfig::default());
 
-    // Valid QUIC shapes, but neither reporter is a configured relay or
-    // AutoNAT server — believing them would let any connected peer aim
-    // punch-time UDP blasts at an address of its choosing.
     let target = h.target;
     identify_observed(&mut h.agent, &target, &maddr(attacker_chosen), at(0));
     let other = peer(b"other-peer");
@@ -1037,7 +1004,6 @@ fn a_replaced_reporter_connection_drops_exactly_its_observation() {
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
     identify_observed(&mut h.agent, &autonat, &maddr(departed), at(0));
 
-    // The server's next connection has not re-identified yet.
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: autonat,
@@ -1061,11 +1027,8 @@ fn a_reporter_vouches_only_for_the_family_it_is_connected_over() {
     let autonat_v6 = "/ip6/2001:db8::78/udp/45680/quic-v1";
     let (mut h, autonat) = with_connected_autonat_server();
     let relay = h.relay;
-    // The relay is reached over IPv4: its IPv6 claim is ignored and does not
-    // evict its IPv4 one.
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
     identify_observed(&mut h.agent, &relay, &maddr(relay_v6), at(1));
-    // A reporter reached over IPv6 supplies that family.
     h.agent.swarm.remote_addrs.insert(
         ConnectionId::new(2),
         maddr("/ip6/2001:db8::60/udp/4009/quic-v1"),
@@ -1107,8 +1070,6 @@ fn an_observation_from_a_stale_connection_is_ignored() {
         false,
         at(1),
     );
-    // Connection 2's Identify arrives after the swarm already replaced it:
-    // nothing would ever remove an entry for it.
     identify_observed_on(
         &mut h.agent,
         &autonat,
@@ -1149,7 +1110,6 @@ fn undecodable_observed_addr_bytes_are_ignored() {
 #[test]
 fn non_quic_observed_addr_is_ignored() {
     let mut h = Harness::with_relay(NatConfig::default());
-    // Well-formed but not a dialable QUIC transport.
     identify_observed(
         &mut h.agent,
         &h.relay.clone(),

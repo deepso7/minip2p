@@ -1,0 +1,9 @@
+# QUIC write scheduling and Writable
+
+How `QuicConnection` implements ADR 0012's write side on quinn-proto:
+
+- **Direct write only with nothing queued.** `send_stream` writes straight into the engine only while no stream has bytes queued and the stream is open on the wire; otherwise the write takes its turn in the scheduler, which also keeps the stream's own bytes in order. `write` copies only the prefix the engine accepts: handing the engine a slice would pin the caller's whole allocation behind a small prefix.
+- **New credit is handed out round-robin.** The engine's `StreamEvent::Writable` is ignored; the scheduler that runs after the events gives the new credit to queued streams in turn rather than to the stream the event names, so streams sharing scarce connection credit all progress. Each turn writes at most its budget (and, for caller bytes on a WebTransport session, the session's data credit). `WriteError::Blocked` waits for the peer's next MAX_* frame.
+- **A failed drain write closes the connection once.** If draining a queue meets a stream the engine no longer has, the failure becomes the close reason, reported once; the write is dropped, not retried on every drain.
+- **Writable never follows the end of a write side.** `close_stream_write`, a reset, a stop and `close` retract a `StreamWritable` already queued for that stream (or connection), even one a `Full` queued before its call returned, and disarm the stream. A reset of a stream that queued nothing frees no room, so the reset itself must disarm it. Freeing a queue, or marking a stream as a control stream, re-checks every armed stream, since the shared connection cap or the control reserve may now have room.
+- **Stopped or reset send halves never report `Finished`.** They are removed from `unacked_fins` so `has_pending_writes` (ADR 0032) does not wait on them. Resetting a half that is already closed is harmless.

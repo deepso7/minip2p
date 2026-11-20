@@ -95,9 +95,6 @@ pub struct SmoltcpConfig {
 impl Default for SmoltcpConfig {
     fn default() -> Self {
         Self {
-            // Four maximum-size segments each way: enough that a link with some
-            // latency stays busy, small enough that a device with a handful of
-            // connections fits in tens of kilobytes.
             rx_buffer: 8 * 1024,
             tx_buffer: 8 * 1024,
             backlog: 2,
@@ -278,9 +275,6 @@ pub struct SmoltcpTcpProvider<D: Device> {
 }
 
 fn instant(millis: u64) -> Instant {
-    // smoltcp keeps time as microseconds in an `i64`, so the largest
-    // millisecond value it can hold is a thousandth of `i64::MAX`. Saturating
-    // at `i64::MAX` itself would overflow the multiplication inside.
     let ceiling = i64::MAX / 1000;
     Instant::from_millis(i64::try_from(millis).unwrap_or(ceiling).min(ceiling))
 }
@@ -406,9 +400,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         for _ in 0..=(end - start) {
             let port = self.next_port;
             self.next_port = if port == end { start } else { port + 1 };
-            // A listener's port is passed over even though a dial could safely
-            // share it -- smoltcp tells the two apart by the four-tuple -- so
-            // that a port has one owner and a reservation means one thing.
             if !self.listen_conflict(None, port) && self.used_ports.insert(port) {
                 return Ok(port);
             }
@@ -499,10 +490,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                     .state();
                 match state {
                     tcp::State::Listen => kept.push(inner),
-                    // Taken. It becomes a stream of its own, announced once the
-                    // handshake finishes -- or, if it dies first, retired
-                    // without a word, since nothing was ever handed over for
-                    // it. Either way the backlog refills below.
                     _ => {
                         let handle = self.allocate_handle();
                         self.entries.insert(
@@ -594,9 +581,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             }
         };
 
-        // After the ingress, so what just arrived is acknowledged in the same
-        // poll. Bounded by the transmit rings rather than by the link, which is
-        // why this one drains rather than counting.
         loop {
             let state = &mut *stack;
             if state
@@ -619,9 +603,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             return;
         }
 
-        // Reads first, and to exhaustion: the receive ring is what bounds this,
-        // and bytes left in it would have to wait for whatever wakes the host
-        // next.
         loop {
             let mut stack = self.stack.borrow_mut();
             let socket = stack.sockets.get_mut::<tcp::Socket>(inner);
@@ -645,8 +626,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
 
         let stack = self.stack.borrow();
         let socket = stack.sockets.get::<tcp::Socket>(inner);
-        // Reads are drained above, so this is genuinely the end of the stream
-        // rather than a full ring.
         let ended = !socket.may_recv();
         let writable = socket.can_send();
         let finished = !socket.is_open();
@@ -665,10 +644,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             self.ready.push_back(TcpEvent::Writable { socket: handle });
         }
         if finished {
-            // smoltcp does not tell a reset apart from an orderly shutdown on
-            // the socket, so there is no reason to report that would not be a
-            // guess. What the peer did or did not manage to send is visible to
-            // the session above, which is where a truncated stream is a fault.
             self.ready.push_back(TcpEvent::Closed {
                 socket: handle,
                 reason: None,
@@ -713,11 +688,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         let socket = stack.sockets.get::<tcp::Socket>(inner);
 
         if !socket.may_send() {
-            // A reset in `SYN-RECEIVED` puts a socket back into `Listen` rather
-            // than closing it, so a stream can end by its socket becoming
-            // somebody else's again. Either way this one is over, and keeping
-            // an entry that names a socket no longer carrying it would hold a
-            // slot against a stream that does not exist.
             let gave_up = if !socket.is_open() || socket.is_listening() {
                 Some("the connection attempt failed")
             } else if matches!(phase, Phase::OpeningUntil(deadline) if self.now_ms >= deadline) {
@@ -728,9 +698,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             let Some(reason) = gave_up else {
                 return false;
             };
-            // Forces a socket still waiting on a `SYN` to `Closed` so it can be
-            // reclaimed. It sends no reset worth having: nothing answered, which
-            // is the whole reason this stream is being given up on.
             drop(stack);
             self.stack
                 .borrow_mut()
@@ -738,9 +705,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 .get_mut::<tcp::Socket>(inner)
                 .abort();
             if let Role::Outbound { .. } = role {
-                // The handle is already the caller's, so it has to be retired
-                // in the open. An inbound attempt was never handed over, so it
-                // leaves without a word.
                 self.ready.push_back(TcpEvent::Closed {
                     socket: handle,
                     reason: Some(reason.to_string()),
@@ -750,9 +714,6 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             return false;
         }
 
-        // A stream with no remote endpoint is one that has not finished coming
-        // up, whatever the transmit half says; announcing it would name an
-        // address nobody is at.
         let Some(remote) = socket.remote_endpoint().map(endpoint_to_multiaddr) else {
             return false;
         };
@@ -817,12 +778,8 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             }
             requested
         };
-        // Only a port this call drew from the pool is handed back on failure;
-        // a port the caller named was never taken out of it.
         let drawn = (requested == 0).then_some(port);
 
-        // A wildcard has to resolve to something concrete, and on an interface
-        // with no address at all there is nothing to resolve it to.
         let bound = if wildcard {
             let address = self
                 .stack
@@ -913,7 +870,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
                 phase: Phase::Opening,
             },
         );
-        // The SYN is queued, not sent.
         self.egress_pending = true;
         Ok(handle)
     }
@@ -924,9 +880,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .get(&socket)
             .ok_or(TcpError::UnknownSocket { socket })?;
         let inner = entry.inner;
-        // `InvalidState` means the transmit half is shut -- the connection is
-        // closing, or gone. That is a socket taking nothing rather than a
-        // failed write, and it is already on its way to a `Closed`.
         let accepted = self
             .stack
             .borrow_mut()
@@ -952,8 +905,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .entries
             .get(&socket)
             .ok_or(TcpError::UnknownSocket { socket })?;
-        // smoltcp sends the `FIN` behind whatever is still queued, so this
-        // needs no flushing of its own -- only a poll to put it on the wire.
         self.stack
             .borrow_mut()
             .sockets
@@ -972,11 +923,7 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .sockets
             .get_mut::<tcp::Socket>(entry.inner)
             .abort();
-        // The caller is owed nothing further, and there is nothing to take
-        // back: `poll` hands over everything it produces before it returns, so
-        // between polls there is never an event queued to discard.
         self.retire(socket);
-        // The reset still has to reach the peer.
         self.egress_pending = true;
     }
 
@@ -992,12 +939,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         }
 
         self.reclaim();
-        // After the reclaim, not before: a connection that ended during this
-        // poll frees a socket, and a listener refilled ahead of that would miss
-        // it and finish the poll with an empty backlog. A `SYN` arriving before
-        // the next poll is then lost, and the peer waits out a retransmit to
-        // get in -- so this is a poll leaving the provider ready rather than
-        // one poll behind.
         for index in 0..self.listeners.len() {
             self.arm_listener(index);
         }
@@ -1013,8 +954,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
 
     fn next_deadline(&self) -> Option<Deadline> {
         if self.egress_pending || self.ingress_pending {
-            // Something is queued -- ours to send, or the link's for us to take
-            // in -- and will not move until the next poll.
             return Some(Deadline::IMMEDIATE);
         }
         let connects = self
@@ -1022,8 +961,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .values()
             .filter_map(|entry| match entry.phase {
                 Phase::OpeningUntil(deadline) => Some(deadline),
-                // A stream still waiting for its first poll was created since
-                // the last one, which `egress_pending` has already made urgent.
                 Phase::Opening | Phase::OpeningForever | Phase::Open => None,
             })
             .min()
@@ -1036,9 +973,6 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .iter()
             .flat_map(|listener| match listener.endpoint.addr {
                 Some(_) => vec![listener.bound.clone()],
-                // A wildcard listener answers on every address the interface
-                // holds, so reporting only the one `listen` picked would hide
-                // most of the ways it can be reached.
                 None => self
                     .stack
                     .borrow()

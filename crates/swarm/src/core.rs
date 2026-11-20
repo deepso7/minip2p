@@ -186,10 +186,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Addresses and transport access
-    // -----------------------------------------------------------------------
-
     /// Sets externally validated addresses (e.g. AutoNAT-confirmed public
     /// addresses or relay circuit addresses) to advertise through Identify
     /// alongside the transport's bound addresses.
@@ -274,10 +270,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     pub fn simultaneous_dial_window_ms(&self) -> u64 {
         self.state.simultaneous_dial_window_ms
     }
-
-    // -----------------------------------------------------------------------
-    // Peers and connections
-    // -----------------------------------------------------------------------
 
     /// Returns peers currently surfaced through `ConnectionEstablished` and
     /// not yet closed. A Connection replacement keeps the peer listed.
@@ -368,10 +360,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.state.connection_remote_addr(conn_id)
     }
 
-    // -----------------------------------------------------------------------
-    // Protocol registration
-    // -----------------------------------------------------------------------
-
     /// Registers an application protocol id for inbound acceptance and
     /// outbound opens, and advertises it through Identify.
     ///
@@ -406,10 +394,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     ) -> Result<(), SwarmError> {
         self.state.add_advertised_protocol(protocol_id)
     }
-
-    // -----------------------------------------------------------------------
-    // Listening and dialing
-    // -----------------------------------------------------------------------
 
     /// Bumps the listened-address revision and records `addr` after a
     /// successful `Transport::listen`, in place of the same address with
@@ -449,8 +433,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         let mut resolved = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let addr = self.transport.listen(&addr)?;
-            // A later bind may still fail, leaving this one bound — record
-            // each successful bind, not the batch.
             self.record_listen(&addr);
             resolved.push(self.local_peer_addr(addr)?);
         }
@@ -526,10 +508,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.state.veto_establish(conn_id);
     }
 
-    // -----------------------------------------------------------------------
-    // Commands
-    // -----------------------------------------------------------------------
-
     /// The swarm's entropy source, for composed drivers that need random
     /// bytes of their own without holding a second source.
     pub fn entropy_mut(&mut self) -> &mut E {
@@ -599,8 +577,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         protocol_id: &str,
         _now_ms: u64,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
-        // Earlier queued work keeps its place ahead of this open, and its
-        // failures keep flowing as events.
         self.flush();
         let conn_id = self.state.admit_user_open(peer_id, protocol_id)?;
         let stream_id = self.open(
@@ -627,7 +603,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         data: Bytes,
         _now_ms: u64,
     ) -> Result<(), DriverError> {
-        // Earlier queued writes for the stream go out first.
         self.flush();
         let data = self
             .state
@@ -785,10 +760,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Driving
-    // -----------------------------------------------------------------------
-
     /// Drive the swarm: poll the transport, run the work each event causes,
     /// advance timers, and return the application's events. Must be called
     /// repeatedly; [`next_deadline`](Self::next_deadline) says when.
@@ -815,22 +786,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     pub(crate) fn drive(&mut self, now: Now) -> Result<(), DriverError> {
         let now_ms = now.monotonic_ms;
 
-        // Closes deferred behind events the caller has since drained are now
-        // due. Run them before reading more transport input so replaced
-        // connections cannot produce another batch ahead of their close.
         self.flush();
 
         let events = self.transport.poll(now)?;
 
-        // A transport that moved a listen address on its own (a
-        // WebTransport certificate rotation) announces it with `Listening`.
         let listen_changed = self.apply_listen_updates(&events);
 
-        // Refresh the snapshot of our listening addresses so Identify
-        // advertises the current bound set plus any validated external
-        // addresses -- but only when one of those moved. It runs after the
-        // poll, so addresses the poll itself moved are in it before any of
-        // its events (an Identify reply, say) are handled.
         self.refresh_local_addresses();
         if listen_changed {
             let addrs = self
@@ -843,15 +804,11 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                 .push_back(SwarmEvent::ListenAddressesChanged { addrs });
         }
 
-        // Each transport event's work runs to completion before the next
-        // event is ingested: a later event must not observe state that
-        // assumes an earlier event's transport actions have already run.
         for event in events {
             self.state.handle_transport_event(event, now_ms);
             self.flush();
         }
 
-        // Timers tick after the transport batch.
         self.state.handle_tick(now_ms);
         self.flush();
         Ok(())
@@ -932,10 +889,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         )
     }
 
-    // -----------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------
-
     /// Dispatches queued transport work until none is due, feeding each
     /// result back into the state (which may queue more).
     fn flush(&mut self) {
@@ -990,7 +943,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                 match self.transport.send_stream(conn_id, stream_id, data) {
                     Ok(()) => {}
                     Err(e) if target_ended(&e) => {}
-                    // The state's own write: it holds the tail.
                     Err(TransportError::Full { unsent, .. }) => {
                         self.state
                             .handle_send_full(conn_id, stream_id, unsent, counted);
@@ -1020,9 +972,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             Action::ResetStream { conn_id, stream_id } => {
                 match self.transport.reset_stream(conn_id, stream_id) {
                     Ok(()) => {}
-                    // The stream is already gone, which is what the reset
-                    // wanted. No terminal event may be left to clear the
-                    // pending reset, so drop it here.
                     Err(e) if target_ended(&e) => {
                         self.state.reset_stream_failed(conn_id, stream_id);
                     }
@@ -1053,7 +1002,6 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             Action::SettleStream { conn_id, stream_id } => {
                 match self.transport.reset_stream(conn_id, stream_id) {
                     Ok(()) => {}
-                    // Nothing held is nothing to settle.
                     Err(e) if target_ended(&e) => {}
                     Err(e) => self.state.record_runtime_error(transport_error(
                         Some(conn_id),

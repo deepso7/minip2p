@@ -28,14 +28,13 @@ use thiserror::Error;
 
 use super::MAX_MESSAGE_SIZE;
 
-// Field numbers for the HolePunch message.
 const FIELD_TYPE: u64 = 1;
 const FIELD_OBS_ADDRS: u64 = 2;
 
 #[cfg(test)]
-const TAG_TYPE: u8 = ((FIELD_TYPE as u8) << 3) | WIRE_VARINT; // 0x08
+const TAG_TYPE: u8 = ((FIELD_TYPE as u8) << 3) | WIRE_VARINT;
 #[cfg(test)]
-const TAG_OBS_ADDRS: u8 = ((FIELD_OBS_ADDRS as u8) << 3) | WIRE_LEN; // 0x12
+const TAG_OBS_ADDRS: u8 = ((FIELD_OBS_ADDRS as u8) << 3) | WIRE_LEN;
 
 /// Type discriminator for the HolePunch message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +81,6 @@ pub enum DcutrMessageError {
 impl HolePunch {
     /// Encodes the message body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
-        // Capacity upper bound: tag + varint type + per-addr (tag + varint len + bytes).
         let addrs_bytes: usize = self
             .obs_addrs
             .iter()
@@ -127,10 +125,6 @@ impl HolePunch {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Length-prefixed framing
-// ---------------------------------------------------------------------------
-
 pub use minip2p_core::{FrameDecode, encode_frame};
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
@@ -141,10 +135,6 @@ pub use minip2p_core::{FrameDecode, encode_frame};
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
     minip2p_core::decode_frame(input, MAX_MESSAGE_SIZE)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -175,7 +165,7 @@ mod tests {
 
     #[test]
     fn wire_failures_preserve_dcutr_context_in_display() {
-        let input = [0x12, 0x05, b'a', b'b']; // obs_addrs LEN, length 5, only 2 bytes
+        let input = [0x12, 0x05, b'a', b'b'];
         let err = HolePunch::decode(&input).unwrap_err();
         assert!(matches!(
             err,
@@ -226,7 +216,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_missing_type() {
-        // Just a single ObsAddrs with no type field.
         let mut buf = Vec::new();
         buf.push(TAG_OBS_ADDRS);
         buf.push(3);
@@ -267,12 +256,11 @@ mod tests {
 
     #[test]
     fn decoder_skips_unknown_fields() {
-        // Unknown field 5 VARINT before the real type field.
         let mut buf = Vec::new();
-        buf.push(5 << 3); // unknown field, varint
+        buf.push(5 << 3);
         write_uvarint(42, &mut buf);
         buf.push(TAG_TYPE);
-        write_uvarint(100, &mut buf); // CONNECT
+        write_uvarint(100, &mut buf);
 
         let decoded = HolePunch::decode(&buf).unwrap();
         assert_eq!(decoded.kind, HolePunchType::Connect);
@@ -280,7 +268,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_field_numbers() {
-        // type = CONNECT, then field 0 / field 2^29.
         let cases: [(&[u8], u64); 2] = [
             (&[TAG_TYPE, 100, 0x00, 0x00], 0),
             (
@@ -304,13 +291,12 @@ mod tests {
     fn decode_does_not_alias_high_field_numbers_to_known_fields() {
         let mut buf = Vec::new();
 
-        // Unknown field 33, wire type LEN, payload "aliased"
         write_uvarint((33 << 3) | (WIRE_LEN as u64), &mut buf);
         write_uvarint(7, &mut buf);
         buf.extend_from_slice(b"aliased");
 
         buf.push(TAG_TYPE);
-        write_uvarint(100, &mut buf); // CONNECT
+        write_uvarint(100, &mut buf);
 
         let decoded = HolePunch::decode(&buf).unwrap();
         assert_eq!(decoded.kind, HolePunchType::Connect);

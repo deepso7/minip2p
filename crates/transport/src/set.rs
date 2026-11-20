@@ -89,8 +89,6 @@ impl RejectedTransport {
 
 impl fmt::Debug for RejectedTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // A boxed transport is not `Debug`, and the reason is the whole of
-        // what a failed `expect` needs to say.
         f.debug_struct("RejectedTransport")
             .field("error", &self.error)
             .finish_non_exhaustive()
@@ -274,8 +272,6 @@ impl TransportSet {
         self.members
             .iter()
             .position(|member| member.namespaces.contains(&namespace))
-            // An id from a namespace nobody claims names no connection here,
-            // which is the same thing as a connection that does not exist.
             .ok_or(TransportError::ConnectionNotFound { id })
     }
 
@@ -327,15 +323,7 @@ impl Transport for TransportSet {
         let target = addr.transport().clone();
         let member = self.for_addr(&target, "dial target")?;
         let id = member.transport.dial(addr)?;
-        // A member that stamps an id in a namespace it did not claim hands
-        // back an id this set cannot route: every later call on it would look
-        // for an owner and find none, and the connection would be unreachable
-        // while still costing the member everything a connection costs. Fail
-        // the dial where the mis-claim is visible, and close what it opened.
         if !member.namespaces.contains(&id.namespace()) {
-            // The routing failure is what the caller can correct. `id` does
-            // not belong to the set, so a failed best-effort cleanup cannot
-            // be retried or reported through the set's public API.
             drop(member.transport.close(id));
             return Err(TransportError::DialFailed {
                 id,
@@ -390,8 +378,6 @@ impl Transport for TransportSet {
         stream_id: StreamId,
         bytes: usize,
     ) -> Result<(), TransportError> {
-        // A connection no member owns is unknown, and acknowledging an
-        // unknown connection is a no-op.
         match self.for_id(id) {
             Ok(member) => member.ack_stream(id, stream_id, bytes),
             Err(_) => Ok(()),
@@ -409,20 +395,12 @@ impl Transport for TransportSet {
     }
 
     fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        // Routed by shape like a dial: a hole punch has to leave the socket the
-        // connection it is opening will arrive on, so the member that would
-        // dial this address is the only one it can come from.
         self.for_addr(target, "datagram target")?
             .transport
             .send_datagram(target, payload)
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        // Events a failing poll held back are delivered before any member is
-        // polled again. That bounds what this queue holds to a single round
-        // and, more importantly, means a member that fails every time cannot
-        // keep a healthy sibling's events queued behind it forever: the host
-        // alternates between hearing the fault and draining what still works.
         if !self.pending.is_empty() {
             return Ok(self.pending.drain(..).collect());
         }
@@ -430,11 +408,6 @@ impl Transport for TransportSet {
             return Err(error);
         }
 
-        // Every member is polled, even after one fails: a member that has
-        // events ready is not answerable for another one's fault, and the
-        // failing member has already told the host what went wrong through the
-        // error. What has been collected so far is kept for the next poll
-        // rather than dropped, so no connection loses events to a sibling.
         for member in &mut self.members {
             match member.transport.poll(now) {
                 Ok(events) => self.pending.extend(events),
@@ -449,7 +422,6 @@ impl Transport for TransportSet {
 
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() || !self.failures.is_empty() {
-            // Events a failed poll held back are due regardless of the clock.
             return Some(Deadline::IMMEDIATE);
         }
         self.members
@@ -564,7 +536,6 @@ mod polling {
                 .tokens
                 .subspace_of(MEMBER_PREFIX_BITS, event.token())
                 .and_then(|index| self.members.get_mut(index));
-            // A token no member holds is stale: harmless, and dropped.
             if let Some(member) = member {
                 member.transport.dispatch(event);
             }
@@ -810,8 +781,6 @@ mod tests {
     }
 
     fn peer() -> minip2p_core::PeerId {
-        // Identity-key ed25519 multihash: 0x00 code, 32-byte digest. Built by
-        // hand so the routing tests need no signing crate to dial with.
         let mut multihash = vec![0x00, 32];
         multihash.extend_from_slice(&[7u8; 32]);
         minip2p_core::PeerId::from_bytes(&multihash).expect("a well-formed peer id")
@@ -845,9 +814,6 @@ mod tests {
     #[test]
     fn everything_about_a_connection_returns_to_the_member_that_issued_its_id() {
         let (mut set, tcp, quic) = duo();
-        // Nothing in this test names an address. The namespace the id carries
-        // is the only thing saying where it belongs -- which is what makes the
-        // set a lookup rather than a search.
         let id = ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 7).expect("in range");
         let stream = StreamId::new(3);
 
@@ -876,9 +842,6 @@ mod tests {
 
     #[test]
     fn a_member_that_claims_two_namespaces_owns_ids_from_both() {
-        // What a transport that splits by family internally looks like from
-        // out here: the dual-stack QUIC transport allocates in two namespaces
-        // and keeps the split to itself, so both have to route to it.
         let dual = Fake::new("quic", ConnectionNamespace::QUIC_IPV4);
         let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
         let mut set = TransportSet::new();
@@ -918,9 +881,6 @@ mod tests {
     fn a_datagram_leaves_from_the_member_that_would_dial_its_target() {
         let (mut set, tcp, quic) = duo();
 
-        // A hole punch has to leave the socket the connection it is opening
-        // will arrive on. Sending it from a sibling transport would open a
-        // binding for packets that never come.
         set.send_datagram(&quic_addr(), b"punch").expect("sent");
         assert_eq!(quic.calls(), vec!["send_datagram"]);
         assert!(tcp.calls().is_empty());
@@ -948,9 +908,6 @@ mod tests {
 
     #[test]
     fn a_dial_landing_outside_the_members_claim_is_refused_and_closed() {
-        // The member allocates in TCP_IPV6 but joined claiming only TCP_IPV4,
-        // so its ids route nowhere. Handing one back would give the host a
-        // connection every later call reports as not found.
         let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV6);
         let mut set = TransportSet::new();
         set.insert(
@@ -989,8 +946,6 @@ mod tests {
     #[test]
     fn an_address_that_names_no_transport_is_refused() {
         let (mut set, ..) = duo();
-        // A relay address is somebody else's to dial; guessing a member for it
-        // would hand it to a transport that cannot reach it.
         let error = set
             .listen(&addr("/ip4/127.0.0.1/tcp/4001/p2p-circuit"))
             .expect_err("not a transport address");
@@ -1026,8 +981,6 @@ mod tests {
         let second = Fake::new("b", ConnectionNamespace::TCP_IPV4);
         let mut set = set_of(&[&first]);
 
-        // Different shape, same namespace: ids would be ambiguous, and an
-        // ambiguous id delivers a connection's work to the wrong transport.
         let rejected = set
             .insert(
                 TransportKind::Quic,
@@ -1047,7 +1000,6 @@ mod tests {
     fn a_member_that_claims_no_namespace_is_refused() {
         let mut set = TransportSet::new();
         let fake = Fake::new("a", ConnectionNamespace::TCP_IPV4);
-        // Nothing it returned could ever be routed back to it.
         assert_eq!(
             set.insert(TransportKind::Tcp, [], fake.boxed())
                 .expect_err("no namespace")
@@ -1061,9 +1013,6 @@ mod tests {
         let (mut set, ..) = duo();
         let other = Fake::new("tcp2", ConnectionNamespace::TCP_IPV6);
 
-        // A transport owns a bound socket by the time it is offered. Dropping
-        // it inside a rejected insert would close a listener the host still
-        // believes it has, with nothing left to close it deliberately.
         let mut returned = set
             .insert(
                 TransportKind::Tcp,
@@ -1093,8 +1042,6 @@ mod tests {
             reason: ConnectionCloseReason::Local,
         }];
 
-        // Both connections, each exactly once: a count alone would pass on a
-        // set that reported one member's event twice and lost the other's.
         let events = set.poll(Now::from_millis(0)).expect("poll");
         assert_eq!(
             events,
@@ -1117,8 +1064,6 @@ mod tests {
         let (mut set, tcp, quic) = duo();
         let quic_id =
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
-        // The failure comes first, so a set that gave up on the first error
-        // would never reach the member with something to report.
         tcp.log().fails_poll = true;
         quic.log().events = vec![TransportEvent::Closed {
             id: quic_id,
@@ -1134,8 +1079,6 @@ mod tests {
             "a member after the failing one still gets polled"
         );
 
-        // QUIC's connection did nothing wrong. Dropping its events because a
-        // sibling transport failed would lose a close nobody could recover.
         tcp.log().fails_poll = false;
         let events = set.poll(Now::from_millis(0)).expect("the next poll");
         assert_eq!(
@@ -1176,9 +1119,6 @@ mod tests {
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
         tcp.log().fails_poll = true;
 
-        // A transport can stay broken. Holding a healthy member's events until
-        // every member succeeds would mean a host never seeing them again, and
-        // a queue that only grows.
         let mut delivered = 0;
         for _ in 0..6 {
             quic.log().events = vec![TransportEvent::Closed {
@@ -1206,7 +1146,6 @@ mod tests {
         quic.log().fails_poll = true;
         drop(set.poll(Now::from_millis(0)));
 
-        // A host that slept here would sit on an event it has never seen.
         assert_eq!(set.next_deadline(), Some(Deadline::IMMEDIATE));
     }
 
@@ -1215,9 +1154,6 @@ mod tests {
         let (set, tcp, quic) = duo();
         assert_eq!(set.next_deadline(), None, "an idle set waits on nothing");
 
-        // Asserted with the earliest deadline in each position in turn: the
-        // set owes the host the soonest of them, not whichever member it
-        // happens to reach first.
         for (first, second) in [(300, 900), (900, 300)] {
             tcp.log().deadline = Some(Deadline::from_millis(first));
             quic.log().deadline = Some(Deadline::from_millis(second));
@@ -1241,16 +1177,11 @@ mod tests {
         let (set, tcp, quic) = duo();
         tcp.log().addresses = vec![tcp_addr()];
         quic.log().addresses = vec![quic_addr()];
-        // Where peers reached us is a different question from where we are
-        // bound, and each member answers both. Asking one for the other would
-        // advertise an address nothing is listening on.
         let tcp_source = addr("/ip4/198.51.100.7/tcp/4001");
         let quic_source = addr("/ip4/198.51.100.9/udp/4001/quic-v1");
         tcp.log().inbound = vec![tcp_source.clone()];
         quic.log().inbound = vec![quic_source.clone()];
 
-        // A host announces where it can be reached; leaving out a transport
-        // would make half of those ways invisible to peers.
         assert_eq!(set.local_addresses(), vec![tcp_addr(), quic_addr()]);
         assert_eq!(
             set.active_inbound_connection_sources(),
@@ -1343,7 +1274,6 @@ mod tests {
         #[test]
         fn a_set_nested_too_deep_fails_to_attach_with_a_typed_error() {
             let (mut set, ..) = duo();
-            // A space with no more than a member prefix's worth of bits.
             let mut tokens = TokenSpace::full();
             while tokens.bits() > MEMBER_PREFIX_BITS {
                 tokens = tokens

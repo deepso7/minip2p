@@ -111,15 +111,11 @@ fn churn(listen: &str, reader: EndpointBuilder, writer: impl Fn() -> EndpointBui
         .expect("bind reader");
     let reader_addr = reader.listen().expect("reader listens");
 
-    // The reader never acknowledges, so the closed connection keeps its
-    // only slot and every later peer is refused rather than delivered to.
     let stream = deliver_then_close(&mut reader, &reader_addr, writer());
     for _ in 0..2 {
         assert!(!dial(&mut reader, &reader_addr, writer()).1, "refused");
     }
 
-    // A partial acknowledgement after the close keeps the slot; the last
-    // byte frees it.
     reader
         .stream_consumed(stream, 2)
         .expect("partial ack after close");
@@ -128,7 +124,6 @@ fn churn(listen: &str, reader: EndpointBuilder, writer: impl Fn() -> EndpointBui
         .stream_consumed(stream, 2)
         .expect("final ack after close");
 
-    // Abandoning after the close frees it too.
     let stream = deliver_then_close(&mut reader, &reader_addr, writer());
     assert!(!dial(&mut reader, &reader_addr, writer()).1, "held again");
     reader.abandon_stream(stream).expect("abandon after close");
@@ -140,7 +135,6 @@ fn churn(listen: &str, reader: EndpointBuilder, writer: impl Fn() -> EndpointBui
 fn a_reader_holding_bytes_across_quic_churn_stays_bounded() {
     let limits = || minip2p::QuicLimits {
         max_connections: 1,
-        // A refused dial gives up quickly.
         idle_timeout_ms: 1_000,
         ..minip2p::QuicLimits::default()
     };

@@ -37,15 +37,12 @@ fn no_incoming(events: &[TransportEvent]) -> bool {
 #[test]
 fn before_listen_an_initial_gets_no_reply_while_dials_still_work() {
     let mut node = loopback(QuicNodeConfig::generate());
-    // The endpoint has no server config yet, so it would answer this Initial
-    // with a stateless reset; a node that is not listening sends nothing.
     let client = RawPeer::connect(node.local_addr(), |_| {});
     let events = settle(&mut node);
     assert!(no_incoming(&events), "{events:?}");
     assert!(node.connections.is_empty());
     assert!(take_datagrams(&client.socket).is_empty());
 
-    // The same socket still dials out.
     let keypair = Ed25519Keypair::generate();
     let mut listener = RawPeer::listen(&keypair);
     let addr = PeerAddr::new(
@@ -153,8 +150,6 @@ fn an_expired_retry_token_creates_no_state() {
 
     let mut client = RawPeer::connect(server.local_addr(), |_| {});
     settle(&mut server);
-    // The Retry is waiting on the client's socket; its token expires before
-    // the client answers.
     time.advance(RETRY_TOKEN_LIFETIME + Duration::from_secs(1));
     client.pump();
     let mut events = settle(&mut server);
@@ -204,9 +199,6 @@ fn the_handshake_completes_through_retry() {
 
 #[test]
 fn a_retry_token_survives_a_round_trip_as_long_as_the_connect_deadline() {
-    // #471: on a bloated link the token can come back seconds after the
-    // Retry. Any round trip the Endpoint's 30 s connect deadline could still
-    // succeed with must not expire it.
     let mut server = listening_server(QuicLimits::default());
     let time = Arc::new(ShiftedTime::default());
     server.update_server_config(|config| {
@@ -231,9 +223,6 @@ fn a_retry_token_survives_a_round_trip_as_long_as_the_connect_deadline() {
 
 #[test]
 fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
-    // ADR 0012 (#356): the receive bound outlives the connection, so a reader
-    // that never acknowledges holds the slot, and acknowledging or
-    // abandoning after close releases it.
     let mut server = listening_server(QuicLimits {
         max_connections: 1,
         ..QuicLimits::default()
@@ -269,7 +258,6 @@ fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
     server.ack_stream(id, stream, 2).expect("the final ack");
     server.ack_stream(id, stream, 1).expect("settled: a no-op");
 
-    // The slot is free again; this time abandon the bytes instead.
     let (id, stream) = deliver_then_close(&mut server);
     refused(&mut server);
     server

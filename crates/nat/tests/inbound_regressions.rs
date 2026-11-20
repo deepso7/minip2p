@@ -197,8 +197,6 @@ fn blast_schedule_starts_at_half_measured_rtt_and_respects_deadline() {
     answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 20);
     drain_actions(&mut h.agent);
 
-    // CONNECT was queued at t=13 and its reply arrived at t=20. Half the
-    // measured 7 ms RTT rounds up to 4 ms, so the first blast is due at t=24.
     for (time, expected) in [(23, 0), (24, 1), (123, 0), (124, 1), (224, 1), (274, 0)] {
         h.agent.handle_tick(at(time));
         assert_eq!(
@@ -221,9 +219,6 @@ fn rtt_is_timed_from_when_a_held_connect_is_fully_written() {
     h.agent.swarm.full_sends = false;
     drain_actions(&mut h.agent);
 
-    // CONNECT was refused as Full at t=13 and held until the stream turned
-    // writable at t=1_013. The reply at t=1_020 measures 7 ms, not 1_007 ms,
-    // so the first blast is due at t=1_024.
     h.agent.handle_event(
         &SwarmEvent::StreamWritable {
             peer_id: h.target,
@@ -274,7 +269,6 @@ fn the_holder_runs_three_rounds_each_with_a_fresh_rtt() {
         );
         drain_actions(&mut h.agent);
 
-        // Each round measures its own RTT: 100, 200, then 300 ms.
         let rtt = 100 * round;
         let replied_at = opened_at + rtt;
         answer_dcutr_at(
@@ -299,7 +293,6 @@ fn the_holder_runs_three_rounds_each_with_a_fresh_rtt() {
             "round {round}"
         );
 
-        // The punch window ends without a direct connection.
         opened_at = first_blast + 250;
         h.agent.handle_tick(at(opened_at));
         actions = drain_actions(&mut h.agent);
@@ -320,9 +313,6 @@ fn zero_rtt_opens_udp_mapping_before_notifying_dialer() {
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
 
-    // CONNECT was queued at t=13 and its reply arrived in the same clock
-    // sample. The first blast leaves in the same cascade as SYNC, so the
-    // mapping is open before SYNC can reach the remote and make it dial.
     answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 13);
     let actions = drain_actions(&mut h.agent);
 
@@ -342,9 +332,6 @@ fn measured_rtt_delay_cannot_consume_the_punch_window() {
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
 
-    // CONNECT was queued at t=13. A reply at t=6_014 measures 6_001 ms,
-    // whose half-RTT delay rounds up to 3_001 ms. The full punch window must
-    // begin at t=9_015 rather than expiring before the first blast.
     answer_dcutr_at(
         &mut h,
         conn,
@@ -531,7 +518,6 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
     let (circuit_a, _) = drive_to_relayed(&mut h);
     let target = h.target;
 
-    // The same peer reaches us again through relay B.
     let stop = StreamId::new(STOP_STREAM + 10);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
@@ -624,8 +610,6 @@ fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
     let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(10));
     let circuit = promoted_circuit(&drain_actions(&mut h.agent));
-    // The swarm is ahead: a direct connection already replaced the circuit
-    // when its establishment reaches the agent.
     h.agent.swarm.connect(&target, ConnectionId::new(7));
     h.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
@@ -782,7 +766,6 @@ fn no_blast_leaves_after_the_upgrade_budget() {
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
 
-    // A 400 ms RTT puts the first blast at t=613, past the budget.
     answer_dcutr_at(
         &mut h,
         conn,
@@ -806,7 +789,6 @@ fn a_reply_after_the_exchange_budget_starts_the_next_round_instead() {
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
 
-    // The reply lands before any tick expired the exchange.
     answer_dcutr_at(
         &mut h,
         conn,
@@ -909,7 +891,6 @@ fn a_second_inbound_punch_replacing_the_first_is_punched() {
             if *old_conn_id == circuit && *new_conn_id == a
     ));
 
-    // Past the round's window (t=124), inside the upgrade budget.
     h.agent.handle_tick(at(200));
     replace(&mut h, a, b, false, 500);
     assert!(h.agent.is_punched(b));
@@ -1004,7 +985,6 @@ fn passive_attribution_leaves_other_connections_alone() {
     let a = ConnectionId::new(70);
     replace(&mut h, circuit, a, false, 30);
 
-    // From another peer.
     let other = ConnectionId::new(80);
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
@@ -1016,7 +996,6 @@ fn passive_attribution_leaves_other_connections_alone() {
     );
     assert!(!h.agent.is_punched(other));
 
-    // A circuit from the source.
     let circuit_again = ConnectionId::new(TEST_CIRCUIT_ID + 1);
     replace(&mut h, a, circuit_again, true, 50);
     assert!(!h.agent.is_punched(circuit_again));
@@ -1032,8 +1011,6 @@ fn passive_attribution_keeps_an_outbound_direct_path() {
     replace(&mut h, circuit, a, false, 30);
     drain_events(&mut h.agent);
 
-    // The engine's own direct dial for an attempt, which the attempt
-    // records as Direct.
     h.agent.swarm.disconnect(&h.target.clone());
     let id = h.start(NO_RELAY, at(40));
     let dialed = ConnectionId::new(71);
@@ -1067,7 +1044,6 @@ fn a_direct_connection_before_any_round_creates_no_passive_state() {
 fn a_punch_during_a_later_round_still_turns_passive() {
     let mut h = inbound_harness(passive_budget());
     let circuit = complete_a_round(&mut h);
-    // The first window ends at t=124 and the next round opens.
     h.agent.handle_tick(at(124));
     opened_stream(&drain_actions(&mut h.agent));
     let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));

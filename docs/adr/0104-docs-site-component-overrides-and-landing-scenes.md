@@ -1,0 +1,12 @@
+# Docs site: component overrides keep Blume's props, and landing scenes are declared in markup
+
+The docs site (`docs/`, built with Blume) works this way:
+
+- **Overrides keep Blume's props.** `docs/components.ts` swaps Blume's built-in layout and MDX components for the redesign's. Each replacement keeps the built-in's props, so the MDX in `docs/md` stays as written. Blume resolves MDX tags from this map, not from imports in the page, so the landing page's Astro parts (`Landing*`, `Mascot`) are registered here too. The layout shell has no header bar on docs pages, puts section tabs atop the content column (in `PageHeader`), and has no footer or table of contents (`empty.astro`).
+- **Workspace metadata comes from the root `Cargo.toml`.** `docs/components/workspace.ts` reads `version`, `license` and `rust-version` from the root manifest, which every crate inherits, so the site follows `just release` without edits.
+- **Landing scenes are declared in markup.** `initScene` (`docs/components/landing/scene.ts`) only moves a step counter over this attribute contract:
+  - root `[data-scene][data-durations="2600,2800"]`: one duration (ms) per step;
+  - `[data-show="n"]`: on from step n; with `[data-hide="m"]`: on for steps n to m - 1;
+  - `[data-goto="n"]`: jumps to step n (the progress bar); `[data-toggle]`: play, pause, or replay once ended. Live parts get `data-on`, plus `data-past` once their step is behind, so only the current step animates. `[data-goto]` gets `data-state="done" | "current"`. The root gets `data-playing`, `data-paused` or `data-ended`. The toggle's `aria-label` names the action it will take.
+- **Scenes degrade to the finished frame.** Without the script, or without `IntersectionObserver`, nothing is hidden (the scene rules in `theme.css`), and the markup reads as the finished frame. A reader who prefers reduced motion gets the finished frame and steps through it by hand: a jump stays on the chosen step instead of playing on.
+- **Scene playback follows visibility.** The stage (`figure`), not just its footer, must be on screen: 40% of it, or half the viewport for stages taller than the viewport (phone landscape). The scene starts there and auto-pauses when scrolled away. Then it resumes, unless the reader paused it. A jump replays the target step's motion: `renderFresh` clears every part and forces a reflow (`root.offsetWidth`) before rendering. The observer is disconnected on `astro:before-swap`, since an observer stays alive while it observes and Blume's client router swaps pages.

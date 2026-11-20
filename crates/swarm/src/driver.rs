@@ -133,7 +133,6 @@ impl<T: BlockingTransport> Swarm<T> {
         local_peer_id: PeerId,
         clock: Box<dyn Clock + Send + Sync>,
     ) -> Result<Self, DriverError> {
-        // Reject bad configuration before the poll opens or a socket attaches.
         timeouts.validate()?;
         let mut poll =
             SharedPoll::new().map_err(|error| poll_error("opening the readiness poll", &error))?;
@@ -347,8 +346,6 @@ impl<T: BlockingTransport> Swarm<T> {
             match self.poll_next_interruptible(deadline)? {
                 PollNext::Event(event) => return Ok(Some(event)),
                 PollNext::Deadline => return Ok(None),
-                // No host source to service here: a host that owns one uses
-                // `poll_next_interruptible`.
                 PollNext::Interrupted | PollNext::Woken => {}
             }
         }
@@ -368,8 +365,6 @@ impl<T: BlockingTransport> Swarm<T> {
         deadline: impl Into<WaitDeadline>,
     ) -> Result<PollNext, DriverError> {
         let deadline = deadline.into();
-        // A blocking harvest already collected this batch; another
-        // zero-timeout one right behind it would only cost a syscall.
         let mut harvested = false;
         loop {
             if let Some(ev) = self.core.next_event() {
@@ -378,16 +373,11 @@ impl<T: BlockingTransport> Swarm<T> {
             if !harvested {
                 self.harvest(Duration::ZERO)?;
             }
-            // Always drive at least once -- even if we're already past the
-            // deadline -- so a caller using a short or elapsed deadline
-            // still sees any events the transport has already produced.
             let now = self.now();
             self.core.drive(now)?;
             if let Some(ev) = self.core.next_event() {
                 return Ok(PollNext::Event(ev));
             }
-            // Checked before parking even when the `Waker` event was already
-            // harvested, so an interrupt is never slept through.
             if self.poll.take_interrupt() {
                 return Ok(PollNext::Interrupted);
             }
@@ -398,13 +388,7 @@ impl<T: BlockingTransport> Swarm<T> {
             if deadline.is_expired_at(now) {
                 return Ok(PollNext::Deadline);
             }
-            // Budget: never sleep past the caller's deadline, the
-            // transport's next protocol timer, or the core's next internal
-            // timer (e.g. a ping timeout, which only fires when a Tick is
-            // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
-            // The core folds the transport's timer together with its
-            // protocol timers onto one timeline.
             let now = self.now();
             if let Some(next) = self.core.next_deadline(now) {
                 budget = budget.min(Duration::from_millis(next.millis_until(now)));
@@ -449,9 +433,6 @@ impl<T: BlockingTransport> Swarm<T> {
         let mut skipped = VecDeque::new();
         let mut result = Ok(None);
 
-        // Phase 1: before the deadline, wait for fresh events normally.
-        // An external interruption only wakes the readiness wait; it does
-        // not satisfy this event predicate or expire the caller's deadline.
         let mut polled_past_deadline = false;
         while !deadline.is_expired_at(Instant::now()) {
             match self.poll_next_interruptible(deadline) {
@@ -459,9 +440,6 @@ impl<T: BlockingTransport> Swarm<T> {
                     result = Err(error);
                     break;
                 }
-                // WaitDeadline expired while idle. `poll_next` has already done
-                // its final "at least once" transport poll and found the
-                // buffer empty, so the drain below must not poll again.
                 Ok(PollNext::Deadline) => {
                     polled_past_deadline = true;
                     break;
@@ -483,9 +461,6 @@ impl<T: BlockingTransport> Swarm<T> {
             }
         }
 
-        // Phase 2: past the deadline, still scan everything that is already
-        // synchronously available: the buffered events plus at most one
-        // transport poll.
         if matches!(result, Ok(None)) {
             loop {
                 let Some(ev) = self.core.next_event() else {
@@ -520,8 +495,6 @@ impl<T: BlockingTransport> Swarm<T> {
             }
         }
 
-        // Restore skipped events in their original order -- on a match, on
-        // deadline expiry, and on error alike.
         for event in skipped.into_iter().rev() {
             self.core.state.events.push_front(event);
         }

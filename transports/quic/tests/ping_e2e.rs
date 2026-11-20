@@ -136,7 +136,6 @@ impl PingHarness {
     fn new(client_conn_id_raw: u64) -> Self {
         let (mut server, mut client, peer_addr) = setup_pair();
 
-        // Connect.
         let _ = client_conn_id_raw;
         let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
@@ -144,10 +143,6 @@ impl PingHarness {
             Self::wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
                 .expect("server should observe connection");
 
-        // Mutual TLS binds the peer identity to the connection automatically
-        // during the handshake; no manual verification step is needed.
-
-        // Open stream and negotiate multistream-select for ping.
         let client_stream = client
             .open_stream(client_conn_id)
             .expect("open client ping stream");
@@ -467,7 +462,6 @@ impl PingHarness {
             &mut closed_stream,
         );
 
-        // When server sees remote write closed, it closes its own write side.
         if let Some(stream_id) = closed_stream {
             self.server
                 .close_stream_write(self.server_conn_id, stream_id)
@@ -494,10 +488,6 @@ impl PingHarness {
         self.peer_addr.peer_id()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {

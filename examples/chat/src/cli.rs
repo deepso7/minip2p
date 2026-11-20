@@ -94,7 +94,6 @@ fn parse_join(args: Vec<String>) -> Result<Mode, CliError> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--allow-unsigned" || arg == "--no-mesh" || arg == "--relay-only" {
-            // Boolean flag: no value follows.
             rest.push(arg.clone());
         } else if arg.starts_with("--") {
             rest.push(arg.clone());
@@ -326,19 +325,12 @@ mod tests {
     #[test]
     fn malformed_targets_are_rejected() {
         let cases: &[String] = &[
-            // Not a multiaddr at all.
             "not-an-address".to_string(),
-            // Direct target without a peer id.
             RELAY.to_string(),
-            // Non-QUIC direct target.
             format!("/ip4/203.0.113.7/tcp/4001/p2p/{PEER_ID}"),
-            // Circuit without the trailing peer.
             format!("{RELAY}/p2p/{RELAY_ID}/p2p-circuit"),
-            // Circuit with an empty relay prefix.
             format!("/p2p/{RELAY_ID}/p2p-circuit/p2p/{PEER_ID}"),
-            // Circuit whose relay transport is not QUIC.
             format!("/ip4/203.0.113.7/tcp/4001/p2p/{RELAY_ID}/p2p-circuit/p2p/{PEER_ID}"),
-            // Circuit with the sections out of order.
             format!("{RELAY}/p2p-circuit/p2p/{RELAY_ID}/p2p/{PEER_ID}"),
         ];
         for raw in cases {

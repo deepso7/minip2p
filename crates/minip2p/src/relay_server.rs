@@ -73,12 +73,9 @@ impl RelayServerDriver {
             | SwarmEvent::StreamRemoteWriteClosed { conn_id, .. }
             | SwarmEvent::StreamWriteStopped { conn_id, .. }
             | SwarmEvent::StreamClosed { conn_id, .. } => conn_id.is_circuit(),
-            // The agent's flag describes the connection taking the slot.
             SwarmEvent::ConnectionReplaced { new, .. } => new.is_circuit(),
             _ => false,
         };
-        // The first event at this time sample runs the agent's deadline sweep
-        // before dispatch, preserving deadline-first ordering for the batch.
         #[cfg(feature = "quic")]
         let claimed = match self.backbone.as_mut() {
             Some(backbone) => self.agent.handle_event(

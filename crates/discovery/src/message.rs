@@ -116,7 +116,6 @@ pub enum DiscoveryWireError {
 }
 
 fn len_field_size(value_len: usize) -> usize {
-    // Beacon fields 1 and 2 always use a single-byte tag.
     1usize
         .saturating_add(uvarint_len(value_len as u64))
         .saturating_add(value_len)
@@ -150,7 +149,6 @@ mod tests {
             }))
         };
         assert_eq!(Beacon::decode(&[0]), invalid(0, 0));
-        // A valid key field, then field 2^29.
         assert_eq!(
             Beacon::decode(&[0x0a, 1, 7, 0x80, 0x80, 0x80, 0x80, 0x10, 0]),
             invalid(1 << 29, 3)
@@ -194,8 +192,6 @@ mod tests {
     #[test]
     fn accepts_variable_length_public_keys_within_the_beacon_budget() {
         let key = Beacon {
-            // Large enough to cover ordinary RSA public-key protobufs and to
-            // regress the former 128-byte wire limit.
             public_key: vec![7; 1_024],
             addrs: vec![],
         };

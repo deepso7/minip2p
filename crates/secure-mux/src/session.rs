@@ -257,8 +257,6 @@ impl SecureMuxSession {
             static_secret: config.static_secret,
             ephemeral_secret: config.ephemeral_secret,
             expected_peer: config.expected_peer,
-            // Extensions are WebTransport-only; TCP and circuit send none and
-            // ignore any received, so their wire bytes stay unchanged.
             local_extensions: None,
         });
         let select = match config.role {
@@ -520,10 +518,6 @@ impl SecureMuxSession {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------
-
     /// Runs `operation` against the established Yamux session and drains
     /// the events it produced. Frames it queued wait for
     /// [`poll_write`](Self::poll_write).
@@ -531,9 +525,6 @@ impl SecureMuxSession {
         &mut self,
         operation: impl FnOnce(&mut YamuxSession) -> Result<R, YamuxError>,
     ) -> Result<R, SessionError> {
-        // Only `Ready` runs stream operations, but every other phase is still
-        // a live session mid-upgrade: put it back, or a stray early call would
-        // strand the connection.
         let (mut noise, mut yamux, peer) = match core::mem::replace(&mut self.phase, Phase::FAILED)
         {
             Phase::Ready { noise, yamux, peer } => (noise, yamux, peer),
@@ -544,9 +535,6 @@ impl SecureMuxSession {
         };
 
         let result = operation(&mut yamux);
-        // A local reset of a peer-opened stream can exhaust the control
-        // reserve, which fails Yamux like a protocol error on input: flush
-        // its GoAway and leave the phase taken.
         if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
             let drained = self.drain_yamux(&mut noise, &mut yamux, true);
             self.phase = Phase::Failed {
@@ -557,8 +545,6 @@ impl SecureMuxSession {
                 "Yamux protocol failed: {error}"
             )));
         }
-        // A failed drain is fatal, exactly as in `handle_input`: leave the
-        // phase taken so the session cannot be used again.
         if let Err(error) = self.drain_yamux(&mut noise, &mut yamux, false) {
             self.phase = Phase::Failed {
                 unsettled: unsettled_of(&yamux),
@@ -699,7 +685,6 @@ impl SecureMuxSession {
                 let fed = self.feed_ready(&mut noise, &mut yamux, data);
                 self.keep_ready(fed, noise, yamux, peer)
             }
-            // `take_phase` refuses a failed session before it gets here.
             failed @ Phase::Failed { .. } => Ok(failed),
         }
     }
@@ -837,10 +822,6 @@ impl SecureMuxSession {
             .handshake_hash()
             .ok_or_else(|| SessionError::protocol("Noise handshake hash is unavailable"))?;
 
-        // Handle the pipelined remainder first, then insert `Established`
-        // ahead of whatever it produced. Announcing up front would leave a
-        // pollable `Established` behind when the remainder fails, and a host
-        // that drains outputs after an error would treat a dead session as up.
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
             let handled = yamux.handle_data(&remaining);
@@ -851,11 +832,6 @@ impl SecureMuxSession {
                 })
             });
             if let Err(error) = outcome {
-                // The upgrade never completed, so nothing the remainder
-                // produced may be published either. Callers drain outputs even
-                // when the input failed, to flush bytes the session had already
-                // queued; without this they would also see substream traffic on
-                // a connection they were never told came up.
                 self.outputs.truncate(established_at);
                 return Err(error);
             }
@@ -940,8 +916,6 @@ impl SecureMuxSession {
         }
         let go_away = push_yamux_events(yamux, &mut self.outputs);
         if yamux.has_failed() {
-            // The failure ended every stream without a close of its own, so
-            // no Writable an earlier pump moved here may follow it.
             self.outputs
                 .retain(|output| !matches!(output, SessionOutput::StreamWritable { .. }));
         }
@@ -1061,9 +1035,6 @@ fn push_yamux_events(
                 SessionOutput::StreamRemoteWriteClosed { stream: stream(id) }
             }
             YamuxOutput::StreamClosed { stream: id } => {
-                // A Writable an earlier pump moved here must not follow the
-                // close; a reset or GoAway can end the stream before the
-                // caller drains it.
                 let closed = stream(id);
                 outputs
                     .retain(|output| *output != SessionOutput::StreamWritable { stream: closed });
@@ -1073,11 +1044,9 @@ fn push_yamux_events(
                 SessionOutput::StreamWritable { stream: stream(id) }
             }
             YamuxOutput::GoAwayReceived { code } => {
-                // Keep the first code: it is the one that ended the session.
                 go_away.get_or_insert(code);
                 continue;
             }
-            // `poll_event` never yields frames.
             YamuxOutput::Outbound(_) => continue,
         };
         outputs.push_back(output);
@@ -1165,8 +1134,6 @@ mod tests {
             .handle_input(b"\x13/multistream/1.0.0\n".to_vec())
             .expect("header");
 
-        // Each refused proposal queues an `na` that nobody pulls, until the
-        // listener's rejection budget fails the negotiation.
         for _ in 0..DEFAULT_MAX_REJECTED_PROPOSALS {
             responder
                 .handle_input(b"\x0b/tls/1.0.0\n".to_vec())
@@ -1220,8 +1187,6 @@ mod tests {
         initiator.start().expect("start");
         responder.start().expect("start");
 
-        // Takes everything `from` has queued and delivers it to `to`, reporting
-        // whether anything moved and whether `to` finished its handshake.
         fn shuttle(from: &mut NoiseSession, to: &mut NoiseSession) -> (bool, bool) {
             let mut batch = Vec::new();
             while let Some(output) = from.poll_output() {
@@ -1239,8 +1204,6 @@ mod tests {
         }
 
         fn completed(session: &mut NoiseSession) -> bool {
-            // Peeking for completion would consume queued outbound bytes, so
-            // ask the session instead of draining it.
             session.is_handshake_complete()
         }
 
@@ -1323,8 +1286,6 @@ mod tests {
             }
         }
 
-        // The dialer pipelines its proposal after its header; the peer
-        // echoes that proposal line back to confirm.
         let echo = first_write
             .strip_prefix(MULTISTREAM_HEADER)
             .expect("dialer writes its header first")
@@ -1430,9 +1391,6 @@ mod tests {
 
     #[test]
     fn a_fatal_pipelined_remainder_publishes_nothing_at_all() {
-        // The confirming echo, then a substream carrying data, then a fatal
-        // GoAway. The frames before the GoAway are what the drain turns into
-        // pollable stream outputs before it fails.
         let mut trailing = syn_with_data();
         trailing.extend_from_slice(&Frame::go_away(1).encode());
         let (mut dialer, result) = feed_packed_remainder(trailing);
@@ -1511,7 +1469,6 @@ mod tests {
                 yamux: Box::new(yamux),
                 peer,
             },
-            // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
         };
@@ -1547,12 +1504,10 @@ mod tests {
                 yamux: Box::new(yamux),
                 peer,
             },
-            // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
         };
 
-        // The ping is never pulled, so the hand-off bound runs out.
         session
             .poll(Now::from_millis(0))
             .expect("quiet clock starts");

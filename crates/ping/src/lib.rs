@@ -223,7 +223,6 @@ impl PingProtocol {
                 });
             }
 
-            // Already registered with this exact stream -- idempotent no-op.
             return Ok(());
         }
 
@@ -360,7 +359,6 @@ impl PingProtocol {
         data: &[u8],
         now_ms: u64,
     ) {
-        // Check stream is known, collecting info before mutating.
         let is_known = self.peers.get(peer_id).is_some_and(|p| {
             p.outbound.stream_id() == Some(stream_id) || p.inbound_streams.contains(&stream_id)
         });
@@ -373,8 +371,6 @@ impl PingProtocol {
             );
         }
 
-        // Append data to the per-stream receive buffer and retain its length
-        // while we hold the peer-state borrow.
         let buf_len = match self.peers.get_mut(peer_id) {
             Some(peer) => {
                 let buf = peer.recv_bufs.entry(stream_id).or_default();
@@ -408,7 +404,6 @@ impl PingProtocol {
             return;
         }
 
-        // Exactly PING_PAYLOAD_LEN bytes -- extract payload and drop the buffer.
         let received = match self.peers.get_mut(peer_id) {
             Some(peer) => match peer.recv_bufs.remove(&stream_id) {
                 Some(received) => received,
@@ -864,12 +859,10 @@ mod tests {
 
         let payload = [7u8; PING_PAYLOAD_LEN];
 
-        // Send first 16 bytes -- should buffer, no action yet.
         ping.on_stream_data(&peer, stream, &payload[..16], 5);
         let out = ping.poll_actions();
         assert!(out.is_empty());
 
-        // Send remaining 16 bytes -- should now echo the full payload.
         ping.on_stream_data(&peer, stream, &payload[16..], 6);
         let out = ping.poll_actions();
         assert_eq!(
@@ -895,16 +888,13 @@ mod tests {
         ping.send_ping(&peer, &payload, 100).expect("send ping");
         let _ = ping.poll_actions();
 
-        // Drain the OutboundStreamRegistered event from registration.
         let _ = ping.poll_events();
 
-        // First chunk -- buffered.
         ping.on_stream_data(&peer, stream, &payload[..10], 120);
         let actions = ping.poll_actions();
         assert!(actions.is_empty());
         assert!(ping.poll_events().is_empty());
 
-        // Second chunk -- completes the payload.
         ping.on_stream_data(&peer, stream, &payload[10..], 135);
         let actions = ping.poll_actions();
         assert!(actions.is_empty());
@@ -931,7 +921,6 @@ mod tests {
         ping.register_inbound_stream(peer, stream);
         let _ = ping.poll_actions();
 
-        // Send more than 32 bytes in one shot.
         let oversized = [0u8; PING_PAYLOAD_LEN + 1];
         ping.on_stream_data(&peer, stream, &oversized, 5);
         let actions = ping.poll_actions();
@@ -991,7 +980,6 @@ mod tests {
         assert!(ping.close_outbound_stream_write(&peer).is_err());
         assert!(ping.poll_actions().is_empty(), "nothing more is written");
 
-        // The remote's close retires the stream; a new one can be registered.
         ping.on_stream_remote_write_closed(&peer, stream);
         ping.register_outbound_stream(peer, StreamId::new(4))
             .expect("register replacement");
@@ -1014,7 +1002,6 @@ mod tests {
 
         ping.remove_peer(&peer);
 
-        // After removal, we can re-register everything fresh.
         ping.register_outbound_stream(peer, StreamId::new(10))
             .expect("re-register outbound stream after remove_peer");
         ping.register_inbound_stream(peer, StreamId::new(11));
@@ -1044,7 +1031,6 @@ mod tests {
         ping.register_outbound_stream(peer, stream)
             .expect("register stream");
 
-        // No ping in flight -- remote closes write side.
         ping.on_stream_remote_write_closed(&peer, stream);
         let actions = ping.poll_actions();
         assert!(actions.is_empty());

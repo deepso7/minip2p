@@ -204,9 +204,6 @@ pub(crate) fn host_and_port(
     use minip2p_core::Protocol;
 
     let protocols = addr.protocols();
-    // Exactly host + port. Anything trailing -- a `/p2p` suffix, a `/p2p-circuit`
-    // -- means the address is not this provider's to dial, and silently
-    // ignoring it would connect somewhere the caller did not ask for.
     let [host, Protocol::Tcp(port)] = protocols else {
         return Err(TcpError::Address {
             context,

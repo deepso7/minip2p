@@ -359,8 +359,6 @@ mod tests {
             ConnectionNamespace::MESH_IPV4,
             ConnectionNamespace::MESH_IPV6,
         ] {
-            // Assert the packing itself, not just `is_circuit()`: hosts and
-            // wire logs may still read the top bit directly.
             let id =
                 ConnectionId::namespaced(namespace, ConnectionId::MAX_SEQUENCE).expect("in range");
             assert_eq!(
@@ -374,9 +372,6 @@ mod tests {
 
     #[test]
     fn only_the_circuit_namespace_counts_as_a_circuit() {
-        // `CIRCUIT` is 0x80, so every namespace above it also has the top bit
-        // set. Before namespacing, circuits were identified by that bit alone;
-        // a regression back to a bit-mask test would misread these as circuits.
         for tag in [0x81u8, 0x90, 0xc0, 0xff] {
             let namespace = ConnectionNamespace::new(tag);
             let id = ConnectionId::namespaced(namespace, 1).expect("in range");
@@ -405,7 +400,6 @@ mod tests {
         let mesh = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV6, 3).expect("in range");
         assert_eq!(format!("{mesh}"), "mesh/ip6#3");
 
-        // Unregistered tags stay printable.
         let custom = ConnectionId::namespaced(ConnectionNamespace::new(9), 3).expect("in range");
         assert_eq!(format!("{custom}"), "ns(9)#3");
 
@@ -437,13 +431,11 @@ mod tests {
     #[test]
     fn allocator_fails_instead_of_reusing_a_live_id() {
         let mut allocator = ConnectionIdAllocator::new(ConnectionNamespace::QUIC_IPV4);
-        // Jump to the last usable sequence rather than allocating 2^56 ids.
         allocator.next = ConnectionId::MAX_SEQUENCE;
 
         let last = allocator.allocate().expect("last id");
         assert_eq!(last.sequence(), ConnectionId::MAX_SEQUENCE);
 
-        // Exhaustion is permanent: no wrap back onto ids already in use.
         for _ in 0..3 {
             assert_eq!(allocator.peek(), None);
             assert_eq!(

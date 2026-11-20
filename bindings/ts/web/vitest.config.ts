@@ -17,7 +17,6 @@ export default defineConfig({
     ],
   },
   test: {
-    // Playwright owns the browser suite.
     exclude: ["e2e/**", "node_modules/**"],
   },
 });

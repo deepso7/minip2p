@@ -86,7 +86,6 @@ describe("@minip2p/node", () => {
     try {
       const unsubscribe = () => endpoint.unsubscribe(topic);
       expect(unsubscribe).toThrow(NotPermittedError);
-      // The typed error carries the variant's detail, not the formatted message.
       expect(unsubscribe).toThrow(
         /^the discovery topic is reserved while discovery is enabled$/u
       );
@@ -140,10 +139,6 @@ describe("@minip2p/node", () => {
   test("Connection targets settle through the native endpoint", async () => {
     const a = createDualStackEndpoint();
     const b = createDualStackEndpoint();
-    // Connections a's events have announced. A dual-stack race can settle
-    // `connect` on one transport and then hand the peer to the other via
-    // `connectionReplaced`, and events trail native state, so poll until the
-    // events catch up with `connectionInfo`.
     const announced: number[] = [];
     a.on("connectionEstablished", ({ connId }) => announced.push(connId));
     a.on("connectionReplaced", ({ newConnId }) => announced.push(newConnId));
@@ -161,7 +156,6 @@ describe("@minip2p/node", () => {
         )
         .toBe(true);
 
-      // A Peer-ID target with no known route is admitted, then fails.
       const stranger = nodeSdk.peerIdFromSecretKey(nodeSdk.generateSecretKey());
       await expect(
         a.connect(stranger, { timeoutMs: 10_000 })
@@ -277,7 +271,6 @@ describe("@minip2p/node", () => {
       });
       const inbound = await inboundPromise;
 
-      // Four Yamux stream caps, so native holds the tail and settles later.
       const payload = Uint8Array.from(
         { length: 1024 * 1024 },
         (_, index) => index % 251
@@ -297,10 +290,7 @@ describe("@minip2p/node", () => {
   }, 20_000);
 
   test.each([
-    // Several 256 KiB Yamux windows plus TCP's socket buffers.
     ["TCP", "/ip4/127.0.0.1/tcp/0", 16 * 1024 * 1024],
-    // Past QUIC's 1 MiB send queue, 10 MB send window and both 1.25 MB stream
-    // windows.
     ["QUIC", "/ip4/127.0.0.1/udp/0/quic-v1", 16 * 1024 * 1024],
   ])(
     "a bulk transfer to a slow reader over %s holds the writer back and loses nothing",
@@ -331,7 +321,6 @@ describe("@minip2p/node", () => {
         })();
         outbound.closeWrite();
 
-        // Nothing reads yet: the receive window fills and the writer waits.
         await delay(500);
         expect(accepted).toBe(false);
 

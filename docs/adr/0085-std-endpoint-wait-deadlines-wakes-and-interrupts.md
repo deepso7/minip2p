@@ -1,0 +1,11 @@
+# The std Endpoint's blocking wait: deadlines, wakes and interrupts
+
+`Endpoint::wait(deadline)` (std) drives the endpoint and sleeps on the shared readiness poll (ADR 0013) until an application event, the deadline, or a `WaitHandle` interrupt. Its loop follows a few rules a reader could easily "simplify" away:
+
+- **A passed deadline still drives once, and only once.** A host loop whose own timer has gone stale passes a past deadline on every call; each call must still make progress (a connect must still settle). Driving only once past the deadline keeps a continuous event stream from holding the wait past it; queued events are still served first, so a caller-side clock check is what ends a fixed-deadline loop.
+- **One readiness harvest per batch.** A blocking harvest already collected the batch's readiness, so the zero-timeout harvest before the next drive is skipped right after it: it would only cost a syscall.
+- **A taken host wake owes one more batch.** Host sources (the mDNS sockets, the `/dns*` lookup threads) only wake the wait; they attach to the poll without being read there. The next batch's mDNS tick reads the edge-triggered mDNS sockets (a refresh re-registers the sockets it rebuilds), and the batch applies finished lookups and starts the lookups it parks before the wait can sleep again. So a wake taken past the deadline still runs its batch, or the edge would be lost.
+- **Past the deadline at most one wake batch runs.** A steady stream of wakes (packets mDNS reads and drops) must not hold the caller; newer wakes stay pending for the next call. A wait past its deadline therefore runs at most two batches: the one drive every wait makes, plus one for a wake.
+- **Host wakes are not interrupts.** A lookup thread or mDNS socket waking the poll keeps the wait going; only `WaitHandle::interrupt` returns `Interrupted`.
+- **A pending interrupt outranks an expired deadline.** It is checked after the drive and before sleeping, even when its `Waker` readiness was already harvested, so a host's non-blocking pump (`wait` with a past deadline) still notices it. Interrupts coalesce: two before a wait are reported once.
+- **`EndpointWaitOutcome` is `#[non_exhaustive]`.** Callers match `Event` and `Deadline` and treat the rest (today `Interrupted`) with `_`, so a later outcome is not a breaking change.

@@ -143,8 +143,6 @@ impl<T: Transport> Transport for PunchGate<T> {
         connected.sort_by_key(|&(token, _)| core::cmp::Reverse(token));
         if let [(_, replaced), (_, kept)] = connected[..] {
             let mut held = core::mem::take(&mut state.held);
-            // Both connections come up first, replaced then kept; the rest
-            // keeps its order behind them.
             held.sort_by_key(|event| match event {
                 TransportEvent::Connected { id, .. } => usize::from(*id == kept),
                 _ => 2,
@@ -258,7 +256,6 @@ fn a_punch_settled_on_ahead_of_its_event_is_punched() {
     }
 
     let (mut initiator, gate_state) = gated_initiator(relay.addr().clone(), responder_peer);
-    // No candidates: every dial to the responder is a punch.
     let connect_id = initiator.connect(responder_peer).expect("connect starts");
     let mut trace = Vec::new();
     let mut upgraded_to = None;
@@ -323,8 +320,6 @@ fn a_punch_settled_on_ahead_of_its_event_is_punched() {
 #[test]
 fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
     let relay = relay_support::RelayServer::spawn();
-    // One loopback family: the responder offers a single punch target, so
-    // exactly one punch replaces the circuit.
     let mut responder = Endpoint::builder()
         .relay(relay.addr().clone())
         .nat_config(punch_config(ReservationPolicy::Always))
@@ -348,7 +343,6 @@ fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
     let mut initiator = Endpoint::builder()
         .relay(relay.addr().clone())
         .nat_config(NatConfig {
-            // Holds the second attempt's relay leg back past the punch.
             relay_stagger_ms: 60_000,
             ..punch_config(ReservationPolicy::Never)
         })
@@ -356,8 +350,6 @@ fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
         .expect("listen address")
         .bind()
         .expect("bind initiator");
-    // A bound socket that never answers: the second attempt's direct
-    // candidate stays in flight.
     let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent socket");
     let silent_addr = PeerAddr::new(
         format!(

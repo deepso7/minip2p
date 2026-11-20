@@ -139,7 +139,6 @@ fn relay_load() -> (Endpoint, Load) {
         target_peer,
     } = Relayed::connect(&mut m, &m_addr, PROTOCOL);
 
-    // The sink counts bytes on the inbound stream and wakes the sender.
     let received = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&received);
     let wake = client.wait_handle();
@@ -180,7 +179,6 @@ fn relay_load() -> (Endpoint, Load) {
                 break;
             }
         }
-        // Flushes queued bytes; the sink's progress interrupts the wait.
         let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     });
 
@@ -207,7 +205,6 @@ fn pubsub_load() -> (Endpoint, Load) {
     };
     let (mut publisher, mut subscriber) = (leaf(), leaf());
 
-    // Every node must know its neighbours' subscriptions before publishing.
     let subscribed = |event| {
         matches!(
             event,
@@ -237,11 +234,9 @@ fn pubsub_load() -> (Endpoint, Load) {
     let mut published = 0u32;
     let source = Driven::run(publisher, move |publisher| {
         while start + period * published <= Instant::now() {
-            // The sequence number keeps every message distinct.
             let mut data = published.to_be_bytes().to_vec();
             data.resize(MSG_LEN, 0x5a);
             if let Err(error) = publisher.publish(TOPIC, data) {
-                // A full outbound queue is retried on the next step.
                 assert!(
                     matches!(error, GossipsubError::Publish(PublishError::Backpressure)),
                     "publish failed: {error}"
@@ -250,8 +245,6 @@ fn pubsub_load() -> (Endpoint, Load) {
             }
             published += 1;
         }
-        // Always a future deadline, so a wait after backpressure still polls
-        // and drains the queue.
         let due = (start + period * published).saturating_duration_since(Instant::now());
         next_event(
             publisher,
@@ -265,7 +258,6 @@ fn pubsub_load() -> (Endpoint, Load) {
         unit: "messages",
         min_per_s: MSGS_PER_S / 2,
     };
-    // The first messages may predate the hub's mesh; wait for delivery.
     load.wait_started(&mut m);
     (m, load)
 }
@@ -278,7 +270,6 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
         let event = next_event(m, start + SAMPLE_TIMEOUT).expect("ping sample timed out");
         match event {
             EndpointEvent::PingRttMeasured { peer_id, .. } if &peer_id == peer => {
-                // A wait may hand over an event polled just past its deadline.
                 let rtt = start.elapsed();
                 assert!(rtt <= SAMPLE_TIMEOUT, "ping sample took {rtt:?}");
                 return rtt;
@@ -333,7 +324,6 @@ fn case(kind: LoadKind, listen: &str, samples: usize) -> Vec<String> {
     let mut sent_at = Instant::now();
     for index in 0..samples {
         if index > 0 {
-            // Keep driving M (and so its load) until the next ping is due.
             sent_at = (sent_at + INTERVAL).max(Instant::now());
             while Instant::now() < sent_at {
                 next_event(&mut m, sent_at);

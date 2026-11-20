@@ -60,10 +60,6 @@ mod negotiation;
 mod ping;
 mod streams;
 
-// ---------------------------------------------------------------------------
-// Protocol identification
-// ---------------------------------------------------------------------------
-
 /// Protocol ids reserved for the swarm's built-in handlers.
 ///
 /// Inbound routing dispatches these ids to the identify and ping state
@@ -420,17 +416,11 @@ fn push_unique(protocols: &mut Vec<String>, protocol_id: String) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SwarmState
-// ---------------------------------------------------------------------------
-
 /// Transport-free swarm state; see the module docs.
 pub(crate) struct SwarmState {
-    // --- Protocol handlers ---
     ping: PingProtocol,
     identify: IdentifyProtocol,
 
-    // --- Connection tracking ---
     /// Maps connection ids to peer ids (verified or synthetic).
     conn_to_peer: BTreeMap<ConnectionId, PeerId>,
     /// Maps peer ids to their primary connection id.
@@ -443,7 +433,6 @@ pub(crate) struct SwarmState {
     /// us from.
     conn_to_remote_addr: BTreeMap<ConnectionId, Multiaddr>,
 
-    // --- Stream tracking ---
     /// Inbound streams being negotiated (server-side multistream-select).
     inbound_negotiators: BTreeMap<(ConnectionId, StreamId), PendingInbound>,
     /// Outbound streams being negotiated (client-side multistream-select).
@@ -459,13 +448,11 @@ pub(crate) struct SwarmState {
     /// Streams deliberately forgotten by their consumer until transport close.
     abandoned_streams: BTreeSet<(ConnectionId, StreamId)>,
 
-    // --- Configuration ---
     /// Protocol IDs accepted by inbound multistream-select negotiation.
     inbound_protocols: Vec<String>,
     /// Protocol IDs applications and composed services may open outbound.
     outbound_protocols: Vec<String>,
 
-    // --- Bookkeeping ---
     /// Each peer's running ping attempt. An entry is removed exactly when
     /// the attempt ends: by `PingRttMeasured`, by `PingFailed` (mostly
     /// [`Self::fail_ping`]), or silently with its connection.
@@ -502,7 +489,6 @@ pub(crate) struct SwarmState {
     /// defaults to [`SIMULTANEOUS_DIAL_WINDOW_MS`].
     pub(crate) simultaneous_dial_window_ms: u64,
 
-    // --- Write backpressure (ADR 0012) ---
     /// Unsent tails of the core's own writes (negotiation, ping, Identify),
     /// and the writes and closes queued behind them.
     held: HeldWrites,
@@ -518,7 +504,6 @@ pub(crate) struct SwarmState {
     /// keep the reserve, until the held tail is replayed.
     pending_demotions: BTreeSet<(ConnectionId, StreamId)>,
 
-    // --- Queues ---
     /// The application event queue. An event here has not been delivered:
     /// [`crate::SwarmCore::poll`] and the std `Swarm` take events from it.
     pub(crate) events: VecDeque<SwarmEvent>,
@@ -713,10 +698,6 @@ impl SwarmState {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Queues (the core drains these)
-    // -----------------------------------------------------------------------
-
     /// Returns the next transport action to dispatch, if any.
     ///
     /// Ordinary actions come first, as soon as they are queued: dispatching
@@ -745,9 +726,6 @@ impl SwarmState {
     /// Takes the next application event, delivering it.
     pub fn next_event(&mut self) -> Option<SwarmEvent> {
         while let Some(event) = self.events.pop_front() {
-            // A replayed tail that came back Full while this Writable waited
-            // holds the stream again: wait for the next Writable instead, or
-            // for none once a close is queued behind the held bytes.
             if let SwarmEvent::StreamWritable {
                 conn_id, stream_id, ..
             } = &event
@@ -805,10 +783,6 @@ impl SwarmState {
             .map(Deadline::from_millis)
     }
 
-    // -----------------------------------------------------------------------
-    // Ingress
-    // -----------------------------------------------------------------------
-
     /// Queues a runtime error the core met while dispatching an action.
     pub fn record_runtime_error(&mut self, error: SwarmRuntimeError) {
         self.events.push_back(SwarmEvent::Error(error));
@@ -819,11 +793,8 @@ impl SwarmState {
         if let Some(id) = transport_event_connection(&event)
             && matches!(self.conn_phases.get(&id), Some(ConnPhase::Closing))
         {
-            // Whatever announced or reported the connection already did;
-            // only its final close is bookkeeping.
             match event {
                 TransportEvent::Closed { reason, .. } => self.handle_connection_closed(id, reason),
-                // Nobody will read it, so the state consumes it.
                 TransportEvent::StreamData {
                     stream_id, data, ..
                 } => self.actions.push_back(Action::AckStream {
@@ -846,20 +817,10 @@ impl SwarmState {
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, *peer_id, endpoint.token(), now_ms);
                 } else {
-                    // Peer identity is not yet known. Synthesize a placeholder PeerId
-                    // for internal bookkeeping so protocol handlers can still
-                    // operate. No ConnectionEstablished event yet -- we emit
-                    // one when the real identity arrives via
-                    // PeerIdentityVerified.
                     let _ = self.ensure_peer_id_for_conn(id);
                 }
             }
             TransportEvent::PeerIdentityVerified { id, endpoint, .. } => {
-                // Refresh the recorded transport address -- on mutual-TLS
-                // QUIC the `Connected` event precedes identity verification,
-                // and the transport may emit a more accurate endpoint here
-                // (e.g. with the real remote address observed after
-                // migration).
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
                 if matches!(self.conn_phases.get(&id), Some(ConnPhase::Vetoed(_))) {
@@ -878,9 +839,6 @@ impl SwarmState {
                 self.handle_incoming_stream(id, stream_id, now_ms);
             }
             TransportEvent::StreamOpened { id, stream_id } => {
-                // Outbound stream ids come back synchronously from
-                // `Transport::open_stream` (see `start_outbound`); this marks
-                // the stream as actually opened, which starts its deadline.
                 let covered = self
                     .outbound_negotiators
                     .get(&(id, stream_id))
@@ -923,9 +881,6 @@ impl SwarmState {
                     self.conn_phases.get_mut(&id)
                 {
                     pending.last_error = Some(message);
-                    // Attempt-owned and raw outbound dials report through
-                    // DialFailed on close. Emitting Error here would leak a
-                    // second diagnostic the connect engine cannot consume.
                     return;
                 }
                 self.emit_error(
@@ -966,10 +921,6 @@ impl SwarmState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
-
     fn emit_error(
         &mut self,
         kind: SwarmErrorKind,
@@ -997,14 +948,6 @@ impl SwarmState {
         }));
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: execute protocol-handler actions
-    // -----------------------------------------------------------------------
-
-    // Ping and Identify outputs are drained right after the input that
-    // produced them, so the peer's current connection is the one the event
-    // came from. `handle_ping_event` and `handle_identify_event` fix it at
-    // queue time: a later replacement must not re-attribute it.
     fn collect_protocol_events(&mut self) {
         self.drain_ping_outputs();
         self.drain_identify_outputs();

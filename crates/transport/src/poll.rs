@@ -220,7 +220,6 @@ impl WaitHandle {
     /// Interrupts the current wait, or the next one if none is active.
     pub fn interrupt(&self) {
         self.flag.store(true, Ordering::SeqCst);
-        // A poll that is gone has no wait left to interrupt.
         drop(self.waker.wake());
     }
 }
@@ -243,7 +242,6 @@ pub struct WakeHandle {
 impl WakeHandle {
     /// Wakes the current wait, or the next one if none is active.
     pub fn wake(&self) {
-        // A poll that is gone has nothing left to wake.
         drop(self.waker.wake());
     }
 }
@@ -387,8 +385,6 @@ impl SharedPoll {
             if transport_space.index_of(event.token()).is_some() {
                 transport.dispatch(event);
             } else {
-                // The `Waker` (host work, socket-less input, or an
-                // interrupt), or a host source's socket.
                 self.woken = true;
             }
         }
@@ -537,7 +533,6 @@ mod tests {
         poll.attach(&mut first).expect("attach");
         poll.attach_host_source(&mut second).expect("host source");
 
-        // Input and a host wake alone never read as an interrupt.
         first.waker.as_ref().expect("waker").wake().expect("wake");
         poll.wake_handle().wake();
         poll.harvest(&mut first, Duration::from_secs(5))
@@ -545,7 +540,6 @@ mod tests {
         assert!(!poll.take_interrupt());
         assert!(poll.take_wake());
 
-        // Coinciding with an interrupt, both survive.
         second.waker.as_ref().expect("waker").wake().expect("wake");
         poll.wait_handle().interrupt();
         poll.wait_handle().interrupt();

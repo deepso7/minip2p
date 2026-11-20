@@ -64,7 +64,6 @@ fuzz_target!(|data: &[u8]| {
     fuzz_ping(data);
     fuzz_webtransport_client(data);
 
-    // Peer TLS certificates are attacker-controlled X.509 DER.
     let _ = minip2p_tls::verify_libp2p_certificate(
         data,
         core::time::Duration::from_secs(1_700_000_000),
@@ -213,8 +212,6 @@ fn fuzz_pubsub(data: &[u8]) {
         let _ = message.verify(true);
     }
 
-    // Exercise the bounded incremental framing and RPC/control processing
-    // paths after a valid meshsub connection setup.
     let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([11; 32]);
     let remote = fuzz_peer_id();
     let stream_id = StreamId::new(1);
@@ -367,8 +364,6 @@ fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
     match addr.protocols() {
         [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
         [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
-        // WebTransport rides the QUIC transport: quic-v1, webtransport, then
-        // only certhashes.
         [
             host,
             Protocol::Udp(_),
@@ -389,28 +384,16 @@ fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
 /// Drives attacker-controlled bytes through both multiaddr codecs.
 fn fuzz_multiaddr(data: &[u8]) {
     if let Ok(addr) = Multiaddr::from_bytes(data) {
-        // Anything that decodes must re-encode and print back identically:
-        // a decoder accepting a shape the encoder cannot reproduce is a
-        // round-trip hole.
         let reencoded = addr.to_bytes();
         let decoded = Multiaddr::from_bytes(&reencoded).expect("re-decode own encoding");
         assert_eq!(decoded, addr);
 
-        // The empty multiaddr is the one shape whose text form does not
-        // round-trip: `from_bytes(&[])` accepts it and it prints as "", but
-        // the text parser rejects "" as `EmptyInput`. That asymmetry predates
-        // `/tcp`; exclude it rather than assert a contract the library does
-        // not make.
         if !addr.protocols().is_empty() {
             let text = addr.to_string();
             let parsed: Multiaddr = text.parse().expect("re-parse own text");
             assert_eq!(parsed, addr);
         }
 
-        // Classification must match the shape rules, checked here against the
-        // protocol slice directly rather than through the same helpers
-        // `transport_kind` is built from -- otherwise the assertion is
-        // entailed by the implementation and cannot fail.
         assert_eq!(addr.transport_kind(), expected_transport_kind(&addr));
     }
 
@@ -459,12 +442,6 @@ fn fuzz_secure_mux(data: &[u8]) {
             while let Ok(Some(_)) = session.poll_write() {}
         }
 
-        // An unauthenticated peer must never reach the established state from
-        // arbitrary bytes: that would mean the Noise handshake was skippable.
-        // Establishing is gated on decrypting an AEAD-protected Yamux
-        // selection under a key derived from statics this harness never puts
-        // on the wire, so the assertion cannot fire on a lucky mutation --
-        // reaching it at all is the defect it is looking for.
         assert!(
             !established,
             "arbitrary bytes must not complete the upgrade"
@@ -475,8 +452,6 @@ fn fuzz_secure_mux(data: &[u8]) {
 
 /// Drives attacker-controlled bridge bytes through circuit negotiation.
 fn fuzz_circuit(data: &[u8]) {
-    // A valid fragmented multistream-select exchange advances both roles into
-    // the Noise decoder before attacker-controlled bytes begin.
     const NOISE_SELECTION: &[u8] = b"\x13/multistream/1.0.0\n\x07/noise\n";
     let relay = fuzz_peer_id();
     let remote = PeerId::from_public_key_protobuf(b"minip2p-fuzz-circuit-remote");
@@ -650,8 +625,6 @@ fn fuzz_identify(data: &[u8]) {
     for chunk in [head, tail] {
         identify.on_stream_data(peer_id, stream_id, chunk);
     }
-    // Closing the remote write side decodes the buffered length-prefixed
-    // message.
     identify.on_stream_remote_write_closed(peer_id, stream_id);
     while identify.poll_output().is_some() {}
 }
@@ -673,9 +646,6 @@ fn fuzz_autonat(data: &[u8]) {
     }
     while server.poll_output().is_some() {}
 
-    // A well-formed DIAL from the authenticated requester, carrying fuzzed
-    // addresses, so the observed-IP filter and the forwarding path run too
-    // (raw bytes almost never name the requester's peer id).
     let offered: Vec<Multiaddr> = data
         .chunks(24)
         .filter_map(|chunk| Multiaddr::from_bytes(chunk).ok())
@@ -769,8 +739,6 @@ fn fuzz_webtransport(data: &[u8]) {
         assert!(size <= MAX_FIELD_SECTION_SIZE && section.len() <= MAX_FIELDS);
     }
 
-    // Feed the stream decoders in two chunks so the incremental paths run:
-    // frames, with DATA payloads going on to the capsule decoder.
     let split = data.first().map_or(0, |&b| usize::from(b)).min(data.len());
     let mut frames = FrameDecoder::new();
     let mut capsules = CapsuleDecoder::new();
@@ -815,8 +783,6 @@ fn fuzz_ping(data: &[u8]) {
     ping.register_inbound_stream(peer, inbound);
     let _ = ping.register_outbound_stream(peer, outbound);
     let _ = ping.send_ping(&peer, &SENT, 0);
-    // Every payload sent back on the inbound stream, and whether the
-    // outbound ping measured an RTT.
     let mut echoes = Vec::new();
     let mut measured = false;
     let mut drain = |ping: &mut PingProtocol| {
@@ -840,7 +806,6 @@ fn fuzz_ping(data: &[u8]) {
         ping.on_stream_data(&peer, outbound, chunk, 1);
         drain(&mut ping);
     }
-    // Idle again only if the echo matched; otherwise this is refused.
     let _ = ping.close_outbound_stream_write(&peer);
     ping.on_stream_data(&peer, StreamId::new(3), head, 2);
     ping.on_stream_remote_write_closed(&peer, inbound);
@@ -849,13 +814,10 @@ fn fuzz_ping(data: &[u8]) {
     ping.on_stream_closed(&peer, outbound);
     drain(&mut ping);
 
-    // The outbound stream's reply is the input's first payload: an RTT is
-    // measured only if it echoes what we sent; a short or wrong reply never is.
     assert!(
         !measured || data.get(..PING_PAYLOAD_LEN) == Some(&SENT[..]),
         "an RTT was measured for a reply that does not echo the ping"
     );
-    // The responder only ever echoes a complete payload the peer sent.
     for echo in echoes {
         assert!(data.windows(PING_PAYLOAD_LEN).any(|window| window == echo));
     }
@@ -1067,15 +1029,11 @@ fn fuzz_webtransport_client(data: &[u8]) {
     let mut script = Script(data);
     let mode = script.byte().unwrap_or(0);
     let fixture = &*WT_FIXTURE;
-    // Mostly the dialed hash; sometimes no extensions or a hash-free list,
-    // which the client must reject.
     let mut offered = match mode % 4 {
         0 => None,
         1 => Some(Vec::new()),
         _ => Some(fixture.certhashes.clone()),
     };
-    // Built on the first honest round, so inputs that never pump skip its
-    // key setup.
     let mut responder: Option<NoiseSession> = None;
     let mut responder_ok = true;
 
@@ -1104,9 +1062,7 @@ fn fuzz_webtransport_client(data: &[u8]) {
         .push_back(IoEvent::SessionReady { session });
 
     let mut now = 0_u64;
-    // Delivered, unacknowledged bytes per caller stream, from the events.
     let mut unacked: BTreeMap<StreamId, usize> = BTreeMap::new();
-    // One poll more than ops, so the last op's effects are polled and checked.
     for step in 0..=MAX_OPS {
         let Ok(events) = client.poll(Now::from_millis(now)) else {
             break;
@@ -1118,7 +1074,6 @@ fn fuzz_webtransport_client(data: &[u8]) {
                 } => {
                     let held = unacked.entry(stream_id).or_default();
                     *held += data.len();
-                    // Grants never let the platform deliver past the window.
                     assert!(*held <= WINDOW, "{held} unacknowledged bytes");
                 }
                 TransportEvent::Closed { .. } => unacked.clear(),
@@ -1134,15 +1089,12 @@ fn fuzz_webtransport_client(data: &[u8]) {
         };
         let arg = script.byte().unwrap_or(0);
         let io = client.io_mut();
-        // The Noise stream is the first one the client opens.
         let noise = StreamHandle(session.0 + 1);
         let handles: Vec<u64> = io.streams.keys().copied().collect();
         let chosen = handles
             .get(usize::from(arg) % handles.len().max(1))
             .map(|&h| StreamHandle(h));
         match op % 20 {
-            // An honest handshake round: complete the client's writes, feed
-            // them to the responder and deliver its reply in two fragments.
             0..=5 => {
                 while io
                     .streams
@@ -1255,8 +1207,6 @@ fn fuzz_webtransport_client(data: &[u8]) {
                     }
                 }
             }
-            // Past the reset grace with small steps, the handshake timeout
-            // with large ones.
             18 => now = now.saturating_add(u64::from(arg) * 32),
             _ => match arg % 6 {
                 0 => io.events.push_back(IoEvent::SessionClosed {

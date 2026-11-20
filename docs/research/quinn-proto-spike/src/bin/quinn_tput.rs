@@ -51,7 +51,6 @@ fn main() {
                             tok_tx.send(peer.connection_token(ch)).unwrap();
                         }
                         Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                            // A new stream's first frame raises only Opened: scan it now.
                             while let Some(id) = peer.conn(ch).streams().accept(Dir::Bi) {
                                 peer.events.push_back((ch, Event::Stream(StreamEvent::Readable { id })));
                             }

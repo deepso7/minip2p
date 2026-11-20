@@ -56,9 +56,6 @@ pub struct SmoltcpMdnsConfig {
 impl Default for SmoltcpMdnsConfig {
     fn default() -> Self {
         Self {
-            // Two ordinary claims' worth: enough that a burst from a peer
-            // does not drop what a poll has not read yet, far short of what
-            // mDNS technically allows.
             rx_payload_bytes: 4 * 1024,
             tx_payload_bytes: 4 * 1024,
             packet_slots: 4,
@@ -188,9 +185,6 @@ impl<D: Device> SmoltcpMdnsIo<D> {
                     vec![0u8; config.tx_payload_bytes],
                 ),
             );
-            // Bound to the port rather than to an address: one socket serves
-            // the group and any unicast reply, whichever address of this
-            // family the datagram was sent to.
             if let Err(error) = socket.bind(IpListenEndpoint {
                 addr: None,
                 port: MDNS_PORT,
@@ -204,8 +198,6 @@ impl<D: Device> SmoltcpMdnsIo<D> {
                     DisplayError(error),
                 ));
             }
-            // mDNS is link-local by definition, and a hop limit of 255 is what
-            // says so on the wire.
             socket.set_hop_limit(Some(255));
             families.push(Family {
                 id,
@@ -257,12 +249,8 @@ impl<D: Device> SmoltcpMdnsIo<D> {
                         matches.then(|| IpNet::new(ip, cidr.prefix_len())).flatten()
                     })
                     .collect();
-                // A family with no address is not an interface mDNS can speak
-                // on: it has no source to claim and nothing on-link to accept.
                 (!addrs.is_empty()).then_some(InterfaceSnapshot {
                     id: family.id,
-                    // One interface, so smoltcp needs no index to tell them
-                    // apart and IPv6 needs no scope to pick one.
                     index: 0,
                     family: family.family,
                     addrs,
@@ -355,9 +343,6 @@ fn leave_multicast_group<D: Device>(
 }
 
 fn instant(millis: u64) -> Instant {
-    // smoltcp keeps time as microseconds in an `i64`, so the largest
-    // millisecond value it can hold is a thousandth of `i64::MAX`. Saturating
-    // at `i64::MAX` itself would overflow the multiplication inside.
     let ceiling = i64::MAX / 1000;
     Instant::from_millis(i64::try_from(millis).unwrap_or(ceiling).min(ceiling))
 }
@@ -427,13 +412,8 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             let (payload, metadata) = match socket.recv() {
                 Ok(received) => received,
                 Err(udp::RecvError::Exhausted) => continue,
-                // smoltcp drops a datagram it could not fit rather than
-                // handing over part of one, so there is nothing to report but
-                // the loss -- and the driver would have dropped it anyway.
                 Err(udp::RecvError::Truncated) => continue,
             };
-            // As much as fits and no more: filling the buffer is how the
-            // driver recognises a datagram too big to act on.
             let len = payload.len().min(buffer.len());
             let (Some(destination), Some(source)) = (buffer.get_mut(..len), payload.get(..len))
             else {
@@ -441,9 +421,6 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             };
             destination.copy_from_slice(source);
             let from = endpoint_to_socket_addr(metadata.endpoint);
-            // Both sockets wildcard-bind the mDNS port. smoltcp may therefore
-            // deliver a packet to either socket, so the receiving socket is
-            // not a reliable family marker. The source address always is.
             let interface = match from.ip() {
                 IpAddr::V4(_) => IPV4_INTERFACE,
                 IpAddr::V6(_) => IPV6_INTERFACE,
@@ -464,11 +441,6 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             target,
             payload,
         } = action;
-        // Resolved against what the interface currently holds, not against the
-        // sockets that outlive it: a family whose last address went away is an
-        // interface mDNS can no longer speak on, and saying so is what lets the
-        // driver drop the packet rather than hand smoltcp one it has no source
-        // for.
         let known = self
             .snapshots
             .iter()
@@ -485,10 +457,6 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             MdnsTarget::Unicast { to } => socket_addr_to_endpoint(*to),
         };
         let handle = family.socket;
-        // A datagram larger than the whole send buffer is refused the same way
-        // a momentarily full one is, so it has to be recognised before the
-        // attempt: the driver parks congestion and comes back for it, which
-        // for this one would be forever.
         let shared = self.stack.borrow();
         let socket = shared.sockets.get::<udp::Socket>(handle);
         let capacity = socket.payload_send_capacity();
@@ -509,16 +477,10 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         };
         match queue(self) {
             Ok(()) => Ok(()),
-            // The ring empties only when the stack is driven, so a burst fills
-            // it well inside a single tick. Draining it here is the difference
-            // between a datagram sent now and one parked for a whole turn.
             Err(udp::SendError::BufferFull) => {
                 let now_ms = self.now_ms;
                 self.drive(now_ms);
                 queue(self).map_err(|error| match error {
-                    // Still nothing: the link itself is not taking frames.
-                    // That is a backlog rather than a fault, and the driver
-                    // holds the datagram until it drains.
                     udp::SendError::BufferFull => MdnsError::Congested {
                         interface: *interface,
                     },
@@ -539,8 +501,6 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         if self.ingress_pending {
             return Some(now.as_deadline());
         }
-        // A datagram already queued leaves on the next poll, so that poll is
-        // due now rather than whenever smoltcp's own timers say.
         let queued = self.families.iter().any(|family| {
             self.stack
                 .borrow()
@@ -552,9 +512,6 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         if queued {
             return Some(now.as_deadline());
         }
-        // A datagram already delivered to a socket -- by the driver's last
-        // poll, or by another user of a shared stack polling the interface --
-        // is read on the next tick, and no device input will announce it.
         let waiting = self.families.iter().any(|family| {
             self.stack
                 .borrow()
@@ -580,13 +537,10 @@ mod tests {
             poll_deadline(1_000, Some(Duration::from_millis(250))),
             Some(Deadline::from_millis(1_250))
         );
-        // Due now is due now, not "never".
         assert_eq!(
             poll_deadline(1_000, Some(Duration::ZERO)),
             Some(Deadline::from_millis(1_000))
         );
-        // Past the end of smoltcp's own clock, the sum saturates rather than
-        // wrapping into the past.
         assert_eq!(
             poll_deadline(Now::MAX_MONOTONIC_MS, Some(Duration::from_millis(250))),
             Some(Deadline::NEVER)

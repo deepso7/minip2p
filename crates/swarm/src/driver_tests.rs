@@ -348,9 +348,6 @@ fn one_drive_iteration_takes_one_clock_sample() {
         protocols: Vec::new(),
         public_key: keypair.public_key().encode_protobuf(),
     };
-    // A Connected event makes the core start Identify, which emits an
-    // OpenStream action. Without it the counted poll dispatches nothing
-    // and the assertion below cannot see per-action re-sampling at all.
     let transport = IdleTransport {
         initial_events: vec![TransportEvent::Connected {
             id: ConnectionId::new(1),
@@ -387,7 +384,6 @@ fn one_drive_iteration_takes_one_clock_sample() {
     swarm.poll().expect("poll");
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 
-    // The transport saw exactly the instants the core was ticked with.
     let samples: Vec<u64> = swarm
         .core()
         .transport()
@@ -413,7 +409,6 @@ fn transport_deadline_caps_the_idle_wait_budget() {
         public_key: keypair.public_key().encode_protobuf(),
     };
     let transport = IdleTransport {
-        // Absolute, on the driver's timeline: 40ms past the current sample.
         deadline: Some(minip2p_core::platform::Deadline::from_millis(
             1_000 + DEADLINE_MS,
         )),
@@ -429,20 +424,14 @@ fn transport_deadline_caps_the_idle_wait_budget() {
     )
     .expect("swarm attaches its transport");
 
-    // The simulated wait ends in an interrupt, so the loop stops after
-    // one budget.
     let interrupt = swarm.wait_handle();
     swarm.simulated_wait = Some(Box::new(move |_| interrupt.interrupt()));
 
-    // A far-off caller deadline must not stop the transport's nearer
-    // timer from bounding the sleep.
     let outcome = swarm
         .poll_next_interruptible(Duration::from_secs(30))
         .expect("interruptible wait");
     assert!(matches!(outcome, PollNext::Interrupted));
 
-    // Without the transport's deadline the driver would have slept on the
-    // caller's 30s deadline instead.
     assert_eq!(swarm.wait_budgets, vec![Duration::from_millis(DEADLINE_MS)]);
 }
 
@@ -468,11 +457,8 @@ fn external_addresses_merge_into_the_identify_snapshot() {
         "an identical replacement is not a change"
     );
     swarm.poll().unwrap();
-    // IdleTransport binds nothing, so the snapshot is exactly the
-    // external set.
     assert_eq!(swarm.core().local_addresses(), &[external.clone(), circuit]);
 
-    // Replacing the set (here: clearing it) stops advertising extras.
     swarm.core_mut().set_external_addresses(Vec::new());
     swarm.poll().unwrap();
     assert!(swarm.core().local_addresses().is_empty());
@@ -613,9 +599,6 @@ fn listened_addrs_revision_counts_each_successful_listen() {
     .expect("swarm attaches its transport");
 
     assert_eq!(swarm.core().listened_addrs_revision(), 0);
-    // The first bound address listens; the second fails — the earlier
-    // bind stays live, so the revision must reflect it, and the
-    // listened set must contain only the address that accepted.
     swarm
         .core_mut()
         .listen_on_bound_addrs()
@@ -689,8 +672,6 @@ fn replaced_connection_close_waits_for_the_buffer_to_drain_across_commands() {
     let replacement = ConnectionId::new(62);
     let other = ConnectionId::new(63);
     let mut swarm = replacement_swarm(remote_peer, original, replacement);
-    // The replacement's batch also connects an unrelated peer, so two
-    // events are buffered when the first is delivered.
     swarm.core_mut().transport_mut().event_batches[1].push(TransportEvent::Connected {
         id: other,
         endpoint: Box::new(ConnectionEndpoint::with_peer_id(
@@ -706,8 +687,6 @@ fn replaced_connection_close_waits_for_the_buffer_to_drain_across_commands() {
         .expect("event");
     assert!(matches!(replaced, SwarmEvent::ConnectionReplaced { old, .. } if old == original));
 
-    // A synchronous command between deliveries runs its own work, but
-    // the close still waits for the rest of the buffer.
     let opens_before = swarm.core().transport().open_calls.len();
     swarm.ping(&remote_peer).expect("ping the replacement");
     assert_eq!(
@@ -727,7 +706,6 @@ fn replaced_connection_close_waits_for_the_buffer_to_drain_across_commands() {
     ));
     assert!(swarm.core().transport().close_calls.is_empty());
 
-    // Drained: the next command dispatches the deferred close first.
     swarm.ping(&other_peer).expect("ping the other peer");
     assert_eq!(swarm.core().transport().close_calls, vec![original]);
 }
@@ -748,20 +726,16 @@ fn deadline_earliest_picks_the_sooner_deadline() {
 
 #[test]
 fn deadline_conversions_cover_instant_duration_and_never() {
-    // A relative Duration lands in the future.
     let relative: WaitDeadline = Duration::from_secs(1).into();
     assert!(!relative.is_expired_at(Instant::now()));
     assert!(relative.remaining_at(Instant::now()).is_some());
 
-    // A Duration too large for Instant arithmetic degrades to NEVER.
     let unbounded: WaitDeadline = Duration::MAX.into();
     assert_eq!(unbounded, WaitDeadline::NEVER);
 
-    // NEVER neither expires nor bounds the wait budget.
     assert!(!WaitDeadline::NEVER.is_expired_at(Instant::now()));
     assert_eq!(WaitDeadline::NEVER.remaining_at(Instant::now()), None);
 
-    // An Instant is an absolute deadline.
     let past = WaitDeadline::from(Instant::now());
     assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
 }
@@ -831,8 +805,6 @@ fn run_until_does_not_treat_interrupt_as_deadline() {
     swarm.wait_handle().interrupt();
     swarm.wake_handle().wake();
 
-    // Nothing here matches, so the loop runs to its deadline: neither the
-    // interrupt nor the wake satisfies the predicate or ends the wait.
     let started = Instant::now();
     let found = swarm
         .run_until(Duration::from_millis(100), |_| false)
@@ -861,8 +833,6 @@ fn buffer_event(swarm: &mut Swarm<IdleTransport>) {
 #[test]
 fn interrupts_coalesce_and_survive_events_and_harvests() {
     let mut swarm = idle_swarm();
-    // Pending before parking, across a buffered event and a non-blocking
-    // harvest: neither clears it.
     swarm.wait_handle().interrupt();
     swarm.wait_handle().interrupt();
     swarm.poll().expect("non-blocking poll harvests");
@@ -875,16 +845,12 @@ fn interrupts_coalesce_and_survive_events_and_harvests() {
         swarm.poll_next_interruptible(WaitDeadline::NEVER),
         Ok(PollNext::Interrupted)
     ));
-    // Reported once: the two calls were one interrupt. The `Waker` event
-    // they share may surface as one conservative wake.
     let mut outcome = swarm.poll_next_interruptible(Duration::from_millis(20));
     if matches!(outcome, Ok(PollNext::Woken)) {
         outcome = swarm.poll_next_interruptible(Duration::from_millis(20));
     }
     assert!(matches!(outcome, Ok(PollNext::Deadline)), "{outcome:?}");
 
-    // Another call after consumption is another interrupt, and an
-    // expired deadline does not swallow it.
     swarm.wait_handle().interrupt();
     assert!(matches!(
         swarm.poll_next_interruptible(Instant::now()),
@@ -984,7 +950,6 @@ fn socketless_input_a_wake_and_an_interrupt_share_one_waker_without_loss() {
         .clone()
         .expect("attached on construction");
 
-    // Input and a host wake alone never read as an interrupt.
     let wake = swarm.wake_handle();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
@@ -1002,7 +967,6 @@ fn socketless_input_a_wake_and_an_interrupt_share_one_waker_without_loss() {
     }
     assert_eq!(seen, ["event", "woken"]);
 
-    // All three at once: none of them is lost.
     let (input, inbox) = std::sync::mpsc::channel();
     swarm.core_mut().transport_mut().inbox = Some(inbox);
     input.send(event(10)).expect("send");
@@ -1097,9 +1061,6 @@ fn run_until_finds_buffered_match_in_second_position_past_deadline() {
         protocols: Vec::new(),
     });
 
-    // Regression: the deadline is already expired, but the matching
-    // event sits *behind* a non-matching one. The scan must still reach
-    // it instead of bailing after the first rejection.
     let past = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .expect("fresh instant is at least one second after its origin");
@@ -1109,7 +1070,6 @@ fn run_until_finds_buffered_match_in_second_position_past_deadline() {
         .expect("buffered match must be found past the deadline");
     assert!(matches!(found, SwarmEvent::PeerReady { .. }));
 
-    // The skipped event is restored in order and no extra events appear.
     assert_eq!(swarm.core.state.events.len(), 1);
     assert!(matches!(
         swarm.core.state.events.front(),
@@ -1173,7 +1133,6 @@ fn buffered_open_failures(swarm: &Swarm<FailingUserOpenTransport>) -> usize {
 fn stream_open_preserves_transport_error_type() {
     const PROTOCOL: &str = "/test/1.0.0";
     let remote_peer = Ed25519Keypair::generate().peer_id();
-    // open_stream call 1 = identify (ok), call 2 = the user's open (fails).
     let mut swarm = connected_swarm(&remote_peer, PROTOCOL, 2);
 
     let error = swarm
@@ -1189,8 +1148,6 @@ fn stream_open_preserves_transport_error_type() {
         swarm.core.state.is_idle(),
         "failed open must clear core state"
     );
-    // The failure is reported synchronously via Err; it must not be
-    // double-reported through a buffered SwarmEvent::Error.
     assert_eq!(
         buffered_open_failures(&swarm),
         0,
@@ -1202,13 +1159,8 @@ fn stream_open_preserves_transport_error_type() {
 fn stream_open_not_misattributed_to_queued_failure() {
     const PROTOCOL: &str = "/test/1.0.0";
     let remote_peer = Ed25519Keypair::generate().peer_id();
-    // open_stream call 1 = identify (ok), call 2 = the stale queued open
-    // (fails), call 3 = the caller's own open (ok).
     let mut swarm = connected_swarm(&remote_peer, PROTOCOL, 2);
 
-    // Queue an unrelated open (a ping stream) directly on the state,
-    // bypassing the core's flush, so it is still pending when the
-    // application call arrives.
     swarm
         .core
         .state
@@ -1220,8 +1172,6 @@ fn stream_open_not_misattributed_to_queued_failure() {
         .expect("the caller's own open succeeds; the stale failure is not its error");
     assert_eq!(stream_id, StreamId::new(3), "caller gets its own stream id");
 
-    // The stale open's failure was not tied to a synchronous call, so it
-    // must keep flowing to the application, as the ping's PingFailed.
     assert_eq!(
         buffered_open_failures(&swarm),
         1,
@@ -1304,7 +1254,6 @@ impl Transport for FailingSendTransport {
                     resource: "test send capacity",
                 });
             }
-            // Other negotiated streams (identify, ping): swallow.
             return Ok(());
         };
         negotiator.on_data(&data);
@@ -1413,10 +1362,6 @@ fn send_stream_transport_failure_is_a_synchronous_error() {
     const PROTOCOL: &str = "/test/1.0.0";
     let (mut swarm, remote_peer, conn_id, stream_id) = ready_user_swarm(PROTOCOL);
 
-    // The transport rejects the payload write. Callers that commit
-    // state once a stream closes (the pubsub one-shot sender) must see
-    // this synchronously -- an Ok here would let a never-sent frame
-    // commit on StreamClosed.
     let error = swarm
         .send_stream(
             &remote_peer,
@@ -1431,8 +1376,6 @@ fn send_stream_transport_failure_is_a_synchronous_error() {
             resource: "test send capacity"
         })
     ));
-    // Reported through Err; it must not also surface as a buffered
-    // runtime-error event.
     assert!(
         !swarm.core.state.events.iter().any(|event| matches!(
             event,
@@ -1498,8 +1441,6 @@ fn run_until_overflow_returns_error_and_restores_events_in_order() {
             .push_back(indexed_stream_data(&peer_id, i as u64));
     }
 
-    // An unbounded wait over a flood of non-matching events must abort
-    // at the cap instead of buffering them forever.
     let error = swarm
         .run_until(WaitDeadline::NEVER, |event| {
             matches!(event, SwarmEvent::PingFailed { .. })
@@ -1526,8 +1467,6 @@ fn run_until_overflow_applies_to_expired_deadline_scan() {
             .push_back(indexed_stream_data(&peer_id, i as u64));
     }
 
-    // Past the deadline, the synchronous buffered scan must honor the
-    // same cap as the waiting phase.
     let past = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .expect("fresh instant is at least one second after its origin");
@@ -1559,8 +1498,6 @@ fn run_until_under_cap_still_finds_match() {
         protocols: Vec::new(),
     });
 
-    // Exactly RUN_UNTIL_SKIP_LIMIT - 1 events are skipped: one below the
-    // cap, so the match right behind them must still be found.
     let found = swarm
         .run_until(WaitDeadline::NEVER, |event| {
             matches!(event, SwarmEvent::PeerReady { .. })
@@ -1678,8 +1615,6 @@ impl Transport for NeverRespondTransport {
         data: Bytes,
     ) -> Result<(), TransportError> {
         let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
-            // Stream already negotiated: swallow protocol payloads so
-            // pings never receive a response.
             return Ok(());
         };
         negotiator.on_data(&data);
@@ -1754,8 +1689,6 @@ fn poll_next_budget_respects_core_ping_timer() {
     )
     .expect("swarm attaches its transport");
 
-    // Settle connection setup and identify stream negotiation, then get
-    // a real ping in flight over the negotiated ping stream.
     for _ in 0..5 {
         swarm.poll().expect("setup poll");
     }
@@ -1774,9 +1707,6 @@ fn poll_next_budget_respects_core_ping_timer() {
         "ping must be in flight with an armed core timer"
     );
 
-    // Drop setup events (ConnectionEstablished, ...) so poll_next blocks.
-    // Each blocking wait pretends it slept its full budget and jumps the
-    // clock past the ping deadline.
     swarm.core.state.events.clear();
     let jumped = clock.clone();
     swarm.simulated_wait = Some(Box::new(move |_| jumped.advance(PING_TIMEOUT_MS + 1_000)));

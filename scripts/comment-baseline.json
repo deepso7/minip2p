@@ -1,0 +1,10 @@
+{
+  "bindings/ts/core/src/backend.ts": 1,
+  "bindings/ts/core/src/event-drain.ts": 1,
+  "bindings/ts/core/src/sdk.ts": 10,
+  "bindings/ts/node/benches/ffi.bench.ts": 1,
+  "bindings/ts/node/tests/fixtures/lifecycle.mjs": 1,
+  "bindings/ts/web/e2e/web.spec.ts": 2,
+  "bindings/ts/web/src/io.ts": 4,
+  "scripts/npm-trusted-publisher-web.sh": 44
+}

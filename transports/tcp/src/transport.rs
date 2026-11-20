@@ -96,8 +96,6 @@ impl Connection {
             socket,
             remote,
             inbound,
-            // Accepted sockets are already up; nothing may be written to a
-            // dialed one until the provider reports the link.
             linked: inbound,
             session,
             outbound: VecDeque::new(),
@@ -118,10 +116,6 @@ impl Connection {
 
     /// When this connection next needs a poll, [`Deadline::IMMEDIATE`] as 0.
     fn wake_at(&self, stall_timeout: Option<u64>) -> Option<u64> {
-        // An unauthenticated connection has to be revisited when its patience
-        // runs out, and an established one when its keepalive is due, whether
-        // or not it has anything queued: a backed-up write path to a dead
-        // peer is exactly what keepalive has to catch.
         let mut at = self.authenticate_by;
         let mut fold = |deadline: u64| at = Some(at.map_or(deadline, |at| at.min(deadline)));
         if let Some(keepalive) = self.session.next_deadline() {
@@ -129,20 +123,13 @@ impl Connection {
         }
         if self.outbound.is_empty() {
             if self.linked && self.session.has_pending_write() {
-                // Framed bytes with room to put them: come straight back.
                 return Some(0);
             }
         } else if let Some(since) = self.stalled_since {
-            // The socket is refusing bytes, and spinning would not change
-            // that. Sleep until the stall becomes fatal; the provider's own
-            // readiness reporting is what wakes us sooner if the peer starts
-            // reading again.
             if let Some(timeout) = stall_timeout {
                 fold(since.saturating_add(timeout));
             }
         } else {
-            // The socket is still taking bytes, so coming straight back makes
-            // progress.
             return Some(0);
         }
         at
@@ -364,8 +351,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     peer,
                     handshake_hash,
                 } => {
-                    // Both ends share the Noise handshake hash, so it serves
-                    // as the connection's token.
                     let mut endpoint = connection.endpoint(Some(peer));
                     endpoint.set_token(ConnectionToken::new(handshake_hash));
                     TransportEvent::Connected {
@@ -408,7 +393,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     /// queue inside Yamux, against its send caps, and come back to the caller
     /// as Full instead of growing this buffer (ADR 0012).
     fn fill(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
-        // Zero still pulls one frame at a time, or nothing would ever leave.
         while connection.outbound.len() < self.config.max_buffered_send.max(1) {
             let Some(bytes) = connection.session.poll_write()? else {
                 break;
@@ -439,12 +423,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 break;
             }
             if core::mem::take(&mut connection.refused) {
-                // Drained after refusing: the peer's TCP acknowledged data, so
-                // keepalive need not probe it (#497).
                 connection.session.note_peer_acked();
             }
             connection.outbound.drain(..accepted);
-            // Progress, even if the session refills the buffer right after.
             connection.stalled_since = None;
         }
         Ok(())
@@ -469,7 +450,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 break Ok(());
             }
         };
-        // Events the session already produced are the host's either way.
         self.pump(connection);
         result
     }
@@ -497,8 +477,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     ) {
         let result = self.with_connection(id, |this, connection| {
             let fed = operation(&mut connection.session);
-            // Pump either way: bytes the session queued before failing, and
-            // events it already produced, are the host's regardless.
             let pumped = this.pump_and_flush(connection);
             fed.map_err(Teardown::from).and(pumped)
         });
@@ -547,7 +525,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 id,
                 stream_id: stream,
             }),
-            // Temporary send pressure: retryable, never a fault.
             Err(SessionError::Yamux(YamuxError::Full { stream, unsent })) => {
                 Err(TransportError::Full {
                     id,
@@ -570,13 +547,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 acked,
                 unacked,
             }),
-            // Yamux refused the operation -- a closed write side, an unknown
-            // substream -- but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
-            // The session failed: a local reset of a peer-opened stream
-            // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_connection(id, ConnectionCloseReason::Error(reason.clone()));
@@ -590,7 +563,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             TcpEvent::Accepted { socket, remote } => self.accept(socket, remote),
             TcpEvent::Connected { socket, remote } => {
                 let Some(id) = self.by_socket.get(&socket).copied() else {
-                    // A handle we never dialed, or one already torn down.
                     self.provider.abort(socket);
                     return;
                 };
@@ -605,18 +577,11 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     self.drive_connection(id, move |session| session.handle_input(data));
                 }
             }
-            // Nothing to do beyond having been polled: `poll` retries every
-            // buffered write before it returns, so readiness needs no separate
-            // path. One flush point is one thing to get right.
             TcpEvent::Writable { .. } => {}
             TcpEvent::RemoteWriteClosed { socket } => {
-                // libp2p needs the stream in both directions, so a remote FIN
-                // ends the connection. Yamux carries its own orderly shutdown
-                // and would have surfaced it before this.
                 self.close_from_provider(socket, "remote closed its write side".to_string());
             }
             TcpEvent::Closed { socket, reason } => {
-                // A lingering socket's wait is over; it names no connection.
                 if self.closing.remove(&socket).is_some() {
                     return;
                 }
@@ -627,28 +592,14 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     }
 
     fn accept(&mut self, socket: SocketHandle, remote: Multiaddr) {
-        // Shed before naming. An inbound connection at the ceiling is refused
-        // where it stands: nothing has been announced about it, so there is
-        // nobody to report a failure to, and spending an id on it would burn
-        // the namespace at whatever rate a peer chose to knock. Ended
-        // connections with unsettled bytes still hold their slots.
         if self.at_capacity() {
             self.provider.abort(socket);
             return;
         }
-        // Build the session before naming the connection. `Error` is an error
-        // *on a connection*, and nothing has been announced about this socket
-        // yet -- so an `Error` here would name an id the caller never saw, with
-        // no `Closed` behind it to end a lifecycle that never began. The same
-        // reasoning as the shed above: it goes where it stands. A dial that
-        // cannot build a session still reports it, because there the caller
-        // asked.
         let Ok(session) = self.new_session(SessionRole::Responder, None) else {
             self.provider.abort(socket);
             return;
         };
-        // Named only now that it will exist. An exhausted namespace leaves
-        // nothing to report against, so the socket just goes.
         let Ok(id) = self.ids.allocate() else {
             self.provider.abort(socket);
             return;
@@ -674,17 +625,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             return;
         };
 
-        // A connection that has not authenticated is on a clock. The ceiling
-        // alone would not hold: a peer that opens a byte stream and then says
-        // nothing keeps its slot for as long as the socket lives, so a few
-        // silent peers could fill the ceiling and keep it full.
         if connection.session.is_established() {
-            // Authenticated, so there is nothing left to time.
             connection.authenticate_by = None;
         } else if let Some(limit) = self.config.handshake_timeout_ms {
-            // Stamped here, from this poll's sample, rather than when the
-            // connection was made: between polls a transport holds no current
-            // time, only the last one it was given.
             let deadline = *connection
                 .authenticate_by
                 .get_or_insert(now.monotonic_ms.saturating_add(limit));
@@ -694,12 +637,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             }
         }
 
-        // Retry buffered writes even without a `Writable` event, so a provider
-        // that only reports readiness coarsely still drains, and pull whatever
-        // the session has framed since. Assume this poll stalls, keeping an
-        // older mark; `flush` clears it the moment the socket accepts a byte.
-        // Comparing buffer lengths instead would miss progress the session
-        // refilled.
         connection.stalled_since.get_or_insert(now.monotonic_ms);
         if let Err(teardown) =
             self.with_connection(id, |this, connection| this.pump_and_flush(connection))
@@ -711,12 +648,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             return;
         };
         if connection.outbound.is_empty() {
-            // Fully drained: nothing is stalled. Leaving a stale mark would
-            // make the next socketful look like the tail of an old stall and
-            // fail the connection on the spot.
             connection.stalled_since = None;
         } else if let Some(since) = connection.stalled_since {
-            // Still set: the socket took nothing this poll.
             let stalled_for = now.saturating_millis_since(Now::from_millis(since));
             if let Some(limit) = self.config.send_stall_timeout_ms
                 && stalled_for >= limit
@@ -725,10 +658,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 return;
             }
         }
-        // Yamux keepalive, backlog or not: a ping that cannot get into the
-        // outbound buffer is timed too. This runs after the retry, so the
-        // poll dates a ping the retry just pulled, and a session whose final
-        // upgrade bytes just drained gets its first keepalive deadline here.
         if self
             .connections
             .get(&id)
@@ -737,8 +666,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             self.drive_connection(id, |session| session.poll(now));
         }
 
-        // Driving the session above queued it as work; only a backlog keeps it
-        // there, or every serviced connection would be serviced forever.
         if !self
             .connections
             .get(&id)
@@ -785,9 +712,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 reason: format!("{target} is not a /tcp transport address"),
             });
         }
-        // Both checks come before anything with a side effect, so a refused
-        // dial leaves nothing behind: no spent id, and no connected socket
-        // without an id to name it.
         if self.at_capacity() {
             return Err(TransportError::ResourceExhausted {
                 resource: "tcp connections",
@@ -798,15 +722,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         })?;
         let session = self.new_session(SessionRole::Initiator, Some(*addr.peer_id()))?;
 
-        // Spend the id before the first failure that names it. `DialFailed`
-        // carries this id, so handing it back for a later dial to reuse would
-        // point two outcomes at one id -- the same reason `accept` allocates up
-        // front. Entropy failures above name no id, so they cost nothing.
         let consumed = self.ids.allocate();
         debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
 
         let socket = self.provider.connect(target).map_err(|error| match error {
-            // A refused address is the caller's to fix, not a dial outcome.
             TcpError::Address { context, reason } => {
                 TransportError::InvalidAddress { context, reason }
             }
@@ -821,7 +740,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             id,
             Connection::new(id, socket, target.clone(), false, session),
         );
-        // The next poll stamps its authentication deadline.
         self.work.insert(id);
         Ok(id)
     }
@@ -833,16 +751,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 reason: format!("{addr} is not a /tcp transport address"),
             });
         }
-        // Listening again on an address already bound is the same listener,
-        // not a second one. Hosts announce what they bound and then listen on
-        // it -- the swarm's own bind-then-listen does exactly that -- and
-        // binding a fresh socket there would fail with the address in use, on
-        // a request that had already been granted.
-        //
-        // Nothing is announced the second time either: the address was
-        // reported when it was bound, and repeating it would have every
-        // re-listen add an event the host has already seen -- growing the
-        // queue for as long as a caller keeps asking.
         if self.provider.local_addresses().iter().any(|a| a == addr) {
             return Ok(addr.clone());
         }
@@ -874,9 +782,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         data: Bytes,
     ) -> Result<(), TransportError> {
         if data.is_empty() {
-            // The contract makes an empty write a no-op, but not a way to
-            // address a connection that does not exist -- the same order the
-            // QUIC adapter applies.
             return if self.connections.contains_key(&id) {
                 Ok(())
             } else {
@@ -916,7 +821,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        // Abandoning a stream of an ended connection only settles it.
         if self.unsettled.abandon(id, stream_id) {
             return Ok(());
         }
@@ -940,17 +844,12 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         bytes: usize,
     ) -> Result<(), TransportError> {
         if !self.connections.contains_key(&id) {
-            // An ended connection's bytes are released without credit.
             return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
-        // Flushed at once, so the window update reaches the peer without
-        // waiting for another poll.
         self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
     fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
-        // Nothing returns to the caller, so a session the mark's flush fails
-        // is torn down with the failure as its close reason.
         if self.connections.contains_key(&id) {
             self.drive_connection(id, |session| session.set_control_stream(stream_id, control));
         }
@@ -963,20 +862,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         self.forget(&connection);
         self.by_socket.remove(&connection.socket);
 
-        // Whether the socket already took everything (a flushed connection):
-        // then only the `GoAway` can be left over, and it is best effort.
-        // Stream bytes held behind the peer's window count as undelivered:
-        // `go_away` discards them.
         let held = connection.session.has_unsent_writes();
         let drained = connection.outbound.is_empty() && !held;
-        // A connection still negotiating has no Yamux session to shut down, so
-        // `go_away` refuses and the socket is aborted instead.
         let announced = connection.session.go_away(0).is_ok();
         let flushed = announced && self.pump_and_flush(&mut connection).is_ok();
-        // Anything else still buffered (or held behind the window, which
-        // `go_away` just discarded) would be cut off by the FIN, so only a
-        // socket left with at most the `GoAway` closes gracefully; a socket
-        // too full for the `GoAway` still delivers what it took.
         let graceful = flushed
             && !held
             && (drained
@@ -987,7 +876,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         } else {
             self.provider.abort(connection.socket);
         }
-        // Every write side ended with the connection.
         self.pending
             .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
         self.pending.push_back(TransportEvent::Closed {
@@ -998,9 +886,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        // Hand back what is already queued before doing more work, so a host
-        // that acts between polls -- opening a stream on a fresh `Connected`,
-        // say -- does so against the state those events described.
         if !self.pending.is_empty() {
             return Ok(self.drain_pending_events());
         }
@@ -1009,9 +894,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             self.handle_provider_event(event);
         }
         self.linger(now);
-        // Only connections with work: those queued since the last poll --
-        // including every one a provider event above just drove -- and those
-        // whose wake-up has come.
         let mut due = core::mem::take(&mut self.work);
         while let Some(&(at, id)) = self.timers.first() {
             if at > now.monotonic_ms {
@@ -1044,15 +926,12 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
-            // Buffered events are due regardless of what the host's clock
-            // reads, so this needs no retained time sample.
             return Some(Deadline::IMMEDIATE);
         }
         let own = self
             .timers
             .first()
             .map(|&(at, _)| Deadline::from_millis(at));
-        // An unstamped linger is stamped by the next poll, so it is due now.
         let linger = self
             .closing
             .values()

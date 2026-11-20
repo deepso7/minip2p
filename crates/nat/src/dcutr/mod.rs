@@ -40,10 +40,6 @@ pub const DCUTR_PROTOCOL_ID: &str = "/libp2p/dcutr";
 /// Maximum size for a single DCUtR message (4 KiB, per spec).
 pub const MAX_MESSAGE_SIZE: usize = 4096;
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 /// Errors returned by DCUtR state machines.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DcutrError {
@@ -72,10 +68,6 @@ impl From<FrameFault> for DcutrError {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// DcutrInitiator: we initiate the hole punch
-// ---------------------------------------------------------------------------
 
 /// Sequence of actions the caller should take based on the initiator state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,11 +167,6 @@ impl DcutrInitiator {
     /// through into the `DialNow` outcome so the caller can use it for SYNC
     /// timing. Any error ends the flow.
     pub fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
-        // Once the CONNECT reply has been consumed the stream carries no
-        // further DCUtR frames toward the initiator, so later bytes are
-        // dropped rather than buffered -- including in `ReadyToSync`,
-        // where the caller has not sent SYNC yet and a misbehaving peer
-        // could otherwise grow the buffer without bound.
         if self.state != InitiatorState::AwaitingConnectReply {
             return Ok(());
         }
@@ -189,8 +176,6 @@ impl DcutrInitiator {
             .map_err(DcutrError::from)
             .and_then(|()| self.try_decode_reply(rtt_ms));
         if result.is_err() {
-            // Terminate without retaining attacker-controlled protocol input
-            // or its backing allocation.
             self.state = InitiatorState::Failed;
             self.frames.take_buffered();
         }
@@ -274,9 +259,6 @@ impl DcutrInitiator {
         }
 
         self.state = InitiatorState::ReadyToSync;
-        // Nothing further is expected inbound. Bytes coalesced behind the
-        // reply belong to the application and remain available through
-        // `take_trailing_data` after SYNC has been flushed.
         let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
             remote_addrs,
@@ -286,10 +268,6 @@ impl DcutrInitiator {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// DcutrResponder: the remote is initiating; we reply and wait
-// ---------------------------------------------------------------------------
 
 /// Events the responder surfaces to its caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,15 +430,12 @@ impl DcutrResponder {
     }
 
     fn try_decode(&mut self) -> Result<(), DcutrError> {
-        // Stop at SYNC: any bytes coalesced behind it belong to the
-        // application, which drains them with `take_trailing_data`.
         while !self.is_done() {
             let Some(msg) = self.frames.next_frame(decode_hole_punch)? else {
                 return Ok(());
             };
             match (self.state, msg.kind) {
                 (ResponderState::AwaitingConnect, HolePunchType::Connect) => {
-                    // Queue our CONNECT reply (size-validated in `new`).
                     queue_message(&mut self.frames, &core::mem::take(&mut self.connect_reply))?;
 
                     let remote_addr_bytes = msg.obs_addrs;
@@ -487,10 +462,6 @@ impl DcutrResponder {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
 
 /// The frame exchange both roles read through.
 ///
@@ -533,10 +504,6 @@ fn decode_remote_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
         .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -588,7 +555,6 @@ mod tests {
         let own = [addr("/ip4/1.2.3.4/udp/1111/quic-v1")];
         let mut init = DcutrInitiator::new(&own).unwrap();
 
-        // Take the initial CONNECT.
         let outbound = initiator_outbound(&mut init);
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
@@ -597,7 +563,6 @@ mod tests {
         assert_eq!(req.kind, HolePunchType::Connect);
         assert_eq!(req.obs_addrs.len(), 1);
 
-        // Remote replies with its own CONNECT.
         let remote_str = "/ip4/5.6.7.8/udp/2222/quic-v1";
         let remote_addr = addr(remote_str);
         let remote_bytes = vec![remote_addr.to_bytes()];
@@ -627,8 +592,6 @@ mod tests {
         let mut init = DcutrInitiator::new(&[]).unwrap();
         let _ = initiator_outbound(&mut init);
 
-        // Reply arrives coalesced with application bytes. They cannot be
-        // handed over before the protocol finishes.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -641,8 +604,6 @@ mod tests {
         ));
         assert_eq!(init.take_trailing_data(), None);
 
-        // Before the caller sends SYNC (`ReadyToSync`), further peer bytes
-        // must be dropped, not buffered without bound.
         init.on_data(&[0xbb; 1024], 7).unwrap();
         assert_eq!(init.take_trailing_data(), None);
 
@@ -685,9 +646,6 @@ mod tests {
     fn responder_exposes_trailing_bytes_after_flow_completes() {
         let mut resp = DcutrResponder::new(&[]).unwrap();
 
-        // CONNECT + SYNC + application bytes in one coalesced input: the
-        // flow completes, but the caller must be able to hand those bytes to
-        // the application with the released raw stream.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -791,9 +749,9 @@ mod tests {
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: vec![
-                addr("/ip4/1.2.3.4/udp/1/quic-v1").to_bytes(), // valid binary
-                vec![0xFF, 0x7F, 0x00],                        // unknown code
-                vec![0x04, 0x7F],                              // truncated ip4
+                addr("/ip4/1.2.3.4/udp/1/quic-v1").to_bytes(),
+                vec![0xFF, 0x7F, 0x00],
+                vec![0x04, 0x7F],
             ],
         });
         init.on_data(&reply, 10).unwrap();
@@ -816,7 +774,6 @@ mod tests {
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
         let mut resp = DcutrResponder::new(&own).unwrap();
 
-        // Feed initiator's CONNECT.
         let remote_str = "/ip4/5.5.5.5/udp/7000/quic-v1";
         let remote_addr = addr(remote_str);
         let remote_bytes = vec![remote_addr.to_bytes()];
@@ -826,7 +783,6 @@ mod tests {
         });
         resp.on_data(&connect).unwrap();
 
-        // Reply should be queued with our own addr (binary-encoded).
         let outbound = responder_outbound(&mut resp);
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
@@ -835,7 +791,6 @@ mod tests {
         assert_eq!(reply.kind, HolePunchType::Connect);
         assert_eq!(reply.obs_addrs, vec![own[0].to_bytes()]);
 
-        // ConnectReceived event should surface parsed multiaddrs.
         let events = resp.poll_events();
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -850,7 +805,6 @@ mod tests {
             _ => panic!(),
         }
 
-        // Feed SYNC.
         let sync = frame(HolePunch {
             kind: HolePunchType::Sync,
             obs_addrs: Vec::new(),
@@ -866,7 +820,6 @@ mod tests {
     fn responder_handles_pipelined_connect_and_sync() {
         let mut resp = DcutrResponder::new(&[]).unwrap();
 
-        // Send CONNECT and SYNC in one packet (unusual but possible).
         let mut packet = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -916,8 +869,6 @@ mod tests {
 
     #[test]
     fn responder_rejects_oversized_declared_frame_length() {
-        // A tiny header declaring an impossible payload length must fail
-        // immediately instead of stalling while waiting for more bytes.
         let mut resp = DcutrResponder::new(&[]).unwrap();
         let err = resp.on_data(&over_declared_header()).unwrap_err();
         assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
@@ -932,8 +883,6 @@ mod tests {
 
     #[test]
     fn constructors_refuse_an_oversized_outbound_connect() {
-        // The oversized frame is never built: the caller learns at
-        // construction, with no input needed to surface the error.
         assert!(matches!(
             DcutrInitiator::new(&oversized_own_addrs()),
             Err(DcutrError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
@@ -954,7 +903,6 @@ mod tests {
             FrameDecode::Complete { payload, .. } if payload.len() == MAX_MESSAGE_SIZE
         ));
 
-        // One more byte and the payload must be refused.
         assert_eq!(
             queue_message(&mut frames, &[0u8; MAX_MESSAGE_SIZE + 1]),
             Err(DcutrError::MessageTooLarge {
@@ -978,7 +926,6 @@ mod tests {
 
     #[test]
     fn responder_accepts_an_exactly_max_connect_with_pipelined_sync() {
-        // A coalesced read can pipeline SYNC behind a maximal CONNECT.
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
         let mut resp = DcutrResponder::new(&own).unwrap();
         let mut coalesced = max_size_connect();

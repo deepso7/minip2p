@@ -150,7 +150,6 @@ fn run_until(
             start.elapsed() < PATIENCE,
             "timed out\n  dialer: {a_events:?}\n  listener: {b_events:?}"
         );
-        // Sockets settle on their own schedule; yield rather than spin.
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -224,7 +223,6 @@ fn upgraded_pair() -> Pair {
     let mut dialer = node(dialer_key);
     let mut listener = node(listener_key);
 
-    // Port 0 lets the kernel choose, and the bound address comes back concrete.
     let bound = listener
         .listen(&"/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>().expect("addr"))
         .expect("listener binds");
@@ -273,11 +271,9 @@ fn two_nodes_upgrade_over_loopback_and_authenticate_each_other() {
         connected_peer(&pair.listener_events),
         Some(&pair.dialer_peer)
     );
-    // Both ends carry the same token: the Noise handshake hash.
     let token = connected_token(&pair.dialer_events).expect("dialer token");
     assert_eq!(connected_token(&pair.listener_events), Some(token));
 
-    // The listener learns the dialer's ephemeral source port from the kernel.
     let inbound = pair.listener.active_inbound_connection_sources();
     assert_eq!(inbound.len(), 1);
     assert!(
@@ -323,8 +319,6 @@ fn a_payload_past_the_send_caps_arrives_intact_by_resending_on_writable() {
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
 
-    // Past Yamux's window plus its send buffer, so the write is Full and the
-    // tail is resent each time the stream reports writable again.
     let payload: Vec<u8> = (0..1024 * 1024u32).map(|byte| byte as u8).collect();
     let mut held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload.clone()));
     assert!(held.is_some(), "a write past the caps is Full");
@@ -361,19 +355,13 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     let mut pair = upgraded_pair();
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
-    // The reader takes what arrives but acknowledges nothing: the sender may
-    // deliver one receive window, and no more.
     let window = minip2p_tcp::TcpConfig::default().yamux.receive_window as usize;
-    // More than the window and the stream's send cap together, so the
-    // sender is left holding a tail.
     let payload = Bytes::from(vec![7u8; 4 * window]);
     let mut held = send_or_hold(&mut pair.dialer, id, stream, payload.clone());
     let mut unacked = 0;
     let mut listener_stream = None;
     let start = Instant::now();
     let mut quiet_since = Instant::now();
-    // Quiet only counts once data started: a loaded machine can take longer
-    // than the quiet spell to deliver the first window.
     while listener_stream.is_none() || quiet_since.elapsed() < Duration::from_millis(300) {
         let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
         for event in pair.dialer.poll(now).expect("poll dialer") {
@@ -399,7 +387,6 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     assert_eq!(unacked, window, "a stalled reader holds exactly its budget");
     assert!(held.is_some(), "the sender is still holding its tail");
 
-    // Acknowledging resumes the transfer, and it then completes.
     let listener_stream = listener_stream.expect("data arrived");
     let listener_id = pair.listener_connection;
     pair.listener
@@ -439,7 +426,6 @@ fn writable_never_follows_a_close_or_reset_after_full() {
             "a write past the caps is Full"
         );
     }
-    // Ended before any poll: a Writable the Full queued must not surface.
     pair.dialer.close_stream_write(id, closed).expect("close");
     pair.dialer.reset_stream(id, reset).expect("reset");
 
@@ -494,7 +480,6 @@ fn substreams_carry_data_in_both_directions() {
         },
     );
 
-    // A half-close leaves the reverse direction usable.
     pair.dialer
         .close_stream_write(dialer_id, stream)
         .expect("FIN");
@@ -536,8 +521,6 @@ fn closing_a_connection_reaches_the_peer() {
 
 #[test]
 fn a_refused_connect_is_reported_and_closed() {
-    // Bind and drop, so the port is almost certainly unused and definitely not
-    // listening.
     let probe = StdTcpListener::bind("127.0.0.1:0").expect("probe binds");
     let dead = probe.local_addr().expect("probe address");
     drop(probe);
@@ -614,10 +597,6 @@ fn listening_again_on_a_bound_address_is_the_same_listener() {
         .expect("the first listen binds");
     let mut events = transport.poll(Now::from_millis(0)).expect("poll");
 
-    // Hosts bind first and then listen on what they bound -- the swarm's own
-    // bind-then-listen does exactly that -- so the second call names a socket
-    // this transport already owns. Binding a fresh one there would fail with
-    // the address in use, on a request that had already been granted.
     for _ in 0..3 {
         transport
             .listen(&bound)
@@ -629,9 +608,6 @@ fn listening_again_on_a_bound_address_is_the_same_listener() {
         "one address, one listener, however many times it was asked for"
     );
 
-    // And announced once. Repeating it would have every re-listen add an event
-    // the host has already seen, growing the queue for as long as a caller
-    // keeps asking.
     events.extend(transport.poll(Now::from_millis(1)).expect("poll"));
     let announced: Vec<&TransportEvent> = events
         .iter()
@@ -646,8 +622,6 @@ fn listening_again_on_a_bound_address_is_the_same_listener() {
 
 #[test]
 fn names_are_refused_with_a_resolve_first_error() {
-    // A lookup inside `dial` would block the driver thread, so the std
-    // provider takes concrete hosts only and says what to do instead.
     let mut transport = node(identity(1));
     assert!(matches!(
         transport.listen(&"/dns/localhost/tcp/0".parse().expect("addr")),
@@ -687,8 +661,6 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
 
     settle(&mut pair.dialer, &mut pair.listener);
 
-    // Nothing is in flight now, so the dialer's wait must run its full budget
-    // rather than return spuriously. Attaching registers what is already open.
     pair.dialer.attach();
     let started = Instant::now();
     let outcome = pair.dialer.wait_for_input(Duration::from_millis(150));
@@ -699,7 +671,6 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
         started.elapsed()
     );
 
-    // Now the peer writes, and the same wait returns early with the data.
     pair.listener
         .send_stream(listener_id, stream, Bytes::from_static(b"wake up"))
         .expect("send");
@@ -729,22 +700,9 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     settle(&mut pair.dialer, &mut pair.listener);
 
-    // Queue more than the peer's Yamux window allows without the peer reading,
-    // so the remainder sits in the dialer's buffer waiting for credit. On
-    // loopback the kernel ends up taking everything the window lets through;
-    // it is the window, not the socket, that holds the rest back.
     let payload = vec![7u8; 512 * 1024];
     let held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload));
     assert!(held.is_some(), "past the window and send buffer is Full");
-    // The accepted prefix beyond the peer's window is the buffered write this
-    // test needs; the unsent tail plays no part, so it is not resent.
-    // Drive until the dialer has nothing left to do. Parking is the state the
-    // rest of the test needs, so wait for it rather than for a slice of time:
-    // under load a fixed slice buys far fewer polls than it looks like it does.
-    // A timeout means parked: nothing arrived, and nothing is left to send.
-    // `TCP_NOTSENT_LOWAT` keeps the socket from taking the window in one go,
-    // so it drains in steps paced by the peer's delayed ACKs (up to ~40 ms);
-    // the quiet slice outlasts them.
     pair.dialer.attach();
     let parking = Instant::now();
     while pair.dialer.wait_for_input(Duration::from_millis(50)) != WaitOutcome::TimedOut {
@@ -752,23 +710,12 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
         assert!(parking.elapsed() < PATIENCE, "the dialer never parked");
     }
 
-    // Writes buffered behind an idle peer are nothing to wake for.
     assert_eq!(
         pair.dialer.wait_for_input(Duration::from_millis(100)),
         WaitOutcome::TimedOut,
         "buffered writes with an idle peer are nothing to wake for"
     );
 
-    // The peer now acts, and the parked dialer must be told. Which readiness
-    // does it -- the socket having room again, or the peer's Yamux window
-    // update arriving -- is deliberately not claimed: loopback buffering makes
-    // a socket that stays full unreliable to arrange.
-    //
-    // One poll only takes a bounded bite, so the peer reads until the dialer
-    // reports something. The zero-budget probe is the assertion: it returns
-    // `Ready` from the same readiness a blocking wait would wake on, and the
-    // provider keeps what it saw, so a blocking wait afterwards would only be
-    // answered from that state.
     let draining = Instant::now();
     let woke = loop {
         match pair.dialer.wait_for_input(Duration::ZERO) {
@@ -796,7 +743,6 @@ fn a_wait_handle_interrupts_a_blocked_wait() {
 
     let (started, wait_started) = mpsc::channel();
     thread::spawn(move || {
-        // Wait for the main thread to be inside its wait before nudging it.
         wait_started.recv().expect("the waiter starts");
         thread::sleep(Duration::from_millis(50));
         handle.interrupt();
@@ -818,8 +764,6 @@ fn queued_events_are_never_slept_through() {
     let mut pair = upgraded_pair();
     pair.dialer.attach();
     let id = pair.dialer_connection;
-    // `open_stream` queues `StreamOpened`, which a driver must see before it
-    // parks on the socket.
     let _ = pair.dialer.open_stream(id).expect("open substream");
 
     let began = Instant::now();
@@ -962,9 +906,6 @@ mod provider {
         );
         client_seen.clear();
 
-        // With the peer FIN already consumed, this retires the socket and
-        // queues Closed synchronously. A blocking driver must poll it rather
-        // than park waiting for readiness that will never come.
         client.close_write(client_socket).expect("client FIN");
         let mut client = Attached::new(client);
         assert_eq!(
@@ -982,10 +923,6 @@ mod provider {
     fn a_stream_closed_from_both_ends_is_retired() {
         let (mut server, server_socket, mut client, client_socket) = linked();
 
-        // Each side shuts its write half. Once a socket has read the peer's FIN
-        // and shut its own, nothing can arrive on it again -- so the provider
-        // has to let go of the descriptor rather than hold it for a caller that
-        // has already been told the stream ended.
         client.close_write(client_socket).expect("client FIN");
         let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
         pump_until(
@@ -1016,7 +953,6 @@ mod provider {
             },
         );
 
-        // Both retirements are orderly, not faults.
         for seen in [&server_seen, &client_seen] {
             assert!(
                 seen.iter()
@@ -1031,9 +967,6 @@ mod provider {
         let (mut server, _server_socket, client, _client_socket) = linked();
         let mut client = Attached::new(client);
 
-        // Nudge the client while nobody is waiting, then harvest -- which is
-        // what absorbs the wake. The next wait still has to honour it, or a
-        // handle could lose its wakeup to that race.
         client.wait_handle().interrupt();
         client
             .poll
@@ -1052,7 +985,6 @@ mod provider {
         );
         assert!(began.elapsed() < Duration::from_secs(5));
 
-        // And it is consumed, not sticky.
         assert_eq!(
             client.wait_for_input(Duration::from_millis(50)),
             WaitOutcome::TimedOut,
@@ -1064,9 +996,6 @@ mod provider {
     fn bytes_already_delivered_survive_the_retirement_that_follows() {
         let (mut server, server_socket, mut client, client_socket) = linked();
 
-        // The server has already finished writing, so the client's FIN is the
-        // last thing the socket is waiting on: reading it retires the stream in
-        // the same pass that delivered the bytes ahead of it.
         server.close_write(server_socket).expect("server FIN");
         let payload = b"the last thing said".to_vec();
         let mut offset = 0;
@@ -1134,10 +1063,6 @@ mod provider {
         total
     }
 
-    // This test needs the loopback send buffer to exceed the provider's fixed
-    // 128 KiB read budget. Linux guarantees that in the CI configurations we
-    // exercise; default buffers on macOS and Windows can be smaller, which
-    // would test an OS tuning choice rather than provider fairness.
     #[cfg(target_os = "linux")]
     #[test]
     fn one_busy_socket_cannot_monopolise_a_poll() {
@@ -1167,9 +1092,6 @@ mod provider {
             thread::sleep(Duration::from_millis(1));
         }
 
-        // The peer writes as much as the kernel will hold and then stops, so
-        // nothing further will announce itself: whatever the provider does not
-        // take now has to be remembered rather than waited for.
         let buffered = stuff(&mut peer);
         assert!(
             buffered > 128 * 1024,
@@ -1192,14 +1114,11 @@ mod provider {
         );
         assert!(taken < buffered, "the budget must actually have bitten");
 
-        // Readiness has nothing left to say, so a driver that parked here would
-        // strand the remainder.
         assert!(
             server.due(),
             "work held back by the budget must be reported due, not slept through"
         );
 
-        // And the rest arrives on the polls that follow.
         let mut rest = 0;
         while rest + taken < buffered {
             let more: usize = server
@@ -1229,7 +1148,6 @@ mod provider {
             .expect("port")
             .to_string();
 
-        // One more than a poll will take, so the backlog has to outlive it.
         let burst = 40;
         let peers: Vec<_> = (0..burst)
             .map(|_| std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect"))
@@ -1297,8 +1215,6 @@ mod provider {
             .expect("bind");
         let target = format!("127.0.0.1:{}", port_of(&bound));
 
-        // More than one poll's budget, so the backlog has to outlive the poll
-        // that fills it.
         let burst = 40;
         let mut peers: Vec<std::net::TcpStream> = (0..burst)
             .map(|_| std::net::TcpStream::connect(&target).expect("connect"))
@@ -1311,9 +1227,6 @@ mod provider {
             "the budget has to have bitten for this test to prove anything"
         );
 
-        // What the budget held back is still queued. A connection taken off the
-        // kernel's queue and then dropped is one peer's dial killed for
-        // somebody else's flood, which is not what deferring work means.
         thread::sleep(Duration::from_millis(50));
         for (index, peer) in peers.iter_mut().enumerate() {
             assert!(
@@ -1338,8 +1251,6 @@ mod provider {
     #[test]
     fn a_flooded_listener_cannot_starve_a_later_bind() {
         let mut server = StdTcpProvider::new();
-        // Bound first, so it is the one a naive walk over the listeners always
-        // reaches first.
         let busy = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind the busy listener");
@@ -1348,20 +1259,12 @@ mod provider {
             .expect("bind the quiet listener");
         let busy_target = format!("127.0.0.1:{}", port_of(&busy));
 
-        // One lonely dial at the listener that bound second. The kernel tells
-        // the server which ephemeral port it came from, which is how the
-        // accepted connection is recognised.
         let lonely = std::net::TcpStream::connect(format!("127.0.0.1:{}", port_of(&quiet)))
             .expect("dial the quiet listener");
         let lonely_source = format!("/tcp/{}", lonely.local_addr().expect("local addr").port());
 
         let mut served = false;
         for _ in 0..6 {
-            // Replenish the busy listener past a whole poll's budget every
-            // round, so it never stops being a flood. The client ends are let
-            // go of immediately: the handshake is complete, so the connection
-            // sits in the kernel's accept queue regardless, and holding 240
-            // sockets open would only risk the process's descriptor limit.
             for _ in 0..40 {
                 let _ = std::net::TcpStream::connect(&busy_target).expect("flood connect");
             }
@@ -1375,8 +1278,6 @@ mod provider {
             if served {
                 break;
             }
-            // Let go of the flood, so a starvation test cannot itself run out
-            // of descriptors.
             for event in &batch {
                 if let TcpEvent::Accepted { socket, .. } = event {
                     server.abort(*socket);
@@ -1395,8 +1296,6 @@ mod provider {
     fn an_aborted_stream_is_never_mentioned_again_but_the_peer_still_finds_out() {
         let (mut server, server_socket, mut client, client_socket) = linked();
 
-        // Something in flight, so this is a teardown mid-conversation rather
-        // than an idle handle being tidied away.
         client.send(client_socket, b"never mind").expect("send");
         client.abort(client_socket);
 
@@ -1415,7 +1314,6 @@ mod provider {
                 })
             },
         );
-        // Give a late event somewhere to turn up before claiming there is none.
         for _ in 0..50 {
             client_seen.extend(client.poll(Now::from_millis(0)).expect("poll client"));
             server_seen.extend(server.poll(Now::from_millis(0)).expect("poll server"));
@@ -1427,8 +1325,6 @@ mod provider {
             "an aborted handle is owed nothing further, got {client_seen:?}"
         );
 
-        // The teardown still has to reach the peer, or an abort is a leak on
-        // the other end rather than a close.
         assert!(
             server_seen.iter().any(|event| matches!(
                 event,
@@ -1437,8 +1333,6 @@ mod provider {
             "the peer must observe the stream ending: {server_seen:?}"
         );
 
-        // And the peer's own half then retires normally, so nothing is left
-        // holding a descriptor for a stream that is gone.
         server.close_write(server_socket).expect("peer FIN");
         pump_until(
             &mut server,
@@ -1461,9 +1355,6 @@ mod provider {
     fn an_abort_that_races_a_retirement_discards_it_too() {
         let (mut server, server_socket, mut client, client_socket) = linked();
 
-        // The peer finishes first, so the client's own `close_write` is what
-        // retires the stream -- queueing a `Closed` the caller has not
-        // collected yet.
         server.close_write(server_socket).expect("peer FIN");
         let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
         pump_until(
@@ -1479,9 +1370,6 @@ mod provider {
         );
         client.close_write(client_socket).expect("client FIN");
 
-        // The caller aborts before collecting that retirement. It asked for the
-        // teardown, so it is owed no report of it -- including one already
-        // sitting in the queue.
         client.abort(client_socket);
         let after = client.poll(Now::from_millis(0)).expect("poll");
         assert!(
@@ -1493,9 +1381,6 @@ mod provider {
     #[test]
     fn addresses_must_be_a_bare_host_and_port() {
         let mut provider = StdTcpProvider::new();
-        // A trailing component means the address is not this provider's to
-        // dial; connecting anyway would reach somewhere the caller did not ask
-        // for.
         let suffixed: Multiaddr =
             "/ip4/127.0.0.1/tcp/1/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"
                 .parse()
@@ -1509,7 +1394,6 @@ mod provider {
             Err(TcpError::Address { .. })
         ));
 
-        // A bare host with no port is equally not dialable.
         assert!(matches!(
             provider.connect(&"/ip4/127.0.0.1".parse().expect("addr")),
             Err(TcpError::Address { .. })

@@ -187,7 +187,6 @@ pub trait NatSwarm {
         handoff: BridgeHandoff,
         now_ms: u64,
     ) -> Result<ConnectionId, PromoteError> {
-        // Best effort: a stream already gone needs no reset.
         match self.reset_stream(
             &handoff.relay,
             handoff.inner_conn,

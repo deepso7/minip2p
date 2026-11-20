@@ -220,7 +220,6 @@ function resolveQuic(quic: Minip2pQuicLimits): BackendQuicLimits {
       quic.streamReceiveWindow,
       "quic.streamReceiveWindow"
     ),
-    // Range-checked natively, which names the field.
     timeThreshold: quic.timeThreshold,
     webtransportHandshakeTimeoutMs: optionalU64(
       quic.webtransportHandshakeTimeoutMs,

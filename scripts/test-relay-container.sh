@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Builds the relay release binary with scripts/build-relay-release.sh, packages
-# it like a release, builds the image through infra/relay/Dockerfile from a
-# local release URL, and runs scripts/check-relay-image.sh on it.
 set -euo pipefail
 
 repository="$(cd "$(dirname "$0")/.." && pwd)"

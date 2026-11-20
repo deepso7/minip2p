@@ -15,9 +15,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from bench_results import GUNGRAUN_NAMES  # noqa: E402
 
-# A `#[library_benchmark]` function reports one id per `#[bench::<id>(...)]`
-# attribute, or its own name when it has none (`summary.json`'s `id` or
-# `function_name`, as `bench_results.py gungraun` reads them).
 ATTRIBUTE = re.compile(r"#\[\s*(bench|benches)::(\w+)")
 FUNCTION = re.compile(r"\bfn\s+(\w+)")
 
@@ -49,7 +46,6 @@ def main() -> int:
         if "bench" in target["kind"]
     }
     errors = []
-    # Every Gungraun bench target must be run by the `ir` pass.
     for key, path in sorted(sources.items()):
         if "gungraun::main!" in path.read_text() and key not in targets:
             errors.append(f"{key[0]} bench {key[1]} uses Gungraun but is not an `ir` line in bench/targets")

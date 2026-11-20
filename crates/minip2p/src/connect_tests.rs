@@ -262,7 +262,6 @@ fn drain(
     while let Some(event) = engine.pop_resolved() {
         out.push(event);
     }
-    // Terminals follow the batch's swarm events, as in the Endpoint.
     for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
         let consumed = engine.observe(&event, runtime, now_ms);
         if !consumed {
@@ -461,7 +460,6 @@ fn tick_past_deadline_times_out_and_aborts() {
 #[test]
 fn winner_keeps_losers_until_the_window_ends() {
     let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
-    // The default window, and one the swarm was configured with.
     let configured = SwarmBuilder::new(&identity)
         .simultaneous_dial_window_ms(200)
         .build_core(FakeTransport::default(), SeqEntropy(1))
@@ -486,8 +484,6 @@ fn winner_keeps_losers_until_the_window_ends() {
             .transport_mut()
             .push_connected(ConnectionId::new(1), peer, second);
         let _ = drain(&mut engine, &mut runtime, 0);
-        // The peer may already have accepted the loser and kept it, so it
-        // stays up for the swarm's race to settle on both sides.
         assert!(runtime.transport().closes.is_empty());
         assert_eq!(
             engine.next_deadline(),
@@ -608,9 +604,6 @@ fn lower_peer_settled_by_the_peers_dial() -> (
 fn lower_peer_keeps_its_other_dials_after_one_replaces_the_peers_dial() {
     let (mut runtime, mut engine, peer, inbound) = lower_peer_settled_by_the_peers_dial();
 
-    // One dial lands and replaces the peer's. The other stays up: the
-    // peer may have accepted it too, and both sides settle the two by
-    // connection token only if both see both.
     let first = addr(&peer, 1);
     runtime
         .transport_mut()
@@ -631,8 +624,6 @@ fn lower_peer_keeps_its_other_dials_after_one_replaces_the_peers_dial() {
         )),
         "{events:?}"
     );
-    // The replacement closes the peer's dial; the other dial is ours to
-    // abort only when the window ends.
     let _ = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS - 1);
     assert_eq!(runtime.transport().closes, vec![inbound]);
     let _ = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
@@ -672,8 +663,6 @@ fn disconnecting_the_peer_aborts_its_kept_dials() {
 #[test]
 fn a_later_settle_extends_the_kept_dials_window() {
     let (mut runtime, mut engine, peer, inbound) = lower_peer_settled_by_the_peers_dial();
-    // The peer's dial closes; a new attempt dials, and the peer's next
-    // dial settles it inside the first window.
     runtime.transport_mut().push_closed(inbound);
     drain(&mut engine, &mut runtime, 1_000);
     let id = engine.connect(addr(&peer, 3).into(), &mut runtime, 3_000);
@@ -712,8 +701,6 @@ fn winner_before_loser_dial_failed_in_same_batch_does_not_leak() {
         &mut runtime,
         0,
     );
-    // Winner establishes first; loser's close is already in the same poll
-    // batch. abort_dial cannot retract the queued DialFailed.
     runtime
         .transport_mut()
         .push_connected(ConnectionId::new(1), peer, second);
@@ -734,8 +721,6 @@ fn winner_before_loser_dial_failed_in_same_batch_does_not_leak() {
 #[test]
 fn candidates_established_in_one_batch_settle_on_the_kept_connection() {
     let (d1, d2) = (ConnectionId::new(1), ConnectionId::new(2));
-    // The swarm keeps the lower token whichever arrives first, before
-    // the engine sees either: d1 first and kept, then d2 first and kept.
     for (tokens, kept, lost) in [((1, 2), d1, d2), ((2, 1), d2, d1)] {
         let peer = peer(b"same-batch");
         let first = addr(&peer, 1);
@@ -772,8 +757,6 @@ fn candidates_established_in_one_batch_settle_on_the_kept_connection() {
             "{case}: {events:?}"
         );
         assert_eq!(runtime.connection_id(&peer), Some(kept), "{case}");
-        // A replaced loser closes once its event is out. That close is
-        // the swarm's; nothing touches the kept connection.
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
         assert_eq!(runtime.transport().closes, vec![lost], "{case}");
         assert!(
@@ -799,8 +782,6 @@ fn a_failure_after_a_retired_establishment_does_not_fail_the_attempt() {
         0,
     );
     let second = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 0);
-    // d3 has the lowest token, so it replaces d1 before the engine sees
-    // d1 establish, and d2's failure is queued in between.
     let transport = runtime.transport_mut();
     transport.push_connected_with_token(d1, peer, addr(&peer, 1), 3);
     transport.push_closed(d2);
@@ -846,8 +827,6 @@ fn a_kept_dial_taking_the_slot_restarts_the_window_for_the_rest() {
         .push_connected_with_token(d1, peer, addr(&peer, 1), 3);
     let _ = drain(&mut engine, &mut runtime, 0);
 
-    // d2 wins the race at 4 s, so the swarm compares against it until
-    // 9 s; d3 may still win at the peer and replace it here before then.
     runtime
         .transport_mut()
         .push_connected_with_token(d2, peer, addr(&peer, 2), 2);
@@ -889,8 +868,6 @@ fn a_kept_dial_landing_after_its_attempt_keeps_the_later_attempts_dials() {
     runtime.transport_mut().push_closed(d1);
     let _ = drain(&mut engine, &mut runtime, 1);
 
-    // A new attempt dials d3; then the first attempt's kept d2 lands.
-    // Both are ours, and the peer may keep either, so d3 stays up.
     let _ = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 1);
     runtime
         .transport_mut()
@@ -926,8 +903,6 @@ fn a_kept_dial_seen_after_its_window_still_counts_as_ours() {
     let _ = drain(&mut engine, &mut runtime, 1);
     let _ = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 1);
 
-    // The swarm registers d2 at 4 s, but the host only hands its events
-    // to the engine after the retained window has lapsed.
     runtime
         .transport_mut()
         .push_connected_with_token(d2, peer, addr(&peer, 2), 9);
@@ -961,8 +936,6 @@ fn higher_peer_aborts_kept_dials_when_the_peers_dial_wins() {
     let _ = drain(&mut engine, &mut runtime, 0);
     assert!(runtime.transport().closes.is_empty(), "d2 is kept");
 
-    // The lower peer's dial replaces ours, so the kept d2 loses on both
-    // sides and goes now rather than when the window ends.
     runtime
         .transport_mut()
         .push_connected(inbound, peer, addr(&peer, 9));
@@ -1019,7 +992,6 @@ fn failed_abort_then_establish_is_closed_not_forwarded() {
         }) if connect_id == id => {}
         other => panic!("expected Cancelled, got {other:?}"),
     }
-    // Abort close failed: dial restored + vetoed. Allow close for refuse.
     runtime.transport_mut().refuse_close = false;
     runtime
         .transport_mut()
@@ -1054,8 +1026,6 @@ fn failed_abort_establish_does_not_replace_existing_connection() {
         ..FakeTransport::default()
     });
     let mut engine = ConnectEngine::new(30_000);
-    // Dial first while the peer is still offline, then cancel with a
-    // failed abort so the candidate is restored + vetoed.
     let id = engine.connect(target.clone().into(), &mut runtime, 0);
     assert_eq!(runtime.transport().dials, vec![target.clone()]);
     engine.abort_attempt(id, &mut runtime);
@@ -1068,8 +1038,6 @@ fn failed_abort_establish_does_not_replace_existing_connection() {
         other => panic!("expected Cancelled, got {other:?}"),
     }
 
-    // A valid connection lands for the same peer (e.g. inbound) while the
-    // restored dial is still live.
     runtime.transport_mut().refuse_close = false;
     runtime
         .transport_mut()
@@ -1089,7 +1057,6 @@ fn failed_abort_establish_does_not_replace_existing_connection() {
     );
     assert_eq!(runtime.connection_id(&peer), Some(existing));
 
-    // Late establish of the vetoed dial must close by conn_id only.
     runtime.transport_mut().push_connected(late, peer, target);
     let events = drain(&mut engine, &mut runtime, 0);
     assert!(
@@ -1209,9 +1176,6 @@ fn race_circuit_established_is_provisional_until_deadline() {
         settled_for(&events, id),
         Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == conn
     ));
-    // Discovery CancelDial / shutdown and Endpoint::cancel_connect gate the
-    // NAT leg on this: after Connected, cancel is a no-op and must not
-    // tear down a provisional relayed path still held by NatAgent.
     assert!(!engine.is_pending(id));
     engine.abort_attempt(id, &mut runtime);
     assert!(engine.pop_resolved().is_none());
@@ -1220,9 +1184,6 @@ fn race_circuit_established_is_provisional_until_deadline() {
 
 #[test]
 fn a_resolving_candidate_keeps_the_attempt_open_until_the_deadline() {
-    // A name still resolving is a candidate in the race: the attempt must
-    // not fail at admission for lack of a dial, and the attempt deadline
-    // is the only bound on the lookup.
     let peer = peer(b"resolving");
     let named = addr(&peer, 4001);
     let mut runtime = runtime(FakeTransport::default());
@@ -1345,8 +1306,6 @@ fn provisional_then_direct_established_settles_on_direct() {
         .transport_mut()
         .push_connected(ConnectionId::new(1), peer, target);
     let events = drain(&mut engine, &mut runtime, 0);
-    // The direct connection replaces the provisional circuit: one
-    // hand-over, never a disconnect, and exactly one terminal.
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -1457,9 +1416,6 @@ fn a_connection_settled_ahead_of_its_event_is_named_after_it() {
     let transport = runtime.transport_mut();
     transport.push_circuit(circuit(4), peer);
     transport.push_connected(punch, peer, addr(&peer, 1));
-    // Stands in for NAT: the punch is recorded once its event is seen.
-    // Paths are named after each event, terminals popped at batch end,
-    // as the Endpoint engine does.
     let mut punched = false;
     for event in runtime.poll(Now::from_millis(1)).expect("poll") {
         engine.observe(&event, &mut runtime, 1);
@@ -1736,7 +1692,6 @@ fn a_relay_refused_before_it_started_is_no_usable_route() {
         &mut runtime,
         0,
     );
-    // The agent refused the relay at once: no `RelayStarted`.
     let error = NatError::DialFailed("refused".into());
     engine.observe_nat(
         &NatEvent::RelayFailed {

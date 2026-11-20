@@ -193,8 +193,6 @@ impl WebTransportCertificateHandle {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<(), WebTransportCertificateError> {
-        // Held across the swap: concurrent replaces take turns, so the
-        // certificate and the hashes Noise lists never come from two of them.
         let mut current = self
             .context
             .write()
@@ -203,9 +201,6 @@ impl WebTransportCertificateHandle {
         let (certificate, mut context) =
             load_provided(&self.tls, &current.keypair, chain, key, unix)
                 .map_err(WebTransportCertificateError::Invalid)?;
-        // A handshake whose certificate resolved just before this swap reads
-        // the new context after it, so the previous leaf stays listed. A
-        // reload of the same leaf keeps the list as it was.
         if let Some(fresh) = Arc::get_mut(&mut context) {
             if current.certhashes.first() == fresh.certhashes.first() {
                 fresh.certhashes = current.certhashes.clone();
