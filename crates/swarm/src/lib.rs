@@ -38,6 +38,8 @@ mod state;
 mod builder;
 #[cfg(feature = "std")]
 mod driver;
+#[cfg(feature = "std")]
+mod wait_deadline;
 
 pub use crate::core::{DriverError, SwarmCore};
 pub use crate::events::{
@@ -55,7 +57,9 @@ pub use minip2p_transport::ConnectionCloseReason;
 
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm, WaitDeadline};
+pub use crate::driver::{PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
+#[cfg(feature = "std")]
+pub use crate::wait_deadline::WaitDeadline;
 // Re-exported so callers need not depend on minip2p-core directly.
 #[cfg(feature = "std")]
 pub use minip2p_core::platform::{Clock, StdClock};
