@@ -1,6 +1,6 @@
 # Plan: Codebase simplification for humans and agents
 
-> **Status:** Draft — ready for execution. Synthesized from a two-round, three-provider council (GPT 6.2 Sol high, Claude Opus 5.5 medium, Gemini 4 Neon high): Round 1 explored simplification opportunities and rejected four risky abstractions; Round 2 scored v1 (6.5/10 Claude, 7/10 GPT Sol, 7/10 Gemini) and surfaced concrete file-level invariants, all folded into this v2 stack.
+> **Status:** Done. PRs 1–6 landed (#577, #581, #578, #584, #579, #580), plus both deferred cleanups (#582, #583); released in v0.13.0. See [Outcome](#outcome) for where the shipped work differs from this plan.
 
 ## Goal
 
@@ -229,3 +229,16 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 
 - **`WaitDeadline` module cleanup:** Moving `WaitDeadline` out of `crates/swarm/src/driver.rs:40` (and removing the unused `Swarm` / `PollNext` re-exports in `crates/minip2p/src/std/mod.rs:85`) is a tiny standalone cleanup if desired later, independent of `Swarm<T>`'s public status (ADR 0013).
 - **Measured Cargo feature consolidation on `minip2p-rs`:** Only revisit after PRs 1 and 4 land, backed by linked `thumbv7em` and `wasm32` size measurements.
+
+---
+
+## Outcome
+
+- **PR 1 (#577):** as planned. `scripts/run-feature-matrix.sh` names every row and takes `ci|full|<row>`; `scripts/check-targets.sh` holds the no_std, wasm, docs and package lists; `scripts/publish-order.py` derives the publish order. The four library-only `cargo check` rows stayed in CI as named rows: `--all-targets` clippy unifies dev-dependency features, so it did not cover them.
+- **PR 2 (#581):** as planned, except the `.agents/skills/` pruning. Every skill beyond the model-invoked ones is `disable-model-invocation: true`, so none load into agent context; they stay as user commands. The recipes live in `docs/agents/change-recipes.md` behind a pointer in `AGENTS.md`, and the spike is excluded through a root `.ignore`.
+- **PR 3 (#578):** as planned. The test list was identical before and after across the workspace and all 34 matrix rows.
+- **PR 4 (#584):** went further than planned: one `EndpointBuilder<K>` (std, portable and smoltcp state types) over the non-generic `CommonBuilder`, with `PortableEndpointBuilder`/`SmoltcpEndpointBuilder` as aliases. Linked wasm grew 0.10–0.13% from the shared non-generic code; `twiggy` showed no monomorphization growth, so the zero-growth gate was not met exactly.
+- **PR 5 (#579):** narrowed to the abandon-stream carry policy (`EventCarry::abandon_stream`); `open_stream` was already one call per host. Benched: no change.
+- **PR 6 (#580):** a typecheck in the React Native adapter instead of a code generator: SDK enums must match the UniFFI-generated ones, and `ENUM_FIELDS` must cover every flat-enum event field. The `publish.yml` `core` freshness check was dropped, since nothing in `core` is generated.
+- **Deferred:** `WaitDeadline` got its own module and `minip2p::Swarm`/`PollNext` were dropped (#582); `minip2p-autonat` and `minip2p-dcutr` were folded into `minip2p-nat` (#583, ADR 0033), which supersedes the corresponding non-goal above. Feature consolidation on `minip2p-rs` remains open.
+- **Found along the way:** the `stream_lifecycle` TCP close tests flake because a graceful TCP close can end in a reset that drops the tail and the FIN; tracked for a follow-up fix.
