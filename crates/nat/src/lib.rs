@@ -1,7 +1,7 @@
 //! Sans-I/O NAT-traversal orchestrator for minip2p.
 //!
 //! The protocol machines for relay circuits ([`minip2p_relay`]), hole
-//! punching ([`minip2p_dcutr`]), and reachability probing live in their own
+//! punching ([`dcutr`]), and reachability probing live in their own
 //! crates; this crate provides the relay-leg orchestrator: [`NatAgent`], a
 //! state machine that dials a relay, establishes a circuit, and upgrades to
 //! a punched direct connection when it can. Direct candidate racing and the
@@ -64,8 +64,10 @@ extern crate alloc;
 mod acquire;
 mod agent;
 mod attempt;
+pub mod autonat;
 mod budget;
 mod config;
+pub mod dcutr;
 mod events;
 mod housekeeping;
 mod inbound;
@@ -88,7 +90,7 @@ pub use types::{
 pub use minip2p_core::platform::{Deadline, Now};
 
 // Protocol ids for everything the agent drives, so a driver can register
-// them without depending on each protocol crate.
-pub use minip2p_autonat::AUTONAT_PROTOCOL_ID;
-pub use minip2p_dcutr::DCUTR_PROTOCOL_ID;
+// them from one place.
+pub use crate::autonat::AUTONAT_PROTOCOL_ID;
+pub use crate::dcutr::DCUTR_PROTOCOL_ID;
 pub use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};

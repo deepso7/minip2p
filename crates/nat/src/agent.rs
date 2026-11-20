@@ -7,8 +7,8 @@ use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, sele
 use minip2p_swarm::{HeldWrites, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use minip2p_autonat::AUTONAT_PROTOCOL_ID;
-use minip2p_dcutr::DCUTR_PROTOCOL_ID;
+use crate::autonat::AUTONAT_PROTOCOL_ID;
+use crate::dcutr::DCUTR_PROTOCOL_ID;
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 
 use crate::attempt::ConnectAttempt;

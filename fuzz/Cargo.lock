@@ -407,14 +407,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "minip2p-autonat"
-version = "0.12.0"
-dependencies = [
- "minip2p-core",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-circuit"
 version = "0.12.0"
 dependencies = [
@@ -437,14 +429,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-dcutr"
-version = "0.12.0"
-dependencies = [
- "minip2p-core",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-discovery"
 version = "0.12.0"
 dependencies = [
@@ -458,15 +442,14 @@ name = "minip2p-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "minip2p-autonat",
  "minip2p-circuit",
  "minip2p-core",
- "minip2p-dcutr",
  "minip2p-discovery",
  "minip2p-identify",
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-multistream-select",
+ "minip2p-nat",
  "minip2p-ping",
  "minip2p-pubsub",
  "minip2p-relay",
@@ -513,6 +496,17 @@ name = "minip2p-multistream-select"
 version = "0.12.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-nat"
+version = "0.12.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-relay",
+ "minip2p-swarm",
+ "minip2p-transport",
  "thiserror",
 ]
 

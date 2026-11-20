@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-nat"
-description = "Sans-I/O NAT traversal and hole-punch orchestration for minip2p"
+description = "Sans-I/O NAT traversal for minip2p: AutoNAT, DCUtR, and relay-leg orchestration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,7 @@ workspace = true
 [features]
 default = ["std"]
 std = [
-  "minip2p-autonat/std",
   "minip2p-core/std",
-  "minip2p-dcutr/std",
   "minip2p-relay/std",
   "minip2p-swarm/std",
   "minip2p-transport/std",
@@ -26,9 +24,7 @@ std = [
 ]
 
 [dependencies]
-minip2p-autonat = { path = "../autonat", version = "0.12.0", default-features = false }
 minip2p-core = { path = "../core", version = "0.12.0", default-features = false }
-minip2p-dcutr = { path = "../dcutr", version = "0.12.0", default-features = false }
 minip2p-relay = { path = "../relay", version = "0.12.0", default-features = false }
 minip2p-swarm = { path = "../swarm", version = "0.12.0", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.12.0", default-features = false }

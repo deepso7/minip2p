@@ -9,7 +9,7 @@
 //! - `CONNECT` (100) -- exchange of observed/predicted addresses.
 //! - `SYNC` (300) -- synchronization signal to kick off the simultaneous dial.
 //!
-//! This crate models both roles:
+//! This module models both roles:
 //! - [`DcutrInitiator`] -- we want to upgrade the relay connection. Sends
 //!   CONNECT first, measures RTT, then SYNC.
 //! - [`DcutrResponder`] -- we received a CONNECT from a remote. Replies with
@@ -21,10 +21,6 @@
 //! UDP packets to open its NAT mapping for inbound QUIC packets.
 //!
 //! `no_std` + `alloc` compatible.
-
-#![cfg_attr(not(feature = "std"), no_std)]
-
-extern crate alloc;
 
 mod message;
 

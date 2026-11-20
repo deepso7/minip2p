@@ -18,8 +18,6 @@
 //! this module keeps DCUtR message types, semantic checks, and contextual
 //! [`DcutrMessageError`] values.
 
-extern crate alloc;
-
 use alloc::vec::Vec;
 
 use minip2p_core::{
@@ -28,7 +26,7 @@ use minip2p_core::{
 };
 use thiserror::Error;
 
-use crate::MAX_MESSAGE_SIZE;
+use super::MAX_MESSAGE_SIZE;
 
 // Field numbers for the HolePunch message.
 const FIELD_TYPE: u64 = 1;
@@ -191,7 +189,7 @@ mod tests {
             display.contains("claims length"),
             "wire detail should remain visible: {display}"
         );
-        let wrapped = crate::DcutrError::Malformed(err);
+        let wrapped = crate::dcutr::DcutrError::Malformed(err);
         let outer = alloc::format!("{wrapped}");
         assert!(
             outer.starts_with("malformed DCUtR message:"),
