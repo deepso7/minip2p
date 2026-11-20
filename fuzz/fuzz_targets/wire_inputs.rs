@@ -4,11 +4,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::LazyLock;
 
 use libfuzzer_sys::fuzz_target;
-use minip2p_nat::autonat::{AutoNatClient, AutoNatServer};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr, PeerId, Protocol, TransportKind};
-use minip2p_nat::dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
     PeerDiscoveryAgent, PeerDiscoveryConfig,
@@ -19,6 +17,8 @@ use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
 use minip2p_multistream_select::MultistreamSelect;
+use minip2p_nat::autonat::{AutoNatClient, AutoNatServer};
+use minip2p_nat::dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
