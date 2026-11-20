@@ -1,60 +1,86 @@
 #!/usr/bin/env bash
 set -eu
 
-operation=${1:-}
-case "$operation" in
-check | clippy | test | test-full) ;;
-*)
-  echo "usage: $0 check|clippy|test|test-full" >&2
+usage() {
+  echo "usage: $0 check|clippy|test [ci|full|<row>]" >&2
+  echo "       $0 list" >&2
   exit 2
-  ;;
+}
+
+operation=${1:-}
+selection=${2:-ci}
+case "$operation" in
+check | clippy | test | list) ;;
+*) usage ;;
 esac
 
-# package | default features | explicit features | test tier
+# name | package | default features | explicit features | test tier
 #
-# check and clippy build every row. `test` runs only the `ci` rows, which PRs
-# and pushes to main use; `test-full` runs every row and gates releases. The
-# `ci` rows plus the workspace run already list every test the full matrix
-# does (1,975 distinct package/binary/test identities), so the `release` rows
-# only re-run those tests under other feature combinations: a bug that needs
-# one of those combinations at runtime is caught at release time, not on PRs.
+# Every operation runs the `ci` rows by default, which PRs and pushes to main
+# test; `full` runs every row (CI lints them all, releases test them all), and
+# a row name runs just that row. The `ci` rows plus the workspace run already
+# list every test the full matrix does (1,975 distinct package/binary/test
+# identities), so the `release` rows only re-run those tests under other
+# feature combinations: a bug that needs one of those combinations at runtime
+# is caught at release time, not on PRs. `list` prints the rows as a table.
 matrix=$(cat <<'EOF'
-minip2p-rs|default|autonat|ci
-minip2p-rs|default|relay|release
-minip2p-rs|default|pubsub|release
-minip2p-rs|default|relay,pubsub|release
-minip2p-rs|default|discovery|release
-minip2p-rs|default|mdns|release
-minip2p-rs|default|mdns,pubsub|release
-minip2p-rs|default|discovery,mdns|release
-minip2p-rs|default|discovery,mdns,relay|release
-minip2p-rs|default|relay-server|release
-minip2p-rs|default|relay,relay-server|release
-minip2p-rs|default|relay,relay-server,tcp|release
-minip2p-rs|no-default|std,tcp,relay-server|ci
-minip2p-rs|default|tcp|release
-minip2p-rs|no-default|std,tcp|release
-minip2p-rs|default|discovery,mdns,tcp,relay|release
-minip2p-rs|default|discovery,mdns,tcp,relay,relay-server,bench|ci
-minip2p-rs|no-default|smoltcp|release
-minip2p-rs|no-default|smoltcp,pubsub|ci
-minip2p-rs|no-default|smoltcp,discovery|release
-minip2p-rs|default|relay,smoltcp|release
-minip2p-rs|no-default|autonat|release
-minip2p-rs|no-default|relay|release
-minip2p-rs|no-default|relay,pubsub|release
-minip2p-rs|no-default|relay-server|release
-minip2p-rs|no-default|mdns,discovery|release
-minip2p-rs|no-default|smoltcp,relay,discovery,relay-server|ci
-minip2p-tcp|default|smoltcp|ci
-minip2p-mdns|default|smoltcp|ci
-minip2p-secure-mux|no-default||ci
-minip2p-transport|default|bench|release
-minip2p-quic|default|diagnostics|ci
-minip2p-ffi-core|no-default|serde|release
-minip2p-web|no-default||ci
+autonat|minip2p-rs|default|autonat|ci
+relay|minip2p-rs|default|relay|release
+pubsub|minip2p-rs|default|pubsub|release
+relay-pubsub|minip2p-rs|default|relay,pubsub|release
+discovery|minip2p-rs|default|discovery|release
+mdns|minip2p-rs|default|mdns|release
+mdns-pubsub|minip2p-rs|default|mdns,pubsub|release
+discovery-mdns|minip2p-rs|default|discovery,mdns|release
+discovery-mdns-relay|minip2p-rs|default|discovery,mdns,relay|release
+relay-server|minip2p-rs|default|relay-server|release
+relay-relay-server|minip2p-rs|default|relay,relay-server|release
+relay-relay-server-tcp|minip2p-rs|default|relay,relay-server,tcp|release
+bare-tcp-relay-server|minip2p-rs|no-default|std,tcp,relay-server|ci
+tcp|minip2p-rs|default|tcp|release
+bare-tcp|minip2p-rs|no-default|std,tcp|release
+discovery-mdns-tcp-relay|minip2p-rs|default|discovery,mdns,tcp,relay|release
+everything|minip2p-rs|default|discovery,mdns,tcp,relay,relay-server,bench|ci
+smoltcp|minip2p-rs|no-default|smoltcp|release
+smoltcp-pubsub|minip2p-rs|no-default|smoltcp,pubsub|ci
+smoltcp-discovery|minip2p-rs|no-default|smoltcp,discovery|release
+relay-smoltcp|minip2p-rs|default|relay,smoltcp|release
+bare-autonat|minip2p-rs|no-default|autonat|release
+bare-relay|minip2p-rs|no-default|relay|release
+bare-relay-pubsub|minip2p-rs|no-default|relay,pubsub|release
+bare-relay-server|minip2p-rs|no-default|relay-server|release
+bare-mdns-discovery|minip2p-rs|no-default|mdns,discovery|release
+smoltcp-embedded|minip2p-rs|no-default|smoltcp,relay,discovery,relay-server|ci
+tcp-smoltcp|minip2p-tcp|default|smoltcp|ci
+mdns-smoltcp|minip2p-mdns|default|smoltcp|ci
+secure-mux-bare|minip2p-secure-mux|no-default||ci
+transport-bench|minip2p-transport|default|bench|release
+quic-diagnostics|minip2p-quic|default|diagnostics|ci
+ffi-core-serde|minip2p-ffi-core|no-default|serde|release
+web-bare|minip2p-web|no-default||ci
 EOF
 )
+
+duplicates=$(cut -d'|' -f1 <<<"$matrix" | sort | uniq -d)
+if [ -n "$duplicates" ]; then
+  echo "duplicate matrix row names: $duplicates" >&2
+  exit 1
+fi
+
+if [ "$operation" = list ]; then
+  column -t -s'|' <<<"$matrix"
+  exit 0
+fi
+
+case "$selection" in
+ci | full) ;;
+*)
+  if ! cut -d'|' -f1 <<<"$matrix" | grep -qxF -- "$selection"; then
+    echo "unknown matrix row: $selection (see \`$0 list\`)" >&2
+    exit 2
+  fi
+  ;;
+esac
 
 run() {
   printf '+'
@@ -63,7 +89,13 @@ run() {
   "$@"
 }
 
-while IFS='|' read -r package defaults features tier; do
+while IFS='|' read -r name package defaults features tier; do
+  case "$selection" in
+  ci) [ "$tier" = ci ] || continue ;;
+  full) ;;
+  *) [ "$name" = "$selection" ] || continue ;;
+  esac
+
   set -- -p "$package"
   if [ "$defaults" = "no-default" ]; then
     set -- "$@" --no-default-features
@@ -82,11 +114,6 @@ while IFS='|' read -r package defaults features tier; do
     run cargo clippy "$@" --all-targets -- -D warnings
     ;;
   test)
-    if [ "$tier" = "ci" ]; then
-      run cargo nextest run --profile variants --locked "$@"
-    fi
-    ;;
-  test-full)
     run cargo nextest run --profile variants --locked "$@"
     ;;
   esac
