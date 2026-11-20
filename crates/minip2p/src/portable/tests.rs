@@ -307,6 +307,19 @@ fn a_failed_goodbye_is_an_event_from_shutdown() {
 }
 
 #[test]
+fn builder_protocols_are_numbered_by_first_registration() {
+    let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+    let endpoint = PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())
+        .protocol("/a/1")
+        .manual_ack_protocol("/b/1")
+        .protocol("/a/1")
+        .build(NoopTransport)
+        .expect("portable endpoint configuration is valid");
+    let (a, b) = (endpoint.protocol_id("/a/1"), endpoint.protocol_id("/b/1"));
+    assert!(a.is_some() && b.is_some() && a < b, "{a:?} {b:?}");
+}
+
+#[test]
 fn portable_builder_constructs_a_protocol_ready_endpoint() {
     let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
     let mut endpoint = PortableEndpointBuilder::new(&identity, ZeroEntropy, ManualClock::default())

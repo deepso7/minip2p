@@ -3,6 +3,7 @@ extern crate alloc;
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::string::String;
+#[cfg(any(feature = "relay-server", feature = "smoltcp"))]
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -85,14 +86,13 @@ pub use minip2p_relay_server::{
 /// `CircuitLimits::yamux`.
 #[cfg(any(feature = "tcp", feature = "relay"))]
 pub use minip2p_secure_mux::YamuxConfig;
-use minip2p_swarm::SwarmBuilder;
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
+use crate::common_builder::CommonBuilder;
 pub use crate::endpoint::{CloseOutcome, CloseReport, ConnectionInfo, Endpoint, EndpointStats};
-use crate::engine::Engine;
 use crate::names::Concrete;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
@@ -101,8 +101,7 @@ use crate::platform::PortableCarrier;
 pub use crate::platform::{Platform, Portable};
 #[cfg(feature = "autonat")]
 use crate::setup::NatConfigError;
-use crate::setup::{self, Capabilities, PlatformCaps, SetupError};
-use crate::writes::WriteQueue;
+use crate::setup::{self, PlatformCaps, SetupError};
 pub use minip2p_core::platform::{Clock, ManualClock};
 
 /// A portable endpoint: an [`Endpoint`] on the [`Portable`] platform, over
@@ -368,16 +367,10 @@ impl From<SetupError> for PortableBuildError {
 /// `CircuitTransport` and call `build_with_circuits` (feature `relay`) to
 /// run relays. AutoNAT alone needs nothing from the transport.
 pub struct PortableEndpointBuilder<E, C> {
-    swarm: SwarmBuilder,
-    /// The application protocols `protocol` registered, in order: the
-    /// order their handles number them in.
-    protocols: Vec<String>,
+    common: CommonBuilder,
     identity: Ed25519Keypair,
     entropy: E,
     clock: C,
-    connect_deadline_ms: u64,
-    write_budget: usize,
-    capabilities: Capabilities,
     /// The carrier [`Self::mdns`] hands over with `capabilities.mdns`.
     #[cfg(feature = "mdns")]
     mdns_io: Option<PortableCarrier>,
@@ -388,14 +381,10 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// endpoint call samples.
     pub fn new(identity: &Ed25519Keypair, entropy: E, clock: C) -> Self {
         Self {
-            swarm: SwarmBuilder::new(identity),
-            protocols: Vec::new(),
+            common: CommonBuilder::default(),
             identity: identity.clone(),
             entropy,
             clock,
-            connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
-            write_budget: crate::DEFAULT_WRITE_BUDGET,
-            capabilities: Capabilities::default(),
             #[cfg(feature = "mdns")]
             mdns_io: None,
         }
@@ -403,15 +392,23 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
 
     /// Overrides the Identify agent-version string.
     pub fn agent_version(mut self, value: impl Into<String>) -> Self {
-        self.swarm = self.swarm.agent_version(value);
+        self.common.agent_version = value.into();
         self
     }
 
-    /// Registers an application stream protocol.
+    /// Registers an application stream protocol. A repeat keeps the
+    /// handle numbering of the first registration.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
-        let protocol_id = protocol_id.into();
-        self.protocols.push(protocol_id.clone());
-        self.swarm = self.swarm.protocol(protocol_id);
+        self.common.protocol(protocol_id.into());
+        self
+    }
+
+    /// Registers an application protocol whose received data the
+    /// application acknowledges itself, with
+    /// [`Endpoint::stream_consumed`](crate::Endpoint::stream_consumed) (see
+    /// [`Endpoint::add_manual_ack_protocol`](crate::Endpoint::add_manual_ack_protocol)).
+    pub fn manual_ack_protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        self.common.manual_ack_protocol(protocol_id.into());
         self
     }
 
@@ -420,13 +417,13 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// ([`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS));
     /// both peers should use the same window.
     pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
-        self.swarm = self.swarm.simultaneous_dial_window_ms(duration_ms(window));
+        self.common.set_simultaneous_dial_window(window);
         self
     }
 
     /// Sets the Connection-attempt deadline. Default 30 seconds.
     pub fn connect_deadline(mut self, deadline: Duration) -> Self {
-        self.connect_deadline_ms = duration_ms(deadline);
+        self.common.set_connect_deadline(deadline);
         self
     }
 
@@ -436,7 +433,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// `0` queues nothing, for hosts that use `try_send_stream` and hold
     /// unsent tails themselves.
     pub fn write_budget(mut self, bytes: usize) -> Self {
-        self.write_budget = bytes;
+        self.common.write_budget = bytes;
         self
     }
 
@@ -445,7 +442,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// fails the build with [`SwarmError::ZeroTimeout`]. See the crate
     /// README's deadline table for how they relate to the connect deadline.
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
-        self.swarm = self.swarm.timeouts(timeouts);
+        self.common.timeouts = timeouts;
         self
     }
 
@@ -463,7 +460,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// `build_with_circuits`.
     #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
-        self.capabilities.relays.push(relay);
+        self.common.capabilities.relays.push(relay);
         self
     }
 
@@ -475,7 +472,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// [`Self::nat_config`] or a relay, the endpoint holds no reservation.
     #[cfg(feature = "autonat")]
     pub fn autonat_server(mut self, server: PeerAddr) -> Self {
-        self.capabilities.autonat_servers.push(server);
+        self.common.capabilities.autonat_servers.push(server);
         self
     }
 
@@ -491,7 +488,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// without relays.
     #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.capabilities.nat = Some(config);
+        self.common.capabilities.nat = Some(config);
         self
     }
 
@@ -510,7 +507,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// build.
     #[cfg(feature = "relay-server")]
     pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
-        self.capabilities.relay_server = Some(setup::RelayServerSetup {
+        self.common.capabilities.relay_server = Some(setup::RelayServerSetup {
             config,
             announce_addrs: Vec::new(),
         });
@@ -520,7 +517,8 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// Enables pubsub with interoperable gossipsub defaults.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub(mut self) -> Self {
-        self.capabilities
+        self.common
+            .capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
         self
@@ -530,7 +528,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// at build.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.capabilities.gossipsub = Some(config);
+        self.common.capabilities.gossipsub = Some(config);
         self
     }
 
@@ -544,10 +542,11 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// validated at build.
     #[cfg(feature = "discovery")]
     pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
-        self.capabilities
+        self.common
+            .capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
-        self.capabilities.beacon = Some(config);
+        self.common.capabilities.beacon = Some(config);
         self
     }
 
@@ -555,7 +554,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// validated at build. It applies to every enabled discovery source.
     #[cfg(feature = "_peer-book")]
     pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.capabilities.peer_discovery = config;
+        self.common.capabilities.peer_discovery = config;
         self
     }
 
@@ -570,7 +569,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     #[cfg(feature = "mdns")]
     pub fn mdns(mut self, io: impl MdnsIo + 'static, config: MdnsConfig) -> Self {
         self.mdns_io = Some(Box::new(io));
-        self.capabilities.mdns = Some(config);
+        self.common.capabilities.mdns = Some(config);
         self
     }
 
@@ -600,7 +599,7 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// Validates the capabilities, builds the swarm over `transport`, and
     /// installs them through Endpoint setup.
     fn assemble<T: Transport>(
-        self,
+        mut self,
         transport: T,
         #[cfg(feature = "relay")] circuits: Option<CircuitOps<T>>,
     ) -> Result<PortableEndpoint<T, E, C>, PortableBuildError> {
@@ -609,17 +608,16 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         #[cfg(not(feature = "relay"))]
         let has_circuits = false;
         let validated = setup::validate(
-            self.capabilities,
+            core::mem::take(&mut self.common.capabilities),
             portable_platform(has_circuits),
             &self.identity.peer_id(),
         )?;
         // The swarm owns the entropy from here on; capabilities draw from it.
-        let core = self.swarm.build_core(transport, self.entropy)?;
-        let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
-        engine.writes = WriteQueue::new(self.write_budget);
-        for protocol in &self.protocols {
-            engine.protocols.intern(protocol)?;
-        }
+        let core = self
+            .common
+            .swarm(&self.identity)
+            .build_core(transport, self.entropy)?;
+        let mut engine = self.common.engine(core)?;
         setup::install(
             &mut engine,
             validated,
@@ -649,14 +647,10 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         let entropy = SharedEntropy::new(self.entropy);
         SmoltcpEndpointBuilder {
             portable: PortableEndpointBuilder {
-                swarm: self.swarm,
-                protocols: self.protocols,
+                common: self.common,
                 identity: self.identity,
                 entropy: entropy.clone(),
                 clock: self.clock,
-                connect_deadline_ms: self.connect_deadline_ms,
-                write_budget: self.write_budget,
-                capabilities: self.capabilities,
                 mdns_io: self.mdns_io,
             },
             entropy,
@@ -669,11 +663,6 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
             mdns: None,
         }
     }
-}
-
-/// Whole milliseconds in `duration`, saturating.
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
@@ -729,6 +718,14 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
     /// Registers an application stream protocol.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         self.portable = self.portable.protocol(protocol_id);
+        self
+    }
+
+    /// Registers an application protocol whose received data the
+    /// application acknowledges itself (see
+    /// [`PortableEndpointBuilder::manual_ack_protocol`]).
+    pub fn manual_ack_protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        self.portable = self.portable.manual_ack_protocol(protocol_id);
         self
     }
 

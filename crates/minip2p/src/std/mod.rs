@@ -114,7 +114,8 @@ pub enum EndpointWaitOutcome {
     Interrupted,
 }
 
-pub(crate) const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
+#[cfg(all(test, feature = "quic"))]
+use crate::common_builder::DEFAULT_AGENT_VERSION;
 
 /// Transport used by [`Endpoint`]. With relays built, relay bridges are
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.

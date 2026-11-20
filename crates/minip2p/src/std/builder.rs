@@ -18,11 +18,10 @@ use crate::NatConfig;
 use crate::PeerDiscoveryConfig;
 #[cfg(all(feature = "relay-server", feature = "quic"))]
 use crate::RelayMeshConfig;
-use crate::engine::Engine;
+use crate::common_builder::CommonBuilder;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
 use crate::setup::{self, Capabilities};
-use crate::writes::WriteQueue;
 #[cfg(feature = "relay-server")]
 use crate::{RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig};
 use minip2p_core::Multiaddr;
@@ -33,7 +32,9 @@ use minip2p_core::TransportKind;
 use minip2p_core::platform::{StdClock, StdEntropy};
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicNodeConfig, QuicTransport, WebTransportCertificates};
-use minip2p_swarm::{SwarmBuilder, SwarmTimeouts};
+#[cfg(all(feature = "relay-server", feature = "quic"))]
+use minip2p_swarm::SwarmBuilder;
+use minip2p_swarm::SwarmTimeouts;
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -43,8 +44,6 @@ use minip2p_transport::SharedPoll;
 use minip2p_transport::Transport;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
-
-use crate::portable::{DEFAULT_CONNECT_DEADLINE_MS, StreamAcks};
 
 /// Default dual-stack QUIC listen addresses used by
 /// [`EndpointBuilder::listen_default`].
@@ -65,9 +64,12 @@ pub(super) fn default_listen_quic_addrs() -> [Multiaddr; 2] {
 }
 
 /// Builder for [`Endpoint`].
+#[derive(Default)]
 pub struct EndpointBuilder {
     keypair: Option<Ed25519Keypair>,
-    agent_version: String,
+    /// The options every endpoint builder shares; the relay server joins
+    /// its capabilities at bind.
+    common: CommonBuilder,
     #[cfg(feature = "quic")]
     quic_limits: QuicLimits,
     /// What WebTransport listeners present to browsers.
@@ -78,9 +80,6 @@ pub struct EndpointBuilder {
     /// Ordered listen addresses; transport is inferred from address shape.
     #[cfg(any(feature = "quic", feature = "tcp"))]
     listen_addrs: Vec<Multiaddr>,
-    protocols: Vec<String>,
-    /// Registered protocols whose data the application acknowledges itself.
-    manual_ack_protocols: Vec<String>,
     #[cfg(feature = "relay-server")]
     relay_server_config: Option<RelayServerConfig>,
     #[cfg(feature = "relay-server")]
@@ -89,47 +88,6 @@ pub struct EndpointBuilder {
     relay_mesh: Option<RelayMeshConfig>,
     #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
-    /// Capability intent for Endpoint setup, which applies the defaults; the
-    /// relay server joins it at bind.
-    capabilities: Capabilities,
-    connect_deadline: std::time::Duration,
-    simultaneous_dial_window: std::time::Duration,
-    timeouts: SwarmTimeouts,
-    write_budget: usize,
-}
-
-impl Default for EndpointBuilder {
-    fn default() -> Self {
-        Self {
-            keypair: None,
-            agent_version: DEFAULT_AGENT_VERSION.to_string(),
-            connect_deadline: std::time::Duration::from_millis(DEFAULT_CONNECT_DEADLINE_MS),
-            simultaneous_dial_window: std::time::Duration::from_millis(
-                minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS,
-            ),
-            timeouts: SwarmTimeouts::default(),
-            write_budget: crate::DEFAULT_WRITE_BUDGET,
-            #[cfg(feature = "quic")]
-            quic_limits: QuicLimits::default(),
-            #[cfg(feature = "quic")]
-            webtransport_certificates: WebTransportCertificates::Derived,
-            #[cfg(feature = "tcp")]
-            tcp_config: TcpConfig::default(),
-            #[cfg(any(feature = "quic", feature = "tcp"))]
-            listen_addrs: Vec::new(),
-            protocols: Vec::new(),
-            manual_ack_protocols: Vec::new(),
-            #[cfg(feature = "relay-server")]
-            relay_server_config: None,
-            #[cfg(feature = "relay-server")]
-            relay_server_announce_addrs: Vec::new(),
-            #[cfg(all(feature = "relay-server", feature = "quic"))]
-            relay_mesh: None,
-            #[cfg(feature = "relay")]
-            circuit_limits: CircuitLimits::default(),
-            capabilities: Capabilities::default(),
-        }
-    }
 }
 
 impl EndpointBuilder {
@@ -141,13 +99,13 @@ impl EndpointBuilder {
 
     /// Overrides the Identify `agentVersion` string.
     pub fn agent_version(mut self, value: impl Into<String>) -> Self {
-        self.agent_version = value.into();
+        self.common.agent_version = value.into();
         self
     }
 
     /// Sets the Connection-attempt deadline. Default is 30 seconds.
     pub fn connect_deadline(mut self, deadline: Duration) -> Self {
-        self.connect_deadline = deadline;
+        self.common.set_connect_deadline(deadline);
         self
     }
 
@@ -160,7 +118,7 @@ impl EndpointBuilder {
     /// connection died silently get back in sooner, at the cost of settling
     /// slow candidate races less reliably.
     pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
-        self.simultaneous_dial_window = window;
+        self.common.set_simultaneous_dial_window(window);
         self
     }
 
@@ -174,7 +132,7 @@ impl EndpointBuilder {
     /// [`connect_deadline`](Self::connect_deadline) and, on TCP,
     /// `TcpConfig::handshake_timeout_ms` (see `tcp_config` for an example).
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
-        self.timeouts = timeouts;
+        self.common.timeouts = timeouts;
         self
     }
 
@@ -187,7 +145,7 @@ impl EndpointBuilder {
     /// `0` queues nothing: use [`Endpoint::try_send_stream`] and hold
     /// unsent tails yourself.
     pub fn write_budget(mut self, bytes: usize) -> Self {
-        self.write_budget = bytes;
+        self.common.write_budget = bytes;
         self
     }
 
@@ -344,10 +302,7 @@ impl EndpointBuilder {
     /// one makes the bind step fail with
     /// [`SwarmError::ReservedProtocol`].
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
-        let id = protocol_id.into();
-        if !self.protocols.iter().any(|protocol| protocol == &id) {
-            self.protocols.push(id);
-        }
+        self.common.protocol(protocol_id.into());
         self
     }
 
@@ -355,11 +310,8 @@ impl EndpointBuilder {
     /// application acknowledges itself, with [`Endpoint::stream_consumed`]
     /// (see [`Endpoint::add_manual_ack_protocol`]).
     pub fn manual_ack_protocol(mut self, protocol_id: impl Into<String>) -> Self {
-        let id = protocol_id.into();
-        if !self.manual_ack_protocols.contains(&id) {
-            self.manual_ack_protocols.push(id.clone());
-        }
-        self.protocol(id)
+        self.common.manual_ack_protocol(protocol_id.into());
+        self
     }
 
     /// Enables Circuit Relay v2 service with production-oriented defaults.
@@ -499,7 +451,7 @@ impl EndpointBuilder {
     /// connects set [`NatConfig::force_relay`].
     #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
-        self.capabilities.relays.push(relay);
+        self.common.capabilities.relays.push(relay);
         self
     }
 
@@ -513,7 +465,7 @@ impl EndpointBuilder {
     /// reservation ([`ReservationPolicy::Never`](crate::ReservationPolicy::Never)).
     #[cfg(feature = "autonat")]
     pub fn autonat_server(mut self, server: PeerAddr) -> Self {
-        self.capabilities.autonat_servers.push(server);
+        self.common.capabilities.autonat_servers.push(server);
         self
     }
 
@@ -530,7 +482,7 @@ impl EndpointBuilder {
     /// configuration, discovery and mDNS turn NAT on for the peers they find.
     #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.capabilities.nat = Some(config);
+        self.common.capabilities.nat = Some(config);
         self
     }
 
@@ -541,7 +493,8 @@ impl EndpointBuilder {
     /// set from the first handshake.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub(mut self) -> Self {
-        self.capabilities
+        self.common
+            .capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
         self
@@ -553,7 +506,7 @@ impl EndpointBuilder {
     /// before a socket is allocated.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.capabilities.gossipsub = Some(config);
+        self.common.capabilities.gossipsub = Some(config);
         self
     }
 
@@ -564,10 +517,11 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
-        self.capabilities
+        self.common
+            .capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
-        self.capabilities.beacon = Some(BeaconConfig::default());
+        self.common.capabilities.beacon = Some(BeaconConfig::default());
         self
     }
 
@@ -579,17 +533,18 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
-        self.capabilities
+        self.common
+            .capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
-        self.capabilities.beacon = Some(config);
+        self.common.capabilities.beacon = Some(config);
         self
     }
 
     /// Enables local-link mDNS discovery with interoperable defaults.
     #[cfg(feature = "mdns")]
     pub fn mdns(mut self) -> Self {
-        self.capabilities.mdns = Some(MdnsConfig::default());
+        self.common.capabilities.mdns = Some(MdnsConfig::default());
         self
     }
 
@@ -598,7 +553,7 @@ impl EndpointBuilder {
     /// ([`BindError::Mdns`]).
     #[cfg(feature = "mdns")]
     pub fn mdns_config(mut self, config: MdnsConfig) -> Self {
-        self.capabilities.mdns = Some(config);
+        self.common.capabilities.mdns = Some(config);
         self
     }
 
@@ -608,7 +563,7 @@ impl EndpointBuilder {
     /// This policy is shared by every enabled discovery source.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.capabilities.peer_discovery = config;
+        self.common.capabilities.peer_discovery = config;
         self
     }
 
@@ -654,9 +609,10 @@ impl EndpointBuilder {
     /// nor be masked by a bind failure. Capabilities are validated by
     /// Endpoint setup, also before binding.
     fn validate(&self) -> Result<(), BindError> {
-        self.timeouts.validate()?;
+        self.common.timeouts.validate()?;
         if let Some(protocol) = self
-            .protocols
+            .common
+            .protocols()
             .iter()
             .find(|protocol| RESERVED_PROTOCOL_IDS.contains(&protocol.as_str()))
         {
@@ -746,7 +702,7 @@ impl EndpointBuilder {
             not(feature = "relay-server"),
             expect(unused_mut, reason = "only the relay server joins here")
         )]
-        let mut capabilities = std::mem::take(&mut self.capabilities);
+        let mut capabilities = std::mem::take(&mut self.common.capabilities);
         #[cfg(feature = "relay-server")]
         if let Some(config) = self.relay_server_config.take() {
             // A mesh node's agent gets the public key and the proof it
@@ -1112,30 +1068,14 @@ pub(super) fn build_endpoint(
     #[cfg(feature = "relay-server")]
     let ca_webtransport_certificate = options.ca_webtransport_certificate();
     #[cfg(all(feature = "relay-server", feature = "quic"))]
-    let relay_mesh = options
-        .relay_mesh
-        .clone()
-        .map(|mesh| (mesh, options.agent_version.clone(), options.timeouts));
-    let mut builder = SwarmBuilder::new(&keypair)
-        .agent_version(options.agent_version)
-        .simultaneous_dial_window_ms(
-            u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
+    let relay_mesh = options.relay_mesh.clone().map(|mesh| {
+        (
+            mesh,
+            options.common.agent_version.clone(),
+            options.common.timeouts,
         )
-        .timeouts(options.timeouts);
-    // Numbered in registration order, like the portable builder's.
-    let mut protocols = crate::protocols::ProtocolTable::default();
-    for protocol in options.protocols {
-        if protocols.intern(&protocol).is_err() {
-            return Err(BindError::Invariant {
-                reason: crate::protocols::TABLE_FULL,
-            });
-        }
-        builder = builder.protocol(protocol);
-    }
-    let mut acks = StreamAcks::default();
-    for protocol in options.manual_ack_protocols {
-        acks.set_manual(protocol, []);
-    }
+    });
+    let mut common = options.common;
     #[cfg(feature = "relay")]
     let mut transport = minip2p_circuit::CircuitTransport::with_limits(
         transport,
@@ -1165,14 +1105,16 @@ pub(super) fn build_endpoint(
         }
         None => None,
     };
-    let core = builder.build_core(transport, StdEntropy::new())?;
-    let mut engine = Engine::new(
-        core,
-        u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
-        acks,
-    );
-    engine.writes = WriteQueue::new(options.write_budget);
-    engine.protocols = protocols;
+    let core = common
+        .swarm(&keypair)
+        .build_core(transport, StdEntropy::new())?;
+    // Numbering the protocols can only fail on a full table.
+    let mut engine = common.engine(core).map_err(|error| BindError::Invariant {
+        reason: match error {
+            crate::DriverError::Invariant { reason } => reason,
+            _ => crate::protocols::TABLE_FULL,
+        },
+    })?;
     setup::install(
         &mut engine,
         capabilities,
