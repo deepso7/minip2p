@@ -612,12 +612,9 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
             portable_platform(has_circuits),
             &self.identity.peer_id(),
         )?;
+        let (swarm, parts) = self.common.into_parts(&self.identity)?;
         // The swarm owns the entropy from here on; capabilities draw from it.
-        let core = self
-            .common
-            .swarm(&self.identity)
-            .build_core(transport, self.entropy)?;
-        let mut engine = self.common.engine(core)?;
+        let mut engine = parts.engine(swarm.build_core(transport, self.entropy)?);
         setup::install(
             &mut engine,
             validated,

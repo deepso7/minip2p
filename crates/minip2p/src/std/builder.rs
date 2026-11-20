@@ -1075,7 +1075,17 @@ pub(super) fn build_endpoint(
             options.common.timeouts,
         )
     });
-    let mut common = options.common;
+    // Numbering the protocols can only fail on a full table.
+    let (swarm, parts) =
+        options
+            .common
+            .into_parts(&keypair)
+            .map_err(|error| BindError::Invariant {
+                reason: match error {
+                    crate::DriverError::Invariant { reason } => reason,
+                    _ => crate::protocols::TABLE_FULL,
+                },
+            })?;
     #[cfg(feature = "relay")]
     let mut transport = minip2p_circuit::CircuitTransport::with_limits(
         transport,
@@ -1105,16 +1115,7 @@ pub(super) fn build_endpoint(
         }
         None => None,
     };
-    let core = common
-        .swarm(&keypair)
-        .build_core(transport, StdEntropy::new())?;
-    // Numbering the protocols can only fail on a full table.
-    let mut engine = common.engine(core).map_err(|error| BindError::Invariant {
-        reason: match error {
-            crate::DriverError::Invariant { reason } => reason,
-            _ => crate::protocols::TABLE_FULL,
-        },
-    })?;
+    let mut engine = parts.engine(swarm.build_core(transport, StdEntropy::new())?);
     setup::install(
         &mut engine,
         capabilities,

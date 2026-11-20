@@ -88,44 +88,56 @@ impl CommonBuilder {
         &self.protocols
     }
 
-    /// The swarm builder these options configure, for `keypair`.
-    pub(crate) fn swarm(&self, keypair: &Ed25519Keypair) -> SwarmBuilder {
-        self.protocols.iter().fold(
-            SwarmBuilder::new(keypair)
-                .agent_version(self.agent_version.clone())
-                .simultaneous_dial_window_ms(self.simultaneous_dial_window_ms)
-                .timeouts(self.timeouts),
-            |swarm, protocol| swarm.protocol(protocol.clone()),
-        )
-    }
-
-    /// The endpoint engine over `core`, the swarm built from
-    /// [`Self::swarm`]: its connect deadline, write budget, acknowledgement
-    /// modes, and protocol handles numbered in registration order. The
-    /// capabilities stay here for Endpoint setup.
-    pub(crate) fn engine<T: Transport, E: EntropySource, M: Carrier>(
-        &mut self,
-        core: SwarmCore<T, E>,
-    ) -> Result<Engine<T, E, M>, DriverError> {
-        let (acks, protocols) = self.tables()?;
-        let mut engine = Engine::new(core, self.connect_deadline_ms, acks);
-        engine.writes = WriteQueue::new(self.write_budget);
-        engine.protocols = protocols;
-        Ok(engine)
-    }
-
-    /// The engine's acknowledgement modes and protocol table, kept out of
-    /// the generic [`Self::engine`] so they are compiled once.
-    fn tables(&mut self) -> Result<(StreamAcks, ProtocolTable), DriverError> {
+    /// Splits the options into the swarm builder they configure for
+    /// `keypair` and what the engine needs once that swarm is built, with
+    /// protocol handles numbered in registration order. Take the
+    /// capabilities out first; they go to Endpoint setup.
+    pub(crate) fn into_parts(
+        self,
+        keypair: &Ed25519Keypair,
+    ) -> Result<(SwarmBuilder, EngineParts), DriverError> {
         let mut acks = StreamAcks::default();
-        for protocol in self.manual_ack_protocols.drain(..) {
+        for protocol in self.manual_ack_protocols {
             acks.set_manual(protocol, []);
         }
-        let mut protocols = ProtocolTable::default();
-        for protocol in &self.protocols {
-            protocols.intern(protocol)?;
+        let mut table = ProtocolTable::default();
+        let mut swarm = SwarmBuilder::new(keypair)
+            .agent_version(self.agent_version)
+            .simultaneous_dial_window_ms(self.simultaneous_dial_window_ms)
+            .timeouts(self.timeouts);
+        for protocol in self.protocols {
+            table.intern(&protocol)?;
+            swarm = swarm.protocol(protocol);
         }
-        Ok((acks, protocols))
+        let parts = EngineParts {
+            connect_deadline_ms: self.connect_deadline_ms,
+            write_budget: self.write_budget,
+            acks,
+            protocols: table,
+        };
+        Ok((swarm, parts))
+    }
+}
+
+/// What [`CommonBuilder::into_parts`] leaves for the engine.
+pub(crate) struct EngineParts {
+    connect_deadline_ms: u64,
+    write_budget: usize,
+    acks: StreamAcks,
+    protocols: ProtocolTable,
+}
+
+impl EngineParts {
+    /// The endpoint engine over `core`, the swarm built from the parts'
+    /// swarm builder.
+    pub(crate) fn engine<T: Transport, E: EntropySource, M: Carrier>(
+        self,
+        core: SwarmCore<T, E>,
+    ) -> Engine<T, E, M> {
+        let mut engine = Engine::new(core, self.connect_deadline_ms, self.acks);
+        engine.writes = WriteQueue::new(self.write_budget);
+        engine.protocols = self.protocols;
+        engine
     }
 }
 
