@@ -81,9 +81,7 @@ use minip2p_core::platform::{Clock, Now, StdClock, StdEntropy};
 pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "quic")]
 pub use minip2p_quic::{CongestionController, QuicBindError, QuicLimits};
-pub use minip2p_swarm::{
-    DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, WaitDeadline,
-};
+pub use minip2p_swarm::{DriverError as Error, RESERVED_PROTOCOL_IDS, SwarmError, WaitDeadline};
 use minip2p_transport::SharedPoll;
 pub use minip2p_transport::{TransportError, TransportSet, WaitHandle};
 
