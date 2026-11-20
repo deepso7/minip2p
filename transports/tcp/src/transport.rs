@@ -19,6 +19,10 @@ use minip2p_transport::{
 use crate::config::TcpConfig;
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
 
+/// Longest a gracefully closed socket waits for the peer to close its side
+/// before it is aborted. See [`TcpTransport::closing`].
+const CLOSE_LINGER_MS: u64 = 10_000;
+
 /// Why a connection is being torn down.
 struct Teardown(ConnectionCloseReason);
 
@@ -178,6 +182,14 @@ pub struct TcpTransport<P, E> {
     /// Each connection's next wake-up -- authentication, keepalive, or stall
     /// deadline, or 0 for straight away -- ordered so the earliest is first.
     timers: BTreeSet<(u64, ConnectionId)>,
+    /// Sockets of gracefully closed connections, kept until the peer closes
+    /// its side too, with when to give up on that (`None` until the next poll
+    /// stamps it). Dropping a socket while the peer still sends -- a window
+    /// update for bytes it is reading, say -- makes the kernel answer with a
+    /// reset, and a reset discards whatever the peer had not read yet. The
+    /// provider reads and discards what arrives meanwhile, and its `Closed`
+    /// ends the wait.
+    closing: BTreeMap<SocketHandle, Option<u64>>,
 }
 
 impl<P, E> TcpTransport<P, E> {
@@ -213,6 +225,7 @@ impl<P, E> TcpTransport<P, E> {
             pending: VecDeque::new(),
             work: BTreeSet::new(),
             timers: BTreeSet::new(),
+            closing: BTreeMap::new(),
         }
     }
 
@@ -603,6 +616,10 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 self.close_from_provider(socket, "remote closed its write side".to_string());
             }
             TcpEvent::Closed { socket, reason } => {
+                // A lingering socket's wait is over; it names no connection.
+                if self.closing.remove(&socket).is_some() {
+                    return;
+                }
                 let message = reason.unwrap_or_else(|| "byte stream closed".to_string());
                 self.close_from_provider(socket, message);
             }
@@ -730,6 +747,20 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             self.work.remove(&id);
         }
         self.reschedule(id);
+    }
+
+    /// Stamps new lingering sockets with their deadline and aborts those
+    /// whose peer never closed in time.
+    fn linger(&mut self, now: Now) {
+        let provider = &mut self.provider;
+        self.closing.retain(|&socket, deadline| {
+            let at = *deadline.get_or_insert(now.monotonic_ms.saturating_add(CLOSE_LINGER_MS));
+            if now.monotonic_ms < at {
+                return true;
+            }
+            provider.abort(socket);
+            false
+        });
     }
 
     /// Ends the connection on `socket` after the byte stream under it ended
@@ -951,7 +982,9 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             && (drained
                 || (connection.outbound.is_empty() && !connection.session.has_pending_write()))
             && self.provider.close_write(connection.socket).is_ok();
-        if !graceful {
+        if graceful {
+            self.closing.insert(connection.socket, None);
+        } else {
             self.provider.abort(connection.socket);
         }
         // Every write side ended with the connection.
@@ -975,6 +1008,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         for event in events {
             self.handle_provider_event(event);
         }
+        self.linger(now);
         // Only connections with work: those queued since the last poll --
         // including every one a provider event above just drove -- and those
         // whose wake-up has come.
@@ -997,12 +1031,15 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 
     /// Bytes the socket has not taken yet, or a session still holding
     /// frames or window-blocked stream bytes. What the socket took is the
-    /// operating system's (or the provider's stack's) to deliver.
+    /// operating system's (or the provider's stack's) to deliver, so a
+    /// gracefully closed socket counts until the peer has closed its side
+    /// too: dropping it sooner can reset the stream and lose that tail.
     fn has_pending_writes(&self) -> bool {
-        self.connections.values().any(|connection| {
-            !connection.outbound.is_empty()
-                || (connection.linked && connection.session.has_unsent_writes())
-        })
+        !self.closing.is_empty()
+            || self.connections.values().any(|connection| {
+                !connection.outbound.is_empty()
+                    || (connection.linked && connection.session.has_unsent_writes())
+            })
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
@@ -1015,7 +1052,16 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             .timers
             .first()
             .map(|&(at, _)| Deadline::from_millis(at));
-        Deadline::earliest_opt(own, self.provider.next_deadline())
+        // An unstamped linger is stamped by the next poll, so it is due now.
+        let linger = self
+            .closing
+            .values()
+            .map(|at| at.map_or(Deadline::IMMEDIATE, Deadline::from_millis))
+            .min();
+        Deadline::earliest_opt(
+            Deadline::earliest_opt(own, linger),
+            self.provider.next_deadline(),
+        )
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {

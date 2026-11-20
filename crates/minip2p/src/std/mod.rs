@@ -576,8 +576,11 @@ impl Endpoint {
     /// First it [`flush`](Self::flush)es, within the same `timeout`, so
     /// bytes and FINs the endpoint accepted go out before the connections
     /// close; what is still pending when the deadline passes is lost (QUIC
-    /// discards it and TCP may abort). With [`Duration::ZERO`] this is an
-    /// immediate best-effort teardown: one pass flushes once, disconnects,
+    /// discards it and TCP may abort). A TCP connection closed gracefully
+    /// then waits, within the same `timeout`, for the peer to close its side:
+    /// dropping the socket sooner can reset it and lose what the peer had not
+    /// read yet. With [`Duration::ZERO`] this is an immediate best-effort
+    /// teardown: one pass flushes once, disconnects,
     /// and hands over what is already queued. Running out
     /// the deadline is [`CloseOutcome::DeadlineExpired`], not an error, and
     /// [`CloseReport::unfinished`] lists what was still tracked.
@@ -682,15 +685,23 @@ impl Endpoint {
         report.unfinished = self.tracked_connections();
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         report.unfinished.extend(self.engine.backbone_connections());
-        if report.outcome == CloseOutcome::Drained && !report.unfinished.is_empty() {
+        // A TCP socket still waiting for its peer's close is cut off too,
+        // though its connection is no longer tracked.
+        let lingering =
+            minip2p_transport::Transport::has_pending_writes(self.engine.core.transport());
+        if report.outcome == CloseOutcome::Drained && (!report.unfinished.is_empty() || lingering) {
             report.outcome = CloseOutcome::DeadlineExpired;
         }
         report
     }
 
     fn close_drain_busy(&self) -> bool {
+        // A TCP socket closed gracefully counts as a pending write until the
+        // peer closes its side; dropping it sooner can reset the stream and
+        // lose what the peer had not read yet.
         let busy = !self.engine.core.connected_peers().is_empty()
-            || self.engine.core.has_tracked_connections();
+            || self.engine.core.has_tracked_connections()
+            || minip2p_transport::Transport::has_pending_writes(self.engine.core.transport());
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         let busy = busy || !self.engine.backbone_connections().is_empty();
         busy

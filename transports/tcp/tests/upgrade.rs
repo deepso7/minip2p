@@ -603,6 +603,37 @@ fn closing_a_flushed_socket_too_full_for_the_go_away_still_half_closes() {
     );
 }
 
+/// Dropping a half-closed socket while the peer still sends makes the kernel
+/// reset it, discarding what the peer had not read; so a graceful close
+/// counts as pending until the peer closes too, or the linger runs out.
+#[test]
+fn a_gracefully_closed_socket_is_pending_until_the_peer_closes() {
+    let mut pair = upgraded_pair();
+    pair.dialer.close(pair.connection).expect("close");
+    assert!(pair.dialer.has_pending_writes(), "waits for the peer");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    assert!(
+        !pair.dialer.has_pending_writes(),
+        "the peer closed its side"
+    );
+
+    // A peer that never closes is aborted once the linger runs out.
+    let mut pair = upgraded_pair();
+    pair.dialer.close(pair.connection).expect("close");
+    let aborts = pair.dialer.provider().abort_calls();
+    let _ = pair.dialer.poll(Now::from_millis(1_000)).expect("closed");
+    let _ = pair.dialer.poll(Now::from_millis(1_000)).expect("stamps");
+    let _ = pair.dialer.poll(Now::from_millis(10_999)).expect("lingers");
+    assert!(pair.dialer.has_pending_writes());
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(11_000))
+    );
+    let _ = pair.dialer.poll(Now::from_millis(11_000)).expect("expires");
+    assert!(!pair.dialer.has_pending_writes());
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
+}
+
 #[test]
 fn closing_with_window_blocked_bytes_aborts_when_the_go_away_does_not_fit() {
     let mut pair = upgraded_pair();

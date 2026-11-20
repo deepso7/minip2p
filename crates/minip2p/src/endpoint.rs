@@ -179,7 +179,9 @@ pub enum CloseOutcome {
     /// The deadline passed with connections still tracked; they are listed
     /// in [`CloseReport::unfinished`] and are torn down without waiting. A
     /// portable close does not wait, so anything it leaves tracked ends
-    /// here, as a std `close_within(Duration::ZERO)` does.
+    /// here, as a std `close_within(Duration::ZERO)` does. A std close also
+    /// ends here, with `unfinished` possibly empty, when a gracefully closed
+    /// TCP socket was still waiting for its peer to close.
     DeadlineExpired,
     /// Driving the transports failed, which ended the teardown early; the
     /// failure is the last of [`CloseReport::errors`]. A failed disconnect
