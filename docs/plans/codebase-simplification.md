@@ -51,6 +51,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 ### PR 1 — Single-source verification matrix, faster local loop, and publish-order verification
 
 **Problem:** Feature and target commands are duplicated across 6 places:
+
 - `scripts/run-feature-matrix.sh` (34 rows: 10 `ci`, 24 `release`)
 - `justfile:33-85` (`check-nostd`, `check-wasm`, `docs`, `package-check`)
 - `.github/workflows/ci.yml:92-128` (4 redundant `cargo check` lines + copy-pasted `nostd`, `wasm`, `docs`, `package-check`, already drifted on `--allow-dirty` and `grep` vs `rg`)
@@ -58,6 +59,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 - `.github/workflows/publish.yml:768-792` (hand-ordered 23-crate publish list)
 
 **Changes:**
+
 1. **Unify the matrix definition into one data file + driver script** (e.g. `scripts/matrix.tsv` or structured rows inside `scripts/run-feature-matrix.sh` plus a single target-check driver script) covering:
    - Host feature rows (`check`, `clippy`, `test`, `test-full`) with **unique short row names** so a human or agent can run a single row (e.g. `just matrix clippy smoltcp` or `scripts/run-feature-matrix.sh clippy --row <name>`).
    - `nostd` (`thumbv7em-none-eabi`), `wasm` (`wasm32-unknown-unknown`), `docs`, and `package-check` lists.
@@ -75,6 +77,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
    - Keep `publish.yml`'s existing per-crate HTTP 200 skip + retry loop intact (do not blindly swap to `cargo publish --workspace` without preserving resumability on partial release failures).
 
 **Verification:**
+
 - `just fmt`, `just dev`, `just clippy full`, `just test`, `just check-nostd`, `just check-wasm`, `just docs`, `just package-check`
 - `node --test bindings/ts/tests/workflows/publish.test.mjs`
 - Verify single-row invocation works (e.g. running one named row only)
@@ -86,6 +89,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 **Problem:** Agents waste turns rediscovering implicit registration sites, skill prompts carry ~30 overlapping vendored skills, `scripts/` is an ungrouped 18-file folder, and `docs/research/quinn-proto-spike/` injects `libp2p::SwarmBuilder` into repo-wide searches.
 
 **Changes:**
+
 1. **Add a concise "Change recipes" table to `AGENTS.md`** mapping common tasks to exact touch points and focused verification commands:
    - Adding a new application protocol (`SwarmBuilder::protocol` / `EndpointBuilder::protocol`)
    - Adding a new endpoint capability / Cargo feature (crate, `crates/minip2p/Cargo.toml`, `setup.rs`, `engine.rs`, builder, matrix data file, `ffi-core` config if exposed)
@@ -93,7 +97,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
    - Adding a new binding method/config field (`minip2p`, `ffi-core`, `ffi`, `nodejs`, `web`, `bindings/ts/*`)
    - Document the remaining useful `just` recipes (`dev`, `check`, `docs`, `package-check`, `bindings-check`, `bench-build`) and note `crates/circuit`, `crates/smoltcp`, `crates/test-support` in the layer summary.
 2. **Add lightweight directory maps:**
-   - `scripts/README.md` grouping the 18 scripts into *local dev/CI*, *benchmarks*, *release*, and *relay container/installer* (avoid moving script paths unless every workflow/justfile reference is updated).
+   - `scripts/README.md` grouping the 18 scripts into _local dev/CI_, _benchmarks_, _release_, and _relay container/installer_ (avoid moving script paths unless every workflow/justfile reference is updated).
    - `tests/README.md` accurately documenting **both** `tests/interop/` (linking to `tests/interop/README.md`) **and** `tests/support/` (`endpoint.rs`, `relay.rs`, `relay_interop.rs`, included via `#[path = ...]` across `crates/minip2p`, `crates/ffi`, and `examples/chat`).
    - Add a one-line historical note in `docs/adr/` (or `docs/adr/README.md` / `0015-withdrawn.md` if appropriate) explaining the `0014` → `0016` numbering gap only if confirmed unused.
 3. **Exclude `docs/research/quinn-proto-spike/` from code search:**
@@ -103,6 +107,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
    - Audit `.agents/skills/` against `skills-lock.json` and `.claude/skills/` (every entry in `.claude/skills/` is a symlink to `../../.agents/skills/*`). Remove only genuinely unused/redundant overlapping skills (e.g. duplicate `grill-*` / `implement-*` / `improve-*` variants), updating **`skills-lock.json`** and removing the corresponding **`.claude/skills/*` symlinks** in lockstep so zero broken symlinks remain. Leave `docs/.agents/skills/` untouched.
 
 **Verification:**
+
 - `find .claude/skills -xtype l` returns empty (no broken symlinks)
 - `rg SwarmBuilder` no longer hits `docs/research/quinn-proto-spike/`
 - `just docs-site` and `just test` pass
@@ -114,9 +119,10 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 **Problem:** Production files carry 850–2,000 LOC of inline unit tests, and two standalone test files are 2,848–4,518 LOC, hurting readability and agent context budgets. (Note: `crates/relay-server/src/agent.rs:3164` only has 26 lines of inline tests — do **not** touch it.)
 
 **Changes (strictly zero behavior change):**
+
 1. **Extract large inline `#[cfg(test)]` modules using the repo's `#[path = "..._tests.rs"]` convention** (following `crates/minip2p/src/setup.rs:538-540`, so tests retain `super::*` access to private items without widening production visibility to `pub(crate)`):
    - `crates/minip2p/src/connect.rs` (inline tests starting ~line 1563, ~1,900 LOC) → `connect_tests.rs`
-   - `crates/minip2p/src/portable/mod.rs` (inline tests starting ~line 951, ~857 LOC) → `portable/tests.rs` *(do this before PR 4!)*
+   - `crates/minip2p/src/portable/mod.rs` (inline tests starting ~line 951, ~857 LOC) → `portable/tests.rs` _(do this before PR 4!)_
    - `crates/circuit/src/lib.rs` (inline tests starting ~line 1216, ~2,000 LOC) → `tests.rs`
    - `crates/swarm/src/driver.rs` (inline tests starting ~line 620, ~1,830 LOC) → `driver_tests.rs`
    - `crates/swarm/src/core.rs` (inline tests starting ~line 1098, ~1,403 LOC) → `core_tests.rs`
@@ -131,6 +137,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
    - Preserve every `#[cfg(feature = ...)]` gate on test submodules.
 
 **Verification:**
+
 - Capture test count before and after via `cargo nextest list --workspace` and across `ci` feature-matrix rows — **exact same test count** (zero tests dropped or skipped).
 - `just clippy full`, `just test`, `just check-nostd`, `just check-wasm`
 
@@ -141,6 +148,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 **Problem:** `EndpointBuilder` (`crates/minip2p/src/std/builder.rs`), `PortableEndpointBuilder<E, C>` (`crates/minip2p/src/portable/mod.rs:370`), and `SmoltcpEndpointBuilder<D, E, C>` (`crates/minip2p/src/portable/mod.rs:708`) duplicate ~17 shared option setters, capability flags, and protocol registration logic (with subtle drift: `std/builder.rs:348` deduplicates `protocol()`, while `portable/mod.rs:411` does not; `manual_ack_protocol()` exists only on `Std`, forcing a post-build loop in `crates/web/src/host.rs:128-135`).
 
 **Design (avoid public typestate churn & embedded monomorphization bloat):**
+
 1. **Introduce a private, non-generic `pub(crate) struct CommonBuilder`** (e.g. in `crates/minip2p/src/builder_common.rs` or `setup.rs`) holding all platform-independent builder state:
    - `agent_version`, `simultaneous_dial_window_ms`, `connect_deadline_ms`, `write_budget`, `timeouts`
    - `protocols: Vec<String>` (unified deduplication preserving first-seen registration order and stable `ProtocolId` handle numbering across duplicate calls)
@@ -157,6 +165,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 4. **Preserve portable assembly:** Both `build(transport)` and `build_with_circuits(circuit_transport)` paths and the `PortableEndpointBuilder::smoltcp(stack)` transition must carry all `CommonBuilder` state forward unchanged.
 
 **Verification:**
+
 - `just test`, `just clippy full`, `just check-nostd`, `just check-wasm`, `just docs`
 - Add unit tests verifying `protocol()` deduplication & handle numbering parity and `manual_ack_protocol()` across `Std`, `Portable`, and `Smoltcp` builders.
 - **Size gate:** Compare linked `minip2p_web_bg.wasm` bytes (default + `--no-default-features`) and `thumbv7em-none-eabi` build output against merge base; confirm no growth from monomorphization.
@@ -168,16 +177,18 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 **Problem:** `crates/web/src/host.rs` already uses ADR 0029's `endpoint.at(now)` and already reuses `ffi-core`'s `send_whole`, `stream_key`, `parse_peer_id`, and `map_driver_error`. The remaining high-risk duplicated lifecycle logic is **`open_stream` and `abandon_stream`** (`crates/ffi-core/src/endpoint.rs:569-587, 646-672` vs. `crates/web/src/host.rs:347-363, 404-426`), where both hosts must coordinate connection-seen tracking, carry cleanup, and discarded-byte acknowledgements.
 
 **Design (narrow, lock-safe, zero-cost):**
+
 1. **Add two small generic helpers in `crates/ffi-core`** (e.g. alongside `writes.rs::send_whole<P>`, available under `no-default-features` so `crates/web` compiles them without `driver`):
    - `open_stream<P: Platform>(endpoint: &mut Endpoint<P>, peer_id: &str, protocol_id: &str, with_carry: impl FnOnce(&mut EventCarry)) -> Result<OpenStreamResult, FfiError>`
    - `abandon_stream<P: Platform>(endpoint: &mut Endpoint<P>, conn_id: u64, stream_id: u64, with_carry: impl FnOnce(&mut EventCarry) -> (bool, usize)) -> Result<(), FfiError>` (or pass a `with_carry: impl FnOnce(&mut EventCarry) -> R` closure that computes `accepted` + `dropped_data` inside the closure so the lock guard drops immediately when the closure returns!)
 2. **Preserve critical locking and snapshot invariants:**
-   - **Never widen the `events` mutex on native `P2pEndpoint`:** `endpoint.open_stream(...)` and `endpoint.abandon_stream(...)` run *before* locking `events`, the `events` mutex is acquired *only* inside `with_carry` to update `EventCarry`, and **dropped before calling `endpoint.stream_consumed(stream, dropped_data)`** (`ffi-core/src/endpoint.rs:661-669`). On `crates/web`, `Host` simply passes `|carry| ...` directly over `&mut self.carry`.
+   - **Never widen the `events` mutex on native `P2pEndpoint`:** `endpoint.open_stream(...)` and `endpoint.abandon_stream(...)` run _before_ locking `events`, the `events` mutex is acquired _only_ inside `with_carry` to update `EventCarry`, and **dropped before calling `endpoint.stream_consumed(stream, dropped_data)`** (`ffi-core/src/endpoint.rs:661-669`). On `crates/web`, `Host` simply passes `|carry| ...` directly over `&mut self.carry`.
    - **Do NOT touch `P2pEndpoint::connected_peers`** (`ffi-core/src/endpoint.rs:360`) — it intentionally reads the driver-published snapshot without interrupting or locking the driver (pinned by `connected_peers_neither_waits_for_nor_interrupts_the_driver`).
    - **Keep `ffi-core` minimal-feature builds compiling:** do not pull `driver`/`pubsub`/`relay`-only items into the shared module; `cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde` must stay green.
    - Leave browser-specific `.at(now)` call sites, discovery stubs, and lifecycle handling in `crates/web/src/host.rs`.
 
 **Verification:**
+
 - Test both native (`crates/ffi-core`) and browser (`crates/web/tests/host.rs`) for:
   1. `open_stream` marks connection seen so a subsequent `ConnectionClosed` is never elided by carry.
   2. Stale `abandon_stream` returns error without dropping pending writes.
@@ -192,6 +203,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
 **Problem:** `bindings/ts/core/src/types.ts` hand-mirrors ~10 Rust enum const objects and the `P2pEvent` union from `crates/ffi-core/src/{events,error}.rs`, and `bindings/ts/react-native/src/adapter.ts:461-482` hand-maintains `ENUM_FIELDS` (mapping event tags to flat numeric enum fields) — forgetting a new enum field causes silent runtime failures in React Native. Furthermore, `.github/workflows/publish.yml:653` checks `git status --porcelain -- react-native web`, omitting `core`.
 
 **Design (phased, zero runtime/WASM dependency):**
+
 1. **Build a dev/build-time generator** (e.g. a small Rust binary/xtask or Node/Rust `syn`-based script reading `crates/ffi-core/src/{events,error}.rs` — adding **zero** runtime or proc-macro dependencies to `minip2p-ffi-core` so WASM and UniFFI builds are completely unaffected).
 2. **Split generated vs. hand-authored TS cleanly:**
    - Generate a dedicated module `bindings/ts/core/src/generated/wire-enums.ts` (re-exported by `bindings/ts/core/src/types.ts`) containing:
@@ -205,6 +217,7 @@ Land these as **6 independent, small PRs** in order (PR 3 before PR 4 keeps PR 4
    - Update `.github/workflows/publish.yml:653` to check `git status --porcelain -- core react-native web` (keeping `bindings/ts/tests/workflows/publish.test.mjs:31` passing and ignoring downloaded Node artifacts).
 
 **Verification:**
+
 - `pnpm --workspace-root typecheck && pnpm --workspace-root test && pnpm --workspace-root lint`
 - `just bindings-check` (confirm running the generator twice produces a clean diff)
 - `node --test bindings/ts/tests/workflows/publish.test.mjs`
