@@ -119,20 +119,15 @@ impl<T: Transport> Host<T> {
         for relay in relays {
             builder = builder.relay(relay);
         }
-        let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
-        let mut endpoint = builder
-            .build_with_circuits(circuits)
-            .map_err(map_build_error)?;
         // The binding acknowledges stream data as its reader consumes it
         // (`stream_consumed`), not as the pump pulls the event.
         for protocol in config.protocols {
-            endpoint
-                .add_manual_ack_protocol(protocol)
-                .map_err(|error| FfiError::InvalidConfig {
-                    capability: ConfigCapability::Options,
-                    detail: error.to_string(),
-                })?;
+            builder = builder.manual_ack_protocol(protocol);
         }
+        let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
+        let endpoint = builder
+            .build_with_circuits(circuits)
+            .map_err(map_build_error)?;
         Ok(Self {
             peer_id: keypair.peer_id().to_base58(),
             lifecycle: Lifecycle::Created(endpoint),

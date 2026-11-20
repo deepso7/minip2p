@@ -3,8 +3,8 @@ extern crate alloc;
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::string::String;
+#[cfg(feature = "smoltcp")]
 use alloc::vec::Vec;
-use core::time::Duration;
 
 pub use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_core::{
@@ -85,14 +85,13 @@ pub use minip2p_relay_server::{
 /// `CircuitLimits::yamux`.
 #[cfg(any(feature = "tcp", feature = "relay"))]
 pub use minip2p_secure_mux::YamuxConfig;
-use minip2p_swarm::SwarmBuilder;
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
+use crate::builder::{CommonBuilder, EndpointBuilder};
 pub use crate::endpoint::{CloseOutcome, CloseReport, ConnectionInfo, Endpoint, EndpointStats};
-use crate::engine::Engine;
 use crate::names::Concrete;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
@@ -101,8 +100,7 @@ use crate::platform::PortableCarrier;
 pub use crate::platform::{Platform, Portable};
 #[cfg(feature = "autonat")]
 use crate::setup::NatConfigError;
-use crate::setup::{self, Capabilities, PlatformCaps, SetupError};
-use crate::writes::WriteQueue;
+use crate::setup::{self, PlatformCaps, SetupError};
 pub use minip2p_core::platform::{Clock, ManualClock};
 
 /// A portable endpoint: an [`Endpoint`] on the [`Portable`] platform, over
@@ -352,7 +350,8 @@ impl From<SetupError> for PortableBuildError {
     }
 }
 
-/// Builder for a [`PortableEndpoint`].
+/// A builder for a [`PortableEndpoint`]: the shared [`EndpointBuilder`]
+/// over a caller-supplied identity, entropy and clock.
 ///
 /// Base endpoint operations work over any [`Transport`]. Capabilities are
 /// opt-in setters behind their Cargo features: AutoNAT and relay
@@ -362,201 +361,37 @@ impl From<SetupError> for PortableBuildError {
 /// # Relay needs circuit operations
 ///
 /// Relay paths turn a relay bridge into a connection, which takes circuit
-/// operations from the transport. [`build`](Self::build) works over any
-/// transport and refuses relay configuration with
+/// operations from the transport. [`build`](EndpointBuilder::build) works
+/// over any transport and refuses relay configuration with
 /// `PortableBuildError::NatConfig`; wrap the transport in a
 /// `CircuitTransport` and call `build_with_circuits` (feature `relay`) to
 /// run relays. AutoNAT alone needs nothing from the transport.
-pub struct PortableEndpointBuilder<E, C> {
-    swarm: SwarmBuilder,
-    /// The application protocols `protocol` registered, in order: the
-    /// order their handles number them in.
-    protocols: Vec<String>,
+pub type PortableEndpointBuilder<E, C> = EndpointBuilder<PortableBuilderState<E, C>>;
+
+/// What a [`PortableEndpointBuilder`] adds to the shared options.
+pub struct PortableBuilderState<E, C> {
     identity: Ed25519Keypair,
     entropy: E,
     clock: C,
-    connect_deadline_ms: u64,
-    write_budget: usize,
-    capabilities: Capabilities,
-    /// The carrier [`Self::mdns`] hands over with `capabilities.mdns`.
+    /// The carrier `mdns` hands over with `capabilities.mdns`.
     #[cfg(feature = "mdns")]
     mdns_io: Option<PortableCarrier>,
 }
 
-impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
+impl<E: EntropySource, C: Clock> EndpointBuilder<PortableBuilderState<E, C>> {
     /// Starts a builder with explicit identity, entropy, and the clock every
     /// endpoint call samples.
     pub fn new(identity: &Ed25519Keypair, entropy: E, clock: C) -> Self {
         Self {
-            swarm: SwarmBuilder::new(identity),
-            protocols: Vec::new(),
-            identity: identity.clone(),
-            entropy,
-            clock,
-            connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
-            write_budget: crate::DEFAULT_WRITE_BUDGET,
-            capabilities: Capabilities::default(),
-            #[cfg(feature = "mdns")]
-            mdns_io: None,
+            common: CommonBuilder::default(),
+            state: PortableBuilderState {
+                identity: identity.clone(),
+                entropy,
+                clock,
+                #[cfg(feature = "mdns")]
+                mdns_io: None,
+            },
         }
-    }
-
-    /// Overrides the Identify agent-version string.
-    pub fn agent_version(mut self, value: impl Into<String>) -> Self {
-        self.swarm = self.swarm.agent_version(value);
-        self
-    }
-
-    /// Registers an application stream protocol.
-    pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
-        let protocol_id = protocol_id.into();
-        self.protocols.push(protocol_id.clone());
-        self.swarm = self.swarm.protocol(protocol_id);
-        self
-    }
-
-    /// Sets how long a peer's new connection can lose a race to its current
-    /// one. Default 5 seconds
-    /// ([`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS));
-    /// both peers should use the same window.
-    pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
-        self.swarm = self.swarm.simultaneous_dial_window_ms(duration_ms(window));
-        self
-    }
-
-    /// Sets the Connection-attempt deadline. Default 30 seconds.
-    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
-        self.connect_deadline_ms = duration_ms(deadline);
-        self
-    }
-
-    /// Sets how many bytes [`Endpoint::send_stream`](crate::Endpoint::send_stream)
-    /// may hold, across every stream, until their streams accept them.
-    /// Default [`DEFAULT_WRITE_BUDGET`](crate::DEFAULT_WRITE_BUDGET) (8 MiB);
-    /// `0` queues nothing, for hosts that use `try_send_stream` and hold
-    /// unsent tails themselves.
-    pub fn write_budget(mut self, bytes: usize) -> Self {
-        self.write_budget = bytes;
-        self
-    }
-
-    /// Overrides the negotiation, first-Identify and ping deadlines
-    /// (default [`SwarmTimeouts::default`]: 30 s, 30 s and 10 s). A zero deadline
-    /// fails the build with [`SwarmError::ZeroTimeout`]. See the crate
-    /// README's deadline table for how they relate to the connect deadline.
-    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
-        self.swarm = self.swarm.timeouts(timeouts);
-        self
-    }
-
-    /// Adds a relay, in preference order; each call adds one.
-    ///
-    /// A relay is a path, not a mode: connects still race direct candidates
-    /// against a leg through the relay, and the endpoint reserves a slot on
-    /// the relay for inbound connections while it is not known to be public.
-    /// Without [`Self::nat_config`], that is the default policy
-    /// ([`ReservationPolicy::WhenPrivate`](crate::ReservationPolicy::WhenPrivate))
-    /// with `dcutr = false`, since portable endpoints do not run DCUtR. For
-    /// relay-only connects set [`NatConfig::force_relay`].
-    ///
-    /// Needs a transport with circuit operations: build with
-    /// `build_with_circuits`.
-    #[cfg(feature = "relay")]
-    pub fn relay(mut self, relay: PeerAddr) -> Self {
-        self.capabilities.relays.push(relay);
-        self
-    }
-
-    /// Adds a trusted AutoNAT server, enabling probing; each call adds one.
-    ///
-    /// Call once per server: a reachability verdict needs a quorum of
-    /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
-    /// so with fewer reachable servers reachability stays Unknown. Without
-    /// [`Self::nat_config`] or a relay, the endpoint holds no reservation.
-    #[cfg(feature = "autonat")]
-    pub fn autonat_server(mut self, server: PeerAddr) -> Self {
-        self.capabilities.autonat_servers.push(server);
-        self
-    }
-
-    /// Sets the base NAT configuration, kept as given. A second call
-    /// replaces the first. Relays and AutoNAT servers added through
-    /// `relay` / [`Self::autonat_server`] are appended to the config's own
-    /// lists, in either call order, without exact repeats.
-    ///
-    /// Checked at build, after the merge (`PortableBuildError::NatConfig`).
-    /// Relay configurations must set `dcutr = false` (direct candidates
-    /// still race the relay leg) or `force_relay` (relay only): portable
-    /// endpoints do not run DCUtR. AutoNAT servers may be configured with or
-    /// without relays.
-    #[cfg(feature = "autonat")]
-    pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.capabilities.nat = Some(config);
-        self
-    }
-
-    /// Enables Circuit Relay v2 service with production-oriented defaults.
-    ///
-    /// The server announces the transport's concrete listener addresses
-    /// and any public addresses AutoNAT confirms. Pause and resume admission
-    /// with [`Endpoint::set_relay_server_accepting`]; its events
-    /// arrive as [`EndpointEvent::RelayServer`].
-    #[cfg(feature = "relay-server")]
-    pub fn relay_server(self) -> Self {
-        self.relay_server_config(RelayServerConfig::default())
-    }
-
-    /// Enables Circuit Relay v2 service with custom limits, validated at
-    /// build.
-    #[cfg(feature = "relay-server")]
-    pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
-        self.capabilities.relay_server = Some(setup::RelayServerSetup {
-            config,
-            announce_addrs: Vec::new(),
-        });
-        self
-    }
-
-    /// Enables pubsub with interoperable gossipsub defaults.
-    #[cfg(feature = "pubsub")]
-    pub fn gossipsub(mut self) -> Self {
-        self.capabilities
-            .gossipsub
-            .get_or_insert_with(GossipsubConfig::default);
-        self
-    }
-
-    /// Enables pubsub with an explicit gossipsub configuration, validated
-    /// at build.
-    #[cfg(feature = "pubsub")]
-    pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.capabilities.gossipsub = Some(config);
-        self
-    }
-
-    /// Enables signed-beacon discovery. Pubsub is enabled automatically.
-    #[cfg(feature = "discovery")]
-    pub fn discovery(self) -> Self {
-        self.discovery_config(BeaconConfig::default())
-    }
-
-    /// Enables signed-beacon discovery with explicit beacon policy,
-    /// validated at build.
-    #[cfg(feature = "discovery")]
-    pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
-        self.capabilities
-            .gossipsub
-            .get_or_insert_with(GossipsubConfig::default);
-        self.capabilities.beacon = Some(config);
-        self
-    }
-
-    /// Overrides the shared bounded peer-book and automatic-dial policy,
-    /// validated at build. It applies to every enabled discovery source.
-    #[cfg(feature = "_peer-book")]
-    pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.capabilities.peer_discovery = config;
-        self
     }
 
     /// Enables mDNS over a caller-owned carrier.
@@ -565,17 +400,18 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
     /// keep a handle to whatever it runs on (a cloned `SmoltcpStack`, say)
     /// to reconfigure it later. The mDNS seed comes from this builder's
     /// entropy. Peer-book and automatic-dial policy comes from
-    /// [`Self::peer_discovery_config`]. The endpoint polls the transport
-    /// again after each mDNS tick, in case the carrier shares its stack.
+    /// [`peer_discovery_config`](EndpointBuilder::peer_discovery_config).
+    /// The endpoint polls the transport again after each mDNS tick, in case
+    /// the carrier shares its stack.
     #[cfg(feature = "mdns")]
     pub fn mdns(mut self, io: impl MdnsIo + 'static, config: MdnsConfig) -> Self {
-        self.mdns_io = Some(Box::new(io));
-        self.capabilities.mdns = Some(config);
+        self.state.mdns_io = Some(Box::new(io));
+        self.common.capabilities.mdns = Some(config);
         self
     }
 
     /// Builds the endpoint over any transport. Relay configuration is
-    /// refused here (see [Relay needs circuit operations](Self#relay-needs-circuit-operations)).
+    /// refused here (see [Relay needs circuit operations](PortableEndpointBuilder#relay-needs-circuit-operations)).
     pub fn build<T: Transport>(
         self,
         transport: T,
@@ -604,34 +440,31 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         transport: T,
         #[cfg(feature = "relay")] circuits: Option<CircuitOps<T>>,
     ) -> Result<PortableEndpoint<T, E, C>, PortableBuildError> {
+        let Self { mut common, state } = self;
         #[cfg(feature = "relay")]
         let has_circuits = circuits.is_some();
         #[cfg(not(feature = "relay"))]
         let has_circuits = false;
         let validated = setup::validate(
-            self.capabilities,
+            core::mem::take(&mut common.capabilities),
             portable_platform(has_circuits),
-            &self.identity.peer_id(),
+            &state.identity.peer_id(),
         )?;
+        let (swarm, parts) = common.into_parts(&state.identity)?;
         // The swarm owns the entropy from here on; capabilities draw from it.
-        let core = self.swarm.build_core(transport, self.entropy)?;
-        let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
-        engine.writes = WriteQueue::new(self.write_budget);
-        for protocol in &self.protocols {
-            engine.protocols.intern(protocol)?;
-        }
+        let mut engine = parts.engine(swarm.build_core(transport, state.entropy)?);
         setup::install(
             &mut engine,
             validated,
-            &self.identity,
+            &state.identity,
             #[cfg(feature = "relay")]
             circuits,
             #[cfg(feature = "mdns")]
-            self.mdns_io,
+            state.mdns_io,
         )?;
         Ok(Endpoint {
             engine,
-            platform: Portable::new(self.clock),
+            platform: Portable::new(state.clock),
             closed_at: None,
         })
     }
@@ -646,18 +479,21 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
         self,
         stack: SmoltcpStack<D>,
     ) -> SmoltcpEndpointBuilder<D, E, C> {
-        let entropy = SharedEntropy::new(self.entropy);
-        SmoltcpEndpointBuilder {
-            portable: PortableEndpointBuilder {
-                swarm: self.swarm,
-                protocols: self.protocols,
-                identity: self.identity,
+        let PortableBuilderState {
+            identity,
+            entropy,
+            clock,
+            #[cfg(feature = "mdns")]
+            mdns_io,
+        } = self.state;
+        let entropy = SharedEntropy::new(entropy);
+        let state = SmoltcpBuilderState {
+            portable: PortableBuilderState {
+                identity,
                 entropy: entropy.clone(),
-                clock: self.clock,
-                connect_deadline_ms: self.connect_deadline_ms,
-                write_budget: self.write_budget,
-                capabilities: self.capabilities,
-                mdns_io: self.mdns_io,
+                clock,
+                #[cfg(feature = "mdns")]
+                mdns_io,
             },
             entropy,
             stack,
@@ -667,13 +503,12 @@ impl<E: EntropySource, C: Clock> PortableEndpointBuilder<E, C> {
             provider_config: SmoltcpConfig::default(),
             listens: Vec::new(),
             mdns: None,
+        };
+        EndpointBuilder {
+            common: self.common,
+            state,
         }
     }
-}
-
-/// Whole milliseconds in `duration`, saturating.
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
@@ -698,15 +533,19 @@ struct EmbeddedMdnsConfig {
     carrier: SmoltcpMdnsConfig,
 }
 
-/// Builder for a [`PortableEndpoint`] over one shared smoltcp stack.
+/// A builder for a [`PortableEndpoint`] over one shared smoltcp stack, from
+/// [`PortableEndpointBuilder::smoltcp`].
 ///
-/// It installs TCP (and mDNS, when asked) on the stack and hands every
-/// capability setter to the [`PortableEndpointBuilder`] it came from. Keep
-/// a cloned [`SmoltcpStack`] from before `smoltcp(..)` to reconfigure the
-/// interface later.
+/// It installs TCP (and mDNS, when asked) on the stack; the shared setters
+/// carry over from the portable builder. Keep a cloned [`SmoltcpStack`]
+/// from before `smoltcp(..)` to reconfigure the interface later.
 #[cfg(feature = "smoltcp")]
-pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource, C: Clock> {
-    portable: PortableEndpointBuilder<SharedEntropy<E>, C>,
+pub type SmoltcpEndpointBuilder<D, E, C> = EndpointBuilder<SmoltcpBuilderState<D, E, C>>;
+
+/// What a [`SmoltcpEndpointBuilder`] adds to the shared options.
+#[cfg(feature = "smoltcp")]
+pub struct SmoltcpBuilderState<D: smoltcp::phy::Device, E: EntropySource, C: Clock> {
+    portable: PortableBuilderState<SharedEntropy<E>, C>,
     /// Shared with the swarm, for the TCP (and circuit) transport.
     entropy: SharedEntropy<E>,
     stack: SmoltcpStack<D>,
@@ -719,50 +558,13 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource, C: 
 }
 
 #[cfg(feature = "smoltcp")]
-impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder<D, E, C> {
-    /// Overrides the Identify agent-version string.
-    pub fn agent_version(mut self, value: impl Into<String>) -> Self {
-        self.portable = self.portable.agent_version(value);
-        self
-    }
-
-    /// Registers an application stream protocol.
-    pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
-        self.portable = self.portable.protocol(protocol_id);
-        self
-    }
-
-    /// Sets how long a peer's new connection can lose a race to its current
-    /// one (see [`PortableEndpointBuilder::simultaneous_dial_window`]).
-    pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
-        self.portable = self.portable.simultaneous_dial_window(window);
-        self
-    }
-
-    /// Sets the Connection-attempt deadline. Default 30 seconds.
-    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
-        self.portable = self.portable.connect_deadline(deadline);
-        self
-    }
-
-    /// Sets the write queue's budget (see
-    /// [`PortableEndpointBuilder::write_budget`]).
-    pub fn write_budget(mut self, bytes: usize) -> Self {
-        self.portable = self.portable.write_budget(bytes);
-        self
-    }
-
-    /// Overrides the protocol deadlines (see
-    /// [`PortableEndpointBuilder::timeouts`]).
-    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
-        self.portable = self.portable.timeouts(timeouts);
-        self
-    }
-
+impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock>
+    EndpointBuilder<SmoltcpBuilderState<D, E, C>>
+{
     /// Overrides secure-session and connection limits. Checked when the
     /// endpoint is built.
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
-        self.tcp_config = config;
+        self.state.tcp_config = config;
         self
     }
 
@@ -770,19 +572,19 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
     /// is built.
     #[cfg(feature = "relay")]
     pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
-        self.circuit_limits = limits;
+        self.state.circuit_limits = limits;
         self
     }
 
     /// Overrides smoltcp socket buffers, backlog, and provider limits.
     pub fn smoltcp_config(mut self, config: SmoltcpConfig) -> Self {
-        self.provider_config = config;
+        self.state.provider_config = config;
         self
     }
 
     /// Adds a TCP listen multiaddress, validated when the endpoint is built.
     pub fn listen(mut self, address: impl Into<String>) -> Self {
-        self.listens.push(address.into());
+        self.state.listens.push(address.into());
         self
     }
 
@@ -794,7 +596,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
 
     /// Enables mDNS with explicit wire and scheduling policy.
     pub fn mdns_config(mut self, config: MdnsConfig) -> Self {
-        self.mdns = Some(EmbeddedMdnsConfig {
+        self.state.mdns = Some(EmbeddedMdnsConfig {
             mdns: config,
             carrier: SmoltcpMdnsConfig::default(),
         });
@@ -803,96 +605,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
 
     /// Overrides the mDNS UDP carrier buffers and enables mDNS when needed.
     pub fn mdns_carrier_config(mut self, config: SmoltcpMdnsConfig) -> Self {
-        self.mdns
+        self.state
+            .mdns
             .get_or_insert_with(|| EmbeddedMdnsConfig {
                 mdns: MdnsConfig::default(),
                 carrier: SmoltcpMdnsConfig::default(),
             })
             .carrier = config;
-        self
-    }
-
-    /// Enables pubsub with interoperable gossipsub defaults.
-    #[cfg(feature = "pubsub")]
-    pub fn gossipsub(mut self) -> Self {
-        self.portable = self.portable.gossipsub();
-        self
-    }
-
-    /// Enables pubsub with an explicit gossipsub configuration.
-    #[cfg(feature = "pubsub")]
-    pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.portable = self.portable.gossipsub_config(config);
-        self
-    }
-
-    /// Enables signed-beacon discovery. Pubsub is enabled automatically.
-    #[cfg(feature = "discovery")]
-    pub fn discovery(mut self) -> Self {
-        self.portable = self.portable.discovery();
-        self
-    }
-
-    /// Enables signed-beacon discovery with explicit beacon policy,
-    /// validated at build.
-    #[cfg(feature = "discovery")]
-    pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
-        self.portable = self.portable.discovery_config(config);
-        self
-    }
-
-    /// Overrides the shared bounded peer-book and automatic-dial policy.
-    pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.portable = self.portable.peer_discovery_config(config);
-        self
-    }
-
-    /// Adds a relay, in preference order: a path raced against direct
-    /// candidates, with a reservation while the endpoint is not known to be
-    /// public (see [`PortableEndpointBuilder::relay`]). For relay-only
-    /// connects set [`NatConfig::force_relay`].
-    #[cfg(feature = "relay")]
-    pub fn relay(mut self, relay: PeerAddr) -> Self {
-        self.portable = self.portable.relay(relay);
-        self
-    }
-
-    /// Enables Circuit Relay v2 service with production-oriented defaults.
-    #[cfg(feature = "relay-server")]
-    pub fn relay_server(mut self) -> Self {
-        self.portable = self.portable.relay_server();
-        self
-    }
-
-    /// Enables Circuit Relay v2 service with custom limits, validated at
-    /// build.
-    #[cfg(feature = "relay-server")]
-    pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
-        self.portable = self.portable.relay_server_config(config);
-        self
-    }
-
-    /// Adds a trusted AutoNAT server, enabling probing; each call adds one.
-    ///
-    /// Call once per server: a reachability verdict needs a quorum of
-    /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
-    /// so with fewer reachable servers reachability stays Unknown.
-    #[cfg(feature = "autonat")]
-    pub fn autonat_server(mut self, server: PeerAddr) -> Self {
-        self.portable = self.portable.autonat_server(server);
-        self
-    }
-
-    /// Sets the base NAT configuration; a second call replaces the first,
-    /// and the relay and AutoNAT setters add to its lists in either order
-    /// (see [`PortableEndpointBuilder::nat_config`]).
-    ///
-    /// TCP relay configurations must set `dcutr = false` or `force_relay`;
-    /// UDP DCUtR remains unavailable. AutoNAT servers may be configured with
-    /// or without relays.
-    #[cfg(feature = "autonat")]
-    pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.portable = self.portable.nat_config(config);
         self
     }
 
@@ -902,8 +621,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
     where
         D: 'static,
     {
-        let Self {
-            mut portable,
+        let SmoltcpBuilderState {
+            portable,
             entropy,
             stack,
             tcp_config,
@@ -912,12 +631,16 @@ impl<D: smoltcp::phy::Device, E: EntropySource, C: Clock> SmoltcpEndpointBuilder
             provider_config,
             listens,
             mdns,
-        } = self;
+        } = self.state;
+        let identity = portable.identity.clone();
+        let mut portable = EndpointBuilder {
+            common: self.common,
+            state: portable,
+        };
         if let Some(config) = mdns {
             let io = SmoltcpMdnsIo::on_stack(stack.clone(), config.carrier)?;
             portable = portable.mdns(io, config.mdns);
         }
-        let identity = portable.identity.clone();
         let transport = TcpTransport::with_config(
             SmoltcpTcpProvider::on_stack(stack, provider_config),
             identity.clone(),
