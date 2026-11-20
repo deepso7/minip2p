@@ -541,6 +541,7 @@ fn decode_remote_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn frame(msg: HolePunch) -> Vec<u8> {
         encode_frame(&msg.encode())

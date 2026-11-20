@@ -149,6 +149,7 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use minip2p_core::write_uvarint;
 
     #[test]

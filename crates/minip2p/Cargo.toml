@@ -78,7 +78,6 @@ thiserror = { workspace = true }
 bytes = { workspace = true, features = ["std"] }
 cpu-time = "1.0.0"
 criterion = { workspace = true }
-minip2p-nat = { path = "../nat" }
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
 # The test-only WebTransport client in `transports/quic/tests/common`.

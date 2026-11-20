@@ -1,8 +1,8 @@
-//! Sans-I/O NAT-traversal orchestrator for minip2p.
+//! Sans-I/O NAT traversal for minip2p.
 //!
-//! The protocol machines for relay circuits ([`minip2p_relay`]), hole
-//! punching ([`dcutr`]), and reachability probing live in their own
-//! crates; this crate provides the relay-leg orchestrator: [`NatAgent`], a
+//! The AutoNAT v1 ([`autonat`]) and DCUtR ([`dcutr`]) protocol machines are
+//! modules here; relay circuits are the separate [`minip2p_relay`] crate.
+//! On top of them sits the relay-leg orchestrator: [`NatAgent`], a
 //! state machine that dials a relay, establishes a circuit, and upgrades to
 //! a punched direct connection when it can. Direct candidate racing and the
 //! attempt's terminal outcome belong to the Connection-attempt engine.
