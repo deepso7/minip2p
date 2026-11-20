@@ -24,7 +24,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate self as minip2p;
 
-mod common_builder;
+mod builder;
 mod connect;
 #[cfg(feature = "_peer-book")]
 mod discovery;
@@ -49,6 +49,7 @@ mod std;
 mod stream_conns;
 mod writes;
 
+pub use builder::EndpointBuilder;
 pub use portable::*;
 pub use protocols::{ProtocolId, ProtocolRef};
 #[cfg(feature = "pubsub")]

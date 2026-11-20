@@ -54,8 +54,9 @@ mod punch_batch_tests;
 #[cfg(all(test, feature = "quic"))]
 mod tests;
 
+use crate::builder::EndpointBuilder;
 pub use bind_error::{BindError, EndpointOptionsError, IpFamily};
-pub use builder::EndpointBuilder;
+pub use builder::StdBuilderState;
 #[cfg(feature = "relay-server")]
 use builder::check_webtransport_announce;
 #[cfg(feature = "quic")]
@@ -115,7 +116,7 @@ pub enum EndpointWaitOutcome {
 }
 
 #[cfg(all(test, feature = "quic"))]
-use crate::common_builder::DEFAULT_AGENT_VERSION;
+use crate::builder::DEFAULT_AGENT_VERSION;
 
 /// Transport used by [`Endpoint`]. With relays built, relay bridges are
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
