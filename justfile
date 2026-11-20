@@ -9,47 +9,48 @@ fmt:
 clean:
     ./scripts/clean.sh
 
-check:
+# Fast workspace-only loop: format check, lint, and tests at default features.
+dev:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo nextest run --workspace
+
+# `tier` picks feature-matrix rows: `ci` (default), `full`, or one row name
+# (`scripts/run-feature-matrix.sh list` prints them).
+check tier="ci":
     cargo check --workspace --all-targets
     cargo check --manifest-path fuzz/Cargo.toml --all-targets
-    scripts/run-feature-matrix.sh check
+    scripts/run-feature-matrix.sh check {{tier}}
 
-clippy:
+# CI lints every row: run `just clippy full` before pushing feature-gated code.
+clippy tier="ci":
     cargo clippy --workspace --all-targets -- -D warnings
-    scripts/run-feature-matrix.sh clippy
+    scripts/run-feature-matrix.sh clippy {{tier}}
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
 # Mirrors CI's `test` job, which runs the feature matrix's `ci` rows;
-# `just test test-full` runs every row, like the release workflow.
+# `just test full` runs every row, like the release workflow.
 # Needs cargo-nextest: https://get.nexte.st
-test matrix="test":
+test tier="ci":
     cargo nextest run --workspace
-    scripts/run-feature-matrix.sh {{matrix}}
+    scripts/run-feature-matrix.sh test {{tier}}
     # nextest does not run doctests, and --workspace --doc is default-features
     # only, so feature-gated doctests need their own line.
     cargo test --workspace --doc
     cargo test -p minip2p-tcp --features smoltcp --doc
 
+# One feature-matrix operation alone, e.g. `just matrix clippy smoltcp`.
+matrix operation tier="ci":
+    scripts/run-feature-matrix.sh {{operation}} {{tier}}
+
 check-nostd:
     rustup target add thumbv7em-none-eabi
-    cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-webtransport -p minip2p-rs
-    cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
-    cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features autonat --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features relay --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features relay-server --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features mdns,discovery,relay --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features smoltcp,relay,discovery,relay-server --target thumbv7em-none-eabi -p minip2p-rs
+    scripts/check-targets.sh nostd
 
 # The browser build's crates compile for wasm32 without the std driver.
 check-wasm:
     rustup target add wasm32-unknown-unknown
-    cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
-    cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
-    cargo check --target wasm32-unknown-unknown -p minip2p-webtransport --no-default-features
-    cargo clippy --target wasm32-unknown-unknown -p minip2p-web -- -D warnings
-    cargo clippy --target wasm32-unknown-unknown -p minip2p-web --no-default-features -- -D warnings
+    scripts/check-targets.sh wasm
 
 peer-ping:
     cargo test -p minip2p-peer --test ping
@@ -67,22 +68,10 @@ interop-relay-go:
     cargo test -p minip2p-rs --features relay-server,tcp --test relay_go_interop -- --ignored --nocapture
 
 docs:
-    cargo doc --workspace --no-deps
-    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
-    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features relay,discovery,mdns,tcp,relay-server --no-deps
-    cargo doc -p minip2p-tcp --features smoltcp --no-deps
-    cargo doc -p minip2p-mdns --features smoltcp --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features autonat --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features relay --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features smoltcp,relay,discovery,relay-server --no-deps
+    scripts/check-targets.sh docs
 
 package-check:
-    # Every published workspace package declares and actually ships its README.
-    cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
-    cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --allow-dirty --list | rg -q '^README.md$' || exit 1; done
-    cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["dep:minip2p-relay-server"]'
+    scripts/check-targets.sh package-check --allow-dirty
 
 docs-site:
     pnpm docs:check

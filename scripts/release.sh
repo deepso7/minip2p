@@ -209,8 +209,8 @@ $mismatched_dependencies"
 
   if [[ "$full_local" == true ]]; then
     echo "release: running the full local CI suite"
-    just test test-full
-    just clippy
+    just test full
+    just clippy full
     just check-nostd
   else
     echo "release: skipping duplicate full local CI (use --full-local to enable it)"
