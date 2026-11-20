@@ -651,17 +651,18 @@ impl P2pEndpoint {
         // write.
         self.with_endpoint_mut(|endpoint| {
             let abandoned = endpoint.abandon_stream(stream);
-            let mut events = self.shared.lock_events();
-            let accepted =
-                abandoned.is_ok() || events.carry.holds_stream_close(raw_conn, raw_stream);
-            if !accepted {
+            // The events lock is released at the end of this statement,
+            // before `stream_consumed` drives the Endpoint again.
+            let dropped = self.shared.lock_events().carry.abandon_stream(
+                raw_conn,
+                raw_stream,
+                abandoned.is_ok(),
+            );
+            let Some(dropped_data) = dropped else {
                 return abandoned.map_err(map_driver_error);
-            }
-            let dropped_data = events.carry.remove_stream(raw_conn, raw_stream);
-            drop(events);
-            // Never drained, so never acknowledged: after a reset or a
-            // settlement this is moot, and a stream closed on a live
-            // connection is released by it.
+            };
+            // After a reset or a settlement this is moot, and a stream
+            // closed on a live connection is released by it.
             if dropped_data > 0 {
                 match endpoint.stream_consumed(stream, dropped_data) {
                     Ok(()) | Err(_) => {}
