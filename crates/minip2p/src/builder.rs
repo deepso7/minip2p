@@ -201,7 +201,7 @@ impl<K> EndpointBuilder<K> {
     /// Registers an application protocol before the endpoint starts. A
     /// repeat keeps the handle numbering of its first registration.
     ///
-    /// Built-in ids ([`RESERVED_PROTOCOL_IDS`](crate::RESERVED_PROTOCOL_IDS))
+    /// Built-in ids ([`RESERVED_PROTOCOL_IDS`](minip2p_swarm::RESERVED_PROTOCOL_IDS))
     /// are reserved; registering one fails the build with
     /// [`SwarmError::ReservedProtocol`](crate::SwarmError::ReservedProtocol).
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {

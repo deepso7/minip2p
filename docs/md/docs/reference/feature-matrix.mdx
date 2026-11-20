@@ -20,7 +20,7 @@ Cargo features control what code is available. Builder methods control what runs
 
 ## Default std API
 
-The default dependency selection enables `std` and `quic`. `Endpoint` and `EndpointBuilder` require `std`; the QUIC methods below also require `quic`.
+The default dependency selection enables `std` and `quic`. `EndpointBuilder` itself works without `std` (`PortableEndpointBuilder` is the same builder over a caller-supplied transport, entropy and clock); `std` adds the default builder state, which binds its own sockets, and the std `Endpoint` methods below. The QUIC methods also require `quic`.
 
 Available on the std `Endpoint`:
 
