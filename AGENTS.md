@@ -17,9 +17,12 @@ Additional constraints: `unsafe` is forbidden workspace-wide, except one scoped 
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
+just dev           # fast loop: fmt check, workspace clippy, workspace nextest
 just test          # nextest + doctests, workspace + the feature matrix's `ci` rows; needs cargo-nextest
-just test test-full # every matrix row, as the release workflow runs it
-just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
+just test full     # every matrix row, as the release workflow runs it
+just clippy        # -D warnings: workspace, the matrix's `ci` rows, and fuzz/
+just clippy full   # every matrix row, as CI lints them
+just matrix clippy smoltcp  # one operation on one named row
 just fmt           # also formats fuzz/
 just clean         # Cargo targets, node_modules, Turbo caches, docs output
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
@@ -27,7 +30,7 @@ just check-wasm    # the browser build's crates on wasm32-unknown-unknown
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine for one test; the matrix runs use nextest because it runs every binary's tests at once instead of one binary at a time). Endpoint features: `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`, `discovery,mdns,tcp`; see `scripts/run-feature-matrix.sh` for the full matrix). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
+Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine for one test; the matrix runs use nextest because it runs every binary's tests at once instead of one binary at a time). Endpoint features: `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`, `discovery,mdns,tcp`; `scripts/run-feature-matrix.sh list` prints every named row; `scripts/check-targets.sh` holds the no_std, wasm, docs, and package lists). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publish a release end to end with:
 
