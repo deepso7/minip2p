@@ -103,8 +103,11 @@ fn payload() -> Vec<u8> {
 /// How a short-lived sender ends after `send_stream` and `close_stream_write`.
 #[derive(Clone, Copy)]
 enum Ending {
-    /// `flush`, then a teardown that waits for nothing.
-    FlushThenCloseNow,
+    /// `flush`, then a teardown that waits at most this long. A flushed
+    /// QUIC stream is acknowledged, so its teardown can wait for nothing;
+    /// a TCP socket has to outlive the peer's reading, so its teardown
+    /// waits for the peer to close too.
+    FlushThenClose(Duration),
     /// `close_within` alone, which flushes first.
     CloseWithin,
 }
@@ -168,10 +171,10 @@ fn short_lived_sender(listen: &str, ending: Ending) -> (Vec<u8>, bool) {
         "most of the payload is still held"
     );
     match ending {
-        Ending::FlushThenCloseNow => {
+        Ending::FlushThenClose(timeout) => {
             assert!(sender.flush(BACKSTOP).expect("flush"), "flush timed out");
             assert!(!sender.has_pending_writes());
-            drop(sender.close_within(Duration::ZERO));
+            drop(sender.close_within(timeout));
         }
         Ending::CloseWithin => drop(sender.close_within(BACKSTOP)),
     }
@@ -180,8 +183,10 @@ fn short_lived_sender(listen: &str, ending: Ending) -> (Vec<u8>, bool) {
 
 #[test]
 fn a_flushed_quic_sender_delivers_every_byte_and_the_fin() {
-    let (received, fin) =
-        short_lived_sender("/ip4/127.0.0.1/udp/0/quic-v1", Ending::FlushThenCloseNow);
+    let (received, fin) = short_lived_sender(
+        "/ip4/127.0.0.1/udp/0/quic-v1",
+        Ending::FlushThenClose(Duration::ZERO),
+    );
     assert!(fin, "the FIN never came");
     assert!(received == payload(), "received {} bytes", received.len());
 }
@@ -196,7 +201,8 @@ fn a_quic_close_within_flushes_before_tearing_down() {
 #[cfg(feature = "tcp")]
 #[test]
 fn a_flushed_tcp_sender_delivers_every_byte_and_the_fin() {
-    let (received, fin) = short_lived_sender("/ip4/127.0.0.1/tcp/0", Ending::FlushThenCloseNow);
+    let (received, fin) =
+        short_lived_sender("/ip4/127.0.0.1/tcp/0", Ending::FlushThenClose(BACKSTOP));
     assert!(fin, "the FIN never came");
     assert!(received == payload(), "received {} bytes", received.len());
 }

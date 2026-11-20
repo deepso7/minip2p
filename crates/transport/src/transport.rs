@@ -232,14 +232,17 @@ pub trait Transport {
     }
 
     /// Whether stream bytes or FINs this transport accepted are still on
-    /// their way out, on a connection that is not closing.
+    /// their way out.
     ///
     /// What counts is everything the transport itself still holds: bytes
     /// queued behind a full send buffer or a peer's flow-control window, and
     /// frames not yet handed to the socket or protocol engine. A transport
     /// that can also tell when the peer has acknowledged a stream's end
     /// counts a FIN until then (QUIC does: a finished stream is pending
-    /// until the peer has acknowledged every byte and the FIN). Bytes on a
+    /// until the peer has acknowledged every byte and the FIN), and one whose
+    /// closed connections still need the peer's close to deliver their tail
+    /// counts those until it comes (TCP does: dropping a socket before then
+    /// can reset it and discard what the peer had not read). Bytes on a
     /// stream left open are best effort: they stop counting once handed on,
     /// though an engine (QUIC's congestion control) may still hold them. To
     /// deliver everything, close the write side before flushing.
