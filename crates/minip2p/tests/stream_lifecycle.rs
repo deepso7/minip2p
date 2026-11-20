@@ -7,7 +7,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, ProtocolId};
+use minip2p::{
+    CloseOutcome, ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, ProtocolId,
+};
 
 const CHAT: &str = "/minip2p/lifecycle/chat/1";
 const FILE: &str = "/minip2p/lifecycle/file/1";
@@ -176,7 +178,12 @@ fn short_lived_sender(listen: &str, ending: Ending) -> (Vec<u8>, bool) {
             assert!(!sender.has_pending_writes());
             drop(sender.close_within(timeout));
         }
-        Ending::CloseWithin => drop(sender.close_within(BACKSTOP)),
+        Ending::CloseWithin => {
+            // The receiver closes once it has read the FIN, which ends the
+            // TCP socket's wait in time.
+            let report = sender.close_within(BACKSTOP);
+            assert_eq!(report.outcome, CloseOutcome::Drained, "{report:?}");
+        }
     }
     reader.join().expect("receiver thread")
 }
@@ -213,4 +220,18 @@ fn a_tcp_close_within_flushes_before_tearing_down() {
     let (received, fin) = short_lived_sender("/ip4/127.0.0.1/tcp/0", Ending::CloseWithin);
     assert!(fin, "the FIN never came");
     assert!(received == payload(), "received {} bytes", received.len());
+}
+
+/// A peer that is not driven never closes its side, so a TCP socket closed
+/// gracefully is still waiting when the deadline passes: the close says so,
+/// though no connection is tracked any more.
+#[cfg(feature = "tcp")]
+#[test]
+fn a_tcp_close_cut_short_while_the_peer_has_not_closed_expires() {
+    let (mut a, mut b) = (bind("/ip4/127.0.0.1/tcp/0"), bind("/ip4/127.0.0.1/tcp/0"));
+    connect(&mut a, &mut b);
+    let report = a.close_within(Duration::from_millis(200));
+    assert_eq!(report.outcome, CloseOutcome::DeadlineExpired, "{report:?}");
+    assert!(report.unfinished.is_empty(), "{report:?}");
+    drop(b);
 }
