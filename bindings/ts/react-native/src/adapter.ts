@@ -522,7 +522,7 @@ type FlatEnumFields<Inner> = {
     Field in keyof Inner as IsFlatEnum<NonNullable<Inner[Field]>> extends true
       ? Field
       : never
-  ]: (typeof ENUMS)[keyof typeof ENUMS] &
+  ]-?: (typeof ENUMS)[keyof typeof ENUMS] &
     readonly [
       SdkEnum<string>,
       NativeEnum & Readonly<Record<string, NonNullable<Inner[Field]> | string>>,
