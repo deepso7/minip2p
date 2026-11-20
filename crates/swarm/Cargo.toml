@@ -37,6 +37,6 @@ minip2p-transport = { path = "../transport", version = "0.12.0", default-feature
 thiserror = { workspace = true }
 
 [dev-dependencies]
-minip2p-relay = { path = "../relay" }
-minip2p-dcutr = { path = "../dcutr" }
-minip2p-test-support = { path = "../test-support" }
+# `Ed25519Keypair::generate` in tests, which bare builds lack.
+minip2p-identity = { path = "../identity" }
+

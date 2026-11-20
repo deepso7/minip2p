@@ -32,11 +32,11 @@ use std::collections::VecDeque;
 use std::str::FromStr;
 
 use minip2p_core::Multiaddr;
-use minip2p_dcutr::{
+use minip2p_identity::Ed25519Keypair;
+use minip2p_nat::dcutr::{
     DcutrInitiator, DcutrInitiatorOutput, DcutrResponder, DcutrResponderOutput, InitiatorOutcome,
     ResponderEvent, decode_frame as dcutr_decode_frame,
 };
-use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{
     HopConnect, HopConnectOutput, HopReservation, HopReservationOutput, ReservationOutcome, Status,
     StopResponder, StopResponderOutput,
@@ -365,14 +365,14 @@ fn dcutr_responder_events(flow: &mut DcutrResponder) -> Vec<ResponderEvent> {
 #[test]
 fn dcutr_frame_decode_round_trips() {
     // Just asserting the crate's own helpers are in scope and work here.
-    use minip2p_dcutr::{HolePunch, HolePunchType, encode_frame};
+    use minip2p_nat::dcutr::{HolePunch, HolePunchType, encode_frame};
     let msg = HolePunch {
         kind: HolePunchType::Sync,
         obs_addrs: Vec::new(),
     };
     let framed = encode_frame(&msg.encode());
     match dcutr_decode_frame(&framed) {
-        minip2p_dcutr::FrameDecode::Complete { payload, .. } => {
+        minip2p_nat::dcutr::FrameDecode::Complete { payload, .. } => {
             let decoded = HolePunch::decode(payload).unwrap();
             assert_eq!(decoded, msg);
         }

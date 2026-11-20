@@ -27,9 +27,9 @@
 
 use alloc::vec::Vec;
 
+use crate::dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
-use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -751,7 +751,7 @@ fn open_round(
     let opened =
         if swarm.connection(source) == Some(circuit) && budget.begin_round(now.monotonic_ms) {
             swarm
-                .open_stream(source, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
+                .open_stream(source, crate::dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
                 .ok()
         } else {
             None

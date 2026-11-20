@@ -1,7 +1,7 @@
 //! Sans-IO state machines for libp2p AutoNAT v1.
 //!
 //! AutoNAT probes whether a peer's advertised addresses are reachable through
-//! real libp2p dials. This crate only handles protocol bytes and state; callers
+//! real libp2p dials. This module only handles protocol bytes and state; callers
 //! own streams, dial-back attempts, timers, and policy decisions.
 //!
 //! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
@@ -9,10 +9,6 @@
 //! number 0), and contextual [`AutoNatError`] values.
 //!
 //! `no_std` + `alloc` compatible.
-
-#![cfg_attr(not(feature = "std"), no_std)]
-
-extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

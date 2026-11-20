@@ -406,12 +406,14 @@ impl<T: Transport> Host<T> {
         let stream = stream_key(conn_id, stream_id);
         let endpoint = self.lifecycle.live()?;
         let abandoned = endpoint.at(now).abandon_stream(stream);
-        if abandoned.is_err() && !self.carry.holds_stream_close(raw_conn, raw_stream) {
+        let Some(dropped_data) = self
+            .carry
+            .abandon_stream(raw_conn, raw_stream, abandoned.is_ok())
+        else {
             return abandoned.map_err(map_driver_error);
-        }
-        let dropped_data = self.carry.remove_stream(raw_conn, raw_stream);
-        // Never drained, so never acknowledged: after a reset this is moot,
-        // and a stream closed on a live connection is released by it.
+        };
+        // After a reset this is moot, and a stream closed on a live
+        // connection is released by it.
         if dropped_data > 0 {
             match endpoint.stream_consumed(stream, dropped_data) {
                 Ok(()) | Err(_) => {}

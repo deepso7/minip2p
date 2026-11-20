@@ -15,7 +15,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use minip2p_autonat::{
+use crate::autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientOutput, AutoNatError, Reachability,
 };
 use minip2p_core::platform::Now;

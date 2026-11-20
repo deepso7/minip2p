@@ -6,8 +6,8 @@ mod common;
 use common::*;
 use minip2p_swarm::ConnectionCloseReason;
 
-use minip2p_autonat::{AUTONAT_PROTOCOL_ID, ResponseStatus};
 use minip2p_core::{PeerAddr, PeerId};
+use minip2p_nat::autonat::{AUTONAT_PROTOCOL_ID, ResponseStatus};
 use minip2p_nat::{
     Deadline, MAX_RESERVATION_RETRY_BACKOFF_MS, NatConfig, NatEvent, NatSwarm, Now,
     ReachabilityState, ReservationPolicy,
