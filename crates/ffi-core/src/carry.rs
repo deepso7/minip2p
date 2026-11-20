@@ -109,15 +109,24 @@ impl EventCarry {
         self.carry.mark_connection_seen(conn_id);
     }
 
-    /// Whether the stream's `StreamClosed` waits in the carry undrained.
-    pub fn holds_stream_close(&self, conn_id: u64, stream_id: u64) -> bool {
-        self.carry.holds_stream_close(conn_id, stream_id)
-    }
-
-    /// Drops every event for one stream being abandoned, returning the data
-    /// bytes they carried, which the host releases with `stream_consumed`.
-    pub fn remove_stream(&mut self, conn_id: u64, stream_id: u64) -> usize {
-        self.carry.remove_stream(conn_id, stream_id).0
+    /// The carry's half of abandoning one stream, once the Endpoint has
+    /// answered its own `abandon_stream` with `endpoint_accepted`.
+    ///
+    /// The abandon stands if the Endpoint accepted it, or if the stream's
+    /// `StreamClosed` still waits here undrained (the Endpoint has already
+    /// handed the stream over). Then every carried event for the stream is
+    /// dropped, and the data bytes they carried are returned for the host to
+    /// release with `stream_consumed`: never drained, so never acknowledged.
+    /// `None` means the abandon is refused and the carry is unchanged, so the
+    /// host returns the Endpoint's error.
+    pub fn abandon_stream(
+        &mut self,
+        conn_id: u64,
+        stream_id: u64,
+        endpoint_accepted: bool,
+    ) -> Option<usize> {
+        (endpoint_accepted || self.carry.holds_stream_close(conn_id, stream_id))
+            .then(|| self.carry.remove_stream(conn_id, stream_id).0)
     }
 }
 
@@ -984,6 +993,21 @@ mod tests {
         carry.push(identify_failed(2));
         carry.push(closed(2));
         assert_eq!(carry.take(10), [identify_failed(2), closed(2)]);
+    }
+
+    #[test]
+    fn an_abandon_stands_if_the_endpoint_took_it_or_the_close_is_still_carried() {
+        let mut carry = EventCarry::default();
+        carry.ingest([data_on(1, 1), data_on(1, 2)]);
+        // Refused by the Endpoint, with no close here: the carry keeps it all.
+        assert_eq!(carry.abandon_stream(1, 1, false), None);
+        // Accepted by the Endpoint: the stream's events go, with their bytes.
+        assert_eq!(carry.abandon_stream(1, 1, true), Some(1));
+        // Refused by an Endpoint that already handed the close over: stands.
+        let [_, close] = lifecycle(2, false);
+        carry.ingest([close]);
+        assert_eq!(carry.abandon_stream(1, 2, false), Some(1));
+        assert!(carry.take_delivery(10).is_empty());
     }
 
     #[test]
