@@ -89,6 +89,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      # Library-only checks, as a consumer builds the crate: the clippy rows
+      # below use `--all-targets`, which unifies dev-dependency features in.
+      - run: |
+          for row in relay-server relay-relay-server relay-relay-server-tcp bare-tcp-relay-server; do
+            scripts/run-feature-matrix.sh check "$row"
+          done
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Every row, not just `ci`: release-tier feature combinations are only
       # linted here (publish.yml tests them but does not run clippy).

@@ -15,9 +15,9 @@ dev:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo nextest run --workspace
 
-# `tier` picks feature-matrix rows: `ci` (default), `full`, or one row name
+# `tier` picks feature-matrix rows: `ci`, `full`, or one row name
 # (`scripts/run-feature-matrix.sh list` prints them).
-check tier="ci":
+check tier="full":
     cargo check --workspace --all-targets
     cargo check --manifest-path fuzz/Cargo.toml --all-targets
     scripts/run-feature-matrix.sh check {{tier}}

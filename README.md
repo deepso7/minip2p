@@ -146,8 +146,9 @@ Every crate has its own README with API-specific details.
 ```bash
 just test          # workspace tests, the feature matrix's CI rows, and doctests
                    # requires cargo-nextest (https://get.nexte.st)
-just test test-full # every feature matrix row, as release CI runs it
-just clippy        # warnings-as-errors, feature variants, and fuzz crate
+just test full     # every feature matrix row, as release CI runs it
+just clippy        # warnings-as-errors, the CI feature rows, and fuzz crate
+just clippy full   # every feature matrix row, as CI lints them
 just fmt           # format the workspace and fuzz crate
 just clean         # Cargo targets, node_modules, Turbo caches, docs output
 just check-nostd   # no_std crates on thumbv7em-none-eabi
