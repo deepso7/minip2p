@@ -27,7 +27,7 @@ nostd() {
     -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit \
     -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping \
     -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay \
-    -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm \
+    -p minip2p-relay-server -p minip2p-swarm \
     -p minip2p-nat -p minip2p-webtransport -p minip2p-rs
   run cargo check --no-default-features --features smoltcp --target "$target" -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
   local features

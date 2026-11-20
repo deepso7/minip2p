@@ -91,4 +91,4 @@ The `no_std` build omits only the blocking `Swarm<T>` wrapper. `SwarmBuilder` re
 
 ## Scope
 
-This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-autonat`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract, `minip2p-quic` for the std-only QUIC adapter, and `minip2p-tcp` for the portable TCP adapter.
+This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, and `minip2p-nat` (AutoNAT and DCUtR). It does not implement transports either -- see `minip2p-transport` for the contract, `minip2p-quic` for the std-only QUIC adapter, and `minip2p-tcp` for the portable TCP adapter.

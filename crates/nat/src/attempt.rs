@@ -3,11 +3,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::platform::Now;
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_dcutr::{
+use crate::dcutr::{
     DCUTR_PROTOCOL_ID, DcutrError, DcutrResponder, DcutrResponderOutput, ResponderEvent,
 };
+use minip2p_core::platform::Now;
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutput, RelayError};
 use minip2p_transport::{ConnectionId, StreamId};
 

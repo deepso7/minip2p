@@ -1309,7 +1309,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 #[test]
 fn a_single_autonat_server_cannot_confirm_addresses() {
-    use minip2p_autonat::{AUTONAT_PROTOCOL_ID, AutoNatServer, AutoNatServerOutput};
+    use minip2p_nat::autonat::{AUTONAT_PROTOCOL_ID, AutoNatServer, AutoNatServerOutput};
 
     let mut server = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([91; 32]))

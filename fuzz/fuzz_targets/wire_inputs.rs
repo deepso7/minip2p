@@ -4,11 +4,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::LazyLock;
 
 use libfuzzer_sys::fuzz_target;
-use minip2p_autonat::{AutoNatClient, AutoNatServer};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr, PeerId, Protocol, TransportKind};
-use minip2p_dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
     PeerDiscoveryAgent, PeerDiscoveryConfig,
@@ -19,6 +17,8 @@ use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
 use minip2p_multistream_select::MultistreamSelect;
+use minip2p_nat::autonat::{AutoNatClient, AutoNatServer};
+use minip2p_nat::dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
@@ -74,7 +74,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = HopMessage::decode(payload);
         let _ = StopMessage::decode(payload);
     }
-    if let DcutrFrame::Complete { payload, .. } = minip2p_dcutr::decode_frame(data) {
+    if let DcutrFrame::Complete { payload, .. } = minip2p_nat::dcutr::decode_frame(data) {
         let _ = HolePunch::decode(payload);
     }
     fuzz_relay_mesh(data);
@@ -661,7 +661,7 @@ fn fuzz_identify(data: &[u8]) {
 /// the input in two halves so a frame header can straddle buffered bytes and
 /// the incoming chunk.
 fn fuzz_autonat(data: &[u8]) {
-    let _ = minip2p_autonat::decode_frame(data);
+    let _ = minip2p_nat::autonat::decode_frame(data);
     let (head, tail) = data.split_at(data.len() / 2);
 
     let observed: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1"
@@ -683,12 +683,12 @@ fn fuzz_autonat(data: &[u8]) {
     let mut dial = AutoNatClient::new(&fuzz_peer_id(), &offered);
     let mut server = AutoNatServer::new(fuzz_peer_id(), &observed);
     while let Some(output) = dial.poll_output() {
-        if let minip2p_autonat::AutoNatClientOutput::Outbound(bytes) = output {
+        if let minip2p_nat::autonat::AutoNatClientOutput::Outbound(bytes) = output {
             let _ = server.on_data(&bytes);
         }
     }
     while let Some(output) = server.poll_output() {
-        if let minip2p_autonat::AutoNatServerOutput::Request(request) = output {
+        if let minip2p_nat::autonat::AutoNatServerOutput::Request(request) = output {
             assert!(
                 request
                     .addrs

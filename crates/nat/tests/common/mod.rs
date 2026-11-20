@@ -8,9 +8,9 @@
     reason = "each integration test imports only the shared helpers it needs"
 )]
 
-use minip2p_autonat::{AutoNatServer, AutoNatServerOutput, ResponseStatus};
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
-use minip2p_dcutr::{
+use minip2p_nat::autonat::{AutoNatServer, AutoNatServerOutput, ResponseStatus};
+use minip2p_nat::dcutr::{
     FrameDecode, HolePunch, HolePunchType, decode_frame as dcutr_decode_frame,
     encode_frame as dcutr_encode_frame,
 };
