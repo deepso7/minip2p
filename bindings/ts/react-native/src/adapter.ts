@@ -435,10 +435,15 @@ type SdkEnum<Name extends string> = Readonly<Record<Name, Name>>;
 /** An SDK enum beside its generated counterpart. */
 type EnumPair = readonly [SdkEnum<string>, NativeEnum];
 
-/** Whether an SDK enum names exactly its generated counterpart's variants. */
+/**
+ * Whether an SDK enum names exactly its generated counterpart's variants,
+ * each mapped to its own name.
+ */
 type SameVariants<Sdk, Native> = [keyof Sdk] extends [keyof Native]
   ? [keyof Native] extends [keyof Sdk]
-    ? true
+    ? Sdk extends { readonly [Name in keyof Sdk]: Name }
+      ? true
+      : false
     : false
   : false;
 
@@ -509,18 +514,19 @@ type IsFlatEnum<Value> = Value extends number
   : false;
 
 /**
- * The fields of a native event payload that carry a flat enum, each with
- * a pair whose generated enum is that field's.
+ * The fields of a native event payload that carry a flat enum, optional or
+ * not, each with the pair from `ENUMS` whose generated enum is that field's.
  */
 type FlatEnumFields<Inner> = {
   readonly [
-    Field in keyof Inner as IsFlatEnum<Inner[Field]> extends true
+    Field in keyof Inner as IsFlatEnum<NonNullable<Inner[Field]>> extends true
       ? Field
       : never
-  ]: readonly [
-    SdkEnum<string>,
-    NativeEnum & Readonly<Record<string, Inner[Field] | string>>,
-  ];
+  ]: (typeof ENUMS)[keyof typeof ENUMS] &
+    readonly [
+      SdkEnum<string>,
+      NativeEnum & Readonly<Record<string, NonNullable<Inner[Field]> | string>>,
+    ];
 };
 
 /**
