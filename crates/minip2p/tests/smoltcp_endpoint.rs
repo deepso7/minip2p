@@ -177,6 +177,24 @@ fn endpoint(device: VirtualDevice, cidr: &str, identity: &Ed25519Keypair, seed: 
     .expect("portable endpoint builds")
 }
 
+/// Options set before `.smoltcp(..)` carry over: protocols keep their
+/// first-registration handles, set on either side of the step.
+#[test]
+fn shared_options_carry_across_the_smoltcp_step() {
+    let local = identity(123);
+    let wire = Wire::default();
+    let endpoint =
+        PortableEndpointBuilder::new(&local, CountingEntropy(124), ManualClock::default())
+            .protocol("/a/1")
+            .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+            .manual_ack_protocol("/b/1")
+            .protocol("/a/1")
+            .build()
+            .expect("smoltcp endpoint builds");
+    let (a, b) = (endpoint.protocol_id("/a/1"), endpoint.protocol_id("/b/1"));
+    assert!(a.is_some() && b.is_some() && a < b, "{a:?} {b:?}");
+}
+
 #[test]
 #[cfg(feature = "autonat")]
 fn portable_autonat_builds_without_relay_state() {
