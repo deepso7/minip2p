@@ -237,6 +237,7 @@ fn config_on(listen_addr: &str) -> EndpointConfig {
         force_relay: false,
         allow_unsigned: false,
         protocols: Vec::new(),
+        inbound_stream_limits: Default::default(),
         discovery: None,
         mdns: None,
         limits: None,

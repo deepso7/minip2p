@@ -168,6 +168,8 @@ pub struct NodeEndpointConfig {
     pub allow_unsigned: bool,
     /// Application protocol identifiers.
     pub protocols: Vec<String>,
+    /// Positive inbound concurrency caps; each entry also registers its protocol.
+    pub inbound_stream_limits: Option<std::collections::HashMap<String, u32>>,
     /// Signed discovery configuration.
     pub discovery: Option<NodeDiscoveryOptions>,
     /// mDNS configuration.
@@ -190,6 +192,7 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             force_relay: config.force_relay,
             allow_unsigned: config.allow_unsigned,
             protocols: config.protocols,
+            inbound_stream_limits: config.inbound_stream_limits.unwrap_or_default(),
             discovery: config.discovery.map(convert_discovery).transpose()?,
             mdns: config.mdns.map(convert_mdns).transpose()?,
             // Converted by the constructor, which tags limit errors.

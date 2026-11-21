@@ -321,6 +321,8 @@ impl SwarmState {
         if demote {
             self.mark_control(conn_id, stream_id, false);
         }
+        self.release_inbound(conn_id, Some(stream_id));
+        self.promote_inbound();
         owed
     }
 
@@ -411,6 +413,8 @@ impl SwarmState {
             return Ok(());
         }
         self.abandoned_streams.insert(key);
+        self.release_inbound(conn_id, Some(stream_id));
+        self.promote_inbound();
         self.forget_held(conn_id, stream_id);
         self.remove_stream_owner(conn_id, stream_id);
         self.inbound_negotiators.remove(&key);
@@ -737,12 +741,16 @@ impl SwarmState {
             }
             ProtocolKind::User(_) => {
                 let len = data.len();
-                self.events.push_back(SwarmEvent::StreamData {
-                    peer_id,
+                self.queue_inbound_event(
                     conn_id,
                     stream_id,
-                    data,
-                });
+                    SwarmEvent::StreamData {
+                        peer_id,
+                        conn_id,
+                        stream_id,
+                        data,
+                    },
+                );
                 return len;
             }
         }
@@ -786,11 +794,15 @@ impl SwarmState {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
-                self.events.push_back(SwarmEvent::StreamRemoteWriteClosed {
-                    peer_id,
+                self.queue_inbound_event(
                     conn_id,
                     stream_id,
-                });
+                    SwarmEvent::StreamRemoteWriteClosed {
+                        peer_id,
+                        conn_id,
+                        stream_id,
+                    },
+                );
             }
         }
     }
@@ -830,12 +842,16 @@ impl SwarmState {
         }
         if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
             let peer_id = self.ensure_peer_id_for_conn(conn_id);
-            self.events.push_back(SwarmEvent::StreamWriteStopped {
-                peer_id,
+            self.queue_inbound_event(
                 conn_id,
                 stream_id,
-                error_code,
-            });
+                SwarmEvent::StreamWriteStopped {
+                    peer_id,
+                    conn_id,
+                    stream_id,
+                    error_code,
+                },
+            );
             return;
         }
         let known = self.stream_protocol(conn_id, stream_id).is_some()
@@ -849,6 +865,7 @@ impl SwarmState {
 
     pub(super) fn handle_stream_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let key = (conn_id, stream_id);
+        let queued = self.inbound_is_queued(conn_id, stream_id);
 
         self.reset_pending.remove(&key);
         self.user_write_ended.remove(&key);
@@ -874,16 +891,20 @@ impl SwarmState {
                     self.fail_identify_stream(&protocol, conn_id, IdentifyFailure::ClosedEarly);
                 }
                 ProtocolKind::User(_) => {
-                    self.events.push_back(SwarmEvent::StreamClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    });
+                    if !queued {
+                        self.events.push_back(SwarmEvent::StreamClosed {
+                            peer_id,
+                            conn_id,
+                            stream_id,
+                        });
+                    }
                 }
             }
         }
 
         self.inbound_negotiators.remove(&key);
+        self.release_inbound(conn_id, Some(stream_id));
+        self.promote_inbound();
         // An open that never negotiated still gets its one terminal event.
         if let Some(pending) = self.outbound_negotiators.remove(&key) {
             if self.fail_identify_stream(&pending.target, conn_id, IdentifyFailure::ClosedEarly)

@@ -1,5 +1,7 @@
 # minip2p-swarm
 
+`SwarmBuilder::protocol_with_inbound_limit(id, NonZeroUsize)` registers a user protocol and caps its concurrently open inbound streams across all peers. Excess negotiated streams wait FIFO until a stream fully closes, resets, or is abandoned, or its connection ends. Outbound streams do not count. Queued bytes remain unacknowledged, bounded by transport receive budgets; queued streams that end are discarded silently. Protocols registered with `protocol` alone remain uncapped. Repeating the limited setter replaces its limit; ordinary registration preserves it.
+
 Orchestration layer that composes minip2p's protocol state machines into a single, DX-friendly swarm: one portable `no_std + alloc` type plus an `std`-gated blocking wrapper.
 
 ## Two layers

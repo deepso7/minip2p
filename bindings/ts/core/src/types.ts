@@ -283,6 +283,12 @@ export interface Minip2pConfig {
   readonly allowUnsigned?: boolean;
   /** Application protocol IDs accepted on inbound streams. */
   readonly protocols?: readonly string[];
+  /**
+   * Positive u32 inbound stream caps per protocol, across all peers. Entries
+   * also register their protocol. Excess streams wait FIFO until a slot opens;
+   * outbound streams do not count. Omitted protocols remain uncapped.
+   */
+  readonly inboundStreamLimits?: Readonly<Record<string, number>>;
   /** Signed-beacon discovery configuration. */
   readonly discovery?: Minip2pDiscoveryOptions;
   /** Enables mDNS with defaults or explicit options. */

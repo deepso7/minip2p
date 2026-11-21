@@ -1,5 +1,7 @@
 # @minip2p/core
 
+`inboundStreamLimits: { "/myapp/1": 4 }` registers the protocol and caps its concurrently open inbound streams across all peers. Limits must be positive u32 integers; protocols without an entry remain uncapped, and outbound streams do not count. Excess streams wait FIFO: `stream` is emitted only when an earlier inbound stream fully ends. Queued data stays unacknowledged to backpressure the sender; streams that end while waiting are silently discarded. This configuration works in Node, React Native, and Web.
+
 Platform-neutral TypeScript SDK for [minip2p](https://minip2p.com).
 
 Applications normally install a platform package such as `@minip2p/react-native`, which provides the native backend and re-exports these public types. Adapter authors can implement the small contract from `@minip2p/core/backend`.

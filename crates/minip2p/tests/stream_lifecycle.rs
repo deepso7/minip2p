@@ -15,6 +15,74 @@ const CHAT: &str = "/minip2p/lifecycle/chat/1";
 const FILE: &str = "/minip2p/lifecycle/file/1";
 const BACKSTOP: Duration = Duration::from_secs(30);
 
+#[test]
+fn inbound_limit_delivers_twenty_streams_with_at_most_four_open() {
+    let mut client = bind("/ip4/127.0.0.1/udp/0/quic-v1");
+    let mut server = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .unwrap()
+        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(4).unwrap())
+        .bind()
+        .unwrap();
+    connect(&mut client, &mut server);
+    let peer = *server.peer_id();
+    for _ in 0..20 {
+        client.open_stream(&peer, CHAT).unwrap();
+    }
+    let deadline = Instant::now() + BACKSTOP;
+    let mut active = std::collections::HashSet::new();
+    let mut delivered = 0;
+    let mut closed = 0;
+    let mut peak = 0;
+    let mut client_ready = 0;
+    let mut pending_fin = Vec::new();
+    let mut draining = false;
+    while closed < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "streams stalled: {delivered} delivered, {closed} closed"
+        );
+        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
+            client_ready += 1;
+            client.send_stream(stream, b"message".to_vec()).unwrap();
+            client.close_stream_write(stream).unwrap();
+        }
+        match next(&mut server) {
+            Some(EndpointEvent::StreamReady { stream, .. }) => {
+                assert!(active.insert(stream));
+                peak = peak.max(active.len());
+                assert!(active.len() <= 4);
+            }
+            Some(EndpointEvent::StreamData { stream, data, .. }) => {
+                assert!(active.contains(&stream));
+                assert_eq!(data.as_ref(), b"message");
+                delivered += 1;
+            }
+            Some(EndpointEvent::StreamRemoteWriteClosed { stream, .. }) => {
+                if draining {
+                    server.close_stream_write(stream).unwrap();
+                } else {
+                    pending_fin.push(stream);
+                }
+            }
+            Some(EndpointEvent::StreamClosed { stream, .. }) => {
+                assert!(active.remove(&stream));
+                closed += 1;
+            }
+            None if client_ready == 20 && !draining => {
+                assert_eq!(active.len(), 4);
+                draining = true;
+                for stream in pending_fin.drain(..) {
+                    server.close_stream_write(stream).unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(delivered, 20);
+    assert_eq!(peak, 4);
+}
+
 fn bind(listen: &str) -> Endpoint {
     Endpoint::builder()
         .listen_on(listen)

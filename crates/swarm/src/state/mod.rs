@@ -40,6 +40,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 use core::ops::RangeInclusive;
 
 use minip2p_core::platform::{Deadline, Now};
@@ -54,6 +55,7 @@ use crate::events::{
 };
 use crate::held::HeldWrites;
 
+mod admission;
 mod connections;
 mod identify;
 mod negotiation;
@@ -454,6 +456,9 @@ pub(crate) struct SwarmState {
     /// Identify handlers are a range query rather than a scan. Each key's peer is
     /// always `conn_to_peer[conn]`; [`Self::set_conn_peer`] rekeys on change.
     stream_owner: BTreeMap<OwnedStream, ProtocolKind>,
+    pub(crate) inbound_limits: BTreeMap<String, NonZeroUsize>,
+    admitted_inbound: BTreeMap<(ConnectionId, StreamId), String>,
+    queued_inbound: VecDeque<admission::QueuedInbound>,
     /// User streams for which a reset has already been queued.
     reset_pending: BTreeSet<(ConnectionId, StreamId)>,
     /// Streams deliberately forgotten by their consumer until transport close.
@@ -615,6 +620,9 @@ impl SwarmState {
             inbound_negotiators: BTreeMap::new(),
             outbound_negotiators: BTreeMap::new(),
             stream_owner: BTreeMap::new(),
+            inbound_limits: BTreeMap::new(),
+            admitted_inbound: BTreeMap::new(),
+            queued_inbound: VecDeque::new(),
             reset_pending: BTreeSet::new(),
             abandoned_streams: BTreeSet::new(),
             inbound_protocols,

@@ -86,6 +86,7 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
             force_relay: true,
             allow_unsigned: false,
             protocols: Vec::new(),
+            inbound_stream_limits: Default::default(),
             discovery: None,
             mdns: None,
             limits: None,

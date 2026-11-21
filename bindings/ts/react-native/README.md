@@ -1,5 +1,7 @@
 # @minip2p/react-native
 
+`inboundStreamLimits: { "/myapp/1": 4 }` registers a protocol with an inbound concurrency cap across all peers. Positive u32 limits delay excess `stream` events FIFO until an earlier inbound stream fully ends; outbound streams do not count. Other protocols remain uncapped. Queued bytes stay unacknowledged; streams that end while waiting are discarded silently.
+
 The React Native package for [minip2p](https://minip2p.com).
 
 The package is pre-1.0 and may introduce breaking changes between releases.

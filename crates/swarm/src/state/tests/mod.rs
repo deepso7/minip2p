@@ -325,6 +325,7 @@ fn identify_on(
     );
 }
 
+mod admission;
 mod connections;
 mod dials;
 mod identify;

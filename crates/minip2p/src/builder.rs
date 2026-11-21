@@ -8,8 +8,10 @@
 //! [`SmoltcpBuilderState`](crate::SmoltcpBuilderState)), and the methods
 //! only that platform has are implemented on it.
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use minip2p_core::platform::EntropySource;
@@ -49,6 +51,7 @@ pub(crate) struct CommonBuilder {
     /// Application protocols, each once, in first-registration order: the
     /// order their handles number them in.
     protocols: Vec<String>,
+    inbound_limits: BTreeMap<String, NonZeroUsize>,
     /// The registered protocols whose data the application acknowledges
     /// itself.
     manual_ack_protocols: Vec<String>,
@@ -65,6 +68,7 @@ impl Default for CommonBuilder {
             connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
             write_budget: crate::DEFAULT_WRITE_BUDGET,
             protocols: Vec::new(),
+            inbound_limits: BTreeMap::new(),
             manual_ack_protocols: Vec::new(),
             capabilities: Capabilities::default(),
         }
@@ -155,6 +159,9 @@ impl CommonBuilder {
             table.intern(&protocol)?;
             swarm = swarm.protocol(protocol);
         }
+        for (protocol, limit) in self.inbound_limits {
+            swarm = swarm.protocol_with_inbound_limit(protocol, limit);
+        }
         let parts = EngineParts {
             connect_deadline_ms: self.connect_deadline_ms,
             write_budget: self.write_budget,
@@ -206,6 +213,23 @@ impl<K> EndpointBuilder<K> {
     /// [`SwarmError::ReservedProtocol`](crate::SwarmError::ReservedProtocol).
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         self.common.protocol(protocol_id.into());
+        self
+    }
+
+    /// Registers an application protocol with an endpoint-wide inbound concurrency cap.
+    ///
+    /// Excess negotiated inbound streams wait in FIFO order until an earlier
+    /// inbound stream fully ends. Outbound streams do not count. Repeating this
+    /// setter replaces the limit without changing the protocol's handle.
+    /// This can be combined with `manual_ack_protocol` for manual acknowledgement.
+    pub fn protocol_with_inbound_limit(
+        mut self,
+        protocol_id: impl Into<String>,
+        limit: NonZeroUsize,
+    ) -> Self {
+        let id = protocol_id.into();
+        self.common.protocol(id.clone());
+        self.common.inbound_limits.insert(id, limit);
         self
     }
 

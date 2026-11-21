@@ -1,5 +1,7 @@
 # @minip2p/web
 
+`inboundStreamLimits: { "/myapp/1": 4 }` registers a protocol with an inbound concurrency cap across all peers. Positive u32 limits delay excess `stream` events FIFO until an earlier inbound stream fully ends; outbound streams do not count. Other protocols remain uncapped. Queued bytes stay unacknowledged; streams that end while waiting are discarded silently.
+
 The browser package for [minip2p](https://minip2p.com): minip2p compiled to WebAssembly, dialing native nodes over libp2p WebTransport, with the same `@minip2p/core` API as `@minip2p/node`. It is ESM-only.
 
 ```ts

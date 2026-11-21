@@ -1,5 +1,7 @@
 # @minip2p/node
 
+Pass `inboundStreamLimits: { "/myapp/1": 4 }` in the endpoint config to register the protocol with an inbound concurrency cap across all peers. Extra streams wait FIFO before `endpoint.on("stream")` runs; outbound streams do not count. Values must be positive u32 integers. Protocols without an entry remain uncapped. Queued data stays unacknowledged and streams that end while waiting are silently discarded.
+
 The Node.js package for [minip2p](https://minip2p.com). It is ESM-only and requires Node.js 24 or newer.
 
 ```ts
