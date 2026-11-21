@@ -351,7 +351,7 @@ impl FrameDecoder {
             payload: Bytes::new(),
         };
         header.validate()?;
-        let payload = self.take_payload(payload_start, payload_end)?;
+        let payload = self.take_payload(payload_start, payload_end, payload_len)?;
         Ok(Some(Frame { payload, ..header }))
     }
 
@@ -364,10 +364,7 @@ impl FrameDecoder {
     /// Consumes the frame ending at `end` and returns its payload at
     /// `start..end`, viewing the buffer itself when the frame ends the buffer
     /// and the payload fills at least half its capacity.
-    fn take_payload(&mut self, start: usize, end: usize) -> Result<Bytes, YamuxError> {
-        let len = end
-            .checked_sub(start)
-            .ok_or(YamuxError::FrameLengthOverflow)?;
+    fn take_payload(&mut self, start: usize, end: usize, len: usize) -> Result<Bytes, YamuxError> {
         if end == self.buffer.len() && len.saturating_mul(2) >= self.buffer.capacity() {
             let mut payload = Bytes::from(core::mem::take(&mut self.buffer));
             payload.advance(start);
@@ -385,7 +382,7 @@ impl FrameDecoder {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.buffer.clear();
+        self.buffer = Vec::new();
         self.offset = 0;
     }
 
@@ -509,5 +506,6 @@ mod tests {
         assert_eq!(frame.payload(), [0x5a; 16]);
         assert!(!buffer.contains(&frame.payload().as_ptr()));
         assert_eq!(decoder.buffered_len(), 0);
+        assert_eq!(decoder.buffer.capacity(), 0);
     }
 }

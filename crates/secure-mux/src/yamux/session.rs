@@ -645,7 +645,8 @@ impl YamuxSession {
     /// terminal events follow; every stream ends with the session.
     ///
     /// When nothing is buffered from earlier input, `bytes` is adopted rather
-    /// than copied, and a data frame ending it is delivered as a view into it.
+    /// than copied, and a data frame ending it is delivered as a view into it
+    /// when its payload fills at least half the buffer's capacity.
     pub fn handle_data(&mut self, bytes: Vec<u8>) -> Result<(), YamuxError> {
         self.ensure_active()?;
         self.decoder.push(bytes);
