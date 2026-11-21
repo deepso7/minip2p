@@ -4,6 +4,8 @@
 
 Platform-neutral TypeScript SDK for [minip2p](https://minip2p.com).
 
+Inbound limits require native QUIC's `limits.quic.connectionReceiveWindow` to remain `"unlimited"` (the default), so queued streams cannot exhaust shared credit and block admitted streams. TCP/Yamux has no connection-level receive window and is unaffected.
+
 Applications normally install a platform package such as `@minip2p/react-native`, which provides the native backend and re-exports these public types. Adapter authors can implement the small contract from `@minip2p/core/backend`.
 
 The API provides typed events, cancellable Promise operations, and `Stream` handles:

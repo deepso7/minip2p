@@ -51,7 +51,7 @@ pub(crate) struct CommonBuilder {
     /// Application protocols, each once, in first-registration order: the
     /// order their handles number them in.
     protocols: Vec<String>,
-    inbound_limits: BTreeMap<String, NonZeroUsize>,
+    pub(crate) inbound_limits: BTreeMap<String, NonZeroUsize>,
     /// The registered protocols whose data the application acknowledges
     /// itself.
     manual_ack_protocols: Vec<String>,
@@ -222,6 +222,11 @@ impl<K> EndpointBuilder<K> {
     /// inbound stream fully ends. Outbound streams do not count. Repeating this
     /// setter replaces the limit without changing the protocol's handle.
     /// This can be combined with `manual_ack_protocol` for manual acknowledgement.
+    ///
+    /// Native QUIC requires an unlimited `connection_receive_window` when any
+    /// inbound cap is set: queued streams could otherwise exhaust shared credit
+    /// and prevent admitted streams from finishing. TCP/Yamux has no connection-
+    /// level receive window and is unaffected.
     pub fn protocol_with_inbound_limit(
         mut self,
         protocol_id: impl Into<String>,

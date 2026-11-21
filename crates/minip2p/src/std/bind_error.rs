@@ -111,6 +111,14 @@ pub enum EndpointOptionsError {
     /// [`CircuitLimits::validate`](crate::CircuitLimits).
     #[error(transparent)]
     InvalidLimit(InvalidLimit),
+    /// Queued inbound streams could exhaust finite shared QUIC receive credit.
+    #[cfg(feature = "quic")]
+    #[error(
+        "QUIC connection_receive_window (limits.quic.connectionReceiveWindow) must be unlimited \
+         when protocol_with_inbound_limit (inboundStreamLimits) is set; queued streams can \
+         otherwise exhaust connection credit"
+    )]
+    InboundLimitWithFiniteQuicWindow,
     /// The PEM given to
     /// [`webtransport_certificate_pem`](super::EndpointBuilder::webtransport_certificate_pem)
     /// is unusable: no certificate, no private key, more than one key, or a

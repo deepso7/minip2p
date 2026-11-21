@@ -287,6 +287,10 @@ export interface Minip2pConfig {
    * Positive u32 inbound stream caps per protocol, across all peers. Entries
    * also register their protocol. Excess streams wait FIFO until a slot opens;
    * outbound streams do not count. Omitted protocols remain uncapped.
+   * Native QUIC requires `limits.quic.connectionReceiveWindow` to be unlimited
+   * (the default), so queued streams cannot exhaust shared credit and prevent
+   * admitted streams from finishing. TCP/Yamux has no connection-level receive
+   * window and is unaffected.
    */
   readonly inboundStreamLimits?: Readonly<Record<string, number>>;
   /** Signed-beacon discovery configuration. */

@@ -84,108 +84,72 @@ fn inbound_limit_delivers_twenty_streams_with_at_most_four_open() {
 }
 
 #[test]
-#[ignore = "diagnostic for finite QUIC connection-window starvation"]
-fn queued_inbound_can_starve_an_admitted_stream_with_a_finite_connection_window() {
-    check_queued_connection_credit(1024, true);
-    check_queued_connection_credit(usize::MAX, false);
-}
-
-fn check_queued_connection_credit(connection_window: usize, expect_starvation: bool) {
-    let mut client = bind("/ip4/127.0.0.1/udp/0/quic-v1");
-    let mut server = Endpoint::builder()
-        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-        .expect("listen address")
+fn inbound_limit_requires_an_unlimited_quic_connection_window() {
+    let builder = || {
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .unwrap()
+            .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+    };
+    let result = builder()
         .quic_limits(minip2p::QuicLimits {
             stream_receive_window: 1024,
-            connection_receive_window: connection_window,
+            connection_receive_window: 1024,
             ..minip2p::QuicLimits::default()
         })
-        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).expect("positive cap"))
-        .manual_ack_protocol(CHAT)
-        .bind()
-        .expect("bind capped server");
-    connect(&mut client, &mut server);
-    let peer = *server.peer_id();
-    client.open_stream(&peer, CHAT).expect("open active stream");
-    let deadline = Instant::now() + BACKSTOP;
-    let mut active = None;
-    let mut server_active = None;
-    while active.is_none() || server_active.is_none() {
-        assert!(Instant::now() < deadline);
-        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
-            active = Some(stream);
-        }
-        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut server) {
-            server_active = Some(stream);
-        }
-    }
-    client.open_stream(&peer, CHAT).expect("open queued stream");
-    let queued = loop {
-        assert!(Instant::now() < deadline);
-        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
-            break stream;
-        }
-        assert!(!matches!(
-            next(&mut server),
-            Some(EndpointEvent::StreamReady { .. })
-        ));
-    };
-    client
-        .send_stream(queued, vec![7; 64 * 1024])
-        .expect("flood queued stream");
-    let fill_until = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < fill_until {
-        let _ = next(&mut client);
-        assert!(!matches!(
-            next(&mut server),
-            Some(EndpointEvent::StreamReady { .. } | EndpointEvent::StreamData { .. })
-        ));
-    }
-    client
-        .send_stream(active.expect("active client stream"), b"finish".to_vec())
-        .expect("send active stream marker");
-    client
-        .close_stream_write(active.expect("active client stream"))
-        .expect("finish active stream");
-    let stalled_until = Instant::now() + Duration::from_millis(1000);
-    while Instant::now() < stalled_until {
-        let _ = next(&mut client);
-        if let Some(EndpointEvent::StreamData { stream, data, .. }) = next(&mut server) {
-            assert!(!expect_starvation, "admitted stream was not starved");
-            assert_eq!(Some(stream), server_active);
-            assert_eq!(data.as_ref(), b"finish");
-            server
-                .stream_consumed(stream, data.len())
-                .expect("acknowledge marker");
-            println!(
-                "unlimited connection-window control: all 6 admitted-stream bytes arrived with queued flood still pending"
-            );
-            return;
-        }
-    }
+        .bind();
     assert!(
-        expect_starvation,
-        "unlimited connection-window control stalled"
+        matches!(
+            result,
+            Err(minip2p::BindError::Options(
+                minip2p::EndpointOptionsError::InboundLimitWithFiniteQuicWindow
+            ))
+        ),
+        "finite QUIC window with an inbound cap must be rejected"
     );
-    println!(
-        "cap=1 stream_window=1024 connection_window=1024: admitted stream made no progress for 1000ms after queued flood"
+    assert!(
+        builder().bind().is_ok(),
+        "default unlimited window must work"
     );
-    client.reset_stream(queued).expect("reset queued stream");
-    loop {
-        assert!(Instant::now() < deadline, "reset did not restore progress");
-        let _ = next(&mut client);
-        if let Some(EndpointEvent::StreamData { stream, data, .. }) = next(&mut server) {
-            assert_eq!(Some(stream), server_active);
-            assert_eq!(data.as_ref(), b"finish");
-            server
-                .stream_consumed(stream, data.len())
-                .expect("acknowledge marker after reset");
-            println!(
-                "resetting only the queued stream restored delivery of all 6 admitted-stream bytes"
-            );
-            break;
-        }
+    let uncapped = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .unwrap()
+        .quic_limits(minip2p::QuicLimits {
+            connection_receive_window: 1024,
+            ..minip2p::QuicLimits::default()
+        })
+        .protocol(CHAT)
+        .bind();
+    assert!(
+        uncapped.is_ok(),
+        "finite windows without inbound caps remain supported"
+    );
+    if let Ok(unlimited) = usize::try_from((1_u64 << 62) - 1) {
+        assert!(
+            builder()
+                .quic_limits(minip2p::QuicLimits {
+                    connection_receive_window: unlimited,
+                    ..minip2p::QuicLimits::default()
+                })
+                .bind()
+                .is_ok(),
+            "QUIC's maximum window is also unlimited"
+        );
     }
+    #[cfg(feature = "tcp")]
+    assert!(
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .unwrap()
+            .quic_limits(minip2p::QuicLimits {
+                connection_receive_window: 1024,
+                ..minip2p::QuicLimits::default()
+            })
+            .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+            .bind()
+            .is_ok(),
+        "TCP-only endpoints do not use QUIC's window"
+    );
 }
 
 fn bind(listen: &str) -> Endpoint {

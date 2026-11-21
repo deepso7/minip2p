@@ -400,6 +400,15 @@ impl EndpointBuilder<StdBuilderState> {
     /// Endpoint setup, also before binding.
     fn validate(&self) -> Result<(), BindError> {
         self.common.timeouts.validate()?;
+        #[cfg(feature = "quic")]
+        if !self.common.inbound_limits.is_empty()
+            && self.state.listen_addrs.iter().any(is_quic_listen)
+            && self.state.quic_limits.connection_receive_window != usize::MAX
+            && u64::try_from(self.state.quic_limits.connection_receive_window)
+                .is_ok_and(|window| window < (1_u64 << 62) - 1)
+        {
+            return Err(EndpointOptionsError::InboundLimitWithFiniteQuicWindow.into());
+        }
         if let Some(protocol) = self
             .common
             .protocols()

@@ -153,6 +153,22 @@ fn inbound_stream_limits_reject_zero_and_register_additional_protocols() {
 }
 
 #[test]
+fn inbound_limits_reject_finite_quic_connection_credit_as_invalid_config() {
+    let mut invalid = config();
+    invalid.inbound_stream_limits.insert("/limited/1".into(), 1);
+    invalid.limits = Some(crate::LimitsOptions {
+        quic: Some(crate::QuicLimitsOptions {
+            connection_receive_window: Some(crate::WindowLimit::Bounded { bytes: 1024 }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(endpoint(invalid), Err(FfiError::InvalidConfig {
+        capability: crate::ConfigCapability::Options, detail,
+    }) if detail.contains("connectionReceiveWindow") && detail.contains("inboundStreamLimits") && detail.contains("must be unlimited")));
+}
+
+#[test]
 fn an_interrupted_driver_resumes_once_commands_end() {
     let endpoint = endpoint(config()).expect("endpoint");
     let pending = PendingCommand::new(&endpoint.shared);

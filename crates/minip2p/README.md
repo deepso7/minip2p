@@ -2,6 +2,8 @@
 
 Application-facing `Endpoint` API for minip2p.
 
+Inbound stream caps require QUIC's `connection_receive_window` to be unlimited (the default); otherwise queued streams could exhaust shared credit and prevent admitted streams from finishing. TCP/Yamux has no connection-level receive window and is unaffected.
+
 `EndpointBuilder::protocol_with_inbound_limit(id, NonZeroUsize)` registers a protocol and limits its concurrently open inbound streams across all peers. Excess negotiated streams wait FIFO: their `StreamReady`, data, and remote write-close are delivered only when an earlier inbound stream fully ends. Outbound streams do not count, and ordinary `protocol` registration remains uncapped. Queued data stays unacknowledged so transport receive budgets backpressure the sender. Streams that end while waiting are silently discarded. Repeating the setter replaces the limit without changing its protocol handle; combine it with `manual_ack_protocol` for manual acknowledgement.
 
 ```bash

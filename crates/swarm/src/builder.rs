@@ -124,6 +124,9 @@ impl SwarmBuilder {
     /// Excess negotiated inbound streams wait in FIFO order until an earlier
     /// stream fully ends. Outbound streams do not count. Repeating this setter
     /// replaces the limit; `protocol` alone leaves an existing limit unchanged.
+    /// With QUIC, use an unlimited connection receive window: queued streams
+    /// could otherwise exhaust shared credit and prevent admitted streams from
+    /// finishing. TCP/Yamux has no connection-level receive window.
     pub fn protocol_with_inbound_limit(
         mut self,
         protocol_id: impl Into<String>,
