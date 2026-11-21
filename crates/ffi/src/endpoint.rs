@@ -47,9 +47,9 @@ impl P2pEndpoint {
     pub fn peer_info(&self, peer_id: String) -> Result<Option<IdentifyInfo>, FfiError> {
         self.0.peer_info(peer_id)
     }
-    /// Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
-    pub fn set_active(&self, active: bool) {
-        self.0.set_active(active);
+    /// Tells the endpoint its app is back in the foreground, so a relay reservation recovers at once.
+    pub fn resume(&self) -> Result<(), FfiError> {
+        self.0.resume()
     }
     /// Returns whether the driver accepts work.
     pub fn is_running(&self) -> bool {

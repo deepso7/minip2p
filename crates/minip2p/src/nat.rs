@@ -281,6 +281,14 @@ impl<T: Transport> NatDriver<T> {
         self.pump(swarm);
     }
 
+    /// Resumes the agent after a host pause and executes what that starts.
+    /// See [`NatAgent::resume`].
+    pub(crate) fn resume<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, now: Now) {
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.resume(&mut io, now);
+        self.pump(swarm);
+    }
+
     /// When [`NatDriver::tick`] next has work: immediately while events or
     /// parked dials are queued, else the agent's next timer, `None` when
     /// nothing is armed.

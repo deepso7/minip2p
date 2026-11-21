@@ -379,12 +379,14 @@ impl P2pEndpoint {
         })
     }
 
-    /// Accepted for compatibility and ignored.
-    ///
-    /// The driver used to poll on a faster cadence while active. It now
-    /// sleeps until the endpoint's next deadline in either state, so there is
-    /// no cadence left to select.
-    pub fn set_active(&self, _active: bool) {}
+    /// Tells the endpoint its app is back in the foreground; see
+    /// [`Endpoint::resume`].
+    pub fn resume(&self) -> Result<(), FfiError> {
+        self.with_endpoint_mut(|endpoint| {
+            endpoint.resume();
+            Ok(())
+        })
+    }
 
     /// Returns whether the background driver is accepting work.
     ///

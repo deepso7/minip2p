@@ -865,7 +865,6 @@ fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
         log: Arc::clone(&a_log),
     }))?;
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
-    a.set_active(true);
     a.subscribe("load-room".into())?;
     b.subscribe("load-room".into())?;
     a.connect(ConnectTarget::Addresses {

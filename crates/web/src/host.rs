@@ -304,6 +304,12 @@ impl<T: Transport> Host<T> {
         Err(pubsub_not_built())
     }
 
+    /// Tells the endpoint its page is visible again; see `Endpoint::resume`.
+    pub fn resume(&mut self, now: Now) -> Result<(), FfiError> {
+        self.endpoint()?.at(now).resume();
+        Ok(())
+    }
+
     /// Sends an explicit ping; its result arrives as an event.
     pub fn ping(&mut self, peer_id: String, now: Now) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;

@@ -488,10 +488,10 @@ impl NodeEndpoint {
         js_value(&env, self.0.peer_info(peer_id))
     }
 
-    /// Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
+    /// Tells the endpoint its host is back from a pause, so a relay reservation recovers at once.
     #[napi]
-    pub fn set_active(&self, active: bool) {
-        self.0.set_active(active);
+    pub fn resume(&self, env: Env) -> Result<()> {
+        self.0.resume().map_err(|error| native_error(&env, error))
     }
 
     /// Subscribes to a pubsub topic.

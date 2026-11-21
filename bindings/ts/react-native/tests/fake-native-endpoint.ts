@@ -238,8 +238,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return true;
   }
 
-  setActive(): never {
-    return notFaked("setActive");
+  resume(): never {
+    return notFaked("resume");
   }
 
   subscribe(): never {

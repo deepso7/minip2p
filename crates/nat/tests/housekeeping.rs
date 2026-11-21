@@ -1691,3 +1691,87 @@ fn a_partly_accepted_request_is_finished_in_order_before_its_close() {
         Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
     ));
 }
+
+/// Fails `count` reservation dials in a row, each when its backoff ends,
+/// and returns the time the last backoff ends.
+fn fail_reservation_dials(hk: &mut Hk, count: usize) -> u64 {
+    let relay = hk.relay;
+    let mut now = 0;
+    for _ in 0..count {
+        hk.agent.handle_tick(at(now));
+        let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+        assert!(dial_failed(hk, conn_id, "connection refused", at(now)));
+        now = hk
+            .agent
+            .next_deadline(at(now))
+            .expect("a backoff")
+            .millis_until(at(0));
+    }
+    now
+}
+
+#[test]
+fn resume_retries_a_backed_off_reservation_at_once_and_from_the_base() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay;
+    let retry_at = fail_reservation_dials(&mut hk, 10);
+    let resumed = retry_at - MAX_RESERVATION_RETRY_BACKOFF_MS / 2;
+
+    hk.agent.resume(at(resumed));
+    let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+    assert!(dial_failed(
+        &mut hk,
+        conn_id,
+        "connection refused",
+        at(resumed)
+    ));
+
+    let base = NatConfig::default().reservation_retry_backoff_ms;
+    let delay = hk
+        .agent
+        .next_deadline(at(resumed))
+        .expect("a backoff")
+        .millis_until(at(resumed));
+    assert!((base..base + base / 5).contains(&delay), "{delay}");
+}
+
+#[test]
+fn resume_renews_a_held_reservation_at_once() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    let (events, _) = hk.finish_reserve(hop_reserve_ok(None), at(5_010));
+    assert_eq!(reserved_renew_at(&events), 5_010 + 1_800 * 1_000);
+}
+
+#[test]
+fn a_resumed_renewal_the_relay_never_answers_loses_the_reservation() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    let relay = hk.relay;
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(5_000));
+    drain_actions(&mut hk.agent);
+
+    let deadline = 5_000 + NatConfig::default().relay_timeout_ms;
+    hk.agent.handle_tick(at(deadline - 1));
+    assert!(drain_events(&mut hk.agent).is_empty());
+    hk.agent.handle_tick(at(deadline));
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::RelayReservationLost { relay: r }] if *r == relay
+    ));
+}
+
+#[test]
+fn resume_without_a_wanted_reservation_does_nothing() {
+    let mut hk = build(ReservationPolicy::Never, 1, 0);
+    hk.agent.resume(at(10));
+    assert!(drain_actions(&mut hk.agent).is_empty());
+    assert!(drain_events(&mut hk.agent).is_empty());
+}

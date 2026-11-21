@@ -1196,7 +1196,9 @@ fn concurrent_commands_queries_and_stop_complete() {
                     0 => {
                         drop(endpoint.connected_peers());
                     }
-                    1 => endpoint.set_active(index % 2 == 0),
+                    1 => {
+                        drop(endpoint.resume());
+                    }
                     2 => {
                         drop(endpoint.publish("room".into(), vec![index]));
                     }

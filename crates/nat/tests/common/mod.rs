@@ -978,6 +978,10 @@ impl Node {
         self.agent.handle_tick(&mut self.swarm, now);
     }
 
+    pub fn resume(&mut self, now: Now) {
+        self.agent.resume(&mut self.swarm, now);
+    }
+
     pub fn dial_result(&mut self, token: NatToken, result: Result<ConnectionId, String>, now: Now) {
         self.agent.dial_result(&mut self.swarm, token, result, now);
     }
