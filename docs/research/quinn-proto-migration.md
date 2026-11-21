@@ -83,7 +83,7 @@ A mixed fleet (for example, relays still on quiche) therefore keeps working.
 - **Read gate (ADR 0012).** An unread stream stops its writer at exactly the 1 MB stream window. Reading half the window returns only that much credit. The tail stays buffered and is readable with no new packet or event.
 - **STOP_SENDING** surfaces as `StreamEvent::Stopped { id, error_code }`. Later writes fail with `WriteError::Stopped(code)`, and the read half stays usable.
 - **Peer reset** surfaces on read as `ReadError::Reset(code)`.
-- **Dead peers still time out with keepalive on.** With a 30 s idle timeout and a 15 s keepalive, a dead peer closes after ~43 s (`TimedOut`). A keepalive restarts the idle timer once per receive (RFC 9000 §10.1), which matches today's quiche behaviour.
+- **Keepalive keeps live peers up, and dead peers still time out.** With a 1 s idle timeout and a 300 ms keepalive, an idle live pair stays up for five idle timeouts, and a dead peer closes after ~1.2 s (`TimedOut`). The production 30 s idle timeout with a 15 s keepalive closed a dead peer after ~43 s. A keepalive restarts the idle timer once per receive (RFC 9000 §10.1), which matches today's quiche behaviour.
 - **Connection token.** A TLS exporter value is identical on both ends.
 
 ## API fit

@@ -72,6 +72,10 @@ pub fn transport_config() -> TransportConfig {
 
 impl Peer {
     pub fn new(keypair: &Ed25519Keypair, bind: &str, opts: Options) -> Self {
+        Self::with_transport(keypair, bind, opts, transport_config())
+    }
+
+    pub fn with_transport(keypair: &Ed25519Keypair, bind: &str, opts: Options, transport: TransportConfig) -> Self {
         let socket = UdpSocket::bind(bind).expect("bind");
         socket.set_nonblocking(true).expect("nonblocking");
         let udp = opts
@@ -79,7 +83,7 @@ impl Peer {
             .then(|| quinn_udp::UdpSocketState::new((&socket).into()).expect("udp state"));
         let max_gso = udp.as_ref().map_or(1, |u| u.max_gso_segments().min(10));
 
-        let transport = Arc::new(transport_config());
+        let transport = Arc::new(transport);
         let mut server = ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(tls::server_config(keypair)).expect("quic server cfg"),
         ));
