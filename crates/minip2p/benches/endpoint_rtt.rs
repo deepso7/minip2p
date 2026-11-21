@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, PeerAddr, PeerId, QuicLimits, TcpConfig};
 use minip2p_quic::datagram_counters;
 use support::bulk::{self, CHUNK, Load};
-use support::delay::{LinkStats, Profile, TcpProxy, UdpProxy};
+use support::delay::{LinkStats, Profile, TcpProxy, UdpProxy, assert_forwarding};
 use support::{Driven, SETUP_TIMEOUT, bind_on, next_event};
 
 const PROTOCOL: &str = "/minip2p/bench/sink/1";
@@ -662,12 +662,22 @@ struct Linked {
 
 /// Pings the idle connection a few times and returns the median round trip
 /// in ms, timed around `ping()` and its `PingRttMeasured`.
-fn idle_rtt_ms(client: &mut Endpoint, target: &mut Endpoint, target_peer: &PeerId) -> f64 {
+///
+/// `healthy` runs on every turn of the wait, so a link that stops forwarding
+/// mid-ping fails here with the socket error rather than as an idle ping that
+/// never came back.
+fn idle_rtt_ms(
+    client: &mut Endpoint,
+    target: &mut Endpoint,
+    target_peer: &PeerId,
+    healthy: impl Fn(),
+) -> f64 {
     let mut rtts = Vec::new();
     for _ in 0..3 {
         let start = Instant::now();
         client.ping(target_peer).expect("ping");
         loop {
+            healthy();
             assert!(start.elapsed() < SETUP_TIMEOUT, "idle ping timed out");
             next_event(target, Duration::from_millis(1));
             if let Some(EndpointEvent::PingRttMeasured { .. }) =
@@ -714,6 +724,7 @@ fn link(profile: Profile, point: &Point) -> Linked {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let mut ready = false;
     while !ready {
+        assert_forwarding(&up, &down);
         assert!(
             Instant::now() < deadline,
             "connect through the proxy timed out"
@@ -724,7 +735,9 @@ fn link(profile: Profile, point: &Point) -> Linked {
             Some(EndpointEvent::PeerReady { peer_id, .. }) if peer_id == target_peer
         );
     }
-    let unloaded_rtt_ms = idle_rtt_ms(&mut client, &mut target, &target_peer);
+    let unloaded_rtt_ms = idle_rtt_ms(&mut client, &mut target, &target_peer, || {
+        assert_forwarding(&up, &down)
+    });
     Linked {
         target,
         client,
@@ -801,6 +814,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
         &sink,
         warm_up,
         Instant::now,
+        || assert_forwarding(&up, &down),
     );
 
     let mut samples = Vec::new();
@@ -823,6 +837,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             &sink,
             load,
             Instant::now,
+            || assert_forwarding(&up, &down),
         );
         let seconds = (end - start).as_secs_f64();
         pinging.store(false, Ordering::Relaxed);

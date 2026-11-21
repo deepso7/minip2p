@@ -97,6 +97,11 @@ pub fn spawn_sink<M: Send + 'static>(
 /// Opens `load.streams` streams to `peer` and moves `load.total` bytes over
 /// them, returning `mark()` taken just before the first write and the
 /// sink's mark taken when the last byte arrived.
+///
+/// `healthy` runs on every turn of both waits, before their deadlines are
+/// checked. A caller driving the link through something that can break
+/// under it — `support::delay`'s proxy, say — fails the run there with
+/// that cause instead of here with a timeout that names the transfer.
 pub fn transfer<M>(
     client: &mut Endpoint,
     peer: &PeerId,
@@ -104,6 +109,7 @@ pub fn transfer<M>(
     sink: &Sink<M>,
     load: Load,
     mark: impl Fn() -> M,
+    healthy: impl Fn(),
 ) -> (M, M) {
     let per_stream = load.total / load.streams as u64;
     assert!(
@@ -119,6 +125,7 @@ pub fn transfer<M>(
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let mut ready = 0;
     while ready < pending.len() {
+        healthy();
         assert!(Instant::now() < deadline, "stream negotiation timed out");
         if let Some(EndpointEvent::StreamReady {
             stream,
@@ -140,6 +147,7 @@ pub fn transfer<M>(
         if let Ok(end) = sink.done.try_recv() {
             break end;
         }
+        healthy();
         assert!(
             started.elapsed() < TRANSFER_TIMEOUT,
             "transfer timed out at {sent} bytes"

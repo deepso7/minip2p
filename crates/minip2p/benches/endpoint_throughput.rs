@@ -132,7 +132,15 @@ fn transfer(
         streams: 1,
         in_flight: IN_FLIGHT,
     };
-    bulk::transfer(client, peer, PROTOCOL, sink, load, || Mark::now(roles))
+    bulk::transfer(
+        client,
+        peer,
+        PROTOCOL,
+        sink,
+        load,
+        || Mark::now(roles),
+        || {},
+    )
 }
 
 /// The rows for one case: throughput and datagrams from the timing pass,
