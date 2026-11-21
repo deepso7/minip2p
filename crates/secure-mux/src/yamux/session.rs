@@ -743,10 +743,18 @@ impl YamuxSession {
 
     /// Whether accepted stream bytes or a `FIN` are still waiting to be
     /// framed: a frame [`has_frames`](Self::has_frames) would hand out now,
-    /// or queued opens and bytes held back by the peer's window. What a host
-    /// drains before closing the session.
+    /// a `FIN` on an open still waiting for a stream slot, or bytes held back
+    /// by the peer's window. What a host drains before closing the session.
     pub fn has_unsent(&self) -> bool {
-        self.total_buffered_send != 0 || !self.pending_opens.is_empty() || self.has_frames()
+        self.total_buffered_send != 0 || self.has_frames() || self.has_queued_fin()
+    }
+
+    fn has_queued_fin(&self) -> bool {
+        self.pending_opens.iter().any(|stream| {
+            self.streams
+                .get(stream)
+                .is_some_and(|state| state.write == WriteSide::FinPending)
+        })
     }
 
     /// Returns the number of tracked streams, including queued opens.

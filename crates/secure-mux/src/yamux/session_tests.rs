@@ -104,6 +104,10 @@ fn empty_queued_fin_counts_as_unsent_until_admission() {
     let first = client.open_stream().unwrap();
     outbound(&mut client);
     let queued = client.open_stream().unwrap();
+    assert!(
+        !client.has_unsent(),
+        "an empty queued open has nothing to flush"
+    );
     client.close_write(queued).unwrap();
     assert!(!client.has_frames());
     assert!(

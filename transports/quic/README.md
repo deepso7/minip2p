@@ -80,6 +80,14 @@ while !connected {
 }
 
 let stream_id = dialer.open_stream(conn_id)?;
+let mut opened = false;
+while !opened {
+    let now = clock.now();
+    listener.poll(now)?;
+    opened = dialer.poll(now)?.iter().any(|event| {
+        matches!(event, TransportEvent::StreamOpened { stream_id: s, .. } if *s == stream_id)
+    });
+}
 dialer.send_stream(conn_id, stream_id, Bytes::from_static(b"hello"))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

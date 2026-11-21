@@ -39,8 +39,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// ## Stream lifecycle
 ///
 /// - `open_stream()` returns a `StreamId` and emits `StreamOpened` once the
-///   stream is open on the wire, which may wait for the peer's stream credit.
-///   Writes and FIN may be issued before it and queue until then.
+///   stream is open on the wire, which may wait for a local stream slot or
+///   the peer's stream credit. FIN may be issued before it and queues; writes
+///   may return `Full` until then, followed by `StreamWritable`.
 /// - Remote-initiated streams emit `IncomingStream` before any `StreamData`.
 /// - `StreamData` may be emitted zero or more times for a stream.
 /// - `StreamRemoteWriteClosed` is emitted at most once per stream when the
