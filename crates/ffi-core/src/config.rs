@@ -167,7 +167,9 @@ pub struct YamuxOptions {
     /// Largest data-frame payload sent; non-zero.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_frame_len: Option<u32>,
-    /// Streams tracked at once, counting unsettled closed ones.
+    /// Active and unsettled streams at once, for TCP or circuits.
+    /// Excess local opens wait FIFO with writes and FIN buffered within the
+    /// send caps. The queue is unbounded and local-caller-only, not remote.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_streams: Option<u64>,
     /// Per-stream cap on accepted, unpulled send bytes; non-zero.

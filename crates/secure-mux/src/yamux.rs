@@ -112,8 +112,11 @@ pub struct YamuxConfig {
     /// pulls frames as the link takes them rather than queueing many ahead
     /// (the TCP transport holds one by default).
     pub max_frame_len: u32,
-    /// Maximum number of simultaneously tracked inbound and outbound streams,
-    /// counting closed streams that are still unsettled.
+    /// Maximum active inbound and outbound streams, including unsettled ones.
+    /// Local opens beyond this cap receive IDs immediately and wait FIFO;
+    /// their SYNs leave only after a slot frees. The pending queue is unbounded
+    /// and local-caller-only, so peers cannot enqueue it for DoS. Pending
+    /// streams may buffer writes and FIN within the ordinary send caps.
     pub max_streams: usize,
     /// Per-stream cap for bytes [`YamuxSession::send`] accepted that have not
     /// been pulled as frames yet, whether or not remote credit allows them.
@@ -182,6 +185,11 @@ impl YamuxConfig {
 pub enum YamuxOutput {
     /// Encoded bytes that must be written to the underlying connection.
     Outbound(Vec<u8>),
+    /// A local stream's first frame carrying `SYN` was pulled for writing.
+    StreamOpened {
+        /// Locally allocated stream identifier.
+        stream: u32,
+    },
     /// The remote opened a new multiplexed stream.
     IncomingStream {
         /// Remote-selected stream identifier.
@@ -296,9 +304,6 @@ pub enum YamuxError {
         /// Bytes delivered and not yet acknowledged.
         unacked: usize,
     },
-    /// The configured stream capacity is already in use.
-    #[error("maximum Yamux stream count reached")]
-    TooManyStreams,
     /// The local role exhausted its same-parity `u32` stream IDs.
     #[error("Yamux stream IDs exhausted")]
     StreamsExhausted,

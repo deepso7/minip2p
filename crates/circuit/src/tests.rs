@@ -1602,6 +1602,59 @@ fn relay_connection_close_closes_each_ready_circuit_once() {
 }
 
 #[test]
+fn circuit_opens_wait_for_yamux_capacity_and_cancel_without_a_syn() {
+    let config = YamuxConfig {
+        max_streams: 1,
+        ..YamuxConfig::default()
+    };
+    let (mut a, mut b, circuit_id, _, a_peer, b_peer) = setup_pair_with_yamux_config(Some(config));
+    complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    let first = a.open_stream(circuit_id).expect("first stream");
+    let opened = |stream| TransportEvent::StreamOpened {
+        id: circuit_id,
+        stream_id: stream,
+    };
+    assert!(
+        a.poll(Now::from_millis(0))
+            .unwrap()
+            .contains(&opened(first))
+    );
+    b.poll(Now::from_millis(0)).unwrap();
+    let cancelled = a.open_stream(circuit_id).expect("queued second");
+    let third = a.open_stream(circuit_id).expect("queued third");
+    a.send_stream(circuit_id, third, Bytes::from_static(b"queued"))
+        .unwrap();
+    a.close_stream_write(circuit_id, third).unwrap();
+    a.reset_stream(circuit_id, cancelled).unwrap();
+    let events = a.poll(Now::from_millis(0)).unwrap();
+    assert!(!events.contains(&opened(cancelled)));
+    assert!(!events.contains(&opened(third)));
+    assert!(b.poll(Now::from_millis(0)).unwrap().is_empty());
+    a.reset_stream(circuit_id, first).unwrap();
+    assert!(
+        a.poll(Now::from_millis(0))
+            .unwrap()
+            .contains(&opened(third))
+    );
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        events.extend(b.poll(Now::from_millis(0)).unwrap());
+        a.poll(Now::from_millis(0)).unwrap();
+    }
+    assert!(!events.iter().any(|event| matches!(event,
+        TransportEvent::IncomingStream { stream_id, .. } if *stream_id == cancelled
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        TransportEvent::StreamData { stream_id, data, .. }
+        if *stream_id == third && data.as_ref() == b"queued"
+    )));
+    assert!(events.contains(&TransportEvent::StreamRemoteWriteClosed {
+        id: circuit_id,
+        stream_id: third,
+    }));
+}
+
+#[test]
 fn yamux_backpressure_is_stream_scoped_and_session_survives() {
     let max_buffered_send = 64;
     let config = YamuxConfig {

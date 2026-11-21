@@ -98,6 +98,8 @@ The session bounds inbound frame lengths, stream count, per-stream queued sends,
 
 Clients allocate odd stream IDs and servers allocate even stream IDs. The default `receive_window` is the specification's 256 KiB (`DEFAULT_RECEIVE_WINDOW`). A host may raise it for long, fat paths; a stream still starts from the 256 KiB credit, and the difference is granted with its first window update.
 
+`open_stream` allocates its ID immediately. Local opens beyond `max_streams` (active plus unsettled streams, default 256) wait FIFO in an unbounded queue that only local callers can enqueue, not remote peers. Writes and FIN on queued streams buffer within the normal send caps. A slot is taken when the first frame carrying SYN is pulled; SYNs leave in increasing ID order, and `StreamOpened` then travels through `SecureMuxSession` to the TCP or circuit transport. Resetting a queued open discards it and its buffered writes without any wire frame. Closing or failing the session drops the queue. Inbound streams beyond the active cap remain refused.
+
 The interoperability fixture is described in [`tests/fixtures/yamux`](tests/fixtures/yamux/README.md). The `data_path_ir` bench counts the instructions of the Yamux session's send and receive paths.
 
 ## no_std

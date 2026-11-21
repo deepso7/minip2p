@@ -47,7 +47,7 @@ export interface Minip2pLimits {
   readonly quic?: Minip2pQuicLimits;
   /** TCP limits, including each connection's Yamux limits. */
   readonly tcp?: Minip2pTcpLimits;
-  /** Relay circuits' Yamux limits; independent of `tcp.yamux`. */
+  /** Relay circuits' Yamux limits; excess opens queue, independently of `tcp.yamux`. */
   readonly circuit?: Minip2pYamuxLimits;
   /** Most relayed circuits held at once. */
   readonly maxCircuits?: number;
@@ -104,7 +104,7 @@ export interface Minip2pTcpLimits {
   readonly maxBufferedSend?: number;
   /** How long a connection may hold bytes its socket refuses, in milliseconds. */
   readonly sendStallTimeoutMs?: number | "never";
-  /** Each TCP connection's Yamux limits. */
+  /** Each TCP connection's Yamux limits; excess opens queue. */
   readonly yamux?: Minip2pYamuxLimits;
 }
 
@@ -114,7 +114,11 @@ export interface Minip2pYamuxLimits {
   readonly receiveWindow?: number;
   /** Largest data-frame payload sent; non-zero. */
   readonly maxFrameLen?: number;
-  /** Streams tracked at once, counting unsettled closed ones. */
+  /**
+   * Active and unsettled streams at once (default 256), for TCP or circuits.
+   * Excess local opens wait FIFO; writes and FIN buffer within the send caps.
+   * The queue is unbounded and local-caller-only, not remotely enqueueable.
+   */
   readonly maxStreams?: number;
   /** Per-stream cap on accepted, unsent bytes; non-zero. */
   readonly maxBufferedSend?: number;

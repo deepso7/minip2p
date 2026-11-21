@@ -23,6 +23,102 @@ fn config() -> YamuxConfig {
 }
 
 #[test]
+fn local_opens_wait_for_settled_capacity() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    let mut server = server_with_delivered(limits, 10, FLAG_FIN);
+    let second = server.open_stream().expect("second open queues");
+    server.send(second, Bytes::from_static(b"queued")).unwrap();
+    server.close_write(second).unwrap();
+    server.close_write(1).unwrap();
+    while server.poll_frame().is_some() {}
+    assert!(
+        server.poll_frame().is_none(),
+        "unsettled bytes keep the slot"
+    );
+    server.ack(1, 9).unwrap();
+    assert!(server.poll_frame().is_none());
+    server.ack(1, 1).unwrap();
+    let opening = decode(&outbound(&mut server));
+    assert_eq!(opening.stream_id(), second);
+    assert_eq!(opening.flags(), FLAG_SYN | FLAG_FIN);
+    assert_eq!(opening.payload(), b"queued");
+}
+
+#[test]
+fn cancelling_a_queued_open_sends_nothing_and_keeps_syns_ordered() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+    let first = client.open_stream().unwrap();
+    assert_eq!(decode(&outbound(&mut client)).stream_id(), first);
+    let cancelled = client.open_stream().expect("queued second");
+    let third = client.open_stream().expect("queued third");
+    client
+        .send(cancelled, Bytes::from_static(b"discard"))
+        .unwrap();
+    client.close_write(cancelled).unwrap();
+    client.send(third, Bytes::from_static(b"third")).unwrap();
+    client.reset(cancelled).unwrap();
+    assert_eq!(client.total_buffered_send(), 5);
+    assert!(client.poll_frame().is_none());
+    client.reset(first).unwrap();
+    assert_eq!(decode(&outbound(&mut client)).flags(), FLAG_RST);
+    let opening = decode(&outbound(&mut client));
+    assert_eq!(opening.stream_id(), third);
+    assert_eq!(opening.flags(), FLAG_SYN);
+    assert_eq!(opening.payload(), b"third");
+    assert!(client.poll_frame().is_none());
+    let queued = client.open_stream().unwrap();
+    client.go_away(0);
+    assert_eq!(
+        decode(&outbound(&mut client)).frame_type(),
+        FrameType::GoAway
+    );
+    assert!(client.poll_frame().is_none());
+    assert_eq!(
+        client.send(queued, Bytes::from_static(b"closed")),
+        Err(YamuxError::SessionClosed)
+    );
+}
+
+#[test]
+fn peer_frames_cannot_activate_queued_local_streams() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+    let first = client.open_stream().unwrap();
+    outbound(&mut client);
+    client.poll_events();
+    let queued = client.open_stream().unwrap();
+    for frame in [
+        Frame::data(queued, FLAG_RST, Vec::new()).unwrap(),
+        Frame::data(queued, 0, b"fake".to_vec()).unwrap(),
+        Frame::window_update(queued, FLAG_ACK | FLAG_FIN, 10).unwrap(),
+    ] {
+        client.handle_data(&frame.encode()).unwrap();
+    }
+    assert!(client.poll_events().is_empty());
+    assert!(client.unsettled_streams().next().is_none());
+    assert_eq!(client.streams[&queued].send_window, DEFAULT_RECEIVE_WINDOW);
+    for _ in 0..2 {
+        let reset = decode(&outbound(&mut client));
+        assert_eq!(reset.stream_id(), queued);
+        assert_eq!(reset.flags(), FLAG_RST);
+    }
+    assert!(client.poll_frame().is_none());
+    client.reset(first).unwrap();
+    assert_eq!(decode(&outbound(&mut client)).flags(), FLAG_RST);
+    assert_eq!(decode(&outbound(&mut client)).stream_id(), queued);
+    let pending = client.open_stream().unwrap();
+    assert!(matches!(
+        client.handle_data(&Frame::window_update(pending, FLAG_SYN, 0).unwrap().encode()),
+        Err(YamuxError::Protocol("remote used a local-parity stream id"))
+    ));
+    assert!(client.pending_opens.is_empty());
+}
+
+#[test]
 fn clients_use_odd_ids_and_servers_use_even_ids() {
     let mut client = YamuxSession::new(YamuxRole::Client);
     let mut server = YamuxSession::new(YamuxRole::Server);
@@ -52,6 +148,10 @@ fn syn_and_ack_piggyback_on_first_data_frames() {
     let stream = client.open_stream().unwrap();
     client.send(stream, Bytes::from(b"hello".to_vec())).unwrap();
     let opening = outbound(&mut client);
+    assert_eq!(
+        client.poll_event(),
+        Some(YamuxOutput::StreamOpened { stream })
+    );
     assert_eq!(decode(&opening).flags(), FLAG_SYN);
     server.handle_data(&opening).unwrap();
     assert_eq!(
@@ -88,6 +188,10 @@ fn server_opened_stream_completes_a_bidirectional_lifecycle() {
         .send(stream, Bytes::from(b"request".to_vec()))
         .unwrap();
     client.handle_data(&outbound(&mut server)).unwrap();
+    assert_eq!(
+        server.poll_event(),
+        Some(YamuxOutput::StreamOpened { stream })
+    );
     assert_eq!(
         client.poll_output(),
         Some(YamuxOutput::IncomingStream { stream })
@@ -197,8 +301,12 @@ fn partial_windows_frame_queued_bytes_in_order() {
         .unwrap();
     let payloads = |client: &mut YamuxSession| {
         core::iter::from_fn(|| client.poll_output())
-            .map(|output| match output {
-                YamuxOutput::Outbound(bytes) => decode(&bytes).payload().to_vec(),
+            .filter_map(|output| match output {
+                YamuxOutput::Outbound(bytes) => Some(decode(&bytes).payload().to_vec()),
+                YamuxOutput::StreamOpened { stream: opened } => {
+                    assert_eq!(opened, stream);
+                    None
+                }
                 output => panic!("expected outbound bytes, got {output:?}"),
             })
             .collect::<Vec<_>>()
@@ -229,15 +337,15 @@ fn data_frames_rotate_across_sendable_streams() {
         let frame = decode(&outbound(client));
         (frame.stream_id(), frame.payload().to_vec())
     };
-    assert_eq!(next(&mut client), (b, Vec::new()));
-    assert_eq!(next(&mut client), (idle, Vec::new()));
     assert_eq!(next(&mut client), (a, b"a1".to_vec()));
-    client.send(b, Bytes::from(b"b1b2".to_vec())).unwrap();
-    assert_eq!(next(&mut client), (b, b"b1".to_vec()));
+    assert_eq!(next(&mut client), (b, Vec::new()));
     assert_eq!(next(&mut client), (c, b"c1".to_vec()));
+    assert_eq!(next(&mut client), (idle, Vec::new()));
+    client.send(b, Bytes::from(b"b1b2".to_vec())).unwrap();
     assert_eq!(next(&mut client), (a, b"a2".to_vec()));
-    assert_eq!(next(&mut client), (b, b"b2".to_vec()));
+    assert_eq!(next(&mut client), (b, b"b1".to_vec()));
     assert_eq!(next(&mut client), (a, b"a3".to_vec()));
+    assert_eq!(next(&mut client), (b, b"b2".to_vec()));
     assert_eq!(client.poll_frame(), None);
 }
 
@@ -366,6 +474,10 @@ fn resending_tails_after_writable_reproduces_the_byte_stream() {
             server.handle_data(&frame).unwrap();
         }
         while let Some(event) = client.poll_event() {
+            if let YamuxOutput::StreamOpened { stream: opened } = event {
+                assert_eq!(opened, stream);
+                continue;
+            }
             assert_eq!(event, YamuxOutput::Writable { stream });
             writable_count += 1;
         }
@@ -528,6 +640,10 @@ fn a_writable_already_queued_is_dropped_when_the_write_side_closes() {
     ));
     while session.poll_frame().is_some() {}
     session.close_write(stream).unwrap();
+    assert_eq!(
+        session.poll_event(),
+        Some(YamuxOutput::StreamOpened { stream })
+    );
     assert_eq!(session.poll_event(), None);
 }
 
@@ -544,7 +660,13 @@ fn a_writable_already_queued_is_dropped_when_the_session_goes_away() {
     while session.poll_frame().is_some() {}
     session.go_away(0);
     let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
-    assert_eq!(events, [YamuxOutput::StreamClosed { stream }]);
+    assert_eq!(
+        events,
+        [
+            YamuxOutput::StreamOpened { stream },
+            YamuxOutput::StreamClosed { stream }
+        ]
+    );
 }
 
 #[test]
@@ -663,6 +785,10 @@ fn close_waits_for_buffered_data_and_reset_is_immediate() {
     session.close_write(stream).unwrap();
     assert_eq!(session.streams[&stream].write, WriteSide::FinPending);
     assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
+    assert_eq!(
+        session.poll_event(),
+        Some(YamuxOutput::StreamOpened { stream })
+    );
     assert_eq!(session.poll_frame(), None);
     session
         .handle_data(&Frame::window_update(stream, FLAG_ACK, 6).unwrap().encode())
@@ -673,6 +799,12 @@ fn close_waits_for_buffered_data_and_reset_is_immediate() {
 
     let reset_stream = session.open_stream().unwrap();
     assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
+    assert_eq!(
+        session.poll_event(),
+        Some(YamuxOutput::StreamOpened {
+            stream: reset_stream
+        })
+    );
     session.reset(reset_stream).unwrap();
     assert_eq!(
         session.poll_output(),
@@ -750,7 +882,8 @@ fn a_closed_stream_keeps_its_slot_until_its_bytes_are_acknowledged() {
     );
     let open = |stream| Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode();
 
-    assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
+    let queued = server.open_stream().unwrap();
+    assert!(server.poll_frame().is_none());
     server.handle_data(&open(3)).unwrap();
     assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_RST);
 
@@ -767,6 +900,8 @@ fn a_closed_stream_keeps_its_slot_until_its_bytes_are_acknowledged() {
     );
 
     server.ack(1, 6).unwrap();
+    server.reset(queued).unwrap();
+    server.poll_events();
     server.handle_data(&open(7)).unwrap();
     assert_eq!(
         server.poll_events(),
@@ -832,9 +967,10 @@ fn a_local_reset_abandons_unacknowledged_bytes() {
     server
         .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
         .unwrap();
-    assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
+    let queued = server.open_stream().unwrap();
+    assert!(server.poll_frame().is_none());
     server.reset(1).unwrap();
-    assert_eq!(server.open_stream(), Ok(2));
+    assert_eq!(decode(&outbound(&mut server)).stream_id(), queued);
 }
 
 fn unsettled(session: &YamuxSession) -> Vec<(u32, usize)> {
@@ -910,13 +1046,11 @@ fn local_capacity_and_id_exhaustion_do_not_damage_existing_streams() {
     limits.max_streams = 1;
     let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
     assert_eq!(client.open_stream().unwrap(), 1);
-    assert_eq!(client.open_stream(), Err(YamuxError::TooManyStreams));
-    client.config.max_streams = 2;
+    assert_eq!(client.open_stream(), Ok(3));
     client.next_stream_id = Some(u32::MAX);
     assert_eq!(client.open_stream().unwrap(), u32::MAX);
-    client.config.max_streams = 3;
     assert_eq!(client.open_stream(), Err(YamuxError::StreamsExhausted));
-    assert_eq!(client.stream_count(), 2);
+    assert_eq!(client.stream_count(), 3);
 }
 
 #[test]
@@ -1291,6 +1425,11 @@ fn a_closed_session_does_not_keepalive() {
 fn rst_before_ack_surfaces_stream_closed() {
     let mut client = YamuxSession::new(YamuxRole::Client);
     let stream = client.open_stream().unwrap();
+    assert_eq!(decode(&outbound(&mut client)).flags(), FLAG_SYN);
+    assert_eq!(
+        client.poll_event(),
+        Some(YamuxOutput::StreamOpened { stream })
+    );
     client
         .handle_data(&Frame::data(stream, FLAG_RST, Vec::new()).unwrap().encode())
         .unwrap();
