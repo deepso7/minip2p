@@ -494,6 +494,11 @@ pub fn run_id(
             .wait(deadline)
             .map_err(|e| format!("waiting for identify: {e}"))?
         {
+            EndpointWaitOutcome::Event(EndpointEvent::IdentifyFailed {
+                peer_id, cause, ..
+            }) if peer_id == peer => {
+                return Err(cause.to_string().into());
+            }
             EndpointWaitOutcome::Event(event) => print_progress("id", true, &event),
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed".into());
