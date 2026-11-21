@@ -750,14 +750,24 @@ fn bytes_field_len(len: usize) -> usize {
 ///
 /// Returns `None` when the RPC body would exceed [`MAX_RPC_SIZE`].
 pub(crate) fn encode_publish_frame(message: &RawMessage) -> Option<Vec<u8>> {
-    let wire = message.wire();
-    let body_len = bytes_field_len(wire.len());
+    let raw_len = if message.raw.is_empty() {
+        message.fields_len(true)
+    } else {
+        message.raw.len()
+    };
+    let body_len = bytes_field_len(raw_len);
     if body_len > MAX_RPC_SIZE {
         return None;
     }
     let mut out = Vec::with_capacity(uvarint_len(body_len as u64) + body_len);
     write_uvarint(body_len as u64, &mut out);
-    encode_bytes_field(&mut out, 2, &wire);
+    if message.raw.is_empty() {
+        out.push((2 << 3) | WIRE_LEN);
+        write_uvarint(raw_len as u64, &mut out);
+        message.write_fields(&mut out, true);
+    } else {
+        encode_bytes_field(&mut out, 2, &message.raw);
+    }
     Some(out)
 }
 
