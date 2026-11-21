@@ -180,8 +180,6 @@ fn attempts_naming_one_host_share_a_lookup_and_its_failure() {
         .send(Err("NXDOMAIN".to_string()))
         .expect("lookup waiting");
 
-    // The lookup thread wakes the driver; that is not the caller's
-    // interrupt, so `wait` keeps going instead of surfacing it.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut unsettled = vec![first, second];
     while !unsettled.is_empty() {
@@ -230,7 +228,6 @@ fn a_resolver_wake_and_a_queued_event_in_one_batch_both_arrive() {
     answer
         .send(Err("NXDOMAIN".to_string()))
         .expect("lookup waiting");
-    // Let the lookup thread queue its answer and wake the poll.
     std::thread::sleep(Duration::from_millis(100));
     let other = Ed25519Keypair::generate().peer_id();
     dialer.engine.events.push_back(EndpointEvent::PingFailed {
@@ -280,7 +277,6 @@ fn cancelling_a_resolving_attempt_is_immediate_and_the_late_answer_is_dropped() 
         }] if *connect_id == id
     ));
 
-    // An answer that would reach the live listener, had anything kept it.
     answer
         .send(Ok(vec![std::net::Ipv4Addr::LOCALHOST.into()]))
         .expect("lookup waiting");
@@ -315,13 +311,10 @@ fn an_answer_after_the_deadline_leaves_the_attempt_timed_out() {
 
     let id = dialer.connect(target).expect("connect");
     started.recv().expect("lookup started");
-    // The answer lands past the deadline but before the next poll: the
-    // attempt already ran out of time, so the answer must not decide it.
     std::thread::sleep(Duration::from_millis(100));
     answer
         .send(Err("NXDOMAIN".to_string()))
         .expect("lookup waiting");
-    // Give the lookup thread time to queue its answer.
     std::thread::sleep(Duration::from_millis(50));
     match connect_outcome(&mut dialer, id) {
         ConnectOutcome::Failed(ConnectFailure::Timeout { candidates, .. }) => {
@@ -388,8 +381,6 @@ fn wait_delivers_connect_timeout_before_the_caller_deadline() {
         .bind()
         .expect("bind listener");
     let addr = listener.listen().expect("listen");
-    // Leave the listener undriven so the handshake hangs past the
-    // attempt deadline instead of failing immediately.
     let mut dialer = Endpoint::builder()
         .connect_deadline(Duration::from_millis(80))
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")

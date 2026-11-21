@@ -345,8 +345,6 @@ impl WebEndpoint {
 
     fn ring(&self) {
         if let Some(doorbell) = &self.doorbell {
-            // Advisory, as in the Node shell: a throwing doorbell must not
-            // fail the pump.
             drop(doorbell.call0(&JsValue::NULL));
         }
     }

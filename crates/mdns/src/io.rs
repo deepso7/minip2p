@@ -484,8 +484,6 @@ mod tests {
             IpFamily::V4,
             vec![net(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 24)],
         );
-        // Comparing a v6 source against a v4 network by its bits would make
-        // every one of them look local.
         assert!(!source_is_on_link(
             &snapshot,
             IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))

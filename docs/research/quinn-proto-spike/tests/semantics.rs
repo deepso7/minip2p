@@ -75,7 +75,6 @@ fn read_gate_withholds_credit_and_data_stays_buffered() {
     {
         let mut rs = server.conn(sch).recv_stream(sid);
         let mut chunks = rs.read(true).unwrap();
-        // Read only half: the gate.
         while read < 500_000 {
             match chunks.next(500_000 - read) {
                 Ok(Some(c)) => read += c.bytes.len(),
@@ -88,7 +87,6 @@ fn read_gate_withholds_credit_and_data_stays_buffered() {
     let more = write_all_possible(&mut client, cch, id);
     assert!(more > 0 && more <= 500_000, "credit for what was read only: {more}");
 
-    // Remaining bytes are already buffered: readable with no new packet.
     let mut rs = server.conn(sch).recv_stream(sid);
     let mut chunks = rs.read(true).unwrap();
     let mut rest = 0;
@@ -153,9 +151,6 @@ fn reset_surfaces_on_read() {
 #[test]
 fn keepalive_keeps_live_paths_and_dead_paths_still_time_out() {
     let (mut server, mut client, _sch, cch) = pair();
-    // Live: 30 s idle timeout, 15 s keepalive -> use the defaults but shorten
-    // via per-connection windows is not possible; instead observe that
-    // after 2 s of mutual idleness nothing closes, then kill the server.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
         drive(&mut server, &mut client);

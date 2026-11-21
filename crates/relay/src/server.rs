@@ -104,8 +104,6 @@ impl HopResponder {
             }
             HopState::Done => return Ok(()),
         }
-        // Framing faults reset; a well-framed message that fails to decode
-        // gets a status, so the decode result is carried out separately.
         let decoded = match self.frames.push(data).and_then(|()| {
             self.frames
                 .next_frame(|payload| Ok::<_, FrameFault>(HopMessage::decode(payload)))
@@ -169,9 +167,6 @@ impl HopResponder {
                 "cannot accept HOP RESERVE without a pending RESERVE request".into(),
             ));
         }
-        // Reservation vouchers are intentionally outside minip2p's relay
-        // server contract. Keep the wire field absent even if a low-level
-        // host reused a client-decoded Reservation value here.
         reservation.voucher = None;
         self.queue_terminal_hop_response(encode_hop_status(Status::Ok, Some(reservation), limit));
         Ok(())
@@ -425,9 +420,6 @@ impl StopInitiator {
             }
             StopState::Done => return,
         }
-        // Framing faults reset; a well-framed message that fails to decode
-        // gets a corrective status, so the decode result is carried out
-        // separately.
         let decoded = match self.frames.push(data).and_then(|()| {
             self.frames
                 .next_frame(|payload| Ok::<_, FrameFault>(StopMessage::decode(payload)))

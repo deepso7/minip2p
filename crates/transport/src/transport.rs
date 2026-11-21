@@ -431,9 +431,6 @@ mod tests {
     fn a_transport_with_no_datagram_of_its_own_says_so() {
         let target: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
 
-        // "Not available here" rather than "this failed": a caller choosing
-        // between transports has to be able to tell those apart, and a stream
-        // transport has nowhere to put a lone packet.
         let error = Minimal
             .send_datagram(&target, b"punch")
             .expect_err("no datagram here");

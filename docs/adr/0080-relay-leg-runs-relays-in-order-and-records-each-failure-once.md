@@ -1,0 +1,9 @@
+# Relay leg: relays tried as runs, each failure recorded once, nothing after the terminal
+
+How `NatAgent`'s relay leg (`Attempt` in `minip2p-nat`) orders relays and reports them, and how `ConnectEngine` in `minip2p-rs` (`connect.rs`: `observe_nat`, `route`, `abort_attempt`) consumes those events (ADR 0008, ADR 0017):
+
+- **A relay's addresses are tried as one run.** `Attempt` orders relay entries so every address of a relay is tried together, even when the configuration lists another relay in between; the addresses split that relay's `relay_timeout_ms` (clipped by the attempt's deadline) rather than taking a share of the next relay's.
+- **A refused relay reports only `RelayFailed`.** A relay refused at once never started a route, so it gets no `RelayStarted`, matching a refused direct candidate.
+- **Each relay failure is recorded once.** `RelayFailed` sets the attempt's current relay even when the agent refused the relay before it started (no `RelayStarted`), so the `ConnectFailed` that ends the leg is recognised as that relay's failure and not recorded a second time. `ConnectFailed` adds its error to `relay_failures` only when it differs from the last recorded failure.
+- **Outcomes after the terminal are dropped.** The agent can produce an attempt outcome in the same turn the attempt settled, before it learned of the settlement; `route` drops attempt outcomes for ids no longer pending instead of routing them, so an attempt has exactly one terminal (ADR 0017), and a stale punch failure never reaches the application.
+- **Cancel after `Connected` is a no-op.** `Endpoint::cancel_connect` and discovery's cancel and shutdown gate the NAT leg on `is_pending`. Once an attempt settled `Connected` it is no longer pending, so a cancel must not tear down a provisional relayed path the `NatAgent` still holds.

@@ -6,16 +6,6 @@ use minip2p_identity::{Multihash, PeerId, read_uvarint_with_remainder, write_uva
 use crate::multiaddr::is_valid_dns;
 use crate::{MultiaddrError, certhash};
 
-// ---------------------------------------------------------------------------
-// Multicodec codes
-// ---------------------------------------------------------------------------
-//
-// Per the multiformats/multicodec table at
-// <https://github.com/multiformats/multicodec/blob/master/table.csv>. Each
-// component of a binary multiaddr is `<varint(code)><value>`; the shape of
-// `<value>` depends on the code (fixed-size bytes, length-prefixed bytes,
-// or absent).
-
 /// Multicodec code for `/ip4/<a.b.c.d>`. 4 raw bytes.
 const IP4_CODE: u64 = 0x04;
 /// Multicodec code for `/ip6/<address>`. 16 raw bytes.
@@ -168,11 +158,6 @@ impl Protocol {
                         reason: e.to_string(),
                     })?
                     .to_string();
-                // Same validation the text parser applies. Without it the
-                // binary decoder accepts names the text form cannot represent:
-                // a name containing `/` re-parses as different components
-                // entirely, so one address would have two meanings depending
-                // on which representation a check looked at.
                 if !is_valid_dns(&name) {
                     return Err(MultiaddrError::InvalidBinaryValue {
                         protocol: label,
@@ -218,8 +203,6 @@ fn length_prefixed<'a>(
     protocol: &'static str,
 ) -> Result<(&'a [u8], &'a [u8]), MultiaddrError> {
     let (len, rest) = read_uvarint_with_remainder(bytes)?;
-    // Compare in u64 so an absurd declared length errs identically on
-    // 32-bit and 64-bit targets.
     if len > rest.len() as u64 {
         return Err(MultiaddrError::TruncatedBinaryValue { protocol });
     }

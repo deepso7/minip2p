@@ -130,12 +130,10 @@ fn two_sessions_complete_the_upgrade_and_authenticate_each_other() {
         "listener must finish the upgrade"
     );
 
-    // Each side learns the other's real identity, not its own.
     assert_eq!(established_peer(&dialer_events), Some(&listener_peer));
     assert_eq!(established_peer(&listener_events), Some(&dialer_peer));
     assert_eq!(dialer.peer(), Some(&listener_peer));
     assert_eq!(listener.peer(), Some(&dialer_peer));
-    // Both ends name the session with the same handshake hash.
     assert_eq!(
         established_hash(&dialer_events),
         established_hash(&listener_events)
@@ -185,7 +183,6 @@ fn drive_until_listener_established(
         if listener.is_established() {
             break;
         }
-        // The listener's reply is needed for the dialer to make progress.
         let batch = take_writes(listener);
         if batch.is_empty() {
             break;
@@ -206,9 +203,6 @@ fn established_is_reported_before_any_stream_output() {
 
     drive_until_listener_established(&mut dialer, &mut listener);
 
-    // Now the listener opens a substream and sends before the dialer has read
-    // its Yamux confirmation, so the dialer decrypts the confirmation and the
-    // frames in one batch -- the pipelined path.
     let stream = listener.open_stream().expect("open substream");
     listener
         .send(stream, Bytes::from_static(b"pipelined"))
@@ -222,7 +216,6 @@ fn established_is_reported_before_any_stream_output() {
         core::iter::from_fn(|| dialer.poll_output()).collect::<Vec<_>>()
     };
 
-    // The batch really did carry both, or this test proves nothing.
     let established = dialer_events
         .iter()
         .position(|event| matches!(event, SessionOutput::Established { .. }))
@@ -237,8 +230,6 @@ fn established_is_reported_before_any_stream_output() {
         })
         .expect("pipelined stream output in the same batch");
 
-    // A caller applying connection policy on `Established` must see it before
-    // it has to decide anything about a stream.
     assert!(
         established < first_stream,
         "Established must precede stream output: {dialer_events:?}"
@@ -269,7 +260,6 @@ fn substreams_carry_data_in_both_directions() {
     assert_eq!(incoming.len(), 1, "listener must see one substream");
     assert_eq!(stream_payloads(&listener_events), vec![b"ping".as_slice()]);
 
-    // ...and back the other way on the same substream.
     listener
         .send(incoming[0], Bytes::from_static(b"pong"))
         .expect("reply on substream");
@@ -279,8 +269,6 @@ fn substreams_carry_data_in_both_directions() {
 
 #[test]
 fn input_longer_than_one_batch_is_split_without_losing_a_byte() {
-    // Several Noise frames in one input, cut into `MAX_INPUT_BATCH` pieces
-    // that straddle frame boundaries.
     let (mut dialer, mut listener, _, _) = upgraded_pair();
     let stream = dialer.open_stream().expect("open substream");
     let payload: Vec<u8> = (0..200 * 1024_usize).map(|i| (i % 251) as u8).collect();
@@ -354,8 +342,6 @@ fn go_away_closes_local_substreams_and_ends_the_remote_session() {
     );
     assert!(!wire.is_empty(), "the GoAway frame must reach the wire");
 
-    // The remote learns this was an orderly end, not a protocol fault, so it
-    // can close quietly rather than report a failure the dialer never made.
     let result = listener.handle_input(wire);
     assert!(
         matches!(result, Err(SessionError::GoAway { code: 0 })),
@@ -386,9 +372,6 @@ fn a_remote_go_away_closes_the_substreams_it_takes_down() {
         "the remote shutdown must still be reported: {result:?}"
     );
 
-    // A remote shutdown ends the substreams exactly as a local one does, so a
-    // caller draining outputs after the error still learns to forget them
-    // rather than leaking a substream it will never hear about again.
     let events: Vec<_> = core::iter::from_fn(|| listener.poll_output()).collect();
     assert_eq!(
         events,
@@ -403,7 +386,6 @@ fn a_mismatched_expected_peer_fails_the_handshake() {
     let listener_key = Ed25519Keypair::generate();
     let impostor = Ed25519Keypair::generate();
 
-    // The dialer demands a peer the listener cannot prove it is.
     let mut dialer = session(SessionRole::Initiator, dialer_key, Some(&impostor));
     let mut listener = session(SessionRole::Responder, listener_key, None);
     dialer.start().expect("start");
@@ -464,8 +446,6 @@ fn stream_operations_before_the_upgrade_are_rejected() {
     assert!(!dialer.is_established());
     assert_eq!(dialer.peer(), None);
 
-    // Rejecting an early call must not consume the session: it is still
-    // mid-upgrade and has to be able to finish.
     dialer.start().expect("start after rejected calls");
     listener.start().expect("start");
     let _ = exchange(&mut dialer, &mut listener);
@@ -481,8 +461,6 @@ fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
     let (mut dialer, _listener, _, _) = upgraded_pair();
     let stream = dialer.open_stream().expect("open substream");
 
-    // Congruent to a live stream modulo 2^32: truncation would alias onto it
-    // and operate on somebody else's substream.
     let aliased = StreamId::new(stream.as_u64() + (1u64 << 32));
     assert!(matches!(
         dialer.send(aliased, Bytes::from_static(b"x")),
@@ -493,7 +471,6 @@ fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
         Err(SessionError::UnknownStream { .. })
     ));
 
-    // The real stream still works, so the rejection cost nothing.
     dialer
         .send(stream, Bytes::from_static(b"ok"))
         .expect("real stream");
@@ -501,14 +478,9 @@ fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
 
 #[test]
 fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
-    // One batch can carry the Yamux confirmation and pipelined frames. If a
-    // frame is fatal, `handle_input` must report it and the session must be
-    // unusable afterwards rather than half-alive.
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
 
-    // The dialer has no reserve for peer-provoked replies, so the listener's
-    // pipelined keepalive ping is fatal to it.
     let strict = YamuxConfig {
         max_pending_control: 0,
         ..YamuxConfig::default()
@@ -523,7 +495,6 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     dialer.start().expect("start");
     listener.start().expect("start");
 
-    // Drive until the listener is up, leaving its confirmation unread.
     drive_until_listener_established(&mut dialer, &mut listener);
 
     listener.poll(Now::from_millis(0)).expect("arm keepalive");
@@ -542,8 +513,6 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
         "a failed session is not established"
     );
 
-    // The phase was consumed, so every later call fails rather than operating
-    // on a half-torn-down session.
     assert!(dialer.handle_input(b"more".to_vec()).is_err());
     let _ = dialer.open_stream().unwrap_err();
 }
@@ -640,8 +609,6 @@ fn stream_bytes_are_encrypted_only_when_pulled_and_full_wakes_writable() {
 
 #[test]
 fn delivered_bytes_stay_counted_after_the_session_fails() {
-    // ADR 0012: whatever ends the session, the bytes it already delivered
-    // remain the host's to settle, so it must be able to take their counts.
     let (mut dialer, mut listener, _, _) = upgraded_pair();
     let stream = dialer.open_stream().expect("open substream");
     dialer
@@ -657,12 +624,10 @@ fn delivered_bytes_stay_counted_after_the_session_fails() {
         .expect("incoming substream");
     assert_eq!(listener.unsettled_streams(), [(incoming, 4)]);
 
-    // Garbage ciphertext is a fatal Noise failure that drops Yamux.
     assert!(listener.handle_input(vec![0, 4, 1, 2, 3, 4]).is_err());
     assert!(!listener.is_established());
     assert_eq!(listener.unsettled_streams(), [(incoming, 4)]);
 
-    // A clean GoAway keeps them too.
     let (mut dialer, mut listener, _, _) = upgraded_pair();
     let stream = dialer.open_stream().expect("open substream");
     dialer

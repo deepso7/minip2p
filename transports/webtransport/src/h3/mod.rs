@@ -142,7 +142,6 @@ mod tests {
     fn webtransport_codes_map_to_the_draft_range() {
         assert_eq!(webtransport_code_to_h3(0), 0x52e4_a40f_a8db);
         assert_eq!(webtransport_code_to_h3(u32::MAX), 0x52e5_ac98_3162);
-        // Code 0x1e skips the reserved codepoint at first + 0x1e.
         assert_eq!(webtransport_code_to_h3(0x1d), 0x52e4_a40f_a8db + 0x1d);
         assert_eq!(webtransport_code_to_h3(0x1e), 0x52e4_a40f_a8db + 0x1f);
     }

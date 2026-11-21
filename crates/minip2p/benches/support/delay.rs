@@ -219,7 +219,6 @@ impl Drop for Threads {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for handle in self.handles.drain(..) {
-            // A forwarding thread panicking is a bench bug; surface it.
             if let Err(payload) = handle.join()
                 && !thread::panicking()
             {
@@ -231,7 +230,6 @@ impl Drop for Threads {
 
 fn grow_receive_buffer(socket: impl Into<socket2::Socket>) -> socket2::Socket {
     let socket = socket.into();
-    // Best effort: the host may cap it, which calibration then shows as loss.
     if let Err(error) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
         eprintln!("proxy receive buffer stays at the default: {error}");
     }
@@ -292,7 +290,6 @@ impl UdpProxy {
                             continue;
                         }
                         Err(error) => {
-                            // The bench then times out on the stalled link.
                             eprintln!("proxy receive failed: {error}");
                             return;
                         }
@@ -319,8 +316,6 @@ impl UdpProxy {
                     } else {
                         client.lock().expect("client lock").expect("client known")
                     };
-                    // A refused send (nothing listening yet) is loss the
-                    // bench's calibration reports, not a reason to stop.
                     drop(to.send_to(datagram, destination));
                     Ok(())
                 });
@@ -413,7 +408,6 @@ fn tcp_pipe(
         stream.set_nodelay(true).expect("nodelay");
     }
     from.set_read_timeout(Some(POLL)).expect("read timeout");
-    // A far end that stopped reading must not keep a drop waiting forever.
     to.set_write_timeout(Some(Duration::from_secs(10)))
         .expect("write timeout");
     let (tx, rx) = mpsc::channel();
@@ -441,7 +435,6 @@ fn tcp_pipe(
     });
     let writer = thread::spawn(move || {
         deliver_loop(rx, stats, |bytes| to.write_all(bytes));
-        // Pass the end of the stream on once everything before it arrived.
         drop(to.shutdown(Shutdown::Write));
     });
     [reader, writer]

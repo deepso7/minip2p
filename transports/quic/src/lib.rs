@@ -259,9 +259,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             "must be greater than zero",
         ));
     }
-    // A zero queue could never free half of itself, so a Full write would
-    // never be told it can retry; nor could an application stream whose
-    // whole connection queue is the control reserve.
     if limits.max_pending_bytes_per_stream == 0 {
         return Err(invalid(
             "max_pending_bytes_per_stream",
@@ -274,9 +271,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             "must be less than max_pending_connection_bytes",
         ));
     }
-    // QUIC treats a zero idle timeout as "no timeout", which would keep dead
-    // connections alive forever -- the opposite of what a limit promises --
-    // so reject it up front.
     if limits.idle_timeout_ms == 0 {
         return Err(invalid("idle_timeout_ms", "must be greater than zero"));
     }
@@ -298,10 +292,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             return Err(invalid(field, "must be greater than zero"));
         }
     }
-    // RFC 9002's floors: lower thresholds declare packets lost that are only
-    // reordered or still in flight. The time threshold's ceiling keeps
-    // quinn's `Duration::mul_f32` by it from overflowing, which panics, and
-    // rejects NaN and infinity.
     if limits.packet_threshold < 3 {
         return Err(invalid("packet_threshold", "must be at least 3"));
     }
@@ -320,8 +310,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     let idle_timeout =
         VarInt::from_u64(limits.idle_timeout_ms).map_err(|_bounds| too_large("idle_timeout_ms"))?;
     let stream_window = var_int("stream_receive_window", limits.stream_receive_window)?;
-    // `usize::MAX`, or anything past what QUIC can express, is unlimited:
-    // on 32-bit targets `usize::MAX` alone would be a finite 4 GiB window.
     let connection_window = if limits.connection_receive_window_is_unlimited() {
         VarInt::MAX
     } else {
@@ -349,9 +337,7 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
         .receive_window(connection_window)
         .send_window(send_window)
         .max_concurrent_bidi_streams(max_streams)
-        // libp2p uses bidirectional streams only.
         .max_concurrent_uni_streams(VarInt::from_u32(0))
-        // QUIC DATAGRAM is not advertised.
         .datagram_receive_buffer_size(None)
         .max_idle_timeout(Some(IdleTimeout::from(idle_timeout)))
         .keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms(
@@ -534,7 +520,6 @@ impl QuicTransport {
     /// [`QuicNodeConfig::with_webtransport_certificates`] chose; a provided
     /// one is checked here (see [`QuicBindError::WebTransportCertificate`]).
     pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, QuicBindError> {
-        // (socket address, serves quic-v1, serves WebTransport)
         let mut binds: Vec<(SocketAddr, bool, bool)> = Vec::new();
         for addr in addrs {
             let invalid = |reason: String| QuicBindError::InvalidAddress {
@@ -567,7 +552,6 @@ impl QuicTransport {
                 return Err(QuicBindError::AddressFamilies { count: binds.len() });
             }
         }
-        // Checked before any socket is bound.
         let transport_config = transport_config(node_config.limits())?;
         let sockets = binds
             .into_iter()
@@ -638,15 +622,12 @@ impl QuicTransport {
             .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
         let mut validation_tokens = ValidationTokenConfig::default();
-        // Retry stays the only address validation: no NEW_TOKEN is issued.
         validation_tokens.sent(0);
         server_config
             .transport_config(Arc::clone(&transport_config))
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
         let webtransport = if sockets.iter().any(|socket| socket.webtransport) {
-            // Until the first poll's sample, the system clock picks the
-            // period, or judges a provided certificate's expiry.
             let unix = host_time.now().as_secs();
             let keypair = node_config.keypair();
             let certificates = match &node_config.webtransport_certificates {
@@ -657,8 +638,6 @@ impl QuicTransport {
             };
             let certificate = certificates.certificate();
             let transport = Arc::new(webtransport_transport_config(node_config.limits())?);
-            // Clones of the endpoint's config, so the Retry tokens it issues
-            // stay valid.
             let config = |libp2p: bool| -> Result<Arc<ServerConfig>, QuicBindError> {
                 let server_tls = tls
                     .webtransport_server_config(Arc::clone(&certificate), libp2p)
@@ -687,14 +666,11 @@ impl QuicTransport {
             .map(|socket| socket.recv_buffer_len(max_payload))
             .max()
             .unwrap_or(RECV_BUFFER_SIZE);
-        // Path MTU discovery needs datagrams the network drops rather than
-        // fragments when they are too large.
         let allow_mtu_discovery = sockets.iter().all(|socket| !socket.may_fragment());
         Ok(Self {
             sockets: Sockets::new(sockets),
             registered: Vec::new(),
             dispatched: false,
-            // No server config until `listen`: the endpoint accepts nothing.
             endpoint: quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
                 None,
@@ -899,10 +875,6 @@ impl QuicTransport {
                 return Ok(());
             };
             slots.clear();
-            // Through the registered clone's `try_io` once attached: on
-            // Windows mio only re-arms readiness when it sees the
-            // `WouldBlock` itself, and a receive on the original socket would
-            // hide it, leaving later datagrams with no wakeup.
             let read = match self.registered.get(index) {
                 Some(registered) => registered
                     .try_io(|| {
@@ -972,8 +944,6 @@ impl QuicTransport {
                     .and_then(|(_, id)| self.connections.get_mut(id).map(|conn| (id, conn)))
                 {
                     conn.handle_event(event);
-                    // `service_due` dedups; this only keeps a burst to one
-                    // connection from repeating it.
                     if self.received.last() != Some(&id) {
                         self.received.push(id);
                     }
@@ -982,9 +952,6 @@ impl QuicTransport {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 self.admit(now, index, incoming, &mut buf);
             }
-            // A reply to a datagram no connection owns. The endpoint answers
-            // an unknown Initial with a stateless reset even before `listen`;
-            // a socket that is not listening sends nothing at all.
             Some(DatagramEvent::Response(transmit)) => {
                 if let Some(socket) = self.sockets.get_mut(index).filter(|s| s.listening) {
                     send_stateless(socket, &buf, &transmit);
@@ -1021,8 +988,6 @@ impl QuicTransport {
             self.endpoint.ignore(incoming);
             return;
         };
-        // The receiving socket picks the config: libp2p-only sockets keep
-        // the endpoint's.
         let config = self
             .webtransport
             .as_ref()
@@ -1035,7 +1000,6 @@ impl QuicTransport {
             .map(|wt| wt.certificates.context());
         match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
-                // The accepted Initial never passes through `handle_event`.
                 let mut counters = ConnectionCounters::default();
                 counters.datagram_received();
                 let endpoint =
@@ -1188,7 +1152,6 @@ impl QuicTransport {
             conn.expire();
         }
         self.service(id, now);
-        // Nothing was reported for it; the caller learns from the error.
         self.pending_events.retain(|event| match event {
             TransportEvent::Error { id: event_id, .. }
             | TransportEvent::Closed { id: event_id, .. } => *event_id != id,
@@ -1218,8 +1181,6 @@ impl Transport for QuicTransport {
             .sockets
             .for_addr(peer_socket)
             .ok_or_else(|| missing_family("dial target", peer_socket))?;
-        // The connection limit counts inbound and outbound alike, across
-        // sockets; admission enforces the same bound for incoming Initials.
         if slots_held >= max_connections {
             return Err(TransportError::ResourceExhausted {
                 resource: "QUIC connections",
@@ -1247,8 +1208,6 @@ impl Transport for QuicTransport {
         self.connections.insert(id, conn);
         self.handles.insert(handle, id);
 
-        // A first flight the socket refuses outright (no route) fails the
-        // dial now rather than at the handshake timeout.
         if let Some(error) = self.service(id, now) {
             self.abandon(id, now);
             return Err(TransportError::DialFailed {
@@ -1314,14 +1273,9 @@ impl Transport for QuicTransport {
         } else {
             &mut socket.announced.0
         };
-        // Listening again is the same listener: report the address without
-        // announcing it twice (the endpoint listens at bind, and callers may
-        // still ask `listen` for the address afterwards).
         if std::mem::replace(announced, true) {
             return Ok(listen_addr);
         }
-        // One endpoint serves both sockets; admission checks that the socket
-        // an Initial arrived on is listening.
         self.endpoint
             .set_server_config(Some(Arc::clone(&self.server_config)));
         self.pending_events.push(TransportEvent::Listening {
@@ -1337,8 +1291,6 @@ impl Transport for QuicTransport {
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
         let stream_id = conn.open_stream()?;
-        // `StreamOpened` follows once the peer's stream credit lets the
-        // engine open it, from this service or a later one.
         self.service(id, Instant::now());
         Ok(stream_id)
     }
@@ -1370,8 +1322,6 @@ impl Transport for QuicTransport {
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
         let result = conn.close_stream_write(stream_id);
-        // Writable never follows the end of a write side, even one a Full
-        // queued before its call returned.
         self.pending_events
             .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
         self.service(id, Instant::now());
@@ -1384,7 +1334,6 @@ impl Transport for QuicTransport {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
-            // Abandoning a stream of an ended connection only settles it.
             if self.unsettled.abandon(id, stream_id) {
                 return Ok(());
             }
@@ -1405,12 +1354,9 @@ impl Transport for QuicTransport {
         bytes: usize,
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
-            // An ended connection's bytes are released without credit.
             self.unsettled.ack(id, stream_id, bytes)?;
             return Ok(());
         };
-        // A stream that had spent its budget resumes now, not when the next
-        // packet happens to arrive: the engine already holds what it can read.
         let result = conn.ack_stream(stream_id, bytes, &mut self.pending_events);
         self.service(id, Instant::now());
         result
@@ -1429,7 +1375,6 @@ impl Transport for QuicTransport {
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
         conn.close(Instant::now());
-        // Nor may one a Full queued before the close.
         self.pending_events.retain(
             |event| !matches!(event, TransportEvent::StreamWritable { id: event_id, .. } if *event_id == id),
         );
@@ -1484,23 +1429,14 @@ impl Transport for QuicTransport {
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        // The engine runs on a fine-grained `Instant` sampled once per poll;
-        // the host's millisecond sample anchors `next_deadline` and is never
-        // handed to the engine as time.
         let instant = Instant::now();
         self.clock = Some((now, instant));
         self.host_time.set(now.unix_seconds);
         self.dispatched = false;
         self.rotate();
-        // Events accumulate in `self.pending_events` for the whole poll and
-        // are only taken at the very end, so an error path leaves the batch
-        // queued for the next call instead of dropping it.
         for socket in self.sockets.iter_mut() {
             socket.flush();
         }
-        // Each socket gets its own receive bound, so one family's traffic
-        // cannot starve the other. The service below runs whatever ended a
-        // batch: connections defer their output to it.
         let mut received = Ok(());
         for index in 0..self.sockets.len() {
             let batch = self.recv_batch(instant, index);
@@ -1529,12 +1465,6 @@ impl Transport for QuicTransport {
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        // Events buffered outside a poll -- `listen`, `open_stream`,
-        // `send_stream`, `close_stream_write` and `reset_stream` all queue
-        // here between polls -- are due regardless of what the clock reads,
-        // and nothing else would wake a host idling on `None`. A receive
-        // batch cut off by its bound may have left input with no fresh
-        // readiness edge to report it.
         if self.dispatched
             || !self.pending_events.is_empty()
             || self.sockets.iter().any(|socket| socket.saturated)
@@ -1542,13 +1472,6 @@ impl Transport for QuicTransport {
             return Some(Deadline::IMMEDIATE);
         }
 
-        // Datagrams stuck on socket writability can't be woken by a readable
-        // peek; return a near deadline so the driver retries the flush soon.
-        // Checked before the retained sample: `dial` queues datagrams before
-        // the first `poll`, and a host that idled on `None` there would never
-        // come back to flush them. `IMMEDIATE` is due on any timeline.
-        // Connections a service left unfinished (most often behind those
-        // datagrams) need another the same way.
         if self.sockets.iter().any(Socket::has_pending) || !self.unfinished.is_empty() {
             return Some(
                 self.clock
@@ -1556,7 +1479,6 @@ impl Transport for QuicTransport {
             );
         }
 
-        // No sample yet means no timeline to answer on.
         let (now, instant) = self.clock?;
         let timer = self.timers.first().map(|&(timeout, _)| {
             deadline_for_timeout(now, timeout.saturating_duration_since(instant))
@@ -1590,7 +1512,6 @@ fn keepalive_interval_ms(idle_timeout_ms: u64) -> u64 {
 /// that adds sits well inside the driver's own 1ms idle cadence.
 fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
     if timeout.is_zero() {
-        // Genuinely due: let the driver poll again without idling.
         return now.as_deadline();
     }
     let millis = u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
@@ -1599,11 +1520,6 @@ fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
 
 impl Drop for QuicTransport {
     fn drop(&mut self) {
-        // Nothing polls after this, so every connection's CONNECTION_CLOSE
-        // leaves now. Drain the retry queues first so a full one has room to
-        // retain them; closing an already-closed connection is a no-op.
-        // A WebTransport session's close capsule and FIN go out with the
-        // close, but its Closing phase is cut short: nothing would end it.
         for socket in self.sockets.iter_mut() {
             socket.flush();
         }
@@ -1651,8 +1567,6 @@ impl PollSource for QuicTransport {
                 Ok(())
             });
         if let Err(error) = result {
-            // All or nothing: a clone shares the socket's file description,
-            // so dropping it would not drop the registration.
             for mut clone in registered {
                 drop(registry.deregister(&mut clone));
             }
@@ -1764,9 +1678,6 @@ mod tests {
 
     #[test]
     fn zero_limits_are_rejected_at_construction() {
-        // A zero idle timeout would disable expiry entirely (QUIC treats 0
-        // as "no timeout"), and a zero datagram queue could never retain a
-        // packet; both must fail fast instead of silently misbehaving.
         for limits in [
             QuicLimits {
                 idle_timeout_ms: 0,
@@ -1795,8 +1706,6 @@ mod tests {
             sender.send_to(&[0u8; 8], destination).expect("send");
         }
 
-        // Wait for the kernel to queue the first datagram, then give the
-        // rest a moment to land before polling.
         let udp = socket(&mut transport, false)
             .udp
             .try_clone()
@@ -1822,7 +1731,6 @@ mod tests {
             "a saturated batch has the driver poll again at once"
         );
 
-        // Follow-up polls drain the remainder.
         let start = std::time::Instant::now();
         while socket::has_queued_input(&udp) {
             assert!(
@@ -1841,10 +1749,6 @@ mod tests {
             .pending_events
             .push(TransportEvent::Listening { addr: addr.clone() });
 
-        // An IPv6 destination on an IPv4 socket makes the datagram send fail
-        // with a hard error. A dead route affects only that packet's
-        // destination, so the poll must drop it and carry on rather than
-        // abort the whole endpoint.
         let good_destination = transport.local_addr();
         let socket = socket(&mut transport, false);
         socket.retain_datagram(&[0u8; 4], "[::1]:9".parse().expect("socket addr"));
@@ -1867,9 +1771,6 @@ mod tests {
     fn sub_millisecond_timeouts_never_report_as_already_due() {
         let now = Now::from_millis(10_000);
 
-        // The regression: truncating to whole milliseconds turned "due in
-        // 300us" into "due now", so the driver took a zero-length budget and
-        // span until wall time caught up.
         for timeout in [
             Duration::from_nanos(1),
             Duration::from_micros(1),
@@ -1885,7 +1786,6 @@ mod tests {
             );
         }
 
-        // Partial milliseconds round up rather than truncating down.
         assert_eq!(
             deadline_for_timeout(now, Duration::from_micros(1_500)).millis_until(now),
             2
@@ -1895,7 +1795,6 @@ mod tests {
             5
         );
 
-        // Zero really is due now: the driver should re-poll without idling.
         assert_eq!(
             deadline_for_timeout(now, Duration::ZERO).millis_until(now),
             0
@@ -1908,8 +1807,6 @@ mod tests {
         let mut transport = loopback(QuicNodeConfig::generate());
         assert_eq!(transport.next_deadline(), None, "idle and never polled");
 
-        // `dial` can queue a datagram before any poll has taken a sample. A
-        // host that idled on `None` here would never flush it.
         let destination = transport.local_addr();
         socket(&mut transport, false).retain_datagram(&[0u8; 4], destination);
 
@@ -1923,7 +1820,6 @@ mod tests {
     #[test]
     fn next_deadline_is_near_while_outbound_work_is_queued() {
         let mut transport = loopback(QuicNodeConfig::generate());
-        // Never polled, so there is no host timeline to answer on yet.
         assert_eq!(transport.next_deadline(), None);
 
         let now = Now::from_millis(10_000);
@@ -1988,8 +1884,6 @@ mod tests {
 
     #[test]
     fn an_attached_dual_stack_transport_wakes_a_shared_poll_for_either_family() {
-        // The best of three is held to the bound, so one descheduled thread
-        // on a busy runner cannot fail it.
         for ipv6 in [false, true] {
             let mut latencies = Vec::new();
             for delay_ms in [3, 13, 23] {
@@ -2015,7 +1909,6 @@ mod tests {
 
                 assert!(events > 0, "ipv6 {ipv6}: woke without readiness");
                 latencies.push(woke.saturating_duration_since(sent));
-                // Readiness consumed nothing: the datagram is still there.
                 assert!(socket::has_queued_input(&socket(&mut transport, ipv6).udp));
             }
             let best = latencies.iter().min().expect("three trials");
@@ -2061,8 +1954,6 @@ mod tests {
 
     #[test]
     fn an_unattached_transport_reads_every_socket_when_polled() {
-        // A `SwarmCore` host never attaches; polling alone must still drain
-        // both families.
         let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
         for ipv6 in [false, true] {
             deliver(&mut transport, ipv6);
@@ -2078,8 +1969,6 @@ mod tests {
 
     #[test]
     fn dns_hosts_are_refused_with_a_resolve_first_error() {
-        // A lookup here would block the driver thread for the resolver's
-        // timeout, so a name is an address error that says what to do.
         let named = PeerAddr::new(
             "/dns4/localhost/udp/9/quic-v1".parse().expect("dns addr"),
             Ed25519Keypair::generate().peer_id(),
@@ -2117,7 +2006,6 @@ mod tests {
             assert_eq!(id.namespace(), namespace, "{addr}");
         }
 
-        // One namespace per allocator: both families can't share one.
         assert_eq!(
             QuicNamespaces::new(
                 ConnectionNamespace::MESH_IPV4,
@@ -2145,7 +2033,6 @@ mod tests {
                 .send_datagram(&quic_addr(&target_addr.to_string()), b"punch")
                 .expect("datagram");
 
-            // Both the Initial and the datagram left from that family's socket.
             let port = socket(&mut transport, ipv6).local_addr.port();
             let mut buf = [0u8; 2048];
             receiver
@@ -2228,7 +2115,6 @@ mod tests {
                 time_threshold: 2.0,
                 ..QuicLimits::default()
             };
-            // quinn keeps the thresholds private; its Debug shows them.
             let config = format!("{:?}", transport_config(&limits).expect("valid limits"));
             assert!(
                 config.contains("packet_threshold: 10") && config.contains("time_threshold: 2.0"),

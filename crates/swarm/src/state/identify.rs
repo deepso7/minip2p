@@ -12,10 +12,6 @@ use crate::events::{IdentifyFailure, SwarmErrorKind, SwarmEvent};
 use super::{Action, FirstIdentify, ProtocolKind, SwarmState};
 
 impl SwarmState {
-    // -----------------------------------------------------------------------
-    // Peer readiness lookups (`SwarmCore` exposes these)
-    // -----------------------------------------------------------------------
-
     /// Returns the latest Identify information received for `peer_id`.
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.peer_info.get(peer_id)
@@ -57,10 +53,6 @@ impl SwarmState {
                 if self.connection_id(peer_id) != Some(*conn_id)
         )
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
 
     /// Ends `conn_id`'s first Identify exchange as failed for `cause`:
     /// reports [`SwarmEvent::IdentifyFailed`] and closes the connection, which
@@ -135,10 +127,6 @@ impl SwarmState {
         });
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: execute protocol-handler actions
-    // -----------------------------------------------------------------------
-
     pub(super) fn execute_identify_action(&mut self, action: IdentifyAction) {
         match action {
             IdentifyAction::Send {
@@ -163,8 +151,6 @@ impl SwarmState {
                         .push_back(Action::CloseStreamWrite { conn_id, stream_id });
                 }
             }
-            // Only the initiator role reads, so only it refuses bytes. The
-            // transport's `StreamClosed` for the reset reclaims the stream.
             IdentifyAction::ResetStream {
                 ref peer_id,
                 stream_id,
@@ -193,8 +179,6 @@ impl SwarmState {
             IdentifyEvent::Received { peer_id, info } => {
                 let conn_id = self.connection_id(&peer_id);
                 if let Some(conn_id) = conn_id {
-                    // A reply that lost the race with the deadline arrives
-                    // on a connection that is already closing.
                     if self.identify_failed(conn_id) {
                         return;
                     }

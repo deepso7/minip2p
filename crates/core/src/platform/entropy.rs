@@ -144,7 +144,6 @@ mod tests {
 
     impl EntropySource for Broken {
         fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
-            // Partial write before failing: callers must not trust `output`.
             if let Some(first) = output.first_mut() {
                 *first = 0xff;
             }

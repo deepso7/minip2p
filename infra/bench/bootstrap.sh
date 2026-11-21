@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Provision the on-demand EC2 bench runner and the CI role's permissions.
-# Idempotent: resources are found by tag, so reruns converge instead of
-# duplicating. Needs administrator credentials and `gh` logged in as a repo
-# admin (for the runner registration token).
-#
-#   infra/bench/bootstrap.sh                     create what is missing, update the CI role
-#   infra/bench/bootstrap.sh --replace           terminate the instance and create a fresh one
-#   infra/bench/bootstrap.sh --ssh-from <cidr>   add a port-22 ingress rule (nothing else)
-#   infra/bench/bootstrap.sh --no-ssh            remove every port-22 ingress rule (nothing else)
-#   infra/bench/bootstrap.sh --render-user-data <file>
-#                                                write the user data with a dummy token; no AWS calls
-#
-# Env: AWS_BENCH_REGION (default ap-south-1), BENCH_INSTANCE_TYPE (default
-# m8a.xlarge), BENCH_SSH_KEY (private key path, default ~/.ssh/minip2p-bench.pem).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -39,8 +25,6 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# Print cloud-init.yaml with the scripts embedded and the given registration
-# token filled in. The output holds a live token: never print or log it.
 render_user_data() {
   local token=$1 b64
   local -A files=(
@@ -70,8 +54,6 @@ export AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
 account=$(aws sts get-caller-identity --query Account --output text)
 tags="{Key=project,Value=minip2p},{Key=Name,Value=$name}"
 
-# First ID of a tagged resource, or empty. $1 is the describe subcommand, $2
-# the JMESPath to the IDs; extra arguments are added filters.
 find_tagged() {
   local cmd=$1 query=$2
   shift 2
@@ -90,7 +72,6 @@ find_sg() {
     --query 'SecurityGroups[0].GroupId' --output text | grep -v '^None$' || true
 }
 
-# --- SSH access only ---------------------------------------------------------
 if [[ "$mode" == ssh-from || "$mode" == no-ssh ]]; then
   sg=$(find_sg)
   [[ -n "$sg" ]] || { echo "security group $sg_name not found; run bootstrap first" >&2; exit 1; }
@@ -100,7 +81,6 @@ if [[ "$mode" == ssh-from || "$mode" == no-ssh ]]; then
       >/dev/null
     echo "allowed SSH from $ssh_cidr on $sg"
   else
-    # All-protocol rules (`-1`, ports -1) also admit SSH.
     rules_json=$(aws ec2 describe-security-group-rules \
       --filters "Name=group-id,Values=$sg" \
       --query 'SecurityGroupRules[?!IsEgress && (IpProtocol==`"-1"` || (IpProtocol==`"tcp"` && FromPort<=`22` && ToPort>=`22`))].SecurityGroupRuleId' \
@@ -116,7 +96,6 @@ fi
 
 echo "Bootstrapping the minip2p bench runner in $account/$region"
 
-# --- Network: one /24 VPC, one public subnet, egress via an IGW only ---------
 vpc=$(find_tagged describe-vpcs 'Vpcs[].VpcId')
 if [[ -z "$vpc" ]]; then
   vpc=$(aws ec2 create-vpc --cidr-block 10.77.0.0/24 \
@@ -127,7 +106,6 @@ fi
 
 subnet=$(find_tagged describe-subnets 'Subnets[].SubnetId' "Name=vpc-id,Values=$vpc")
 if [[ -z "$subnet" ]]; then
-  # Not every AZ offers every instance type; pick one that does.
   az=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
     --filters "Name=instance-type,Values=$instance_type" \
     --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -n1)
@@ -165,7 +143,6 @@ if [[ -z "$associated" || "$associated" == None ]]; then
   aws ec2 associate-route-table --route-table-id "$rtb" --subnet-id "$subnet" >/dev/null
 fi
 
-# No inbound rules; the default allow-all egress stays.
 sg=$(find_sg)
 if [[ -z "$sg" ]]; then
   sg=$(aws ec2 create-security-group --group-name "$sg_name" --vpc-id "$vpc" \
@@ -175,9 +152,6 @@ if [[ -z "$sg" ]]; then
   echo "created security group $sg"
 fi
 
-# --- Key pair: the private key stays on this machine ---------------------------
-# Only a definite NotFound creates a key; any other error stops here, and an
-# existing key file is never overwritten (AWS cannot return a lost key).
 if key_error=$(aws ec2 describe-key-pairs --key-names "$name" 2>&1 >/dev/null); then
   [[ -f "$key_file" ]] \
     || echo "note: key pair $name exists but $key_file is missing; SSH needs the original key" >&2
@@ -198,19 +172,13 @@ else
   exit 1
 fi
 
-# --- Instance -----------------------------------------------------------------
 instance=$(find_instance)
-# Everything that can fail runs before --replace terminates the old instance,
-# so a failure never leaves the repository without a runner.
 if [[ -z "$instance" || "$replace" == true ]]; then
   ami=$(aws ssm get-parameter \
     --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
     --query Parameter.Value --output text)
   root_device=$(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].RootDeviceName' --output text)
 
-  # The rendered user data holds the registration token: keep it in a private
-  # temp file, gzip it (cloud-init accepts gzip) to stay under 16 KB, and
-  # remove it on exit.
   workdir=$(mktemp -d)
   trap 'rm -rf "$workdir"' EXIT
   token=$(gh api -X POST "repos/$repo/actions/runners/registration-token" --jq .token)
@@ -242,17 +210,12 @@ if [[ -z "$instance" ]]; then
   echo "launched $instance ($instance_type, $ami); first-boot setup takes a few minutes"
 fi
 
-# --- CI role: trust both environments, start and lease only this instance ------
 if ! aws iam get-role --role-name "$role" >/dev/null 2>&1; then
   echo "role $role not found; create it per README.md, then rerun" >&2
   exit 1
 fi
 
-# Converge to exactly one inline policy and no attached ones. JSON output
-# distinguishes an empty list from a policy named `None`.
 policy_name=minip2p-bench-start
-# Each listing is captured first so a failed call stops the script under
-# `set -e` (a process substitution would swallow it).
 inline_json=$(aws iam list-role-policies --role-name "$role" --query PolicyNames --output json)
 mapfile -t inline < <(jq -r '.[]' <<<"$inline_json")
 for p in "${inline[@]}"; do
@@ -283,7 +246,6 @@ aws iam put-role-policy --role-name "$role" --policy-name "$policy_name" --polic
     {"Sid": "Describe", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"}
   ]
 }'
-# Trust the unattended environment only once the permissions have converged.
 aws iam update-assume-role-policy --role-name "$role" --policy-document '{
   "Version": "2012-10-17",
   "Statement": [{

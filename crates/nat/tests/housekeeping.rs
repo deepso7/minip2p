@@ -230,15 +230,9 @@ impl Hk {
     }
 
     fn relay_for_current(&self) -> PeerId {
-        // Tests drive one relay at a time; the current one is whichever has
-        // a queued OpenStream. Defaults to the primary relay.
         self.relay
     }
 }
-
-// ---------------------------------------------------------------------------
-// Reachability confidence
-// ---------------------------------------------------------------------------
 
 #[test]
 fn initial_reservation_policy_arms_only_the_needed_tick() {
@@ -258,7 +252,6 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
     let public = [maddr(LISTEN_ADDR)];
 
-    // Unsettled cadence is 5s; each probe asks the next server.
     let (_, events) = hk.probe(Answer::Public(&public), 0);
     assert!(events.is_empty(), "1 vote of 3: no flip");
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
@@ -276,10 +269,8 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
     ));
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
-    // Settled cadence is 90s; more agreement changes nothing.
     assert!(hk.probe(Answer::Public(&public), 110_000).1.is_empty());
 
-    // One disagreeing server must never flap the verdict.
     let (_, events) = hk.probe(Answer::DialError, 210_000);
     assert!(
         events.is_empty(),
@@ -287,7 +278,6 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
     );
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
-    // Three servers voting private flip it exactly once.
     assert!(hk.probe(Answer::DialError, 310_000).1.is_empty());
     let (_, events) = hk.probe(Answer::DialError, 410_000);
     assert!(matches!(
@@ -308,8 +298,6 @@ fn confidence_threshold_above_window_clamps_to_unanimity() {
         config.confidence_threshold = 9;
     });
 
-    // A full (three-server) unanimous window. An unclamped threshold could
-    // never settle here.
     let public = [maddr(LISTEN_ADDR)];
     assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
     assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
@@ -331,13 +319,10 @@ fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
         config.confidence_window = 1;
         config.confidence_threshold = 1;
     });
-    // We ask about a wildcard listen address too, so the server may name it.
     let wildcard = maddr("/ip4/0.0.0.0/udp/4001/quic-v1");
     hk.agent
         .set_listen_addrs(&[maddr(LISTEN_ADDR), wildcard.clone()]);
 
-    // Establish both housekeeping sessions, then hold a relay reservation
-    // while reachability is still Unknown.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay), 1);
@@ -384,7 +369,6 @@ fn a_quorum_of_distinct_servers_confirms_each_address() {
     let (a, b) = (maddr(LISTEN_ADDR), maddr(OUR_OBSERVED_ADDR));
     hk.agent.set_listen_addrs(&[a.clone(), b.clone()]);
 
-    // Probes rotate across the servers after every completed exchange.
     let (first, events) = hk.probe(Answer::Public(std::slice::from_ref(&a)), 0);
     assert!(events.is_empty());
     let (second, events) = hk.probe(Answer::Public(&[a.clone(), b.clone()]), 6_000);
@@ -392,7 +376,6 @@ fn a_quorum_of_distinct_servers_confirms_each_address() {
     let (third, events) = hk.probe(Answer::Public(std::slice::from_ref(&a)), 12_000);
     assert_eq!([first, second, third], hk.servers[..]);
 
-    // Three servers vouch for `a`, only one for `b`.
     assert!(
         matches!(
             events.as_slice(),
@@ -419,9 +402,6 @@ fn unrelated_returned_addresses_are_ignored() {
 
 #[test]
 fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
-    // rust-libp2p and go-libp2p servers dial back the requested transport
-    // and port at the IP they observe, so the probe must ask about our
-    // listen port at that IP; the observed port (often ephemeral) is not it.
     let cases = [
         (
             "/ip4/10.0.0.2/tcp/4001",
@@ -462,9 +442,6 @@ fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
 
 #[test]
 fn different_reporters_contribute_different_families() {
-    // Each reporter vouches only for the family of its own connection, so
-    // a dual-stack host learns its IPv4 mapping from an AutoNAT server
-    // reached over IPv4 and its IPv6 one from a relay reached over IPv6.
     let mut hk = build(ReservationPolicy::Never, 1, 3);
     hk.agent.set_listen_addrs(&[
         maddr("/ip4/10.0.0.2/tcp/4001"),
@@ -523,7 +500,6 @@ fn dial_refused_is_never_a_private_vote() {
     }
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
 
-    // A failed dial-back is still a private vote.
     for round in 3..5 {
         assert!(hk.probe(Answer::DialError, round * 6_000).1.is_empty());
     }
@@ -547,13 +523,10 @@ fn votes_expire_after_fifteen_minutes() {
     assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
     assert!(hk.probe(Answer::Public(&public), 10_000).1.is_empty());
 
-    // The first server's vote (cast at 2ms) is over 15 minutes old by the
-    // third: two live votes are no quorum.
     let (_, events) = hk.probe(Answer::Public(&public), 900_001);
     assert!(events.is_empty(), "{events:?}");
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
 
-    // The first server votes again: three live votes.
     let (_, events) = hk.probe(Answer::Public(&public), 906_000);
     assert!(
         matches!(
@@ -576,8 +549,6 @@ fn a_settled_verdict_lapses_to_unknown_once_its_votes_expire() {
     assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
-    // Every server only refuses from now on. Once the first vote (cast at
-    // 2ms) is 15 minutes old, two live votes are too few to stand on.
     let mut changes = Vec::new();
     for round in 1..=10 {
         changes.extend(hk.probe(Answer::DialRefused, 12_000 + round * 90_100).1);
@@ -613,11 +584,9 @@ fn a_confirmed_address_needs_a_quorum_to_be_withdrawn() {
         "{events:?}"
     );
 
-    // One, then two servers leave `b` out: it stays advertised.
     let only_a = std::slice::from_ref(&a);
     assert!(hk.probe(Answer::Public(only_a), 17_100).1.is_empty());
     assert!(hk.probe(Answer::Public(only_a), 107_200).1.is_empty());
-    // The third makes a quorum without it.
     let (_, events) = hk.probe(Answer::Public(only_a), 197_300);
     assert!(
         matches!(
@@ -627,7 +596,6 @@ fn a_confirmed_address_needs_a_quorum_to_be_withdrawn() {
         "{events:?}"
     );
 
-    // Likewise a quorum of private votes, not one, ends the verdict.
     assert!(hk.probe(Answer::DialError, 287_400).1.is_empty());
     assert!(hk.probe(Answer::DialError, 377_500).1.is_empty());
     let (_, events) = hk.probe(Answer::DialError, 467_600);
@@ -652,10 +620,8 @@ fn a_settled_verdict_wakes_the_host_when_its_votes_expire() {
     assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
     assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
     assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
-    // The probe after the flip is the last for an hour.
     assert!(hk.probe(Answer::Public(&public), 17_002).1.is_empty());
     drain_actions(&mut hk.agent);
-    // The oldest live vote, cast at 6_002ms, expires long before then.
     assert_eq!(
         hk.agent.next_deadline(at(20_000)),
         Some(Deadline::from_millis(906_002))
@@ -668,7 +634,6 @@ fn a_settled_verdict_wakes_the_host_when_its_votes_expire() {
             ..
         }]
     ));
-    // Back to Unknown, it probes again at the unsettled cadence.
     assert_eq!(
         hk.agent.next_deadline(at(906_002)),
         Some(Deadline::from_millis(911_002))
@@ -682,8 +647,6 @@ fn the_window_keeps_the_latest_servers_even_at_one_instant() {
         config.probe_interval_settled_ms = 0;
     });
     let public = [maddr(LISTEN_ADDR)];
-    // Every answer lands at 0ms. The first server's is inconclusive, so it
-    // votes last.
     assert!(hk.probe_taking(Answer::DialRefused, 0, 0).1.is_empty());
     let mut events = Vec::new();
     for _ in 0..3 {
@@ -693,8 +656,6 @@ fn the_window_keeps_the_latest_servers_even_at_one_instant() {
     for _ in 0..3 {
         events.extend(hk.probe_taking(Answer::Public(&public), 0, 0).1);
     }
-    // The sixth vote pushes out the first private one, not itself: the
-    // latest five servers hold three public votes.
     assert_eq!(
         hk.agent.reachability(),
         ReachabilityState::Public,
@@ -714,7 +675,6 @@ fn probe_timeout_rotates_to_the_next_server() {
     hk.stream_ready(&server.clone(), stream, AUTONAT_PROTOCOL_ID, at(4));
     drain_actions(&mut hk.agent);
 
-    // The server never answers: the probe deadline (20s) aborts the flight.
     hk.agent.handle_tick(at(20_004));
     let actions = drain_actions(&mut hk.agent);
     assert!(
@@ -723,16 +683,11 @@ fn probe_timeout_rotates_to_the_next_server() {
     );
     assert!(drain_events(&mut hk.agent).is_empty(), "no sample recorded");
 
-    // The retry goes to the *other* server.
     hk.agent.handle_tick(at(25_004));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.server2), 1);
     assert_eq!(dial_count_for(&actions, &hk.server), 0);
 }
-
-// ---------------------------------------------------------------------------
-// Reservation lifecycle
-// ---------------------------------------------------------------------------
 
 /// Feeds an asynchronous `DialFailed` for the relay dial on `conn_id`.
 fn dial_failed(hk: &mut Hk, conn_id: ConnectionId, reason: &str, now: Now) -> bool {
@@ -792,9 +747,7 @@ fn reservation_renews_at_half_the_reported_lifetime() {
         config.reservation_keep_alive_interval_ms = 0;
     });
 
-    // Relay reports expiry at unix 1900; the clock says unix 1000 at mono 10.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
-    // Half of the remaining 900s after mono 10.
     let expected_renew = 10 + 450 * 1_000;
     assert!(matches!(
         events.as_slice(),
@@ -810,14 +763,11 @@ fn reservation_renews_at_half_the_reported_lifetime() {
         hk.agent.next_deadline(at(10_000)),
         Some(Deadline::from_millis(expected_renew))
     );
-    // The completed exchange closes its write side; drain it.
     drain_actions(&mut hk.agent);
 
-    // Too early: nothing happens.
     hk.agent.handle_tick(at_unix(expected_renew - 1, 1_449));
     assert!(drain_actions(&mut hk.agent).is_empty());
 
-    // At renew time a fresh RESERVE goes out on the still-ready session.
     hk.agent.handle_tick(at_unix(expected_renew, 1_450));
     let (events, _) = hk.finish_reserve(
         hop_reserve_ok(Some(2_350)),
@@ -834,35 +784,23 @@ fn reservation_renews_at_half_the_reported_lifetime() {
 
 #[test]
 fn an_expiry_already_past_falls_back_to_the_default_ttl() {
-    // The relay reports an expiry 500s in the past: a stale value, or a clock
-    // skewed far enough that the remaining lifetime reads as gone. Taken at
-    // face value, renewal would fire at once and report the same stale expiry
-    // again, for as long as the reservation is held.
     assert_eq!(renew_at_for_expire(Some(500)), 10 + 1_800 * 1_000);
-    // An expiry of exactly now leaves no lifetime either.
     assert_eq!(renew_at_for_expire(Some(1_000)), 10 + 1_800 * 1_000);
 }
 
 #[test]
 fn a_one_second_reservation_renews_before_it_expires() {
-    // Relays may grant a 1s TTL. Renewal must land strictly inside it, and a
-    // second apart would be at expiry, after the relay already dropped it.
     assert_eq!(renew_at_for_expire(Some(1_001)), 10 + 500);
     assert_eq!(renew_at_for_expire(Some(1_003)), 10 + 1_500);
 }
 
 #[test]
 fn a_lifetime_just_past_the_old_margin_does_not_renew_every_second() {
-    // 121s against the former fixed 120s margin renewed after 1s, and each
-    // renewal was granted 121s again: a RESERVE per second, indefinitely.
     assert_eq!(renew_at_for_expire(Some(1_121)), 10 + 60_500);
 }
 
 #[test]
 fn renewal_lands_before_expiry_despite_a_relay_clock_ahead_of_ours() {
-    // The relay grants 600s, but its clock runs 200s ahead, so its absolute
-    // `expire` reads as 800s from our now. Renewing a fixed 120s before the
-    // reported expiry would fire at 680s, 80s after the reservation is gone.
     let renew_at = renew_at_for_expire(Some(1_800));
     assert_eq!(renew_at, 10 + 400 * 1_000);
     assert!(renew_at < 10 + 600 * 1_000);
@@ -873,10 +811,6 @@ fn an_expiry_beyond_the_default_ttl_is_clamped_to_it() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(u64::MAX)), at_unix(10, 0));
 
-    // Trusting the relay's expiry saturates the deadline, so renewal never
-    // fires: the relay drops the reservation on its own TTL while the
-    // connection stays up, no `RelayReservationLost` is emitted, and the
-    // holder keeps advertising a ticket dialers get NO_RESERVATION on.
     let expected_renew = 10 + 1_800 * 1_000;
     assert_eq!(reserved_renew_at(&events), expected_renew);
     assert_eq!(
@@ -892,7 +826,6 @@ fn an_expiry_beyond_the_default_ttl_is_clamped_to_it() {
 fn reservation_without_expire_uses_default_ttl() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
-    // Half the 3600s default TTL.
     let expected_renew = 10 + 1_800 * 1_000;
     assert!(matches!(
         events.as_slice(),
@@ -907,7 +840,6 @@ fn reservation_without_expire_uses_default_ttl() {
 #[test]
 fn reservation_on_clockless_host_uses_default_ttl() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
-    // The relay reports an expiry, but we have no wall clock to compare.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at(10));
     let expected_renew = 10 + 1_800 * 1_000;
     assert!(matches!(
@@ -926,7 +858,7 @@ fn reservation_keep_alive_uses_synthetic_time_only_for_quic() {
         config.reservation_keep_alive_interval_ms = 100;
     });
     reserve_via_relay(&mut quic, hop_reserve_ok(None), at(10));
-    drain_actions(&mut quic.agent); // completed exchange's close-write
+    drain_actions(&mut quic.agent);
 
     assert_eq!(
         quic.agent.next_deadline(at(10)),
@@ -947,7 +879,7 @@ fn reservation_keep_alive_uses_synthetic_time_only_for_quic() {
         config.reservation_keep_alive_interval_ms = 100;
     });
     reserve_via_relay(&mut tcp, hop_reserve_ok(None), at(10));
-    drain_actions(&mut tcp.agent); // completed exchange's close-write
+    drain_actions(&mut tcp.agent);
 
     tcp.agent.handle_tick(at(110));
     assert!(
@@ -967,12 +899,9 @@ fn refused_reservation_rotates_relay_after_backoff() {
     assert!(has_reset_for(&actions, stream));
     assert!(hk.agent.active_reservation().is_none());
 
-    // Still inside the 500ms backoff: quiet.
     hk.agent.handle_tick(at(400));
     assert!(drain_actions(&mut hk.agent).is_empty());
 
-    // After the backoff (500ms plus under a fifth of jitter) the manager
-    // tries the *other* relay.
     hk.agent.handle_tick(at(610));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay2), 1);
@@ -997,8 +926,6 @@ fn hop_open_count(actions: &[Out], peer: &PeerId) -> usize {
 fn connect_and_reservation_racing_in_one_tick_share_one_dial() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
 
-    // Whatever internal order the machines run in, only one dial may reach
-    // the relay.
     start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(0));
     hk.agent.handle_tick(at(250));
     let actions = drain_actions(&mut hk.agent);
@@ -1037,7 +964,6 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
     ));
     assert!(hk.agent.active_reservation().is_none());
 
-    // After the backoff the (single) relay is dialed again.
     hk.agent.handle_tick(at(5_600));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay), 1);
@@ -1051,12 +977,8 @@ fn retiring_another_relay_connection_keeps_the_reservation() {
         events.as_slice(),
         [NatEvent::RelayReserved { .. }]
     ));
-    drain_actions(&mut hk.agent); // completed exchange's close-write
+    drain_actions(&mut hk.agent);
 
-    // A second connection to the relay comes and goes while the swarm keeps
-    // the reservation's connection (1) current. Losing one connection id
-    // must not be treated as losing the relay peer, or the reservation made
-    // on another connection.
     let relay = hk.relay;
     hk.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
@@ -1101,7 +1023,6 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<Out> {
         false,
         now,
     );
-    // The relay dropped the reservation with its connection: withdraw it now.
     assert!(matches!(
         drain_events(&mut hk.agent).as_slice(),
         [NatEvent::RelayReservationLost { relay: r }] if *r == relay
@@ -1134,7 +1055,7 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<Out> {
 fn replacing_the_reservation_connection_reacquires_on_the_new_one() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
-    drain_actions(&mut hk.agent); // completed exchange's close-write
+    drain_actions(&mut hk.agent);
 
     let relay = hk.relay;
     let actions = replace_relay_connection(&mut hk, at(20));
@@ -1146,9 +1067,8 @@ fn replacing_the_reservation_connection_reacquires_on_the_new_one() {
 fn replacement_during_a_refresh_starts_exactly_one_exchange_on_new() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
-    drain_actions(&mut hk.agent); // completed exchange's close-write
+    drain_actions(&mut hk.agent);
 
-    // Start the renewal and get its stream allocated on connection 1.
     let renew_at = 10 + 780 * 1_000;
     hk.agent.handle_tick(at_unix(renew_at, 1_790));
     let relay = hk.relay;
@@ -1167,8 +1087,6 @@ fn reservation_work_started_on_a_replacement_survives_the_replacement_event() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let relay = hk.relay;
     let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
-    // The swarm is ahead of the events NAT has handled: the relay's first
-    // connection was already replaced, and the replacement is ready.
     hk.agent
         .swarm
         .make_ready(&relay, new, &[HOP_PROTOCOL_ID.to_string()]);
@@ -1177,8 +1095,6 @@ fn reservation_work_started_on_a_replacement_survives_the_replacement_event() {
     assert_eq!(dial_count_for(&actions, &relay), 0);
     let stream = opened_stream_for(&actions, &relay);
 
-    // The buffered lifecycle of the retired connection catches up. Cleanup
-    // is scoped to `old`: the exchange on `new` keeps going.
     let hop = || vec![HOP_PROTOCOL_ID.to_string()];
     for event in [
         SwarmEvent::ConnectionEstablished {
@@ -1235,8 +1151,6 @@ fn when_private_policy_follows_the_reachability_verdict() {
     let mut hk = build(ReservationPolicy::WhenPrivate, 1, 3);
     let public = [maddr(LISTEN_ADDR)];
 
-    // While reachability is Unknown, both housekeeping flows start: a
-    // reservation (dialable now) and a probe (gather evidence).
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay), 1);
@@ -1254,8 +1168,6 @@ fn when_private_policy_follows_the_reachability_verdict() {
     assert!(hk.finish_probe(true, 5).is_empty());
     assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
 
-    // The third server's public vote: the verdict flips and, in the same
-    // cascade, the now-unneeded reservation is released.
     let (_, events) = hk.probe(Answer::Public(&public), 12_000);
     assert!(matches!(
         events.as_slice(),
@@ -1269,10 +1181,8 @@ fn when_private_policy_follows_the_reachability_verdict() {
     ));
     assert!(hk.agent.active_reservation().is_none());
 
-    // Service the next scheduled probe, then verify quiet ticks stay quiet:
-    // no reservation reacquisition while confidently public.
     assert!(hk.probe(Answer::Public(&public), 50_000).1.is_empty());
-    drain_actions(&mut hk.agent); // the finished probe's close-write
+    drain_actions(&mut hk.agent);
     hk.agent.handle_tick(at(100_000));
     let actions = drain_actions(&mut hk.agent);
     assert!(
@@ -1280,8 +1190,6 @@ fn when_private_policy_follows_the_reachability_verdict() {
         "no reservation while confidently public: {actions:?}"
     );
 
-    // Flip back to Private once three servers say so: reacquisition
-    // begins in the same cascade.
     assert!(hk.probe(Answer::DialError, 145_000).1.is_empty());
     assert!(hk.probe(Answer::DialError, 236_000).1.is_empty());
     let (_, events) = hk.probe(Answer::DialError, 330_000);
@@ -1301,10 +1209,6 @@ fn when_private_policy_follows_the_reachability_verdict() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Session-dial sharing
-// ---------------------------------------------------------------------------
-
 /// Regression test for a failure first seen against a live relay: the
 /// reservation manager and a connect attempt's relay leg both dialed the
 /// relay while the first handshake was still in flight (real-network RTT),
@@ -1315,13 +1219,10 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let relay = hk.relay;
 
-    // The reservation manager dials the relay first.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 1);
 
-    // A connect starts while that dial is still handshaking; its relay leg
-    // must wait on the pending connection instead of dialing again.
     let _id = start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     hk.agent.handle_tick(at(300));
     let actions = drain_actions(&mut hk.agent);
@@ -1331,8 +1232,6 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
         "a second relay dial replaces the first connection: {actions:?}"
     );
 
-    // The shared connection comes up: both machines proceed, each opening
-    // its own HOP stream on it.
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(410));
     let actions = drain_actions(&mut hk.agent);
     let hop_opens = actions
@@ -1355,23 +1254,16 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
 /// recreating the replacement this map exists to prevent.
 #[test]
 fn pending_probe_dial_covers_the_probe_deadline_not_the_relay_legs() {
-    // The AutoNAT server doubles as the configured relay, so the probe's
-    // dial and the attempt's relay leg target the same peer.
     let mut hk = build_with_config(ReservationPolicy::Never, 1, 0, |config| {
         config.autonat_servers =
             vec![PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), peer(b"relay-peer")).unwrap()];
     });
     let relay = hk.relay;
 
-    // The probe dials the server; the handshake is slow but still within
-    // the probe's own deadline.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 1, "{actions:?}");
 
-    // A connect starts past the relay-leg deadline but inside the probe
-    // deadline: the probe's dial is still in flight, so the relay leg must
-    // join it rather than open a second, replacing connection.
     start(
         &mut hk.agent,
         1,
@@ -1397,16 +1289,13 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let relay = hk.relay;
 
-    // The reservation manager owns the relay dial.
     hk.agent.handle_tick(at(0));
     let reserve_dial = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
 
-    // A connect attempt joins the pending dial.
     start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 
-    // The shared dial fails: the waiting attempt re-dials at once.
     dial_failed(&mut hk, reserve_dial, "connection refused", at(500));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
@@ -1500,12 +1389,10 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
             .iter()
             .all(|delay| *delay <= MAX_RESERVATION_RETRY_BACKOFF_MS)
     );
-    // At the cap the delays keep a random spread instead of all landing on it.
     let tail = &delays[delays.len() - 4..];
     assert!(tail.iter().all(|delay| capped(*delay)), "{delays:?}");
     assert!(tail.windows(2).any(|pair| pair[0] != pair[1]), "{delays:?}");
 
-    // A held reservation, then its loss: the retry is back at the base.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at(now));
     assert_eq!(events.len(), 1, "{events:?}");
     hk.agent.handle_event(
@@ -1538,12 +1425,10 @@ fn waiting_attempt_redials_when_the_shared_dial_expires() {
     });
     let relay = hk.relay;
 
-    // The probe owns the dial (20s flight); the handshake stalls silently.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 1, "{actions:?}");
 
-    // A connect joins the pending dial mid-flight.
     start(
         &mut hk.agent,
         1,
@@ -1554,8 +1439,6 @@ fn waiting_attempt_redials_when_the_shared_dial_expires() {
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 
-    // The probe's flight deadline: the entry expires and the same tick must
-    // re-drive the waiting relay leg (whose own deadline, 27s, is live).
     hk.agent.handle_tick(at(20_000));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
@@ -1580,7 +1463,6 @@ fn late_shared_dial_failure_does_not_redial_a_dead_leg() {
     start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     drain_actions(&mut hk.agent);
 
-    // The failure lands past the attempt's relay-leg deadline (10 + 12s).
     dial_failed(&mut hk, reserve_dial, "timed out", at(12_500));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
@@ -1601,11 +1483,7 @@ fn stalled_session_dial_expires_and_the_retry_redials() {
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 1);
-    // No dial_result, no connection: the handshake silently stalls.
 
-    // Past the acquisition deadline (relay_timeout_ms) and the retry
-    // backoff, the manager tries again — with a real dial, not a wait on
-    // the dead one.
     hk.agent.handle_tick(at(12_600));
     let mut actions = drain_actions(&mut hk.agent);
     hk.agent.handle_tick(at(13_500));
@@ -1646,7 +1524,6 @@ fn late_probe_dial_failure_after_rotation_keeps_the_new_flight() {
 
     hk.agent.handle_tick(at(0));
     let old = dial_conn_for(&drain_actions(&mut hk.agent), &server);
-    // The first server never answers; the retry dials the second.
     hk.agent.handle_tick(at(deadline));
     hk.agent.handle_tick(at(deadline + 5_000));
     let new = dial_conn_for(&drain_actions(&mut hk.agent), &server2);
@@ -1674,12 +1551,10 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
     let mut hk = build(ReservationPolicy::Always, 2, 0);
     let (relay, relay2) = (hk.relay, hk.relay2);
     let config = NatConfig::default();
-    // The base backoff plus its most jitter, a fifth.
     let retry_at = config.relay_timeout_ms + config.reservation_retry_backoff_ms * 6 / 5;
 
     hk.agent.handle_tick(at(0));
     let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
-    // The first relay never connects; after the backoff the second is dialed.
     hk.agent.handle_tick(at(config.relay_timeout_ms));
     hk.agent.handle_tick(at(retry_at));
     let new = dial_conn_for(&drain_actions(&mut hk.agent), &relay2);
@@ -1697,8 +1572,6 @@ fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
     let relay = hk.relay;
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
 
-    // The RESERVE is refused as Full; a relay that answers anyway finishes
-    // the exchange, which releases the stream with the tail still held.
     hk.agent.swarm.full_sends = true;
     let (events, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
     assert!(matches!(
@@ -1736,13 +1609,11 @@ fn a_held_request_whose_resend_fails_resets_instead_of_closing() {
     hk.agent.handle_tick(at(0));
     let relay = hk.relay;
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
-    // As above: the finished exchange leaves the tail and its FIN held.
     hk.agent.swarm.full_sends = true;
     let (_, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
     hk.agent.swarm.full_sends = false;
     drain_actions(&mut hk.agent);
 
-    // The transport may have taken a prefix before failing.
     let conn_id = hk.agent.swarm.connection(&relay).expect("relay session");
     hk.agent.swarm.failed_sends = Some(TransportError::StreamSendFailed {
         id: conn_id,
@@ -1771,7 +1642,6 @@ fn a_held_request_whose_resend_fails_resets_instead_of_closing() {
 
 #[test]
 fn a_partly_accepted_request_is_finished_in_order_before_its_close() {
-    // The RESERVE an unconstrained stream carries, for reference.
     let mut reference = build(ReservationPolicy::Always, 1, 0);
     reference.agent.handle_tick(at(0));
     let relay = reference.relay;
@@ -1797,12 +1667,9 @@ fn a_partly_accepted_request_is_finished_in_order_before_its_close() {
         );
     };
 
-    // One byte per write: the first write and its replay each leave a tail.
     hk.agent.swarm.accept_at_most = Some(1);
     hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(3));
     writable(&mut hk, 4);
-    // The relay answers early; the finished exchange queues its close behind
-    // the tail.
     hk.stream_data(&relay, stream, hop_reserve_ok(None), at(5));
     hk.agent.swarm.accept_at_most = None;
     writable(&mut hk, 6);

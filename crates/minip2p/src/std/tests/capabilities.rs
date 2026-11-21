@@ -32,11 +32,10 @@ fn mdns_config_is_rejected_before_binding() {
         max_packet_bytes: 4_097,
         ..MdnsConfig::default()
     };
-    // TEST-NET-1 is never a local address: a socket bind would fail.
     assert!(matches!(
         Endpoint::builder()
             .mdns_config(config)
-            .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+            .listen_on(UNBINDABLE_QUIC)
             .expect("quic listen address")
             .bind()
             .err(),

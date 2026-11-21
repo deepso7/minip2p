@@ -941,7 +941,6 @@ mod tests {
         let due = Deadline::from_millis(110);
         assert_eq!(agent.next_deadline(Now::from_millis(10)), Some(due));
         assert!(due.is_expired_at(Now::from_millis(110)));
-        // Overdue but not yet ticked: still the past expiry, not pushed out.
         assert_eq!(agent.next_deadline(Now::from_millis(500)), Some(due));
     }
 

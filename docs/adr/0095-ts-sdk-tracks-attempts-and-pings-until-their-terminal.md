@@ -1,0 +1,10 @@
+# TS SDK tracks Connection attempts and pings until their terminal event
+
+ADR 0007 says a wait never stops its operation and a dropped terminal must never hang a promise. In `@minip2p/core`'s `Minip2p` (`sdk.ts`), that becomes:
+
+- **One attempt record per Connect ID.** `ConnectAttempt` holds either its terminal that no wait has taken yet, or at most one local wait (`settle`). The record outlives a wait that ends early (timeout or abort), so a later `waitConnectResult` still gets the real outcome. `#settleConnect` hands the terminal to the pending wait or stores it.
+- **Validate before admitting.** `connect` checks `timeoutMs` and an already-aborted signal before calling `startConnect`, so a bad option never leaves an orphaned native attempt.
+- **Abort and timeout do different things.** A timeout ends only the local wait and keeps the attempt tracked (unless `cancelOnTimeout`). An abort asks native to cancel and clears the local timer, so a `TimeoutError` cannot win the race against the cancelled terminal.
+- **`#requestCancel` never throws.** Cancellation from a signal or timer has no caller to throw to; native cancel fails only once the endpoint stops, and teardown then settles the wait.
+- **Delivery loss settles exactly the attempts it names.** Both carries (native `EventsDropped.terminalConnectIds`, and the SDK's own queue dropping a terminal or a native loss report) name every dropped terminal, so `#connectResultsLost` fails only those attempts with a delivery-loss error. Every other attempt still receives its own terminal.
+- **Pings are shared per peer and end on any loss.** `ping` calls native before `#runPing` listens, which is safe because native events are flushed asynchronously. The operation stays in `#pings` until its terminal event, even after every caller stopped waiting, so a retry joins the native ping already running and an older ping's result never settles a newer one. A ping result carries no correlation ID in the loss report, so any `EventsDropped` (or SDK-side drop) cancels every pending ping with `EventQueueOverflowError` instead of leaving it to hang.

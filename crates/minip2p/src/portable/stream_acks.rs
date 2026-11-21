@@ -113,14 +113,12 @@ mod tests {
     #[test]
     fn streams_already_ready_keep_auto_acknowledgement() {
         let mut acks = StreamAcks::default();
-        // Stream 1 became ready before the registration, but is pulled after.
         acks.set_manual("/later/1".into(), [key(1)]);
         assert_eq!(acks.pulled(&ready("/later/1", 1)), None);
         assert_eq!(acks.pulled(&data(1, 3)), Some((key(1), 3)));
         acks.pulled(&ready("/later/1", 2));
         assert_eq!(acks.pulled(&data(2, 3)), None);
 
-        // Registering it again changes nothing: stream 3 was manual already.
         acks.set_manual("/later/1".into(), [key(3)]);
         acks.pulled(&ready("/later/1", 3));
         assert_eq!(acks.pulled(&data(3, 3)), None);
@@ -137,7 +135,6 @@ mod tests {
         assert_eq!(acks.pulled(&data(2, 5)), None);
         assert_eq!(acks.pulled(&data(1, 0)), None, "nothing to acknowledge");
 
-        // An ended manual stream is forgotten with its connection.
         acks.pulled(&EndpointEvent::ConnectionClosed {
             peer_id: peer(),
             conn_id: ConnectionId::new(1),

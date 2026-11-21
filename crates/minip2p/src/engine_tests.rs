@@ -9,8 +9,6 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-// Tests run on the host, so the harness's `std` is there even when the
-// crate itself is `no_std`.
 extern crate std;
 use std::sync::{Mutex, PoisonError};
 
@@ -214,7 +212,6 @@ fn std_batches_report_lifecycle_before_connect_settled() {
     let events = endpoint.poll().expect("poll");
     assert_lifecycle_before_settled(&events, &peer);
 
-    // `wait` hands the same batch out one event at a time, in that order.
     let peer = Ed25519Keypair::from_secret_key_bytes([34; 32]).peer_id();
     endpoint.connect(target(&peer)).expect("admitted");
     let mut waited = Vec::new();
@@ -372,8 +369,6 @@ fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
 #[test]
 fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     const PROTOCOL: &str = "/engine/bulk/1";
-    // Each side names the other as its AutoNAT server; neither serves
-    // AutoNAT, so the NAT agent is live but its probes go nowhere.
     let configure = |builder: crate::PortableEndpointBuilder<CountingEntropy, ManualClock>,
                      server: PeerAddr| {
         let builder = builder.protocol(PROTOCOL);
@@ -676,8 +671,6 @@ impl RelayLegFixture {
             relays: vec![relay.clone()],
             force_relay,
             reservation_policy: minip2p_nat::ReservationPolicy::Never,
-            // The relay's budget is the whole attempt: the leg gives up
-            // exactly when the attempt does.
             relay_timeout_ms: crate::DEFAULT_CONNECT_DEADLINE_MS,
             ..minip2p_nat::NatConfig::default()
         };
@@ -762,8 +755,6 @@ fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
         f.transport.closed(relay_dial),
         "the leg's cleanup ran inside cancel, before its terminal is drained"
     );
-    // The relay answers late, and the attempt's budget runs out: neither
-    // wakes the cancelled leg.
     f.transport
         .connect(relay_dial, f.relay.transport().clone(), f.relay.peer_id());
     let mut events = f.endpoint.at(now).poll().expect("poll");
@@ -795,7 +786,6 @@ fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
 #[cfg(feature = "autonat")]
 #[test]
 fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
-    // DCUtR on: a circuit stays provisional until the deadline settles it.
     let mut f = RelayLegFixture::new(63, false);
     let now = Now::from_millis(0);
     let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
@@ -809,8 +799,6 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
         ]),
         &f.peer,
     );
-    // The circuit lands just before the deadline, so the peer, which never
-    // answers Identify here, is still inside `IDENTIFY_TIMEOUT_MS` then.
     let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
     f.endpoint
         .at(Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS - 1_000))
@@ -821,8 +809,6 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
         "Relayed is provisional"
     );
 
-    // The deadline settles the attempt on the circuit; a cancel arriving
-    // before that terminal is drained finds nothing pending.
     f.endpoint.engine.expire_attempts(deadline);
     f.endpoint.at(deadline).cancel_connect(id);
     let events = f.endpoint.at(deadline).poll().expect("poll");
@@ -902,8 +888,6 @@ fn a_connect_failed_after_the_attempt_settled_is_dropped() {
         )),
         "the leg reported its own failure before learning of the settle"
     );
-    // A stale punch failure is dropped too; it would otherwise reach the
-    // application.
     nat.push_event(NatEvent::HolePunchFailed {
         connect_id: id,
         attempt: 1,
@@ -939,7 +923,6 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
     let book = PeerDiscoveryAgent::new(
         Ed25519Keypair::from_secret_key_bytes([72; 32]).peer_id(),
         PeerDiscoveryConfig {
-            // A second peer evicts the first, cancelling its dial.
             max_known_peers: 1,
             dial_tie_break: false,
             ..PeerDiscoveryConfig::default()
@@ -970,7 +953,6 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
     let peer = f.peer;
     observe(&mut f, peer);
     f.endpoint.at(now).poll().expect("poll");
-    // The book's dial is the first attempt the endpoint admitted.
     let id = crate::ConnectId::from_u64(1);
     assert!(f.endpoint.engine.connect.is_pending(id));
     let relay_dial = f.relay_dial();
@@ -1083,7 +1065,6 @@ fn a_portable_peer_connect_dials_a_named_relay_itself() {
         RelayLegFixture::with_relay(90, true, "/dns/relay.test/udp/443/quic-v1/webtransport");
     let now = Now::from_millis(0);
     let id = f.endpoint.at(now).connect(f.peer).expect("admitted");
-    // Parked for the next batch, which the host is told to run at once.
     assert_eq!(
         f.endpoint.at(now).next_deadline(),
         Some(minip2p_core::platform::Deadline::IMMEDIATE)
@@ -1212,8 +1193,6 @@ fn one_answer_serves_every_candidate_and_parked_dial_naming_the_host() {
     let engine = &mut f.endpoint.engine;
     let target = crate::ConnectTarget::try_from(candidates).expect("one peer");
     let id = engine.connect(target, &mut names, now);
-    // Resolving candidates count as racing, so the relay leg waits out its
-    // stagger before it parks the relay dial.
     let now = Now::from_millis(minip2p_nat::NatConfig::default().relay_stagger_ms);
     engine.drive(now, &mut names).expect("drive");
     assert_eq!(names.lookups, ["shared.test"; 3]);

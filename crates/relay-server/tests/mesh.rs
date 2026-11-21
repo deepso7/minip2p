@@ -119,7 +119,6 @@ impl Bob {
             mesh.connect(entry, &bob(), bob_stream(), &alice(), now);
             return Self { entry, nat: None };
         };
-        // Every node runs as the one relay identity, `common::Node`'s.
         let relay = common::mesh::relay_peer();
         let relay_addr = PeerAddr::new(
             "/ip4/192.0.2.1/udp/4001/quic-v1"
@@ -248,8 +247,6 @@ fn forwarded_circuit_carries_bytes_both_ways_with_backpressure_and_half_close() 
     let stop = open_forwarded(&mut mesh, B, A, &bob(), bob_stream());
     let forward_at_a = Mesh::remote(B, mesh.opened(B, A, FORWARD_PROTOCOL_ID)[0]);
 
-    // Bob to Alice, with Alice's STOP stream taking two bytes at first: the
-    // holding node acknowledges the backbone only for what Alice took.
     mesh.nodes[A].swarm.credit.insert(stop, 2);
     mesh.nodes[B].data(&bob(), bob_stream(), b"abcdef", at(1));
     mesh.pump(at(1));
@@ -268,8 +265,6 @@ fn forwarded_circuit_carries_bytes_both_ways_with_backpressure_and_half_close() 
     assert_eq!(sends_on(&calls, stop), [b"cdef".to_vec()]);
     assert_eq!(acked(&calls, forward_at_a), 4);
 
-    // Alice to Bob, with Bob's stream taking three bytes at first: the entry
-    // node acknowledges the backbone only for what Bob took.
     mesh.nodes[B].swarm.credit.insert(bob_stream(), 3);
     mesh.nodes[A].data(&alice(), stop, b"uvwxyz", at(3));
     mesh.pump(at(3));
@@ -284,11 +279,9 @@ fn forwarded_circuit_carries_bytes_both_ways_with_backpressure_and_half_close() 
     assert_eq!(sends_on(&calls, bob_stream()), [b"xyz".to_vec()]);
     assert_eq!(acked_on(&calls, link(A)), 3);
 
-    // Bob's half-close reaches Alice after his bytes.
     mesh.nodes[B].half_close(&bob(), bob_stream(), at(5));
     mesh.pump(at(5));
     assert_eq!(closes(&mesh.calls(A)), [stop]);
-    // Alice's reaches Bob, and both nodes close the circuit cleanly.
     mesh.nodes[A].half_close(&alice(), stop, at(6));
     mesh.pump(at(6));
     assert_eq!(closes(&mesh.calls(B)), [bob_stream()]);
@@ -323,7 +316,6 @@ fn a_reset_crosses_the_backbone() {
 fn holding_node_without_the_reservation_answers_no_reservation_and_the_entry_passes_it_on() {
     let mut mesh = mesh(defaults());
     mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(0));
-    // Alice leaves A before A's `Gone` reaches B.
     mesh.hold_directory(A, B);
     mesh.nodes[A].close_connection(&alice(), ConnectionId::new(ALICE_CONN), 1);
     mesh.pump(at(1));
@@ -369,8 +361,6 @@ fn an_unchanged_client_reaches_a_peer_reserved_on_another_node() {
 fn the_newer_claim_is_tried_first_during_a_move() {
     for dialer in DIALERS {
         let mut mesh = mesh(defaults());
-        // Alice holds a reservation on A, then a newer one on B; both are
-        // live.
         mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at_unix(0, 1_000));
         mesh.reserve(B, &alice(), key(ALICE_CONN_2, 1), at_unix(0, 2_000));
 
@@ -393,8 +383,6 @@ fn a_stale_claim_tried_first_falls_through_to_the_live_one() {
             configs[A].max_circuits = 0;
         }
         let mut mesh = mesh(configs);
-        // Alice moved from B to A, so A's claim is newer; then she left A
-        // before A's `Gone` reached C.
         mesh.reserve(B, &alice(), key(ALICE_CONN_2, 1), at_unix(0, 1_000));
         mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at_unix(0, 2_000));
         mesh.hold_directory(A, C);
@@ -419,26 +407,22 @@ fn a_local_stop_that_fails_to_open_falls_through_to_a_remote_claim() {
     configs[C].max_circuits_per_ip = 1;
     let mut mesh = mesh(configs);
     mesh.reserve(A, &alice(), key(ALICE_CONN_2, 1), at(0));
-    // One circuit per IP on C; Alice's stale connection has her own.
     let alice_ip = "/ip4/203.0.113.1/tcp/1";
     mesh.nodes[C]
         .swarm
         .remote_addrs
         .insert(ConnectionId::new(ALICE_CONN), common::maddr(alice_ip));
     mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(0));
-    // C's swarm already lost Alice; the agent has not heard yet.
     mesh.nodes[C].swarm.forget(&alice());
 
     let bob = Bob::dial(&mut mesh, C, Dialer::Scripted, at(1));
     assert_eq!(forward_opens(&mesh, C, A), 1);
     mesh.answer_stop(A, &alice(), Status::Ok, at(1));
     bob.assert_opened(&mut mesh, at(1));
-    // The forwarded circuit does not hold the stale connection's IP.
     mesh.nodes[C].assert_indexes_consistent();
     mesh.nodes[C].close_connection(&alice(), ConnectionId::new(ALICE_CONN), 2);
     mesh.pump(at(2));
     mesh.nodes[C].events();
-    // Carol to Dave, both on Alice's old IP, fit under its cap of one.
     let dave = peer(b"mesh-dave");
     for conn in [30, 31] {
         mesh.nodes[C]
@@ -458,7 +442,6 @@ fn a_replaced_link_keeps_connects_waiting_for_the_new_snapshot() {
 
     let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
     mesh.nodes[C].replace(&member(B), link(B), new_link, false, 2);
-    // Not pumped: the harness only carries the original links.
     let calls = mesh.nodes[C].calls();
     assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
     assert_eq!(mesh.nodes[C].circuit_count(), 1);
@@ -471,13 +454,11 @@ fn a_forward_lost_to_a_replaced_link_retries_the_member_on_the_new_link() {
     mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
     assert_eq!(forward_opens(&mesh, C, B), 1);
 
-    // The forward is in flight when C's link to B is replaced.
     let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
     let node = &mut mesh.nodes[C];
     node.replace(&member(B), link(B), new_link, false, 2);
     let calls = node.calls();
     verify_by_hand(node, B, new_link, &calls, at(2));
-    // B's snapshot arrives on the new link, still claiming Alice.
     let directory = StreamKey {
         conn_id: new_link,
         stream_id: StreamId::new(7),
@@ -561,13 +542,11 @@ fn a_waiting_connect_that_turns_local_respects_the_destinations_ip_cap() {
             .remote_addrs
             .insert(ConnectionId::new(conn), common::maddr(full_ip));
     }
-    // Carol's circuit to Dave fills the cap on Alice's future IP.
     let (carol, dave) = (peer(b"mesh-carol"), peer(b"mesh-dave"));
     mesh.reserve(C, &dave, key(30, 1), at(0));
     mesh.connect(C, &carol, key(31, 2), &dave, at(0));
     mesh.calls(C);
 
-    // Bob waits on B's snapshot; meanwhile Alice reserves on C itself.
     mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
     assert_eq!(mesh.hop_status(C, bob_stream()).0, None);
     mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(1));
@@ -585,7 +564,6 @@ fn a_waiting_connect_uses_a_new_claim_from_a_synced_member() {
         let bob = Bob::dial(&mut mesh, C, dialer, at(1));
         bob.assert_waiting(&mut mesh);
 
-        // B never syncs; Alice reserves on A, which C already synced with.
         mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(2));
         assert_eq!(forward_opens(&mesh, C, A), 1);
         mesh.answer_stop(A, &alice(), Status::Ok, at(2));
@@ -598,8 +576,6 @@ fn a_waiting_connect_uses_a_reservation_moved_to_a_replacement_connection() {
     for dialer in DIALERS {
         let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
         mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(0));
-        // C's swarm already replaced Alice's connection; the agent hasn't
-        // heard, so her STOP fails to open and the CONNECT waits on B.
         mesh.nodes[C].swarm.forget(&alice());
         let bob = Bob::dial(&mut mesh, C, dialer, at(1));
         bob.assert_waiting(&mut mesh);
@@ -628,7 +604,6 @@ fn a_waiting_connect_uses_a_local_reservation_made_during_the_wait() {
         let bob = Bob::dial(&mut mesh, C, dialer, at(1));
         bob.assert_waiting(&mut mesh);
 
-        // B never syncs; Alice reserves on C itself.
         mesh.reserve(C, &alice(), key(ALICE_CONN, 1), at(2));
         let stop = opened(&mesh.calls(C)).expect("a STOP to Alice");
         mesh.nodes[C].stop_ready(&alice(), stop, at(2));
@@ -679,7 +654,6 @@ fn a_reset_directory_stream_reopens_after_a_second_and_resyncs() {
             Some(Deadline::from_millis(1_010))
         );
 
-        // B dropped A's entries and waits for A's next snapshot.
         let bob = Bob::dial(&mut mesh, B, dialer, at(20));
         bob.assert_waiting(&mut mesh);
 
@@ -704,9 +678,7 @@ fn the_entry_node_spends_the_rate_token_and_applies_the_dialers_limits() {
     mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(0));
     open_forwarded(&mut mesh, B, A, &bob(), bob_stream());
 
-    // A spent no token on Bob: another entry node still gets him through.
     open_forwarded(&mut mesh, C, A, &bob(), key(BOB_CONN + 1, 2));
-    // B did: Bob's next CONNECT there is refused before any forward.
     mesh.connect(B, &bob(), key(BOB_CONN, 4), &alice(), at(1));
     assert_eq!(
         mesh.hop_status(B, key(BOB_CONN, 4)).0,
@@ -720,7 +692,6 @@ fn the_holding_node_applies_the_destinations_limits_without_falling_through() {
     let mut configs = defaults();
     configs[A].max_circuits_per_peer = 1;
     let mut mesh = mesh(configs);
-    // Alice is claimed by C and, newer, by A.
     mesh.reserve(C, &alice(), key(ALICE_CONN_2, 1), at_unix(0, 1_000));
     mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at_unix(0, 2_000));
     open_forwarded(&mut mesh, B, A, &bob(), bob_stream());
@@ -764,13 +735,11 @@ fn both_nodes_enforce_the_entry_nodes_limits() {
         max_circuit_duration_secs: secs,
         ..unlimited_rates()
     };
-    // A (holding) is the strictest; B's limits are looser; C has none.
     let mut mesh = mesh([limited(16, 5), limited(32, 10), limited(0, 0)]);
     mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(0));
     let via_b = open_forwarded(&mut mesh, B, A, &bob(), bob_stream());
     let via_c = open_forwarded(&mut mesh, C, A, &bob(), key(BOB_CONN, 4));
 
-    // Past A's own 16 bytes, within B's 32: the circuit stays open.
     mesh.nodes[B].data(&bob(), bob_stream(), &[1; 20], at(1));
     mesh.nodes[C].data(&bob(), key(BOB_CONN, 4), &[1; 40], at(1));
     mesh.pump(at(1));
@@ -780,7 +749,6 @@ fn both_nodes_enforce_the_entry_nodes_limits() {
     for node in [A, B, C] {
         assert_eq!(closed_reasons(&mesh.nodes[node].events()), []);
     }
-    // Past B's 32: both B and A close the circuit through B.
     mesh.nodes[B].data(&bob(), bob_stream(), &[2; 20], at(2));
     mesh.pump(at(2));
     let byte_limit = CircuitCloseReason::ByteLimit {
@@ -789,8 +757,6 @@ fn both_nodes_enforce_the_entry_nodes_limits() {
     assert_eq!(closed_reasons(&mesh.nodes[A].events()), [byte_limit]);
     assert_eq!(closed_reasons(&mesh.nodes[B].events()), [byte_limit]);
 
-    // Durations: A does not close at its own 5 s, and a circuit through B
-    // closes on both nodes at B's 10 s.
     let via_b = open_forwarded(&mut mesh, B, A, &bob(), key(BOB_CONN, 6));
     mesh.nodes[A].handle_tick(at(5_000));
     assert_eq!(closed_reasons(&mesh.nodes[A].events()), []);
@@ -826,14 +792,12 @@ fn a_forward_that_times_out_fails_and_leaves_no_state() {
     let stop = opened(&mesh.calls(A)).expect("A opens STOP");
     let forward = mesh.opened(B, A, FORWARD_PROTOCOL_ID)[0];
 
-    // Alice never answers.
     mesh.nodes[B].handle_tick(at(1_000));
     mesh.pump(at(1_000));
     assert_eq!(
         mesh.hop_status(B, bob_stream()).0,
         Some(Status::ConnectionFailed)
     );
-    // A gave the STOP stream up; it is gone once the swarm closes it.
     mesh.nodes[A].stream_closed(&alice(), stop, at(1_000));
     for node in [A, B] {
         assert_eq!(mesh.nodes[node].circuit_count(), 0);

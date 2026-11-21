@@ -148,9 +148,6 @@ impl MdnsAgent {
             .cloned()
             .collect();
         if self.interfaces != filtered {
-            // Even a stable id can have a changed address set. Encoded
-            // responses capture the old expansion, so all prior interface
-            // work becomes stale on any snapshot change.
             self.scheduled.clear();
             self.actions.clear();
             self.interfaces = filtered;
@@ -708,11 +705,8 @@ mod tests {
         )));
         let next_query = Deadline::from_millis(1_005);
         assert_eq!(agent.next_deadline(Now::from_millis(5)), Some(next_query));
-        // The same interfaces again are not a change, so nothing restarts.
         agent.set_interfaces(&[iface(1), iface(2)], 6);
         assert_eq!(agent.next_deadline(Now::from_millis(6)), Some(next_query));
-        // Due exactly at its millisecond, and still reported at its own past
-        // value when the host runs late, so it reads as due, not pushed out.
         assert!(next_query.is_expired_at(Now::from_millis(1_005)));
         assert_eq!(
             agent.next_deadline(Now::from_millis(9_000)),
@@ -796,9 +790,6 @@ mod tests {
     fn a_tcp_listener_is_announced_and_expanded_like_any_other() {
         let mut agent = MdnsAgent::new(peer(1), MdnsConfig::default(), [7; 32]).unwrap();
         agent.set_interfaces(&[iface(1)], 0);
-        // The only thing a device with no operating system has to say. mDNS
-        // that could not say it would find peers on the link and leave them
-        // with no way to reach it -- which is the whole of what mDNS is for.
         agent.set_local_addrs(&["/ip4/0.0.0.0/tcp/4001".parse().unwrap()], 0);
         agent.handle_tick(0);
         while agent.poll_action().is_some() {}
@@ -821,9 +812,6 @@ mod tests {
         let advertised = core::str::from_utf8(&strings[0]).unwrap();
         assert!(
             advertised.contains("/ip4/192.168.1.1/tcp/4001/"),
-            // The wildcard is replaced by the interface's own address, the
-            // same substitution a QUIC listener gets: everything after the
-            // host is carried through untouched.
             "expected the interface address on a /tcp listener, got {advertised}"
         );
     }

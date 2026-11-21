@@ -46,3 +46,42 @@ A layer that keeps a slice of a payload shorter than half the payload's original
 - The SDK's fire-and-forget write path and its dropping read queue go away.
 - A peer that stops reading can no longer force a teardown through our buffers; it is left to the idle and keep-alive timeouts.
 - An application that stops acknowledging can, with enough peer churn, hold every connection slot, and the transport then refuses new connections until it acknowledges or abandons (#356).
+
+## Amendments: implementation details
+
+Where delivery stops without acknowledgement:
+
+- A reader that never acknowledges sees delivery stop at about one stream window, but the exact point differs by transport (`tests/bulk_backpressure.rs` depends on it). On Yamux (TCP), part of the initial window was spent on the multistream negotiation the endpoint consumed itself, and Yamux returns credit in half windows, so delivery stops just short of the window. On QUIC the gate is the delivery budget, which the endpoint restores for the bytes it consumed itself, so delivery reaches the full window.
+- Payloads meant to exercise backpressure must exceed QUIC's default connection queue (1 MiB) plus its send and connection windows (2 and 3 MiB), and Yamux's 256 KiB stream cap plus the kernel socket buffer.
+
+Circuits (`minip2p-nat`):
+
+- **A full circuit table fails the whole relay leg.** The circuit limit (`max_circuits`) is local, so no other relay would do better: when it is reached before HOP CONNECT, `Attempt` fails the relay leg with `ResourceExhausted` instead of rotating to the next relay, and CONNECT is never sent. Inbound, `InboundCircuit` reserves its circuit slot before accepting STOP and refuses with `RESOURCE_LIMIT_EXCEEDED` past the limit.
+
+Yamux settlement (`YamuxSession` in `minip2p-secure-mux`):
+
+- An unsettled stream id is still in use: a SYN reopening it (from either side's parity) is a protocol error ("duplicate SYN for an existing stream"), since reopening would replace its unacknowledged count.
+- Settling an unsettled stream with `reset` needs no wire, so it works after the session has ended too.
+- On protocol failure (`fail`), `Data` events still queued are dropped and never delivered, so their bytes are subtracted from the stream's unacknowledged count (including a stream that already closed within the same input); only bytes actually delivered stay the host's to settle.
+- When every write side ends (GoAway or failure), `Writable` events already queued are retracted too, not just future ones. When a reset removes a stream whose bytes were still unframed, those bytes leave the shared connection cap without a frame being pulled, so streams blocked on that cap are woken there.
+
+Swarm (`SwarmCore`):
+
+- **Control-stream demotion waits for held negotiation bytes.** When a stream negotiated for an application protocol still has negotiation bytes held after a `Full`, its `SetControlStream { control: false }` is deferred (`pending_demotions`) until `handle_stream_writable` replays the tail, so those bytes keep the control reserve. `forget_stream` hands the owed bytes to the new owner as application writes and re-applies a pending demotion after them.
+- **Writes behind held bytes stay behind them.** `hold_action` appends a later write or close for a held stream to the held tail. A `StreamWritable` queued while a replayed tail came back `Full` again is swallowed by `next_event` (and re-armed unless a close is queued), so the application is woken only once the held bytes are all accepted.
+- **Exceeding `MAX_HELD_PER_STREAM` resets the stream** and drops its still-queued writes first, so none goes out ahead of the reset.
+- **The swarm acknowledges data no consumer will read**, beyond the replaced and race-loser cases: data arriving on a connection the swarm is closing unannounced, `StreamData` dropped with a discarded placeholder peer, and data dropped by `abandon_stream` for a stream the transport already closed (no reset is coming to settle it). Left unacknowledged, the muxer would hold the stream's slot against its stream limit for good.
+
+ffi-core carry:
+
+- When the carry overflows, only dropped Connection-attempt terminals are reported (their Connect IDs, in `OverflowDiagnostic::terminal_connect_ids`): a lost stream terminal or write settlement cannot happen, since stream events are never dropped. Each Connect ID settles exactly one terminal, so the list has no duplicates.
+- A connection counts as seen by the binding once it drains any event naming it, except `PeerReady`, `IdentifyReceived`, `IdentifyFailed`, `EndpointError` and the other informational events listed in `Carry::track_connection`; anything else naming it is something the binding acts on. A connection also becomes seen when the binding opens a stream on it (`mark_connection_seen`, used by ffi-core and the web host), so its end is never elided. Connection-attempt terminals are delivered even when they name a connection the binding never saw, since they answer the application's own connect.
+
+TS SDK (`Stream` and `Minip2p` in `core/src/sdk.ts`):
+
+- A stream's unread-chunk FIFO is unbounded in the SDK, because native delivers at most one unconsumed receive window per stream; the bound lives in the receive budget.
+- An empty write buffer admits any write, whatever its size, so a payload larger than the high-water mark can still go out; only writes behind it are refused with `WriteBufferFull`.
+- `#emitData` reads `byteLength` before calling `data` handlers, because a handler may transfer the buffer and detach it; the consumed count must still be right.
+- `StreamClosed` carries no cause. Once a remote FIN established EOF, a later full closure does not turn the receive side into a failure: buffered bytes stay readable before EOF.
+- `StreamData` for a stream the SDK no longer tracks is consumed at once (`consumeUntracked`). Nothing will read it, and an abandon that native refused (the stream had already closed there) would otherwise leave the bytes holding the native stream slot.
+- `openStream` marks its connection as seen, so the SDK queue never elides that connection's end: the application now knows the connection and must hear it close.

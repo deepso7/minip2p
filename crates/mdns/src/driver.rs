@@ -139,8 +139,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
             interface_refresh_ms: config.interface_refresh_ms,
             pending_action: None,
             last_now: Now::from_millis(0),
-            // One byte past the limit, so a datagram that fills it is
-            // recognisably too big rather than silently truncated.
             buffer: vec![0; MAX_DATAGRAM_BYTES + 1],
             events: VecDeque::new(),
         }
@@ -186,7 +184,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// returned; see [Failure](Self#failure).
     pub fn tick(&mut self, now: Now, local_addrs: &[Multiaddr]) {
         self.last_now = now;
-        // Out for the turn, so it can be held across the agent's borrows.
         let Some(mut running) = self.running.take() else {
             return;
         };
@@ -232,31 +229,23 @@ impl<I: MdnsIo> MdnsDriver<I> {
         now_ms: u64,
         local_addrs: &[Multiaddr],
     ) -> Result<bool, MdnsError> {
-        // Anything waiting to come in has to be in before it can be read: a
-        // carrier that moves bytes only when driven holds them until now.
         io.poll(now_ms)?;
         let next_refresh = now_ms.saturating_add(self.interface_refresh_ms);
         let refresh_due = match self.next_interface_refresh_ms {
             Some(due) => now_ms >= due,
-            // Construction just read the interfaces; the schedule starts here.
             None => {
                 self.next_interface_refresh_ms = Some(next_refresh);
                 false
             }
         };
         if refresh_due {
-            // A refresh that fails stays due, so the retry repeats it.
             if io.refresh()? {
                 self.agent.set_interfaces(io.interfaces(), now_ms);
-                // The parked action may embed address expansion from the old
-                // snapshot even when its stable interface id still exists.
                 self.pending_action = None;
             }
             self.next_interface_refresh_ms = Some(next_refresh);
         }
         if self.agent.set_local_addrs(local_addrs, now_ms) {
-            // A parked packet was encoded from the previous listen-address
-            // snapshot and must not be sent after that snapshot changes.
             self.pending_action = None;
         }
 
@@ -265,17 +254,11 @@ impl<I: MdnsIo> MdnsDriver<I> {
         if let Some(action) = self.pending_action.take() {
             match io.send(&action) {
                 Ok(()) => sent = 1,
-                // Nowhere to send it, or nothing that could ever carry it:
-                // either way holding on to it only delays the next word.
                 Err(MdnsError::UnknownInterface { .. } | MdnsError::Oversized { .. }) => {}
-                // Still no room. Put it back where it was rather than lose it,
-                // and do not queue anything behind it: the carrier is full, and
-                // what would go next has to wait for the same drain.
                 Err(MdnsError::Congested { .. }) => {
                     self.pending_action = Some(action);
                     congested = true;
                 }
-                // Held for the retry, as a congested one would be.
                 Err(error) => {
                     self.pending_action = Some(action);
                     return Err(error);
@@ -288,8 +271,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
         let action_backlog =
             congested || self.send_batch(io, MAX_ACTIONS_PER_TICK.saturating_sub(sent))?;
 
-        // And again on the way out, so what was just sent leaves now rather
-        // than waiting for whatever wakes the host next.
         io.poll(now_ms)?;
         Ok(receive_backlog || action_backlog)
     }
@@ -314,15 +295,10 @@ impl<I: MdnsIo> MdnsDriver<I> {
         let Running { io, health } = self.running.as_ref()?;
         match health {
             Health::BackingOff(failure) => return Some(failure.retry_at),
-            // Work was left on the floor by this tick's budget, so the next
-            // one is due regardless of what any timer says.
             Health::Clear { backlog: true } => return Some(now.as_deadline()),
             Health::Clear { backlog: false } => {}
         }
         let refresh = self.next_interface_refresh_ms.map(Deadline::from_millis);
-        // The carrier's own timers count too: a stack running in this process
-        // gets nothing done between ticks, so a host that slept past one of
-        // its deadlines would stall it.
         Deadline::earliest_opt(
             Deadline::earliest_opt(refresh, self.agent.next_deadline(now)),
             io.next_deadline(now),
@@ -341,9 +317,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
     pub fn shutdown(&mut self, now: Now) -> Result<(), MdnsError> {
         self.last_now = now;
         let now_ms = now.monotonic_ms;
-        // Taking the io is what makes this idempotent, and it is the same
-        // thing that makes a stopped driver inert: there is one way to be
-        // finished here, not two that have to agree.
         let Some(Running { mut io, .. }) = self.running.take() else {
             return Ok(());
         };
@@ -351,15 +324,8 @@ impl<I: MdnsIo> MdnsDriver<I> {
         self.agent.shutdown(now_ms);
 
         let mut first_error = None;
-        // Every goodbye, not a budget's worth: this is the last thing that
-        // will be said, and an unsent one costs a peer a full TTL of pointing
-        // at a host that has gone.
         while let Some(action) = self.agent.poll_action() {
             let mut result = io.send(&action);
-            // There is no next turn to park a congested goodbye until, so the
-            // draining a tick would have done has to happen here. Bounded,
-            // because a carrier that will not drain must not hold a shutdown
-            // open forever -- a host waiting to exit gets to.
             for _ in 0..SHUTDOWN_DRAIN_ATTEMPTS {
                 if !matches!(result, Err(MdnsError::Congested { .. })) {
                     break;
@@ -380,10 +346,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 first_error = Some(error);
             }
         }
-        // The carrier is about to be dropped, so this is its last chance to
-        // put those on the wire. A stack that moves bytes only when driven
-        // would otherwise take every goodbye with it -- and a goodbye that
-        // never left is the exact thing it exists to prevent.
         if let Err(error) = io.poll(now_ms)
             && first_error.is_none()
         {
@@ -410,9 +372,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 return Ok(false);
             };
             processed += 1;
-            // A datagram that got this far cost the same to read whether or
-            // not it is usable, so both drops count toward the budget: a flood
-            // of unusable ones must not buy an attacker unbounded work.
             if datagram.len > MAX_DATAGRAM_BYTES {
                 continue;
             }
@@ -443,21 +402,11 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 return Ok(false);
             };
             match io.send(&action) {
-                // An interface that left between the encode and the send takes
-                // its packet with it. Nothing is wrong here, and there is
-                // nowhere to send it. A datagram bigger than the carrier will
-                // ever hold is dropped for the mirror-image reason: parking it
-                // would retry an impossible send on every turn from now on.
                 Ok(()) | Err(MdnsError::UnknownInterface { .. } | MdnsError::Oversized { .. }) => {}
-                // A full send buffer is a moment, not a fault. Park what did
-                // not fit and stop here: the next turn begins with a drain, so
-                // the burst is delayed rather than lost -- and mDNS does not
-                // fail because a device spoke faster than its link could carry.
                 Err(MdnsError::Congested { .. }) => {
                     self.pending_action = Some(action);
                     return Ok(true);
                 }
-                // Parked the same way, for the retry.
                 Err(error) => {
                     self.pending_action = Some(action);
                     return Err(error);
@@ -501,12 +450,8 @@ fn same_failure(a: &MdnsError, b: &MdnsError) -> bool {
 
 impl<I: MdnsIo> Drop for MdnsDriver<I> {
     fn drop(&mut self) {
-        // A host that drops its driver said goodbye by doing so. Dated with
-        // the last reading a caller gave, since a drop brings no clock with
-        // it and a stale-but-real timestamp beats inventing one.
         let now = self.last_now;
         if let Err(error) = self.shutdown(now) {
-            // `Drop` cannot return the I/O failure after attempting a goodbye.
             drop(error);
         }
     }
@@ -596,8 +541,6 @@ mod tests {
 
         fn poll(&mut self, _now_ms: u64) -> Result<(), MdnsError> {
             self.ops.borrow_mut().push("poll");
-            // A carrier drains when it is driven, which is what makes a
-            // congested send worth trying again after one.
             if let Some(room) = self.room.as_mut() {
                 *room += self.room_per_poll;
             }
@@ -716,8 +659,6 @@ mod tests {
     #[test]
     fn a_datagram_from_off_link_is_not_a_peer_on_this_link() {
         let mut io = FakeIo::with_interfaces(1);
-        // Outside the interface's /24. mDNS is link-local: acting on this
-        // would let a host anywhere put addresses into a local peer book.
         io.queue_from(1, Ipv4Addr::new(203, 0, 113, 7), CLAIM, CLAIM.len());
         let mut driver = driver(io);
 
@@ -727,8 +668,6 @@ mod tests {
             "an off-link datagram must not reach the agent at all"
         );
 
-        // The same bytes from the link do reach it, so the drop above was
-        // about where it came from and not about what it said.
         driver.io_mut().expect("still running").queue(1, CLAIM);
         driver.tick(Now::from_millis(1), &[]);
         assert!(
@@ -743,9 +682,6 @@ mod tests {
     #[test]
     fn an_oversized_datagram_is_dropped_before_it_is_read() {
         let mut io = FakeIo::with_interfaces(1);
-        // Filling the buffer is how an implementation says "there was more":
-        // the buffer is one byte past what mDNS will read, so anything that
-        // reaches its end was truncated on the way in.
         io.queue_from(
             1,
             Ipv4Addr::new(192, 168, 1, 9),
@@ -770,7 +706,6 @@ mod tests {
         }
         let mut driver = driver(io);
 
-        // At nonzero uptime, so "due now" is told apart from `IMMEDIATE`.
         let now = Now::from_millis(7_000);
         driver.tick(now, &[]);
         assert_eq!(
@@ -788,8 +723,6 @@ mod tests {
     #[test]
     fn an_unusable_datagram_still_costs_its_share_of_the_budget() {
         let mut io = FakeIo::with_interfaces(1);
-        // A flood of datagrams that will all be dropped. If dropping were
-        // free, sending them would buy unbounded work inside one tick.
         for _ in 0..MAX_DATAGRAMS_PER_TICK + 5 {
             io.queue_from(1, Ipv4Addr::new(203, 0, 113, 7), CLAIM, CLAIM.len());
         }
@@ -816,7 +749,6 @@ mod tests {
             Some(Deadline::IMMEDIATE)
         );
 
-        // The parked one goes first on the next turn, before anything new.
         driver.tick(Now::from_millis(1), &[]);
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK + 2);
         assert!(driver.pending_action.is_none());
@@ -825,9 +757,6 @@ mod tests {
     #[test]
     fn a_full_carrier_delays_a_datagram_instead_of_ending_mdns() {
         let mut io = FakeIo::with_interfaces(3);
-        // Room for one of the three announcements. A carrier that only moves
-        // bytes when it is driven fills up like this inside a single tick,
-        // which is exactly when a burst is queued.
         io.room = Some(1);
         let sent = io.sent.clone();
         let mut driver = driver(io);
@@ -848,9 +777,6 @@ mod tests {
             "and it is due as soon as the carrier can take it"
         );
 
-        // The carrier drains between turns, and the parked datagram is the
-        // first thing said on the next one -- so a burst is delayed, never
-        // lost.
         driver.io_mut().expect("still running").room = None;
         driver.tick(Now::from_millis(1), &[]);
         assert_eq!(sent.borrow().get(1), Some(&parked));
@@ -885,9 +811,6 @@ mod tests {
     #[test]
     fn a_datagram_the_carrier_can_never_hold_is_dropped_rather_than_held() {
         let mut io = FakeIo::with_interfaces(2);
-        // A send buffer smaller than an announcement. Draining cannot make
-        // room that does not exist, so parking this would hand the same
-        // datagram back to the same carrier on every turn from now on.
         io.max_payload = Some(0);
         let sent = io.sent.clone();
         let mut driver = driver(io);
@@ -916,8 +839,6 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        // Not a failure: interfaces come and go, and there is nowhere to send
-        // a packet encoded for one that left.
         driver.tick(Now::from_millis(0), &[]);
         assert!(driver.is_active());
         assert_eq!(
@@ -951,7 +872,6 @@ mod tests {
             driver.is_active(),
             "a carrier that fails is backed off from, not abandoned"
         );
-        // The claim arrived before the send failed, and is still the host's.
         assert!(matches!(
             driver.poll_event(),
             Some(MdnsEvent::ProtocolViolation { .. })
@@ -963,11 +883,9 @@ mod tests {
             }]
         );
 
-        // The same send failing again, in other words: not news.
         driver.tick(Now::from_millis(MDNS_FAILURE_RETRY), &[]);
         assert_eq!(failure_states(&mut driver), vec![]);
 
-        // A different failure is.
         let io = driver.io_mut().expect("running");
         io.send_fails = false;
         io.receive_fails = true;
@@ -1047,8 +965,6 @@ mod tests {
         driver.tick(Now::from_millis(0), &[]);
         assert!(driver.pending_action.is_some(), "a send backlog");
 
-        // Failing before the agent's next word is handled, so that is overdue
-        // too, alongside the backlog and the carrier's timer.
         let agent_due = driver
             .agent
             .next_deadline(Now::from_millis(0))
@@ -1142,9 +1058,6 @@ mod tests {
         io.interfaces.clear();
         driver.tick(Now::from_millis(refresh_at), &[]);
 
-        // The parked packet was encoded against the interface set that just
-        // changed -- every interface went away -- so sending it now would
-        // announce a view of this host that no longer exists.
         assert!(
             driver.pending_action.is_none(),
             "work encoded against the old snapshot is dropped, not held"
@@ -1165,10 +1078,6 @@ mod tests {
             .expect("the budget parked one");
         let announced = sent.borrow().len();
 
-        // What mDNS advertises is where this host listens, and the parked
-        // packet says what that was a moment ago. The parked one goes out
-        // first on the next turn, so if it survived a change it would be the
-        // first thing said -- announcing an address the host no longer has.
         let addr: Multiaddr = "/ip4/192.168.1.1/udp/4001/quic-v1"
             .parse()
             .expect("test address");
@@ -1190,10 +1099,6 @@ mod tests {
         driver.tick(Now::from_millis(0), &[]);
         let ops = ops.borrow();
 
-        // A stack running in this process moves nothing on its own. Reading
-        // before driving it would find an empty link however much had
-        // arrived, and sending without driving it afterwards would leave the
-        // datagram sitting until whatever wakes the host next.
         assert_eq!(ops.first(), Some(&"poll"), "{ops:?}");
         assert_eq!(ops.last(), Some(&"poll"), "{ops:?}");
         let first_receive = ops.iter().position(|op| *op == "receive").expect("a read");
@@ -1208,9 +1113,6 @@ mod tests {
         let mut driver = driver(io);
         driver.tick(Now::from_millis(0), &[]);
 
-        // A stack of its own gets nothing done between ticks, so a host that
-        // slept through one of its deadlines would stall it -- retransmits
-        // included.
         assert_eq!(
             driver.next_deadline(Now::from_millis(0)),
             Some(Deadline::from_millis(5)),
@@ -1222,7 +1124,6 @@ mod tests {
     fn deadlines_are_on_the_hosts_timeline_from_the_first_tick() {
         let io = FakeIo::with_interfaces(1);
         let mut driver = driver(io);
-        // A host whose clock has been running a while before mDNS starts.
         let start = Now::from_millis(50_000);
         driver.tick(start, &[]);
 
@@ -1231,14 +1132,9 @@ mod tests {
         assert!(first_query < Deadline::from_millis(50_000 + refresh_ms));
         assert_eq!(driver.next_deadline(start), Some(first_query));
 
-        // A host that ran late still sees the query at its own past due time,
-        // so it reads as due rather than being pushed out.
         let late = Now::from_millis(first_query.as_millis() + 7_000);
         assert_eq!(driver.next_deadline(late), Some(first_query));
 
-        // The interface refresh is an interval after the first tick, not after
-        // some epoch of the driver's own: a host started late is not owed one
-        // straight away, and is owed one exactly when the interval is up.
         let refresh_at = 50_000 + refresh_ms;
         driver.tick(Now::from_millis(refresh_at - 1), &[]);
         assert_eq!(driver.io().expect("running").refreshes, 0);
@@ -1254,9 +1150,6 @@ mod tests {
         driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
-        // Every interface, not a budget's worth: this is the last thing that
-        // will be said, and an unsent goodbye costs a peer a full TTL of
-        // pointing at a host that has gone.
         driver.shutdown(Now::from_millis(10)).expect("goodbye");
         let after_goodbye = sent.borrow().len();
         assert_eq!(
@@ -1290,11 +1183,6 @@ mod tests {
         driver.tick(Now::from_millis(0), &[]);
         ops.borrow_mut().clear();
 
-        // The carrier is dropped at the end of a shutdown, so this is its
-        // last chance to put the goodbyes on the wire. A stack that moves
-        // bytes only when driven would take every one of them with it --
-        // and a goodbye that never left is the exact thing it exists to
-        // prevent.
         driver.shutdown(Now::from_millis(10)).expect("goodbye");
         let ops = ops.borrow();
         assert!(ops.contains(&"send"), "{ops:?}");
@@ -1309,18 +1197,12 @@ mod tests {
     fn a_goodbye_that_did_not_fit_is_driven_out_rather_than_lost() {
         let mut io = FakeIo::with_interfaces(3);
         io.room = Some(3);
-        // A carrier with room for the announcements and nothing left for the
-        // goodbyes, which drains a datagram's worth each time it is driven.
         io.room_per_poll = 1;
         let sent = io.sent.clone();
         let mut driver = driver(io);
         driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
-        // A tick would park a congested datagram and come back for it. A
-        // shutdown has no next turn, so it drains here instead -- and an
-        // unsent goodbye costs a peer a full TTL of pointing at a host that
-        // has gone, which is the whole reason a shutdown says one.
         driver.shutdown(Now::from_millis(10)).expect("goodbye");
         assert_eq!(
             sent.borrow().len() - announced,
@@ -1346,13 +1228,10 @@ mod tests {
     fn a_carrier_that_will_not_drain_does_not_hold_a_shutdown_open() {
         let mut io = FakeIo::with_interfaces(2);
         io.room = Some(0);
-        // Nothing this carrier is asked to do frees anything up.
         io.room_per_poll = 0;
         let ops = io.ops.clone();
         let mut driver = driver(io);
 
-        // Reported rather than retried forever: a host that wants to exit
-        // gets to, and it is told the goodbye did not make it.
         let error = driver
             .shutdown(Now::from_millis(10))
             .expect_err("the goodbye never got out");
@@ -1378,8 +1257,6 @@ mod tests {
         driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
-        // A host that drops its driver has left the link. Peers that are not
-        // told keep pointing at it until the records time out.
         drop(driver);
         assert_eq!(
             sent.borrow().len() - announced,

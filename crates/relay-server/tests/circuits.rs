@@ -102,7 +102,6 @@ fn admitted_connect_opens_stop_on_the_reserved_exact_connection() {
     node.stop_status(&destination, stop_stream, Status::Ok, at(2));
     let calls = node.calls();
     assert_eq!(hop_reply_status(&calls, source_stream), Some(Status::Ok));
-    // The pipelined payload is released after commit, and crosses the limit.
     assert_eq!(
         sends_on(&calls, stop_stream),
         [b"pipelined-source".to_vec()]
@@ -179,8 +178,6 @@ fn a_refused_connect_spends_no_rate_token() {
 
 #[test]
 fn a_pending_circuit_leg_does_not_hold_a_hop_slot() {
-    // The CONNECT took the source connection's only HOP slot, and its worker
-    // is now a pending circuit leg.
     let Fixture {
         mut node, source, ..
     } = pending_stop(
@@ -197,8 +194,6 @@ fn a_pending_circuit_leg_does_not_hold_a_hop_slot() {
         "a pending circuit leg must not hold a HOP slot"
     );
 
-    // That second stream is an ordinary HOP worker, so it fills the slot: the
-    // exclusion is for circuit legs, not a blanket opt-out.
     let third = key(SOURCE_CONN.as_u64(), 4);
     node.hop_ready(&source, third, at(0));
     assert_eq!(
@@ -246,9 +241,6 @@ fn a_failed_circuit_leg_holds_a_hop_slot_while_its_stream_stays_open() {
         0,
     );
 
-    // The destination refuses, so the circuit never commits. The HOP denial
-    // completes, but the worker stays until the source closes its stream,
-    // and with no circuit to exclude it, it must count again.
     node.stop_status(&destination, stop_stream, Status::PermissionDenied, at(0));
     assert!(node.owns_stream(source_stream));
     node.calls();
@@ -283,7 +275,6 @@ fn control_timeouts_release_hop_and_stop_ownership() {
     assert_eq!(node.circuit_count(), 0);
     assert_eq!(denied(&node.events()), [Status::ConnectionFailed]);
     assert!(resets(&node.calls()).contains(&stop_stream));
-    // The reset STOP stream is claimed until it closes.
     assert!(node.owns_stream(stop_stream));
     assert!(node.stream_closed(&destination, stop_stream, at(6)));
     assert!(!node.owns_stream(stop_stream));
@@ -419,7 +410,6 @@ fn precommit_payload_is_bounded_in_both_directions() {
         } = pending_stop(RelayServerConfig::default(), 0);
         let (peer_id, stream) = match direction {
             CircuitDirection::SourceToDestination => (source, source_stream),
-            // The STATUS accepts, and the payload behind it overflows.
             CircuitDirection::DestinationToSource => (destination, stop_stream),
         };
         let mut data = match direction {
@@ -474,7 +464,6 @@ fn source_eof_while_connect_is_pending_follows_its_payload_after_commit() {
     node.half_close(&source, source_stream, at(1));
     assert_eq!(acked(&node.calls(), source_stream), 0, "payload waits");
 
-    // The destination is full at commit: the FIN waits behind the payload.
     node.swarm.credit.insert(stop_stream, 0);
     node.stop_status(&destination, stop_stream, Status::Ok, at(1));
     assert!(matches!(
@@ -529,7 +518,6 @@ fn replacing_a_leg_connection_closes_its_circuit() {
             [other_stream],
             "{leg:?}: the surviving leg's stream is reset"
         );
-        // Only the destination's own reservation follows its connection.
         let reservation_conn = match leg {
             CircuitLeg::Source => stop_stream.conn_id,
             CircuitLeg::Destination => ConnectionId::new(62),
@@ -578,8 +566,6 @@ fn replacing_the_destination_fails_a_pending_connect() {
 /// through the indexes, leaving none of them pointing at it.
 #[test]
 fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
-    // `relay` (connection 60) is the destination of a committed circuit from
-    // `source` (connection 61).
     let Fixture {
         mut node,
         source,
@@ -589,7 +575,6 @@ fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
     } = connected_circuit(RelayServerConfig::default(), 0);
     let now = at(0);
 
-    // `relay` is also the source of a committed circuit to `far`.
     let far = peer(b"far-both-legs");
     node.reserve(&far, key(70, 1));
     let outbound = key(DESTINATION_CONN.as_u64(), 5);
@@ -605,7 +590,6 @@ fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
 
     node.calls();
 
-    // A third peer's CONNECT to `relay` is still opening its STOP stream.
     let late = peer(b"late-both-legs");
     node.establish(&late, ConnectionId::new(71));
     node.feed_hop(&late, key(71, 7), connect_request(&relay), &[]);
@@ -615,8 +599,6 @@ fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
 
     node.close_connection(&relay, DESTINATION_CONN, 0);
 
-    // Circuits close in source-stream order: the outbound one on connection
-    // 60 first, then the inbound one from connection 61.
     let mut closed = Vec::new();
     let mut denied = 0;
     let mut open_failed = 0;
@@ -651,8 +633,6 @@ fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
     for stream in [stop_stream, outbound, late_stop] {
         assert!(!node.owns_stream(stream), "{stream:?}");
     }
-    // The surviving legs were reset; `far`'s and `source`'s streams are
-    // only claimed until they close.
     let reset = resets(&node.calls());
     assert!(reset.contains(&far_stop) && reset.contains(&source_stream));
     let _ = source;
@@ -694,22 +674,17 @@ fn circuits_per_ip_count_either_end_and_a_shared_key_once() {
     };
     let refused = Err(Status::ResourceLimitExceeded);
 
-    // Two sources on one key fill it; their pending circuits count.
     let source_key = "/ip4/203.0.113.9/tcp/1";
     assert_eq!(connect(&mut node, source_key, &d1), Ok(()));
     assert_eq!(connect(&mut node, source_key, &d2), Ok(()));
     assert_eq!(connect(&mut node, source_key, &d3), refused);
-    // The destination end counts too: d1's key holds one circuit.
     assert_eq!(connect(&mut node, "/ip4/203.0.113.10/tcp/1", &d1), Ok(()));
     assert_eq!(connect(&mut node, "/ip4/203.0.113.11/tcp/1", &d1), refused);
-    // Both ends on one key count once, so two such circuits fit.
     let shared_key = "/ip4/192.0.2.50/tcp/2";
     assert_eq!(connect(&mut node, shared_key, &shared), Ok(()));
     assert_eq!(connect(&mut node, shared_key, &shared), Ok(()));
     assert_eq!(connect(&mut node, shared_key, &shared), refused);
 }
-
-// --- The STOP open: the one command whose result arrives later ---------------
 
 /// A circuit abandoned while its STOP stream still negotiates cannot reset
 /// that stream yet. Its late `StreamReady` resets it, and the relay claims

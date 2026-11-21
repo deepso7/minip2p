@@ -211,10 +211,9 @@ mod tests {
     #[test]
     fn decodes_close_and_flow_control_capsules() {
         let bytes = [
-            0x68, 0x43, 0x07, 0x00, 0x00, 0x00, 0x07, b'b', b'y', b'e', // CLOSE 7 "bye"
-            0x99, 0x0b, 0x4d, 0x3d, 0x02, 0x40, 0x64, // WT_MAX_DATA 100
-            0x99, 0x0b, 0x4d, 0x3f, 0x01, 0x05, // WT_MAX_STREAMS bidi 5
-            0x99, 0x0b, 0x4d, 0x40, 0x01, 0x06, // WT_MAX_STREAMS uni 6
+            0x68, 0x43, 0x07, 0x00, 0x00, 0x00, 0x07, b'b', b'y', b'e', 0x99, 0x0b, 0x4d, 0x3d,
+            0x02, 0x40, 0x64, 0x99, 0x0b, 0x4d, 0x3f, 0x01, 0x05, 0x99, 0x0b, 0x4d, 0x40, 0x01,
+            0x06,
         ];
         let capsules = decode_all(&mut CapsuleDecoder::new(), &bytes).unwrap();
         assert_eq!(
@@ -233,7 +232,6 @@ mod tests {
         for capsule in &capsules {
             capsule.encode(&mut encoded).unwrap();
         }
-        // The encoder picks the shortest varint for 100, unlike the input.
         assert_eq!(
             decode_all(&mut CapsuleDecoder::new(), &encoded).unwrap(),
             capsules
@@ -261,7 +259,6 @@ mod tests {
     #[test]
     fn unknown_capsules_are_skipped_up_to_the_cap() {
         let mut decoder = CapsuleDecoder::new();
-        // DATAGRAM (0x00) capsule of 64 KiB, then MAX_DATA.
         let mut header: &[u8] = &[0x00, 0x80, 0x01, 0x00, 0x00];
         assert_eq!(decoder.decode(&mut header), Ok(None));
         let body = [0u8; 1024];
@@ -282,11 +279,11 @@ mod tests {
     #[test]
     fn malformed_known_capsules_are_message_errors() {
         let cases: [&[u8]; 5] = [
-            &[0x68, 0x43, 0x03, 0, 0, 0],          // close shorter than its code
-            &[0x68, 0x43, 0x80, 0x00, 0x04, 0x05], // reason past 1024 bytes
-            &[0x68, 0x43, 0x05, 0, 0, 0, 0, 0xff], // reason not UTF-8
-            &[0x99, 0x0b, 0x4d, 0x3d, 0x02, 0x05, 0x00], // trailing byte after varint
-            &[0x99, 0x0b, 0x4d, 0x3f, 0x00],       // empty body
+            &[0x68, 0x43, 0x03, 0, 0, 0],
+            &[0x68, 0x43, 0x80, 0x00, 0x04, 0x05],
+            &[0x68, 0x43, 0x05, 0, 0, 0, 0, 0xff],
+            &[0x99, 0x0b, 0x4d, 0x3d, 0x02, 0x05, 0x00],
+            &[0x99, 0x0b, 0x4d, 0x3f, 0x00],
         ];
         for bytes in cases {
             assert_eq!(

@@ -91,8 +91,6 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
 #[test]
 #[ignore = "downloads/builds pinned rust-libp2p and opens loopback sockets"]
 fn pinned_rust_libp2p_connects_across_a_relay_mesh() {
-    // Built before the relays bind: nothing drives them while it builds,
-    // and an idle backbone left undriven that long goes stale.
     let client = build_client();
     let (mut relays, [first, second], backbones) = relay_interop::mesh(LIMITS);
 

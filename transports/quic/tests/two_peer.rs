@@ -466,7 +466,6 @@ fn mtls_verifies_listener_side_client_identity() {
     assert_eq!(verified_event.1.peer_id(), Some(&client_peer_id));
     assert!(verified_event.2.is_none());
 
-    // `Connected` already carries the verified identity.
     let (connected_id, endpoint) = server_connected.expect("server connected");
     assert_eq!(connected_id, verified_event.0);
     assert_eq!(endpoint.peer_id(), Some(&client_peer_id));

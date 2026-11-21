@@ -80,8 +80,6 @@ fn register_with_token(
 fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
     let current = ConnectionId::new(1);
     let new = ConnectionId::new(2);
-    // The current connection is the lower peer's dial: ours when we are
-    // lower, the peer's when it is.
     for (peer, current_outbound) in [(HIGHER_PEER, true), (LOWER_PEER, false)] {
         for upgrade in [false, true] {
             let case = format!("current_outbound={current_outbound} upgrade={upgrade}");
@@ -93,8 +91,6 @@ fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
             register(&mut core, &peer, new, !current_outbound, upgrade, 4_999);
             let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
             assert_eq!(lifecycle(&outputs), ["close 2"], "{case}");
-            // Only our own losing dial reports anything: it completes as
-            // DialFailed. The peer's losing dial closes with no event.
             let events: Vec<_> = outputs
                 .iter()
                 .filter_map(|output| match output {
@@ -115,7 +111,6 @@ fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
             }
             assert_eq!(core.connection_id(&peer), Some(current), "{case}");
 
-            // Data the loser still delivers is dropped and acknowledged.
             feed(
                 &mut core,
                 TransportEvent::StreamData {
@@ -133,7 +128,6 @@ fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
                 "{case}"
             );
 
-            // Its transport close is bookkeeping only.
             feed(
                 &mut core,
                 TransportEvent::Closed {
@@ -151,8 +145,6 @@ fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
 fn same_direction_race_keeps_the_lower_token_in_either_order() {
     let low = (ConnectionId::new(1), 1);
     let high = (ConnectionId::new(2), 2);
-    // Our two dials, or two of the peer's: the two ends of the race see
-    // the same pair, possibly in opposite orders, and must agree.
     for outbound in [true, false] {
         for upgrade in [false, true] {
             for (first, second) in [(low, high), (high, low)] {
@@ -183,8 +175,6 @@ fn same_direction_race_keeps_the_lower_token_in_either_order() {
                         "{case}"
                     );
                 } else {
-                    // Unannounced; our own losing dial completes as
-                    // DialFailed, which a settled attempt consumes.
                     assert_eq!(lifecycle(&outputs), [format!("close {}", high.0)]);
                     let dial_failed = outputs.iter().any(|output| {
                         matches!(
@@ -206,9 +196,6 @@ fn newest_connection_wins_outside_a_simultaneous_dial() {
     let circuit = ConnectionId::namespaced(minip2p_transport::ConnectionNamespace::CIRCUIT, 1)
         .expect("circuit id");
     let new = ConnectionId::new(2);
-    // (case, current, current_outbound, new_outbound, tokens, new_at_ms).
-    // We are the lower peer, so our own dial wins a simultaneous dial;
-    // a same-direction race needs a token on both to keep the older.
     let cases = [
         (
             "new is the lower peer's dial",
@@ -302,8 +289,6 @@ fn newest_connection_wins_outside_a_simultaneous_dial() {
 fn a_configured_window_bounds_the_race() {
     let current = ConnectionId::new(1);
     let new = ConnectionId::new(2);
-    // Our dial to the higher peer is the one both sides keep, until the
-    // window ends.
     for (new_at_ms, expected) in [
         (199, ["close 2"].as_slice()),
         (200, &["replaced 1->2", "close 1"]),
@@ -319,5 +304,3 @@ fn a_configured_window_bounds_the_race() {
         assert_eq!(lifecycle(&outputs), expected, "new at {new_at_ms}ms");
     }
 }
-
-// --- A connection's first Identify fails (#470) ---

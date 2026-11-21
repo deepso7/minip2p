@@ -44,8 +44,6 @@ pub fn encode_base58btc(input: &[u8]) -> String {
         .get(leading_zeros..)
         .expect("leading zero count comes from the same input");
 
-    // Little-endian limbs in base 58^5. The first group takes the odd
-    // bytes (possibly none) so every later group is exactly 4 bytes wide.
     let mut limbs: Vec<u32> = Vec::with_capacity(rest.len() * 138 / 500 + 1);
     let (head, tail) = rest.split_at(rest.len() % 4);
     for group in
@@ -68,7 +66,6 @@ pub fn encode_base58btc(input: &[u8]) -> String {
 
     let mut out = String::with_capacity(leading_zeros + limbs.len() * BASE58_LIMB_DIGITS);
     out.extend(core::iter::repeat_n('1', leading_zeros));
-    // Every limb but the most significant prints all five digits.
     for (index, limb) in limbs.iter().rev().enumerate() {
         let mut digits = [0u8; BASE58_LIMB_DIGITS];
         let mut value = *limb;
@@ -112,8 +109,6 @@ pub fn decode_base58btc(input: &str) -> Result<Vec<u8>, MultibaseError> {
         );
     }
 
-    // Little-endian limbs in base 2^32. The first group takes the odd
-    // digits (possibly none) so every later group is exactly five wide.
     let mut limbs: Vec<u32> = Vec::with_capacity(digits.len() * 733 / 3200 + 1);
     let (head, tail) = digits.split_at(digits.len() % BASE58_LIMB_DIGITS);
     for group in core::iter::once(head).chain(
@@ -141,7 +136,6 @@ pub fn decode_base58btc(input: &str) -> Result<Vec<u8>, MultibaseError> {
     out.resize(leading_zeros, 0u8);
     for (index, limb) in limbs.iter().rev().enumerate() {
         let bytes = limb.to_be_bytes();
-        // The most significant limb drops its zero padding.
         let skip = if index == 0 {
             bytes.iter().take_while(|byte| **byte == 0).count()
         } else {
@@ -414,7 +408,6 @@ mod tests {
 
     #[test]
     fn base58_codec_matches_reference() {
-        // xorshift64: deterministic inputs without a dev-dependency.
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
             state ^= state << 13;
@@ -453,7 +446,6 @@ mod tests {
         for c in (0..=255u8).map(char::from) {
             assert_eq!(base58_value(c), reference_base58_value(c), "value {c:?}");
         }
-        // The reference truncated `char as u8`, so U+0131 aliased to '1'.
         assert_eq!(
             decode_base58btc("12D3\u{131}"),
             Err(MultibaseError::InvalidBase58Character {

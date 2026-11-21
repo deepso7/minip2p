@@ -191,10 +191,6 @@ fn finish_stream(
     shared.release_stream(conn, stream);
 }
 
-// ---------------------------------------------------------------------------
-// Reachability prober
-// ---------------------------------------------------------------------------
-
 /// One in-flight AutoNAT probe.
 struct ProbeFlight {
     server: PeerAddr,
@@ -240,8 +236,6 @@ impl Prober {
             next_vote_seq: 0,
             public_addrs: Vec::new(),
             flight: None,
-            // Without configured servers there is nothing to schedule, and
-            // the agent must not report a phantom timeout.
             next_probe_at: has_servers.then_some(0),
             server_idx: 0,
         }
@@ -265,7 +259,6 @@ impl Prober {
     /// Starts the next probe if the preconditions hold.
     fn start_probe(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if shared.config.autonat_servers.is_empty() || shared.listen_addrs.is_empty() {
-            // Nothing to probe (yet); check again at the unsettled cadence.
             self.next_probe_at = Some(now.monotonic_ms + shared.config.probe_interval_unsettled_ms);
             return;
         }
@@ -279,9 +272,6 @@ impl Prober {
             .expect("the checked AutoNAT server cursor is within the configured list")
             .clone();
         let deadline_ms = shared.config.probe_deadline_ms;
-        // Another machine may already be dialing this peer (an AutoNAT
-        // server can double as the configured relay); the acquisition then
-        // waits on that connection.
         let result = acquire::start(
             &server,
             AUTONAT_PROTOCOL_ID,
@@ -505,18 +495,12 @@ impl Prober {
         let public_addrs = match reachability {
             Reachability::Public { addrs, .. } => {
                 let selected = select_direct_addrs(addrs, None, None);
-                // A successful dial-back is useful public evidence only when
-                // it leaves the application with an address something can
-                // actually dial. Counting an empty selection could release a
-                // WhenPrivate reservation while providing no direct
-                // replacement path.
                 if selected.is_empty() {
                     return false;
                 }
                 selected
             }
             Reachability::Private { .. } => Vec::new(),
-            // No signal: an inconclusive probe never casts a vote.
             Reachability::Unknown { .. } => return false,
         };
         self.votes.insert(
@@ -551,9 +535,6 @@ impl Prober {
             self.votes.remove(&oldest);
         }
 
-        // A threshold above the bounded window can never be reached. Treat
-        // it as unanimity for the configured window instead of leaving
-        // reachability permanently Unknown.
         let threshold = usize::from(shared.config.confidence_threshold.max(1)).min(window);
         let confirmed = self.quorum_addrs(threshold);
         let private_votes = self
@@ -564,8 +545,6 @@ impl Prober {
         let (new, addrs) = if self.votes.len() < threshold {
             (ReachabilityState::Unknown, Vec::new())
         } else if !confirmed.is_empty() {
-            // Addresses already confirmed stay unless a quorum drops them,
-            // then come the newly confirmed ones.
             let mut addrs = self.held_addrs(threshold);
             for addr in confirmed {
                 if !addrs.contains(&addr) {
@@ -588,8 +567,6 @@ impl Prober {
         let old = core::mem::replace(&mut self.verdict, new);
         self.public_addrs = addrs;
         if new == ReachabilityState::Unknown {
-            // Gather fresh evidence at the unsettled cadence, not the
-            // settled one the next probe may be waiting on.
             let soon = now_ms.saturating_add(shared.config.probe_interval_unsettled_ms);
             self.next_probe_at = self.next_probe_at.map(|due| due.min(soon));
         }
@@ -694,8 +671,6 @@ impl Prober {
     }
 
     fn next_deadline(&self) -> Option<u64> {
-        // A settled verdict must lapse when its votes expire, even between
-        // probes.
         let expiry = (self.verdict != ReachabilityState::Unknown)
             .then(|| self.votes.values().map(|vote| vote.cast_at_ms).min())
             .flatten()
@@ -710,10 +685,6 @@ impl Prober {
         .min()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Reservation manager
-// ---------------------------------------------------------------------------
 
 /// Where the reservation flow currently stands.
 enum ResState {
@@ -778,8 +749,6 @@ impl ReservationManager {
         match shared.config.reservation_policy {
             ReservationPolicy::Never => false,
             ReservationPolicy::Always => true,
-            // Reserve unless we are confidently public: a NAT'd listener
-            // must be dialable while evidence is still being gathered.
             ReservationPolicy::WhenPrivate => verdict != ReachabilityState::Public,
         }
     }
@@ -812,8 +781,6 @@ impl ReservationManager {
                 keep_alive_at_mono_ms: Some(due),
                 ..
             } if now.monotonic_ms >= *due => {
-                // Relay liveness is re-established from lifecycle events; a
-                // refused ping changes nothing here.
                 match swarm.ping(relay.peer_id(), now.monotonic_ms) {
                     Ok(()) | Err(_) => {}
                 }
@@ -1028,7 +995,6 @@ impl ReservationManager {
                         && !acquire::can_become_ready(peer, swarm, shared, now))) =>
             {
                 if let Some((conn, stream)) = stage.stream() {
-                    // The connection is terminal; nothing to reset.
                     shared.release_stream(conn, stream);
                 }
                 emit_renewal_lost(renewing, shared);
@@ -1063,8 +1029,6 @@ impl ReservationManager {
                 ..
             } if relay.peer_id() == peer && stage.is_on(old) => {
                 if let Some((conn, stream)) = stage.stream() {
-                    // The stream lived on the retired connection: release
-                    // it without a reset.
                     shared.release_stream(conn, stream);
                 }
                 (relay.clone(), renewing.take())
@@ -1177,18 +1141,6 @@ impl ReservationManager {
         finish_stream(&relay_peer, conn, stream, swarm, shared, now);
 
         let default_ttl = shared.config.reservation_default_ttl_secs;
-        // Renew at half the reported lifetime when both the expiry and a wall
-        // clock exist; otherwise at half the default TTL. Clockless renewal is
-        // approximate by design.
-        //
-        // The relay owns `expire` and is not trusted to report it sanely.
-        // Clamping to the default TTL bounds the renewal delay, so a value far
-        // in the future cannot postpone renewal indefinitely. Past that, a
-        // relay enforcing a shorter lifetime than it reports can still expire
-        // first: it then drops the reservation with the connection still up
-        // -- so no `RelayReservationLost` -- while we keep advertising a
-        // ticket that dialers get NO_RESERVATION on. An expiry at or before now (a stale
-        // value, or clock skew) is treated as no expiry at all.
         let lifetime_secs = match (expire_unix_secs, now.unix_seconds) {
             (Some(expire), Some(unix_now)) if expire > unix_now => {
                 (expire - unix_now).min(default_ttl)
@@ -1198,8 +1150,6 @@ impl ReservationManager {
         let info = ReservationInfo {
             relay: relay_peer,
             expires_unix_secs: expire_unix_secs,
-            // The relay controls `expire`, so this conversion must not let a
-            // large value wrap the monotonic renewal deadline.
             renew_at_mono_ms: now
                 .monotonic_ms
                 .saturating_add(renewal_delay_ms(lifetime_secs)),
@@ -1249,10 +1199,6 @@ impl ReservationManager {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Composition
-// ---------------------------------------------------------------------------
 
 /// The agent's own-side housekeeping, running independently of connect
 /// attempts.
@@ -1363,8 +1309,6 @@ impl Housekeeping {
                     .prober
                     .on_stream_input(stream, input, swarm, shared, now)
                 {
-                    // A verdict flip can change what the reservation policy
-                    // wants; reconcile inside the same cascade.
                     self.reservations
                         .sync(self.prober.verdict, swarm, shared, now);
                 }

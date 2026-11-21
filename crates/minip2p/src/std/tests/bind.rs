@@ -7,11 +7,10 @@ fn discovery_config_is_rejected_before_binding() {
         beacon_interval_ms: 0,
         ..BeaconConfig::default()
     };
-    // TEST-NET-1 is never a local address: a socket bind would fail.
     assert!(matches!(
         Endpoint::builder()
             .discovery_config(config)
-            .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+            .listen_on(UNBINDABLE_QUIC)
             .expect("quic listen address")
             .bind()
             .err(),
@@ -23,8 +22,6 @@ fn discovery_config_is_rejected_before_binding() {
 
 #[test]
 fn an_endpoint_with_nothing_to_bind_is_refused() {
-    // It could neither dial nor be reached; failing here says that once,
-    // where the mistake is, instead of at every later call.
     let Err(error) = Endpoint::builder().bind() else {
         panic!("an endpoint with no transport must not build");
     };
@@ -175,9 +172,7 @@ fn webtransport_listens_share_the_quic_socket_of_their_family() {
             .expect("WebTransport on the same socket")
     };
     for rejected in [
-        // Another port: QUIC has one socket per family.
         "/ip4/127.0.0.1/udp/4001/quic-v1/webtransport",
-        // The same shape twice.
         "/ip4/127.0.0.1/udp/0/quic-v1/webtransport",
     ] {
         let Err(error) = builder().listen_on(rejected) else {
@@ -360,8 +355,6 @@ fn a_tcp_endpoint_reports_the_port_it_was_given() {
         .bind()
         .expect("bind tcp endpoint");
 
-    // Bound at build time like a QUIC socket, so a caller that asked for
-    // port 0 can learn which port it got without driving anything first.
     let addrs = endpoint.listen_all().expect("listen");
     assert_eq!(addrs.len(), 1, "one transport, one address: {addrs:?}");
     let port = tcp_port(&addrs[0]);
@@ -388,9 +381,6 @@ fn every_bound_transport_reports_where_it_listens() {
         .bind()
         .expect("bind both");
 
-    // A host announces where it can be reached. Leaving a transport out
-    // would make half of those ways invisible to peers, and the host would
-    // have no way to tell.
     let reported: Vec<String> = endpoint
         .listen_all()
         .expect("listen")
@@ -426,9 +416,6 @@ fn a_second_tcp_address_joins_the_transport_that_already_serves_tcp() {
         "two binds, two sockets"
     );
 
-    // A transport claims an address shape, not an address family, so
-    // asking for two /tcp addresses asks for two sockets on one transport
-    // -- not a second one, which the set would refuse.
     let second = addrs[1].clone();
     let _driver = Driven::new(endpoint);
     let mut dialer = Endpoint::builder()
@@ -449,9 +436,6 @@ fn a_second_tcp_address_joins_the_transport_that_already_serves_tcp() {
 #[cfg(feature = "tcp")]
 #[test]
 fn listening_arms_every_bound_transport_not_just_the_first() {
-    // TCP first, so the transport that still needs arming is the one
-    // `listen` does not return. An endpoint that reported success while
-    // QUIC accepted nothing would look bound and be unreachable.
     let mut listener = Endpoint::builder()
         .listen_on("/ip4/127.0.0.1/tcp/0")
         .expect("tcp listen address")
@@ -459,8 +443,6 @@ fn listening_arms_every_bound_transport_not_just_the_first() {
         .expect("quic listen address")
         .bind()
         .expect("bind both");
-    // Read straight off the bound sockets, so nothing here arms anything:
-    // `listen` below is the only call that does.
     let bound = listener
         .core()
         .transport()
@@ -492,9 +474,6 @@ fn listening_arms_every_bound_transport_not_just_the_first() {
 #[cfg(feature = "tcp")]
 #[test]
 fn a_peer_is_reached_over_the_transport_its_address_names() {
-    // One peer per transport: the swarm keeps a single connection per
-    // peer, so two paths to one host would be the second replacing the
-    // first rather than a test of which path each address took.
     let mut over_tcp = Endpoint::builder()
         .listen_on("/ip4/127.0.0.1/tcp/0")
         .expect("tcp listen address")
@@ -517,10 +496,6 @@ fn a_peer_is_reached_over_the_transport_its_address_names() {
         .expect("bind dialer");
     let _drivers = (Driven::new(over_tcp), Driven::new(over_quic));
 
-    // The address decides the transport, and nothing above the endpoint
-    // had to choose: the namespace on the connection id says which one
-    // actually carried it. Each connection is waited for by name, since
-    // the one before it keeps producing events of its own.
     for (addr, expected) in [
         (&tcp_addr, ConnectionNamespace::TCP_IPV4),
         (&quic_addr, ConnectionNamespace::QUIC_IPV4),
@@ -561,9 +536,6 @@ fn tcp_limits_and_namespace_reach_the_transport() {
     )
     .expect("target");
 
-    // The id a raw swarm dial hands back is minted by the transport, so
-    // its namespace is what the configuration actually reached -- whether
-    // anything answers is beside the point.
     let id = endpoint.core_mut().dial(&target).expect("the dial starts");
     assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
 }
@@ -621,9 +593,6 @@ fn circuit_limits_that_break_the_yamux_invariants_are_refused_at_bind() {
 #[cfg(feature = "tcp")]
 #[test]
 fn a_tcp_transport_tagged_for_another_carrier_is_refused() {
-    // The namespace routes a connection id back to the transport that
-    // minted it. Tagged as QUIC's, TCP's ids would name the wrong carrier
-    // and take a claim the QUIC member needs.
     let Err(error) = Endpoint::builder()
         .tcp_config(TcpConfig {
             namespace: ConnectionNamespace::QUIC_IPV4,

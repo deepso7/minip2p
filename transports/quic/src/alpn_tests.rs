@@ -16,6 +16,8 @@ use crate::test_peer::{
 
 const H3: &[u8] = b"h3";
 const LIBP2P: &[u8] = b"libp2p";
+const NO_APPLICATION_PROTOCOL_ALERT: u8 = 120;
+const CERTIFICATE_UNKNOWN_ALERT: u8 = 46;
 
 /// A listening transport on loopback without WebTransport.
 fn quic_v1_server() -> QuicTransport {
@@ -77,8 +79,11 @@ fn a_quic_v1_only_socket_offers_only_libp2p() {
             .any(|event| matches!(event, TransportEvent::Connected { .. })),
         "{events:?}"
     );
-    // TLS's no_application_protocol alert.
-    assert_eq!(crypto_alert(&lost_reason(&h3)), Some(120), "{events:?}");
+    assert_eq!(
+        crypto_alert(&lost_reason(&h3)),
+        Some(NO_APPLICATION_PROTOCOL_ALERT),
+        "{events:?}"
+    );
 }
 
 /// `quic-v1` and WebTransport bound on one loopback socket.
@@ -235,17 +240,14 @@ fn an_h3_client_gets_the_webtransport_certificate_and_no_connection_before_noise
         server.local_addr(),
         foreign_client_config(&[H3], None, Arc::clone(&seen)),
     );
-    // The server's wall clock is pinned mid-period, so the certificate it
-    // serves cannot move across a period boundary under the test.
-    let unix = 1_000 * PERIOD_SECS + PERIOD_SECS / 2;
-    let mut events = handshake_at(&mut peer, &mut server, Some(unix), |_| {});
+    let mid_period = 1_000 * PERIOD_SECS + PERIOD_SECS / 2;
+    let mut events = handshake_at(&mut peer, &mut server, Some(mid_period), |_| {});
     assert_eq!(negotiated(&mut peer).as_deref(), Some(H3));
-    let period = minip2p_tls::webtransport::period_at(unix);
+    let period = minip2p_tls::webtransport::period_at(mid_period);
     let (expected, _) =
         minip2p_tls::webtransport::webtransport_certificate(&keypair, period).expect("cert");
     assert_eq!(seen.seen(), Some(expected));
 
-    // A client that never authenticates is never reported.
     peer.conn().close(
         Instant::now(),
         quinn_proto::VarInt::from_u32(0),
@@ -264,8 +266,11 @@ fn an_h3_only_socket_offers_only_h3() {
     server.listen_on_bound_addrs().expect("listen");
     let mut libp2p = RawPeer::connect(server.local_addr(), |_| {});
     let events = drive_until_peer_closed(&mut server, &mut libp2p);
-    // TLS's no_application_protocol alert.
-    assert_eq!(crypto_alert(&lost_reason(&libp2p)), Some(120), "{events:?}");
+    assert_eq!(
+        crypto_alert(&lost_reason(&libp2p)),
+        Some(NO_APPLICATION_PROTOCOL_ALERT),
+        "{events:?}"
+    );
 }
 
 #[test]
@@ -296,7 +301,6 @@ fn an_h3_only_socket_serves_the_webtransport_certificate_to_a_client_also_offeri
 #[test]
 fn an_invalid_libp2p_certificate_under_h3_is_rejected_inside_the_handshake() {
     let mut server = dual_server();
-    // A well-formed certificate without the libp2p extension.
     let invalid =
         minip2p_tls::webtransport::webtransport_certificate(&Ed25519Keypair::generate(), 1)
             .expect("cert");
@@ -305,9 +309,11 @@ fn an_invalid_libp2p_certificate_under_h3_is_rejected_inside_the_handshake() {
         foreign_client_config(&[H3], Some(invalid), Arc::default()),
     );
     let mut events = drive_until_peer_closed(&mut server, &mut peer);
-    // TLS's certificate_unknown alert, not the application close a failed
-    // check after the handshake would send.
-    assert_eq!(crypto_alert(&lost_reason(&peer)), Some(46), "{events:?}");
+    assert_eq!(
+        crypto_alert(&lost_reason(&peer)),
+        Some(CERTIFICATE_UNKNOWN_ALERT),
+        "{events:?}"
+    );
     drive_until_server_closed(&mut server, &mut peer, &mut events);
     assert_only_arrival_and_close(&events);
 }
@@ -323,13 +329,11 @@ fn a_quic_v1_only_socket_grants_no_unidirectional_streams_or_datagrams() {
 #[test]
 fn a_peer_unidirectional_stream_on_a_libp2p_connection_is_stopped_and_never_surfaced() {
     let mut server = dual_server();
-    // The peer enables DATAGRAM itself, or it may not send any.
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
         config.datagram_receive_buffer_size(Some(1024));
     });
     let uni = open_uni(&mut peer);
     assert_eq!(peer.write(uni, b"control"), 7);
-    // Datagrams are drained and dropped.
     peer.conn()
         .datagrams()
         .send(Bytes::from_static(b"datagram"), true)
@@ -366,8 +370,6 @@ fn close_racing_incoming_streams(mut server: QuicTransport, uni: bool) {
     }
     peer.service();
     std::thread::sleep(Duration::from_millis(20));
-    // Into the engine without a service, so the stream events are still
-    // queued there when the close runs one.
     server.recv_batch(Instant::now(), 0).expect("receive");
     server.close(id).expect("close");
 

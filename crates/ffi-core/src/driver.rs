@@ -64,8 +64,6 @@ pub(crate) fn run_with(
             }),
             _ => None,
         };
-        // The pump only returns once shutdown has begun. A panic may have
-        // left the endpoint mid-update: the guard drops it.
         let (endpoint, timeout) = match &mut state.lifecycle {
             Lifecycle::Stopping {
                 live,
@@ -82,8 +80,6 @@ pub(crate) fn run_with(
         };
         (failure, endpoint, timeout)
     };
-    // The drain's events (connection ends among them) go to the binding
-    // ahead of `EndpointClosed`.
     let mut drained = Vec::new();
     let closed = match endpoint {
         Some(endpoint) => {
@@ -128,23 +124,11 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         else {
             return Ok(());
         };
-        // Only `Endpoint::wait`, so the carry stays in Endpoint emission
-        // order. A follow-up `poll()` would open a second batch and finish
-        // that batch on its own.
-        //
-        // No deadline of our own: the wait already wakes for every timer the
-        // endpoint's transports, protocols and agents report, and for input
-        // on any socket registered with its readiness poll (mDNS included).
-        // Every command, query and `stop` interrupts it; interrupts sent
-        // before one is reported coalesce into one, so a burst of commands
-        // costs one wake and the queue is drained below. An idle driver
-        // therefore sleeps until something is due.
         let mut batch = Vec::new();
         let mut interrupted = false;
         match endpoint.wait(WaitDeadline::NEVER)? {
             EndpointWaitOutcome::Interrupted => interrupted = true,
             EndpointWaitOutcome::Event(event) => batch.push(event),
-            // Deadline, or an outcome this driver predates: nothing to carry.
             _ => {}
         }
         if !interrupted {
@@ -155,7 +139,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                         interrupted = true;
                         break;
                     }
-                    // Deadline, or an outcome this driver predates.
                     _ => break,
                 }
             }
@@ -170,9 +153,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             .into_iter()
             .filter_map(convert_endpoint_event)
             .collect();
-        // Published and ingested before `state` is released, so no command
-        // runs between the endpoint emitting these events and the carry
-        // holding them, and the doorbell never rings ahead of the peers.
         guard.shared.publish_peers(endpoint, published_peers);
         let should_ring = {
             let mut events = guard.shared.lock_events();
@@ -190,7 +170,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
 }
 
 fn ring(doorbell: &Arc<dyn EventDoorbell>) {
-    // Foreign callbacks are advisory; an unwind must not stop event delivery.
     drop(catch_unwind(AssertUnwindSafe(|| {
         doorbell.on_events_ready()
     })));

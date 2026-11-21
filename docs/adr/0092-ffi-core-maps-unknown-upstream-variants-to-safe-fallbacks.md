@@ -1,0 +1,9 @@
+# ffi-core maps unknown upstream variants to a safe fallback
+
+`minip2p-ffi-core` converts `#[non_exhaustive]` enums from `minip2p-rs` (and below) into binding types. A variant the binding predates is never a compile error or a panic; it maps to the closest safe fallback so the binding keeps working across upstream additions:
+
+- `DriverError` → `DriverFailureKind::Invariant`; `BindError` → `FfiError::Internal` (an unmapped construction path, not a caller mistake; this also covers bind errors of capabilities the binding does not enable, such as the relay server); unknown builder options → `FfiError::InvalidConfig { capability: Options }` (also relay-server announce addresses); unknown `SendError` → `FfiError::InvalidState`.
+- Unknown `ConnectionCloseReason` → `Error { message }` keeping its description; unknown `SwarmErrorKind` → `EndpointErrorKind::Driver`; unknown `ConnectFailure` → `NatErrorKind::Protocol`; an unknown non-relayed path → `PathKind::Direct`.
+- An unknown settled outcome still settles the attempt exactly once, as `ConnectFailed { kind: Protocol }`. Other unknown events have no binding shape yet and are dropped (`None`).
+- Some known events are deliberately not surfaced: raw dial failures; relay-service events (a capability this core does not expose); `StreamWritable`, because every binding write goes through the Endpoint's write queue, and an aborted write is reported by the event that ended its stream (stop, close or connection end). NAT attempt terminals (`PathEstablished`, `ConnectFailed`, `FellBackToRelay`, `RelayStarted`, ...) reach the app only as the Endpoint's `ConnectSettled`, converted by `convert_settled`; per-relay progress is carried inside the settled failure's message, which lists each relay address tried and why it failed.
+- `SendError::OverBudget` and `TooLarge` map to `FfiError::Backpressure` even though the binding's unbounded write budget never refuses for size.

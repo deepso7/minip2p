@@ -23,7 +23,6 @@ fn check_forwarded((fixture, actions): (Forward, Vec<GossipsubAction>)) {
 #[bench::gossipsub_forward_1_kib_128(args = (128), setup = forward_fixture, teardown = check_forwarded)]
 fn gossipsub_forward(mut fixture: Forward) -> (Forward, Vec<GossipsubAction>) {
     let actions = black_box(forward(&mut fixture.agent, &fixture.frame));
-    // Returned so drops are not counted.
     (fixture, actions)
 }
 

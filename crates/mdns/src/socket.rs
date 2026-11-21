@@ -130,7 +130,6 @@ impl Registration {
 
     /// Releases `pair`'s registration ahead of dropping it.
     fn deregister(&self, pair: &mut SocketPair) {
-        // About to drop, which releases the registration too.
         drop(self.registry.deregister(&mut pair.receive));
     }
 }
@@ -188,7 +187,6 @@ impl MdnsSockets {
 
     fn refresh_interfaces(&mut self) -> Result<bool, MdnsError> {
         let grouped = enumerate_interfaces(self.enable_ipv6)?;
-        // Assigned on a copy, so a refresh that fails hands out no ids.
         let mut registry = self.registry.clone();
         let snapshots = registry.assign(&grouped)?;
         self.replace(registry, snapshots, SocketPair::new)
@@ -223,7 +221,6 @@ impl MdnsSockets {
             registration.register_all(&mut fresh)?;
         }
 
-        // Nothing below fails: this is the commit.
         let mut old = core::mem::take(&mut self.pairs);
         let mut fresh = fresh.into_iter();
         for snapshot in &snapshots {
@@ -259,9 +256,6 @@ impl MdnsIo for MdnsSockets {
         if count == 0 {
             return Ok(None);
         }
-        // Starts where the last read stopped, and allocates nothing: this runs
-        // once per datagram, so a flood would pay for anything done here a
-        // budget's worth of times per tick.
         for step in 0..count {
             let index = (self.next_receive_offset + step) % count;
             let Some(pair) = self.pairs.get_mut(index) else {
@@ -327,8 +321,6 @@ impl PollSource for MdnsSockets {
         registration
             .register_all(&mut self.pairs)
             .map_err(|error| {
-                // Keep the platform's kind: a host reports it (a refused
-                // registration is not the same failure as running out of room).
                 let kind = match &error {
                     MdnsError::Io { kind, .. } => (*kind).into(),
                     _ => io::ErrorKind::Other,
@@ -629,7 +621,6 @@ mod tests {
             .expect("sender")
             .send_to(b"query", addr)
             .expect("send");
-        // A host source is never dispatched to, so any transport will do.
         let mut transport = MdnsSockets::from_pairs(Vec::new());
         let events = poll
             .harvest(&mut transport, std::time::Duration::from_secs(5))
@@ -651,8 +642,6 @@ mod tests {
         let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
         poll.attach_host_source(&mut sockets).expect("attach");
 
-        // Interface 1 went away and interface 2 arrived, but 2's socket
-        // cannot be built. Swapping half-way would leave mDNS on nothing.
         let mut arrived = snapshot.clone();
         arrived.id = InterfaceId::new(2);
         let error = sockets
@@ -668,7 +657,6 @@ mod tests {
         assert!(matches!(error, MdnsError::Io { .. }), "{error:?}");
         assert_eq!(sockets.interfaces(), [snapshot], "the snapshots stand");
 
-        // And so does the socket, still registered for readiness.
         UdpSocket::bind("127.0.0.1:0")
             .expect("sender")
             .send_to(b"query", addr)
@@ -686,7 +674,6 @@ mod tests {
         let kept_snapshot = kept.snapshot.clone();
         let mut sockets = MdnsSockets::from_pairs(vec![kept]);
         let mut poll = mio::Poll::new().expect("poll");
-        // One bit of tokens: interfaces 0 and 1 fit, interface 2 does not.
         let tokens = TokenSpace::full()
             .subspace(usize::BITS - 1, 0)
             .expect("a one-bit space");
@@ -699,8 +686,6 @@ mod tests {
             .expect("the kept socket registers");
         sockets.registration = Some(registration);
 
-        // Interface 1's socket registers, then interface 2's cannot, so the
-        // refresh has to undo the first before giving up.
         let (first, _) = loopback_pair(1);
         let (second, _) = loopback_pair(2);
         let arrived = vec![first.snapshot.clone(), second.snapshot.clone()];
@@ -722,7 +707,6 @@ mod tests {
         );
         assert_eq!(sockets.interfaces(), core::slice::from_ref(&kept_snapshot));
 
-        // The kept socket still wakes the host.
         UdpSocket::bind("127.0.0.1:0")
             .expect("sender")
             .send_to(b"query", kept_addr)
@@ -732,7 +716,6 @@ mod tests {
             .expect("poll");
         assert!(!events.is_empty(), "the kept socket woke the poll");
 
-        // And a retry that fits commits.
         let (retry, _) = loopback_pair(1);
         let arrived = vec![kept_snapshot, retry.snapshot.clone()];
         let mut built = Some(retry);
@@ -748,10 +731,6 @@ mod tests {
 
     #[test]
     fn a_full_send_buffer_is_backpressure_and_not_a_broken_socket() {
-        // Kernel send-buffer pressure is not something a test can conjure on
-        // demand, so the decision is checked where it is made. What it costs
-        // to get wrong is not small: the driver backs off on an I/O failure,
-        // so every busy moment would take the host off the link for a while.
         assert_eq!(
             send_error(
                 InterfaceId::new(1),
@@ -761,7 +740,6 @@ mod tests {
                 interface: InterfaceId::new(1)
             }
         );
-        // Anything else is what it says it is.
         assert!(matches!(
             send_error(
                 InterfaceId::new(1),
@@ -778,9 +756,6 @@ mod tests {
         let mut sockets = MdnsSockets::from_pairs(vec![first, second]);
         let sender = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
 
-        // Two waiting on one interface and one on the other. Draining the
-        // first would spend a caller's budget on whichever interface happened
-        // to be talking most, and a quiet one could wait indefinitely.
         sender.send_to(b"a", first_addr).expect("send");
         sender.send_to(b"a", first_addr).expect("send");
         sender.send_to(b"b", second_addr).expect("send");

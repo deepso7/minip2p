@@ -165,7 +165,6 @@ impl From<UpstreamConnectionCloseReason> for ConnectionCloseReason {
             UpstreamConnectionCloseReason::TimedOut => Self::TimedOut,
             UpstreamConnectionCloseReason::Stalled => Self::Stalled,
             UpstreamConnectionCloseReason::Error(message) => Self::Error { message },
-            // A reason this binding does not know yet keeps its description.
             other => Self::Error {
                 message: other.to_string(),
             },
@@ -870,8 +869,6 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: stream.conn_id().as_u64(),
             stream_id: stream.stream_id().as_u64(),
-            // Takes the allocation back without a copy when the handle is
-            // the only one, which it is for transport reads.
             data: Vec::from(data),
         },
         EndpointEvent::StreamWriteStopped {
@@ -911,12 +908,6 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             conn_id: stream.conn_id().as_u64(),
             stream_id: stream.stream_id().as_u64(),
         },
-        // Capability variants are dispatched by `convert_endpoint_event`;
-        // raw dial failures and variants of capabilities this core does
-        // not surface (relay service) have no foreign event. A binding's
-        // writes all go through the endpoint's write queue, so a Writable
-        // never concerns it, and an aborted write is told by the event that
-        // ended its stream (a stop, close or connection end).
         _ => return None,
     })
 }
@@ -932,8 +923,6 @@ pub fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
         } => convert_settled(connect_id, &peer_id, outcome),
         #[cfg(feature = "pubsub")]
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
-        // NAT comes with the std driver or the portable relay; discovery
-        // and mDNS are the std driver's.
         #[cfg(any(feature = "driver", feature = "relay"))]
         EndpointEvent::Nat(event) => convert_nat(event),
         #[cfg(feature = "driver")]
@@ -987,7 +976,6 @@ pub(crate) fn convert_settled(
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
         }),
-        // An outcome this binding predates still settles the attempt once.
         other => Some(P2pEvent::ConnectFailed {
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
@@ -1044,10 +1032,6 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
         NatEvent::RelayReservationLost { relay } => P2pEvent::RelayReservationLost {
             relay_peer_id: relay.to_base58(),
         },
-        // Attempt terminals reach the app only as the Endpoint's
-        // `ConnectSettled`, converted by `convert_settled`. Per-relay
-        // progress reaches the app inside the settled failure's message,
-        // which lists each relay address tried and why it failed.
         NatEvent::PathEstablished { .. }
         | NatEvent::ConnectFailed { .. }
         | NatEvent::FellBackToRelay { .. }
@@ -1095,7 +1079,6 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
             old_conn_id: old_conn_id.as_u64(),
             new_conn_id: new_conn_id.as_u64(),
         },
-        // An event this binding predates has no binding shape yet.
         _ => return None,
     })
 }
@@ -1197,8 +1180,6 @@ pub fn convert_path(path: Path) -> PathKind {
         Path::Relayed { relay } => PathKind::Relayed {
             relay_peer_id: relay.to_base58(),
         },
-        // A path this binding predates; every current non-relayed path is
-        // direct.
         _ => PathKind::Direct,
     }
 }
@@ -1220,19 +1201,15 @@ fn convert_swarm_error_kind(kind: SwarmErrorKind) -> EndpointErrorKind {
         SwarmErrorKind::IdentifyStreamRejected => EndpointErrorKind::IdentifyStreamRejected,
         SwarmErrorKind::OpenStreamFailed => EndpointErrorKind::OpenStreamFailed,
         SwarmErrorKind::UnsupportedProtocol => EndpointErrorKind::UnsupportedProtocol,
-        // A category this binding predates.
         _ => EndpointErrorKind::Driver,
     }
 }
 
 fn convert_connect_failure_kind(failure: &ConnectFailure) -> NatErrorKind {
     match failure {
-        // Only an attempt that never started a route.
         ConnectFailure::NoUsableRoute { .. } => NatErrorKind::NoPathAvailable,
         ConnectFailure::Timeout { .. } => NatErrorKind::Timeout,
-        // Started routes (direct dials, relays) that all failed.
         ConnectFailure::AllRoutesFailed { .. } => NatErrorKind::DialFailed,
-        // A failure this binding predates.
         _ => NatErrorKind::Protocol,
     }
 }
@@ -1469,7 +1446,6 @@ mod tests {
                 NatError::DialFailed(_) => NatErrorKind::DialFailed,
                 NatError::Protocol(_) => NatErrorKind::Protocol,
                 NatError::RelayRefused(_) => NatErrorKind::RelayRefused,
-                // A full local circuit table: no relayed path is available.
                 NatError::ResourceExhausted { .. } => NatErrorKind::NoPathAvailable,
             }
         }
@@ -1550,7 +1526,6 @@ mod tests {
                 detail: failure.to_string(),
             })
         );
-        // A relay-only attempt whose relays all failed started a route.
         let failure = ConnectFailure::AllRoutesFailed {
             candidates: Vec::new(),
             relays: vec![minip2p::RelayFailure {

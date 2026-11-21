@@ -139,13 +139,9 @@ test("events iteration ends quietly on abort", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const controller = new AbortController();
-  const reading = (async () => {
-    for await (const _event of endpoint.events({
-      signal: controller.signal,
-    })) {
-      // Wait for cancellation.
-    }
-  })();
+  const reading = Array.fromAsync(
+    endpoint.events({ signal: controller.signal })
+  );
 
   controller.abort();
 
@@ -576,7 +572,6 @@ test("aborting a connect wait cancels, then the terminal settles it", async () =
     inner: { connectId: cancelled, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectCancelled,
   });
-  // Cancellation is a no-op for an attempt that already settled.
   backend.emit(pathEstablished(raced));
   await assert.rejects(cancelledWait, ConnectCancelledError);
   assert.equal((await racedWait).connectId, raced);
@@ -653,7 +648,6 @@ test("an already-aborted signal cancels before waiting", async () => {
   });
   await assert.rejects(waiting, ConnectCancelledError);
 
-  // connect() with an aborted signal never starts a native attempt.
   await assert.rejects(endpoint.connect("peer", { signal }), AbortError);
   assert.equal(
     backend.operations.filter(([name]) => name === "connect").length,
@@ -677,7 +671,6 @@ test("cancelConnect lets the native terminal settle the pending wait", async () 
   assert.equal(await remainsPending(settledWait), true);
   assert.equal(await remainsPending(unsettledWait), true);
 
-  // Cancellation raced a settled attempt: its real outcome still arrives.
   backend.emit(pathEstablished(settled));
   backend.emit({
     inner: { connectId: unsettled, peerId: "peer" },
@@ -751,7 +744,6 @@ test("native EventsDropped ends a pending ping so the next ping starts afresh", 
   const endpoint = new TestMinip2p(backend);
   const first = endpoint.ping("peer", { timeoutMs: 0 });
 
-  // Its result may be among the lost events, so it can never settle.
   backend.emit({
     inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
     tag: P2pEvent_Tags.EventsDropped,
@@ -875,10 +867,13 @@ test("waitPeerReady's default stays within the timer limit for a huge identifyMs
 
 test("waitPeerReady by default allows the connect and Identify deadlines", async () => {
   vi.useFakeTimers();
+  const connectMs = 30_000;
+  const identifyMs = 60_000;
+  const slackMs = 5000;
   try {
     const backend = new MockBackend();
     const endpoint = new TestMinip2p(backend, {
-      timeouts: { identifyMs: 60_000 },
+      timeouts: { identifyMs },
     });
     const ready = endpoint.waitPeerReady("peer");
     const settled = (async () => {
@@ -888,8 +883,7 @@ test("waitPeerReady by default allows the connect and Identify deadlines", async
         return error;
       }
     })();
-    // Connect (30 s) + Identify (60 s) + 5 s.
-    await vi.advanceTimersByTimeAsync(94_999);
+    await vi.advanceTimersByTimeAsync(connectMs + identifyMs + slackMs - 1);
     assert.equal(await remainsPending(settled), true);
     await vi.advanceTimersByTimeAsync(1);
     assert.ok((await settled) instanceof TimeoutError);
@@ -1045,7 +1039,6 @@ test("a pull reader consumes a chunk when read() returns it, and a terminal cons
   assert.equal((await direct).byteLength, 2 * 1024 * 1024);
   assert.deepEqual(backend.consumed, [[2, 3, 2 * 1024 * 1024]]);
 
-  // Unread data is buffered whole and stays unconsumed, holding the sender.
   backend.emit(streamData(new Uint8Array(3), 3));
   await tick();
   backend.emit(streamData(new Uint8Array(5), 3));
@@ -1108,8 +1101,6 @@ test("peer streams that close without data before dispatch leave the queue whole
   const endpoint = new TestMinip2p(backend);
   const streams = [];
   endpoint.on("stream", (stream) => streams.push(stream.streamId));
-  // Queued before any dispatch: the data-less stream is never surfaced, and
-  // its events are still released to the adapter.
   backend.emit(streamReady({ streamId: 5 }));
   backend.emit(streamClosed(5));
   backend.emit(streamReady({ streamId: 7 }));
@@ -1140,8 +1131,6 @@ function identifyFailed(connId) {
 }
 
 test("connections that end unseen without data leave the queue whole", async () => {
-  // ADR 0012 (#356): peer churn while nothing is dispatched leaves no trace,
-  // and every elided event still reaches the adapter.
   const backend = new MockBackend();
   let handled = 0;
   backend.eventHandled = () => {
@@ -1165,7 +1154,6 @@ test("connections that end unseen without data leave the queue whole", async () 
   assert.deepEqual(seen, []);
   assert.equal(handled, 5000);
 
-  // A connection that carried data is kept, with its end.
   backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 5));
   backend.emit(streamReady({ connId: 5, streamId: 1 }));
   backend.emit({
@@ -1206,7 +1194,6 @@ test("an unseen connection replaced folds into its successor", async () => {
       tag: P2pEvent_Tags.ConnectionReplaced,
     });
   }
-  // Readiness is the survivor's own, never the replaced connection's.
   backend.emit({
     inner: { connId: 4, peerId: "peer", protocols: [] },
     tag: P2pEvent_Tags.PeerReady,
@@ -1224,12 +1211,10 @@ test("a connection the application opened a stream on keeps its end", async () =
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
-  // Opened before the establishment was dispatched.
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 60_000 });
   backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, 2));
   await tick();
 
-  // Rejected by the close, not left to its timeout.
   assert.equal(await remainsPending(opening), false);
   await assert.rejects(opening);
   endpoint.close();
@@ -1261,7 +1246,6 @@ test("a connection the application opened a stream on stays seen through a fold"
   backend.openResults.push({ connId: 3, streamId: 1 });
   const endpoint = new TestMinip2p(backend);
   backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
-  // Native already routes to the successor before its replacement is queued.
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 60_000 });
   backend.emit({
     inner: { newConnId: 3, oldConnId: 2, peerId: "peer" },
@@ -1320,7 +1304,6 @@ test("a data listener attached after a clean close drains and consumes the unrea
 
 test("data for a stream the SDK no longer tracks is consumed", async () => {
   const backend = new MockBackend();
-  // Native already closed the stream, so the unclaimed stream's abandon fails.
   backend.abandonError = new Error("stream is not active");
   const endpoint = new TestMinip2p(backend);
   backend.emit(streamReady({ streamId: 9 }));
@@ -1373,7 +1356,6 @@ test("data in the same batch as StreamReady reaches a reader that attaches later
   const endpoint = new TestMinip2p(backend);
   const reads = [];
   endpoint.on("stream", (stream) => {
-    // The reader attaches only after other work, past the whole batch.
     void (async () => {
       await tick();
       await tick();
@@ -1408,8 +1390,6 @@ test("stream events are never dropped by queue overflow, and adjacent data coale
   const received = [];
   stream.on("data", (chunk) => received.push(...chunk));
 
-  // 5000 one-byte chunks, each between two gossip messages so none
-  // coalesce, all queued before the SDK dispatches any of them.
   for (let index = 0; index < 5000; index += 1) {
     backend.emit({
       inner: {
@@ -1430,7 +1410,6 @@ test("stream events are never dropped by queue overflow, and adjacent data coale
   );
   assert.equal(dropped, 5000 - 4096, "only gossip messages drop");
 
-  // Back to back, data for one stream arrives as one chunk.
   const chunks = [];
   stream.on("data", (chunk) => chunks.push([...chunk]));
   backend.emit(streamData(new Uint8Array([1]), 3));
@@ -1461,7 +1440,6 @@ test("stream async iteration yields chunks in order and ends on remote write clo
   });
 
   await reading;
-  // Queued back to back, the two chunks coalesced.
   assert.deepEqual(chunks, [[1, 2, 3]]);
   endpoint.close();
 });
@@ -1496,11 +1474,7 @@ test("stream async iteration keeps half-close EOF final when StreamClosed follow
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
   backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
   const stream = await opening;
-  const reading = (async () => {
-    for await (const _chunk of stream) {
-      // Wait for read-side EOF.
-    }
-  })();
+  const reading = Array.fromAsync(stream);
 
   backend.emit({
     inner: { connId: 2, peerId: "peer", streamId: 3 },
@@ -1522,11 +1496,7 @@ test("stream async iteration rejects when the endpoint closes", async () => {
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
   backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
   const stream = await opening;
-  const reading = (async () => {
-    for await (const _chunk of stream) {
-      // Wait for endpoint shutdown.
-    }
-  })();
+  const reading = Array.fromAsync(stream);
 
   endpoint.close();
 
@@ -1539,11 +1509,7 @@ test("stream async iteration rejects when the remote stream resets", async () =>
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
   backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
   const stream = await opening;
-  const reading = (async () => {
-    for await (const _chunk of stream) {
-      // Wait for the remote terminal event.
-    }
-  })();
+  const reading = Array.fromAsync(stream);
 
   backend.emit({
     inner: { connId: 2, peerId: "peer", streamId: 3 },
@@ -1995,7 +1961,6 @@ test("connectionInfo reports the native path in public form", () => {
 
 test("waitPeerReady resolves only for the current connection's peerReady", async () => {
   const backend = new MockBackend();
-  // Native state is ahead of the queued events: 1 was already replaced by 2.
   backend.connections.set("peer", connectionOn(2));
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
@@ -2018,7 +1983,6 @@ test("waitPeerReady ignores readiness of a connection queued before the snapshot
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
-  // Events for connection 1 were still queued when the wait snapshotted 2.
   backend.emit({
     inner: { connId: 1, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionEstablished,
@@ -2062,7 +2026,6 @@ test("waitPeerReady rejects only once the peer is disconnected", async () => {
   const endpoint = new TestMinip2p(backend);
   const disconnected = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
-  // A stale close from before the peer reconnected.
   backend.emit({
     inner: { connId: 1, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
@@ -2084,11 +2047,9 @@ test("waitPeerReady rejects with the current connection's Identify cause", async
   const endpoint = new TestMinip2p(backend);
   const failed = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
-  // A replaced connection's failure does not end the wait.
   backend.emit(identifyFailed(1));
   assert.equal(await remainsPending(failed), true);
 
-  // Native state is ahead: the failed connection is already closed.
   backend.connected = [];
   backend.connections.delete("peer");
   backend.emit(identifyFailed(2));
@@ -2112,7 +2073,6 @@ test("waitPeerReady ignores an older connection's failure once native forgot the
   const endpoint = new TestMinip2p(backend);
   const waiting = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
-  // Connection 2 closed natively; connection 1's failure is still queued.
   backend.connected = [];
   backend.connections.delete("peer");
   backend.emit(identifyFailed(1));
@@ -2282,7 +2242,6 @@ test("writes past the high-water mark reject with WriteBufferFullError", async (
   stream.writeHighWaterMark = 8;
   backend.sendResults = [false];
 
-  // An empty buffer admits any write, so a large payload can still go out.
   const big = stream.write(new Uint8Array(16));
   const refused = stream.write(new Uint8Array(1));
   await assert.rejects(refused, (error) => {

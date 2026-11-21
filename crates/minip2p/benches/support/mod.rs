@@ -118,13 +118,11 @@ impl Driven {
 impl Drop for Driven {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            // Re-raise a driver-thread panic unless already unwinding.
-            if let Err(payload) = thread.join()
-                && !thread::panicking()
-            {
-                std::panic::resume_unwind(payload);
-            }
+        if let Some(thread) = self.thread.take()
+            && let Err(payload) = thread.join()
+            && !thread::panicking()
+        {
+            std::panic::resume_unwind(payload);
         }
     }
 }

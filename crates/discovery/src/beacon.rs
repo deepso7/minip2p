@@ -275,9 +275,6 @@ mod tests {
     #[test]
     fn announces_a_tcp_listener_the_way_it_announces_a_quic_one() {
         let mut agent = BeaconAgent::new(key(1), BeaconConfig::default()).unwrap();
-        // A device with no operating system has no QUIC to offer. A beacon
-        // that carried only QUIC would let it publish nothing at all, so it
-        // would be discoverable and unreachable in the same breath.
         agent.set_local_addrs(
             &[
                 Multiaddr::from_str("/ip4/192.0.2.5/tcp/4001").unwrap(),

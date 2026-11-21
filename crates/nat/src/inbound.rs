@@ -201,13 +201,9 @@ impl InboundCircuit {
                 self.on_stop_input(|stop| stop.on_data(data), swarm, shared, now);
             }
             StreamInput::RemoteWriteClosed => {
-                // A peer can stop sending while the local write half remains
-                // usable. Let the protocol parser consume that boundary and
-                // retain the circuit until its normal exchange deadline.
                 self.on_stop_input(StopResponder::on_remote_write_closed, swarm, shared, now);
             }
             StreamInput::Closed => {
-                // The circuit died before the app took over.
                 self.abandon(false, swarm, shared, now);
             }
             StreamInput::Ready => {}
@@ -242,11 +238,9 @@ impl InboundCircuit {
         };
 
         let Ok(source) = PeerId::from_bytes(&request.source_peer_id) else {
-            // Unusable source identity: reject and drop the circuit.
             self.refuse(Status::MalformedMessage, swarm, shared, now);
             return;
         };
-        // Reserved before acceptance: past the circuit limit, refuse.
         if !shared.reserve_circuit(swarm) {
             self.refuse(Status::ResourceLimitExceeded, swarm, shared, now);
             return;
@@ -260,8 +254,6 @@ impl InboundCircuit {
             return;
         }
 
-        // STATUS:OK first, then preserve any secure-mux bytes the relay
-        // pipelined behind CONNECT for circuit promotion.
         let mut outbound = Vec::new();
         let mut pipelined = Vec::new();
         while let Some(output) = stop.poll_output() {
@@ -275,8 +267,6 @@ impl InboundCircuit {
             send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
         }
 
-        // Bytes behind STOP STATUS belong to the circuit's secure-mux
-        // handshake. DCUtR is opened later on the promoted connection.
         self.promote(source, pipelined, swarm, shared, now);
     }
 
@@ -302,8 +292,6 @@ impl InboundCircuit {
         }
         close_write(swarm, &self.relay, self.inner_conn, self.stream, now);
         self.abandon(false, swarm, shared, now);
-        // Still owned until it closes: whatever the relay sends meanwhile is
-        // NAT's to consume, never an application stream's.
         shared.own_stream(
             &self.relay,
             self.inner_conn,
@@ -333,8 +321,6 @@ impl InboundCircuit {
             role: BridgeRole::Responder,
             pending_data,
             unsent_data: Vec::new(),
-            // CONNECT completion promotes in the same input cascade, so no
-            // later half-close can arrive while NAT owns the bridge.
             remote_write_closed: false,
         };
         self.phase = match swarm.promote_bridge(handoff, now.monotonic_ms) {
@@ -350,7 +336,6 @@ impl InboundCircuit {
     pub(crate) fn on_tick(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         match &mut self.phase {
             Phase::AwaitStop { deadline, .. } if now.monotonic_ms >= *deadline => {
-                // The relay never even sent CONNECT.
                 self.abandon(true, swarm, shared, now);
             }
             Phase::Handshaking {
@@ -360,19 +345,13 @@ impl InboundCircuit {
                 self.phase = Phase::Done { promoted: None };
             }
             Phase::Upgrading { budget, round, .. } => {
-                // A limit that ran out, and whether the whole upgrade still
-                // runs.
                 let upgrading = now.monotonic_ms < budget.deadline();
                 match budget.due(now.monotonic_ms) {
-                    // The round's exchange stalled while the upgrade still
-                    // runs: the next round starts at once.
                     Some(UpgradeStop::ExchangeTimeout { .. }) if upgrading => {
                         self.fail_round(swarm, shared, now);
                         return;
                     }
                     Some(_) => {
-                        // The whole upgrade is over, before any late blast
-                        // goes out; the Relayed path stays.
                         self.end_exchange(swarm, shared, now);
                         self.finish();
                         return;
@@ -406,8 +385,6 @@ impl InboundCircuit {
                     }
                 }
                 if now.monotonic_ms >= *until {
-                    // The round's punch window passed without a direct
-                    // connection.
                     self.next_round(swarm, shared, now);
                 }
             }
@@ -513,8 +490,6 @@ impl InboundCircuit {
         if self.promoted() == Some(conn_id)
             || (relay_conn_lost && matches!(self.phase, Phase::AwaitStop { .. }))
         {
-            // Registry entries for a dead connection are dropped by the
-            // agent; nothing to reset.
             self.finish();
         }
     }
@@ -590,8 +565,6 @@ impl InboundCircuit {
         let Some(conn) = self.exchange_mut(stream).map(|exchange| exchange.conn) else {
             return;
         };
-        // Input can arrive before the tick that expires the exchange or the
-        // upgrade: expire them first, as that tick would have.
         let expired = matches!(
             &self.phase,
             Phase::Upgrading { budget, .. } if budget.due(now.monotonic_ms).is_some()
@@ -623,8 +596,6 @@ impl InboundCircuit {
             self.fail_round(swarm, shared, now);
             return;
         };
-        // CONNECT is queued at construction and drained below on any input;
-        // a remote close is judged by whether the exchange completed.
         if let StreamInput::Data(bytes) = input
             && dcutr.on_data(bytes, rtt_ms).is_err()
         {
@@ -641,8 +612,6 @@ impl InboundCircuit {
                 DcutrInitiatorOutput::Outbound(data) => {
                     send(swarm, source, conn, stream, data, now);
                     if matches!(exchange.connect, ConnectWrite::Unsent) {
-                        // A held tail starts the clock once the host reports
-                        // it written (`on_write_completed`).
                         exchange.connect = if swarm.write_pending(conn, stream) {
                             ConnectWrite::Held
                         } else {
@@ -685,7 +654,6 @@ impl InboundCircuit {
                         });
                     }
                     if dcutr.send_sync().is_ok() {
-                        // The source punches once it reads SYNC.
                         shared.ledger.expect_punches(*source, budget.deadline());
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             send(swarm, source, conn, stream, data, now);
@@ -745,9 +713,6 @@ fn open_round(
     shared: &mut Shared,
     now: Now,
 ) -> Option<Round> {
-    // `open_stream` opens on the current connection, just checked to be the
-    // circuit. A round that then fails to open ends coordination, so
-    // counting it is harmless.
     let opened =
         if swarm.connection(source) == Some(circuit) && budget.begin_round(now.monotonic_ms) {
             swarm
@@ -757,8 +722,6 @@ fn open_round(
             None
         };
     let Some((conn, stream)) = opened else {
-        // No round left to punch in: direct connections from the source are
-        // no longer this side's punches.
         shared.ledger.end_punches(source);
         return None;
     };
@@ -793,8 +756,6 @@ pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>)
             break;
         }
         let protocols = addr.protocols();
-        // Only concrete IPs are punched; a name must not take an IP
-        // family's quota, and the receiver drops it anyway.
         let (Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))), Some(Protocol::Udp(port))) =
             (protocols.first(), protocols.get(1))
         else {
@@ -851,7 +812,6 @@ fn is_punchable_quic(addr: &Multiaddr, allow_private: bool) -> bool {
         Some(Protocol::Ip4(octets)) if allow_private => is_unicast_v4((*octets).into()),
         Some(Protocol::Ip6(octets)) if allow_private => {
             let ip = core::net::Ipv6Addr::from(*octets);
-            // A mapped IPv4 address is judged as the address it carries.
             match ip.to_ipv4_mapped() {
                 Some(v4) => is_unicast_v4(v4),
                 None => !(ip.is_unspecified() || ip.is_multicast()),
@@ -870,36 +830,26 @@ fn is_unicast_v4(ip: core::net::Ipv4Addr) -> bool {
 
 fn is_global_unicast_v4([a, b, c, d]: [u8; 4]) -> bool {
     !(a == 0
-        // RFC 1918 private space.
         || a == 10
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
-        // RFC 6598 shared carrier-grade NAT space.
         || (a == 100 && (64..=127).contains(&b))
         || a == 127
         || (a == 169 && b == 254)
-        // IETF protocol assignments. .9 and .10 are globally reachable
-        // anycast addresses and therefore remain eligible.
         || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
-        // Documentation ranges.
         || (a == 192 && b == 0 && c == 2)
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
-        // Benchmarking, multicast, reserved, and broadcast space.
         || (a == 198 && (b == 18 || b == 19))
         || a >= 224)
 }
 
 fn is_global_unicast_v6(octets: [u8; 16]) -> bool {
     let segments = core::net::Ipv6Addr::from(octets).segments();
-    // The currently allocated global-unicast block is 2000::/3.
     if segments[0] & 0xe000 != 0x2000 {
         return false;
     }
 
-    // Special-purpose allocations within 2000::/3 are not ordinary global
-    // unicast destinations. Keep the small set explicitly designated global
-    // by IANA inside 2001::/23.
     if segments[0] == 0x2001 && segments[1] < 0x0200 {
         let value = u128::from_be_bytes(octets);
         let globally_reachable_exception = value == 0x2001_0001_0000_0000_0000_0000_0000_0001
@@ -912,7 +862,6 @@ fn is_global_unicast_v6(octets: [u8; 16]) -> bool {
         }
     }
 
-    // 6to4 and documentation ranges are not globally reachable endpoints.
     segments[0] != 0x2002
         && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
         && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)

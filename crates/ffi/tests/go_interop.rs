@@ -83,7 +83,6 @@ impl GoPeer {
 
 impl Drop for GoPeer {
     fn drop(&mut self) {
-        // The child may have already exited; shutdown is best-effort in Drop.
         drop(serde_json::to_writer(
             &mut self.stdin,
             &json!({ "op": "stop" }),

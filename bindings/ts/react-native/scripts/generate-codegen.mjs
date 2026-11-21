@@ -40,7 +40,6 @@ function run(command, args, cwd) {
   }
 }
 
-// Codegen reads the customized spec, so the mDNS hooks land first.
 customizeGenerated();
 run(process.execPath, [cli, "codegen", "--source", "library"], packageRoot);
 

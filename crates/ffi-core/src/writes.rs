@@ -45,13 +45,11 @@ pub fn send_whole<P: Platform>(
 /// close is [`FfiError::InvalidState`].
 pub fn map_send_error(error: SendError) -> FfiError {
     match error {
-        // The unbounded budget never refuses for size; mapped all the same.
         SendError::OverBudget { .. } | SendError::TooLarge { .. } => FfiError::Backpressure,
         SendError::Closing { stream, .. } => FfiError::InvalidState {
             detail: format!("stream {} write side is closing", stream.stream_id()),
         },
         SendError::Driver(error) => crate::map_driver_error(error),
-        // A refusal this core predates.
         error => FfiError::InvalidState {
             detail: error.to_string(),
         },
@@ -109,7 +107,6 @@ mod tests {
             }
         }
 
-        // Past every send cap, so the tail is held and the FIN deferred.
         let accepted = send_whole(&mut writer, stream, vec![0; 4 << 20]).expect("write");
         assert!(!accepted);
         assert!(matches!(

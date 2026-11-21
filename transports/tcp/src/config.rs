@@ -86,18 +86,9 @@ impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             namespace: ConnectionNamespace::TCP_IPV4,
-            // Matches the QUIC transport's ceiling, so a host that runs both
-            // budgets them the same way.
             max_connections: 1_024,
-            // Generous next to the handful of round trips an upgrade actually
-            // takes, so only a peer that has stopped participating trips it.
             handshake_timeout_ms: Some(30_000),
-            // One frame at a time: the provider's send buffer keeps the link
-            // busy, and everything else waits in Yamux, which interleaves
-            // streams and sends control frames first.
             max_buffered_send: 0,
-            // Long enough that a briefly wedged peer recovers, short enough
-            // that a dead one does not hold a connection indefinitely.
             send_stall_timeout_ms: Some(30_000),
             yamux: YamuxConfig::default(),
         }

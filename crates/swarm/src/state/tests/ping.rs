@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn next_deadline_arms_on_ping_and_clears_on_rtt() {
-    let mut core = test_core(); // default request_timeout_ms = 10_000
+    let mut core = test_core();
     let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
     let conn_id = ConnectionId::new(1);
     let stream_id = StreamId::new(4);
@@ -17,7 +17,6 @@ fn next_deadline_arms_on_ping_and_clears_on_rtt() {
     let payload = [7u8; PING_PAYLOAD_LEN];
     core.ping(&peer_id, payload, 1_000).expect("send ping");
 
-    // The attempt is due ping_ms after the ping call.
     let due = Deadline::from_millis(11_000);
     assert_eq!(core.next_deadline(Now::from_millis(1_000)), Some(due));
     assert_eq!(
@@ -36,7 +35,6 @@ fn next_deadline_arms_on_ping_and_clears_on_rtt() {
         "an overdue timer keeps its past due time"
     );
 
-    // The echoed payload resolves the ping and disarms the timer.
     core.handle_transport_event(
         TransportEvent::StreamData {
             id: conn_id,
@@ -67,14 +65,12 @@ fn next_deadline_disarms_after_timeout_tick() {
     core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 1_000)
         .expect("send ping");
 
-    // An early tick must not disarm the timer.
     core.handle_tick(5_000);
     assert_eq!(
         core.next_deadline(Now::from_millis(5_000)),
         Some(Deadline::from_millis(11_000))
     );
 
-    // A tick at the deadline fires the timeout and disarms the timer.
     core.handle_tick(11_000);
     let events = drain_events(&mut core);
     assert!(
@@ -172,8 +168,6 @@ fn break_ping(how: PingBreak) -> (SwarmState, Vec<Output>, ConnectionId, u64) {
         id: conn,
         stream_id,
     };
-    // Opens a fresh ping stream for the attempt started at `start`, the
-    // transport reporting it opened at `start + 2_000`.
     let open_fresh = |core: &mut SwarmState, start: u64| {
         core.ping(&peer, [3; PING_PAYLOAD_LEN], start)
             .expect("ping");
@@ -300,7 +294,6 @@ fn a_failed_ping_attempt_ends_in_exactly_one_ping_failed() {
             core.handle_tick(ends_by);
             outputs.extend(core::iter::from_fn(|| core.poll_output()));
         }
-        // Long after: nothing more, whatever other deadline was running.
         core.handle_tick(ends_by + 10 * PING_TIMEOUT);
         outputs.extend(core::iter::from_fn(|| core.poll_output()));
 
@@ -373,7 +366,6 @@ fn a_retry_after_a_bad_echo_opens_a_fresh_stream() {
         "{outputs:?}"
     );
 
-    // Before the transport reports the reset stream closed.
     core.ping(&peer, [3; PING_PAYLOAD_LEN], 1_000)
         .expect("retry");
     let actions = drain_actions(&mut core);
@@ -428,7 +420,6 @@ fn a_ping_stream_has_no_negotiation_deadline_of_its_own() {
             stream_id: stream,
         },
     );
-    // Past the 10 s negotiation deadline, inside the 25 s ping deadline.
     core.handle_tick(15_000);
     let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
     accept.extend_from_slice(&multistream_frame(PING_PROTOCOL_ID));

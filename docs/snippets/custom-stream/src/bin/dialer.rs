@@ -21,7 +21,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind()?;
 
     let connect_id = node.connect(target)?;
-    // A `StreamKey`: stream ids are per connection, so it names both.
     let mut stream = None;
     let mut response = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -29,9 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = match node.wait(deadline)? {
             EndpointWaitOutcome::Event(event) => event,
-            // Another thread woke the wait; nothing to service here.
             EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
-            _ => continue, // interrupted by a WaitHandle
+            _ => continue,
         };
 
         match event {
@@ -41,7 +39,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } if id == connect_id => {
                 match outcome {
-                    // A known protocol does not need to wait for Identify.
                     ConnectOutcome::Connected { .. } => {
                         stream = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
                     }
@@ -54,8 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 protocol_id,
                 ..
             } if peer == peer_id && Some(ready) == stream && protocol_id == ECHO_PROTOCOL => {
-                // The endpoint queues what the stream cannot take at once,
-                // and the FIN waits behind it.
                 node.send_stream(ready, b"hello".to_vec())?;
                 node.close_stream_write(ready)?;
             }

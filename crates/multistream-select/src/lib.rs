@@ -270,7 +270,6 @@ fn handle_message(role: &mut Role, state: State, line: &str) -> (State, Vec<Mult
                     actual: line.to_string(),
                 });
             }
-            // The dialer's proposal went out with its header in `start`.
             (State::Negotiating, Vec::new())
         }
         (
@@ -296,10 +295,6 @@ fn handle_message(role: &mut Role, state: State, line: &str) -> (State, Vec<Mult
             } else {
                 *rejections_left -= 1;
                 (
-                    // A dialer may propose another protocol on the same
-                    // stream after `na` (for example rust-libp2p tries
-                    // meshsub 1.2 before falling back to 1.1). Keep the
-                    // listener alive for that next proposal.
                     State::Negotiating,
                     vec![
                         MultistreamOutput::OutboundData(encode_message(NOT_AVAILABLE)),
@@ -324,7 +319,6 @@ fn handle_message(role: &mut Role, state: State, line: &str) -> (State, Vec<Mult
                 })
             }
         }
-        // `process_buffer` only runs in the two states above.
         (State::Unstarted | State::Done, _) => (state, Vec::new()),
     }
 }
@@ -342,7 +336,7 @@ fn protocol_error(error: MultistreamError) -> (State, Vec<MultistreamOutput>) {
 ///
 /// Wire format: `<uvarint: len(payload + '\n')> <payload> <'\n'>`
 fn encode_message(protocol: &str) -> Vec<u8> {
-    let payload_len = protocol.len() + 1; // +1 for trailing '\n'
+    let payload_len = protocol.len() + 1;
     let mut out = Vec::with_capacity(uvarint_len(payload_len as u64) + payload_len);
     write_uvarint(payload_len as u64, &mut out);
     out.extend_from_slice(protocol.as_bytes());
@@ -392,8 +386,6 @@ fn decode_message(buf: &[u8]) -> DecodeResult<'_> {
         return DecodeResult::Incomplete;
     };
 
-    // The message must end with '\n' per the spec. `split_last` also leaves
-    // the payload without the terminator.
     let Some((&b'\n', payload_bytes)) = msg_bytes.split_last() else {
         return DecodeResult::Error(MultistreamError::MissingNewline);
     };
@@ -571,13 +563,11 @@ mod tests {
     fn listener_fails_after_the_rejection_budget() {
         let mut listener = negotiating_listener(MultistreamSelect::listener([PING.to_string()]));
 
-        // Counted across reads: one per call up to the budget.
         for _ in 0..DEFAULT_MAX_REJECTED_PROPOSALS {
             assert_eq!(listener.receive(&unsupported_proposals(1)), rejections(1));
         }
         assert!(!listener.is_done());
 
-        // The next one fails without an `na`, and the stream ignores the rest.
         let mut tail = unsupported_proposals(1);
         tail.extend_from_slice(&encode_message(PING));
         assert_eq!(
@@ -597,7 +587,6 @@ mod tests {
         out.push(too_many_rejected(2));
         assert_eq!(listener.receive(&unsupported_proposals(3)), out);
 
-        // A budget of zero fails on the first unsupported proposal.
         let mut strict = negotiating_listener(MultistreamSelect::listener_with_max_rejected(
             [PING.to_string()],
             0,
@@ -691,8 +680,6 @@ mod tests {
 
     #[test]
     fn dialer_requires_header_before_the_echo() {
-        // The proposal is already out, but the listener's answer still has
-        // to come after its header.
         for first in [PING, NOT_AVAILABLE] {
             let mut dialer = MultistreamSelect::dialer(PING);
             let _ = dialer.start_drained();
@@ -741,7 +728,6 @@ mod tests {
     #[test]
     fn data_before_start_is_answered_after_the_header() {
         let mut listener = MultistreamSelect::listener([PING.to_string()]);
-        // Nothing may go out before the listener's own header.
         assert!(listener.receive(&header_and(PING)).is_empty());
 
         assert_eq!(
@@ -775,9 +761,8 @@ mod tests {
     fn encode_decode_roundtrip() {
         let encoded = encode_message("/ipfs/ping/1.0.0");
 
-        // Verify wire format: varint + payload + newline
         let (msg_len, varint_bytes) = read_uvarint(&encoded).unwrap();
-        assert_eq!(msg_len as usize, "/ipfs/ping/1.0.0".len() + 1); // +1 for '\n'
+        assert_eq!(msg_len as usize, "/ipfs/ping/1.0.0".len() + 1);
         assert_eq!(encoded.len(), varint_bytes + msg_len as usize);
         assert_eq!(encoded.last(), Some(&b'\n'));
 
@@ -792,7 +777,6 @@ mod tests {
 
     #[test]
     fn rejects_non_utf8_payload() {
-        // Build a message with invalid UTF-8: varint(3) + [0xFF, 0xFE] + '\n'
         let mut msg = Vec::new();
         write_uvarint(3, &mut msg);
         msg.push(0xFF);
@@ -827,7 +811,6 @@ mod tests {
         let mut dialer = MultistreamSelect::dialer(PING);
         let _ = dialer.start_drained();
 
-        // Send header + protocol confirmation in a single buffer
         let mut combined = encode_message(MULTISTREAM_PROTOCOL_ID);
         combined.extend_from_slice(&encode_message(PING));
 
@@ -844,7 +827,6 @@ mod tests {
     fn dialer_receives_na() {
         let mut dialer = MultistreamSelect::dialer(PING);
         let _ = dialer.start_drained();
-        // `na` ends this dialer; a caller falls back with a fresh stream.
         let out = dialer.receive(&header_and(NOT_AVAILABLE));
         assert_eq!(out, vec![MultistreamOutput::NotAvailable]);
         assert!(dialer.is_done());

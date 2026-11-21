@@ -96,15 +96,9 @@ mod tests {
     #[test]
     fn rejects_shapes_nothing_can_dial() {
         for bad in [
-            // Half a QUIC address.
             "/ip4/203.0.113.7/udp/4001",
-            // A host with no transport on it.
             "/ip4/203.0.113.7",
-            // A whole, valid circuit address: reached by dialing the relay and
-            // asking it to connect, which is not the same as dialing this.
             "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWA8EXV3KjBxEU9NMLC4ksHy4Zi8Kj9Y9Wq6ZFVvhFTa9J/p2p-circuit",
-            // A dialable address wearing someone's peer id, which belongs to a
-            // `PeerAddr` rather than to a transport candidate.
             "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWA8EXV3KjBxEU9NMLC4ksHy4Zi8Kj9Y9Wq6ZFVvhFTa9J",
         ] {
             let bad = addr(bad);
@@ -115,10 +109,6 @@ mod tests {
 
     #[test]
     fn accepts_every_transport_a_host_might_have_bound() {
-        // A device with no operating system has no QUIC, so a TCP address is
-        // the only direct candidate it can offer. Dropping it here would be
-        // dropping it everywhere: this selector feeds the whole NAT agent, so
-        // such a host would advertise nothing to dial and never be dialed back.
         let tcp = addr("/ip4/203.0.113.7/tcp/4001");
         let quic = addr("/ip4/203.0.113.7/udp/4001/quic-v1");
 

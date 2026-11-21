@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Runs one pass inside a benchmark container (cwd /minip2p, the measured
-# code): scripts/run-bench-container.sh `docker exec`s it once per pass, from
-# the trusted checkout as the `bash -c` argument, so the measured ref never
-# supplies it. Each tier runs with the measured code's own harness and
-# registries, so a base and a head tree each validate their own rows.
-#
-#   ir | wall | node   run that tier
-#   results            merge the tiers and print the result document as a
-#                      base64 stdout marker
-#   sweep              run only the emulated-link window sweeps (#361) and
-#                      print their logs and JSON lines as a marker instead
 set -euo pipefail
 
 : "${BENCH_GIT_SHA:?BENCH_GIT_SHA must identify the measured commit}"

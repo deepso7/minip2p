@@ -5,8 +5,6 @@
 mod endpoint;
 
 pub use endpoint::P2pEndpoint;
-// Records, enums and errors are UniFFI types of `minip2p-ffi-core` itself,
-// derived behind its `uniffi` feature.
 pub use minip2p_ffi_core::{
     ConnectTarget, ConnectionCloseReason, ConnectionInfo, DiscoveryOptions, DiscoverySource,
     DriverFailureKind, EndpointConfig, EndpointErrorKind, FfiError, IdentifyInfo, KnownPeerInfo,

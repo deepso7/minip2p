@@ -57,18 +57,11 @@ fn drive<A: EntropySource, B: EntropySource>(
 ) -> (Vec<TransportEvent>, Vec<TransportEvent>) {
     let mut a_events = Vec::new();
     let mut b_events = Vec::new();
-    // Generous: a deliberately tiny peer buffer needs one round per few dozen
-    // bytes, and the bound only has to rule out a genuine livelock.
     for _ in 0..2048 {
         let from_a = a.poll(Now::from_millis(0)).expect("drive a");
         let from_b = b.poll(Now::from_millis(0)).expect("drive b");
         a_events.extend(from_a.iter().cloned());
         b_events.extend(from_b.iter().cloned());
-        // `IMMEDIATE` is real work. A future stall is too — the peer has to
-        // be polled so it can read and unstick the writer. A future keepalive
-        // is not: the session is idle until that timer. One extra pair of
-        // polls lets a stalled writer observe the peer's read before we
-        // decide the link is quiet.
         let due_now = |deadline: Option<Deadline>| {
             deadline.is_some_and(|deadline| deadline.is_expired_at(Now::from_millis(0)))
         };
@@ -167,7 +160,6 @@ fn is_stream_event(event: &TransportEvent) -> bool {
 fn two_nodes_complete_the_upgrade_and_authenticate_each_other() {
     let pair = upgraded_pair();
 
-    // Each side learns the other's real identity, not its own.
     assert_eq!(
         connected_peer(&pair.dialer_events, pair.connection),
         Some(&pair.listener_peer)
@@ -177,7 +169,6 @@ fn two_nodes_complete_the_upgrade_and_authenticate_each_other() {
         Some(&pair.dialer_peer)
     );
 
-    // The listener announces the inbound connection before it is usable.
     let incoming = position(&pair.listener_events, |event| {
         matches!(event, TransportEvent::IncomingConnection { .. })
     })
@@ -192,9 +183,6 @@ fn two_nodes_complete_the_upgrade_and_authenticate_each_other() {
         pair.listener_events
     );
 
-    // The contract forbids stream events before Connected. Nothing about a
-    // substream may surface from an upgrade at all -- if the session ever
-    // leaked what a pipelined remainder produced, it would show up here.
     for events in [&pair.dialer_events, &pair.listener_events] {
         assert!(
             !events.iter().any(is_stream_event),
@@ -216,8 +204,6 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
     let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
     let _ = dialer.dial(&target).expect("dial starts");
 
-    // Stop as soon as the listener is up, while the dialer has not yet read
-    // the confirmation that would finish its own upgrade.
     let mut settled = false;
     for _ in 0..64 {
         let _ = dialer.poll(Now::from_millis(0)).expect("drive dialer");
@@ -231,8 +217,6 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
     }
     assert!(settled, "the listener must establish first");
 
-    // Its substream frames now sit behind that unread confirmation, so the
-    // dialer decrypts both together and must still report Connected first.
     let listener_id = listener
         .connection_ids()
         .into_iter()
@@ -281,7 +265,6 @@ fn substreams_carry_data_half_close_and_reset() {
         "IncomingStream must precede StreamData: {listener_events:?}"
     );
 
-    // Half-close leaves the reverse direction open.
     pair.dialer.close_stream_write(id, stream).expect("FIN");
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     assert!(
@@ -303,7 +286,6 @@ fn substreams_carry_data_half_close_and_reset() {
         "reply must arrive: {dialer_events:?}"
     );
 
-    // Reset closes both directions, once per side.
     pair.listener.reset_stream(id, stream).expect("reset");
     let (dialer_events, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     for events in [&dialer_events, &listener_events] {
@@ -328,7 +310,6 @@ fn a_mismatched_expected_peer_fails_the_dial() {
     let mut listener = node(&net, identity(2), 20);
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
-    // Dial the listener's address while demanding an identity it cannot prove.
     let impostor = identity(3).peer_id();
     let target = PeerAddr::new(addr(LISTEN_ADDR), impostor).expect("dial target");
     let id = dialer.dial(&target).expect("dial starts");
@@ -368,8 +349,6 @@ fn a_dial_that_fails_outright_never_hands_its_id_to_another_connection() {
     };
     assert!(dialer.connection_ids().is_empty());
 
-    // That id already named a failure the caller was told about, so a later
-    // dial must not answer to it as well.
     dialer.provider_mut().fail_connect(false);
     let second = dialer.dial(&target).expect("second dial starts");
     assert_ne!(
@@ -423,12 +402,8 @@ fn a_full_socket_buffers_and_drains_as_the_peer_reads() {
 
     let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
     let id = dialer.dial(&target).expect("dial starts");
-    // The socket exists now, so a tiny peer buffer constrains the whole
-    // conversation: 64 unread bytes and the socket accepts nothing more.
     dialer.provider_mut().set_in_flight_capacity(Some(64));
 
-    // A transport that dropped the remainder of a partial write, or that never
-    // retried it, could not finish the upgrade at all.
     let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
     assert!(
         dialer_events
@@ -443,10 +418,6 @@ fn a_full_socket_buffers_and_drains_as_the_peer_reads() {
         .send_stream(id, stream, Bytes::from(payload.clone()))
         .expect("queue a payload far larger than the peer's buffer");
 
-    // Drain the queued `StreamOpened` first, so buffered bytes are the only
-    // thing left that could make the transport urgent. This poll also fills the
-    // peer's 64 bytes and stops, leaving the rest waiting on writability --
-    // which is exactly what a driver must not sleep through.
     let queued = dialer
         .poll(Now::from_millis(0))
         .expect("drain queued events");
@@ -496,8 +467,6 @@ fn buffered_writes_drain_even_without_a_writable_event() {
     let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
     let id = dialer.dial(&target).expect("dial starts");
     dialer.provider_mut().set_in_flight_capacity(Some(64));
-    // This provider never says when the socket frees up, so every retry has to
-    // come from the transport polling again on its own.
     dialer.provider_mut().suppress_writable();
 
     let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
@@ -534,9 +503,6 @@ fn closing_a_socket_that_cannot_flush_aborts_instead_of_truncating() {
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     let close_writes_before = pair.dialer.provider().close_write_calls();
 
-    // Fill the peer's buffer, then queue more than fits and close. A half-close
-    // now would put a FIN in front of bytes the peer never received, so the
-    // socket has to be discarded instead.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(64));
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![7u8; 8 * 1024]))
@@ -564,8 +530,6 @@ fn closing_a_flushed_socket_too_full_for_the_go_away_still_half_closes() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The last bytes and FIN reach the socket, which then has no room left:
-    // the `GoAway` cannot follow, but aborting would discard what it took.
     pair.dialer
         .send_stream(id, stream, Bytes::from_static(b"last"))
         .expect("send");
@@ -617,7 +581,6 @@ fn a_gracefully_closed_socket_is_pending_until_the_peer_closes() {
         "the peer closed its side"
     );
 
-    // A peer that never closes is aborted once the linger runs out.
     let mut pair = upgraded_pair();
     pair.dialer.close(pair.connection).expect("close");
     let aborts = pair.dialer.provider().abort_calls();
@@ -641,8 +604,6 @@ fn closing_with_window_blocked_bytes_aborts_when_the_go_away_does_not_fit() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // More than the peer's initial window, never acknowledged: the socket
-    // takes every frame it may, and the rest waits behind the window.
     for _ in 0..64 {
         if pair
             .dialer
@@ -663,8 +624,6 @@ fn closing_with_window_blocked_bytes_aborts_when_the_go_away_does_not_fit() {
         pair.dialer.provider().abort_calls(),
     );
 
-    // `go_away` discards the held bytes, so a FIN would pass the truncated
-    // stream off as complete.
     pair.dialer.close(id).expect("close");
     assert_eq!(pair.dialer.provider().close_write_calls(), close_writes);
     assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
@@ -677,8 +636,6 @@ fn closing_with_window_blocked_bytes_aborts_when_the_go_away_fits() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // More than the peer's initial window, never acknowledged: the socket
-    // takes every frame it may, and the rest waits behind the window.
     for _ in 0..64 {
         if pair
             .dialer
@@ -695,8 +652,6 @@ fn closing_with_window_blocked_bytes_aborts_when_the_go_away_fits() {
         pair.dialer.provider().abort_calls(),
     );
 
-    // `go_away` discards the held bytes, so a FIN would pass the truncated
-    // stream off as complete.
     pair.dialer.close(id).expect("close");
     assert_eq!(pair.dialer.provider().close_write_calls(), close_writes);
     assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
@@ -709,9 +664,6 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The peer stops reading. What is queued stays well under the ceiling, so
-    // the connection lives on -- and must not keep telling the driver to come
-    // straight back, which would spin for as long as the peer stays silent.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![3u8; 1024]))
@@ -732,7 +684,6 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
         "a stall well inside the timeout is not fatal"
     );
 
-    // The peer reads again, so the stall clears and the bytes go out.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     let delivered: usize = listener_events
@@ -752,8 +703,6 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
 
 #[test]
 fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
-    // Shorter than keepalive's ACK wait, so the stall is the deadline that
-    // shows once the long-quiet connection's ping goes out.
     const STALL_TIMEOUT: u64 = 5_000;
     let config = TcpConfig {
         send_stall_timeout_ms: Some(STALL_TIMEOUT),
@@ -764,16 +713,12 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // Stall early.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![1u8; 512]))
         .expect("queue bytes");
     let _ = pair.dialer.poll(Now::from_millis(0)).expect("first stall");
 
-    // Recover through a send rather than a poll, so the backlog drains inside
-    // that call and no poll ever observes the buffer shrinking. Only noticing
-    // the drained buffer itself clears the mark on this path.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![9u8; 16]))
@@ -784,9 +729,6 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
         .expect("observe the drained buffer");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // Long after that first stall would have expired, stall again. The clock
-    // for the new one starts now; carrying the old mark forward would fail the
-    // connection on its very first refused write.
     let much_later = Now::from_millis(10 * 60 * 1000);
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
@@ -799,7 +741,6 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
         "a fresh stall must not be treated as an expired one: {events:?}"
     );
     assert_eq!(pair.dialer.connection_ids(), vec![id]);
-    // The ping that went out with it is dated by the next poll.
     pair.dialer.poll(much_later).expect("date the ping");
     assert_eq!(
         pair.dialer.next_deadline(),
@@ -824,7 +765,6 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
         .expect("stall starts");
     assert_eq!(pair.dialer.connection_ids(), vec![id]);
 
-    // Still refusing a full timeout later: the peer is gone, not busy.
     let events = pair
         .dialer
         .poll(Now::from_millis(1_000 + 30_000))
@@ -842,12 +782,6 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
 
 #[test]
 fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
-    // One equal-sized frame buffered at a time: each poll the socket takes
-    // the buffered frame and the session refills it with the next, so the
-    // buffer never looks shorter, yet the connection is making progress.
-    // Polls come further apart than the stall timeout, but all within one
-    // keepalive interval: the peer never reads, so it could not answer a
-    // ping.
     const STALL_TIMEOUT: u64 = 2_000;
     let mut config = TcpConfig {
         max_buffered_send: 1,
@@ -855,8 +789,8 @@ fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
         ..TcpConfig::default()
     };
     config.yamux.max_frame_len = 1000;
-    // Noise length prefix, Yamux header, payload, Noise tag.
-    let frame = 2 + 12 + 1000 + 16;
+    let (noise_length_prefix, yamux_header, noise_tag) = (2, 12, 16);
+    let frame = noise_length_prefix + yamux_header + 1000 + noise_tag;
     let mut pair = upgraded_pair_with(config, TcpConfig::default());
     let id = pair.connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
@@ -893,10 +827,6 @@ fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
 
 #[test]
 fn concurrent_writes_to_a_backed_up_socket_interleave_on_the_wire() {
-    // With the default config, a socket that is taking nothing holds back at
-    // most a frame or so of ciphertext, so the rest stays in Yamux and goes
-    // out round-robin. A deep queue would already hold all of the first
-    // stream's frames ahead of the second's.
     let mut pair = upgraded_pair();
     let id = pair.connection;
     let first = pair.dialer.open_stream(id).expect("open first substream");
@@ -915,8 +845,6 @@ fn concurrent_writes_to_a_backed_up_socket_interleave_on_the_wire() {
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // Only data events, in arrival order; a run is consecutive chunks of one
-    // stream.
     let data: Vec<(StreamId, usize)> = listener_events
         .iter()
         .filter_map(|event| match event {
@@ -958,8 +886,6 @@ fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection(
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The peer stops reading, so the socket takes nothing more and the write
-    // backs up into Yamux, whose cap rejects the tail.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(64));
     let payload: Vec<u8> = (0..16 * 1024u32).map(|byte| byte as u8).collect();
     let error = pair
@@ -981,7 +907,6 @@ fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection(
         "exactly the unsent suffix"
     );
 
-    // Full is backpressure, not failure: the connection survives.
     let mut dialer_events = pair.dialer.poll(Now::from_millis(0)).expect("poll");
     assert!(
         !dialer_events
@@ -991,9 +916,6 @@ fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection(
     );
     assert_eq!(pair.dialer.connection_ids(), vec![id]);
 
-    // The peer reads again; the stream reports writable (once: possibly
-    // already on the poll above, which pulls into the socket buffer) and the
-    // tail goes out.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     let (drained, mut listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     dialer_events.extend(drained);
@@ -1042,8 +964,6 @@ fn a_recovered_socket_drains_old_bytes_before_applying_the_buffer_ceiling() {
         .send_stream(id, stream, Bytes::from(vec![1u8; 3000]))
         .expect("queue the first payload");
 
-    // Recovery happens between polls. The second payload would cross the
-    // ceiling if the transport counted the stale queue before retrying it.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![2u8; 3000]))
@@ -1092,7 +1012,6 @@ fn a_dial_that_cannot_draw_entropy_opens_no_socket() {
     let mut listener = node(&net, identity(2), 20);
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
-    // Consume the listener's own `Listening` so what follows is only the dial.
     assert!(matches!(
         listener
             .poll(Now::from_millis(0))
@@ -1108,8 +1027,6 @@ fn a_dial_that_cannot_draw_entropy_opens_no_socket() {
     ));
     assert!(dialer.connection_ids().is_empty());
 
-    // Entropy is drawn before the connect, so the listener never saw anything:
-    // a failed dial leaves no half-open socket behind.
     let events = listener.poll(Now::from_millis(0)).expect("listener idle");
     assert!(events.is_empty(), "unexpected listener events: {events:?}");
 }
@@ -1167,9 +1084,6 @@ fn a_truncated_stream_is_a_fault_not_an_orderly_close() {
     let mut pair = upgraded_pair();
     let id = pair.connection;
 
-    // The peer stops writing without ever sending a Yamux GoAway. libp2p needs
-    // the stream in both directions, so this ends the connection -- and unlike
-    // a real shutdown it is a failure the host should hear about.
     pair.listener.provider_mut().half_close_all();
     let (dialer_events, _) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
@@ -1192,8 +1106,6 @@ fn an_inbound_connection_that_cannot_be_secured_goes_where_it_stands() {
     let listener_key = identity(2);
     let listener_peer = listener_key.peer_id();
     let mut dialer = node(&net, identity(1), 10);
-    // The first draw fails, so the first inbound connection is refused and the
-    // second succeeds.
     let mut listener = TcpTransport::with_config(
         net.provider(),
         listener_key,
@@ -1207,10 +1119,6 @@ fn an_inbound_connection_that_cannot_be_secured_goes_where_it_stands() {
     dialer.dial(&target).expect("first dial starts");
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
 
-    // Nothing was ever said about this socket, so there is nothing to correct:
-    // an `Error` is an error on a connection, and an id the host never saw
-    // names none -- with no `Closed` behind it, it would read as a connection
-    // still open. It goes the way a connection past the ceiling goes.
     assert!(
         listener_events.iter().all(|event| !matches!(
             event,
@@ -1222,7 +1130,6 @@ fn an_inbound_connection_that_cannot_be_secured_goes_where_it_stands() {
     );
     assert!(listener.connection_ids().is_empty());
 
-    // And the listener keeps listening: one refusal is not the end of it.
     dialer.dial(&target).expect("second dial starts");
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
     let accepted = listener_events
@@ -1256,8 +1163,6 @@ fn unknown_connections_and_substreams_are_rejected() {
         Err(TransportError::ConnectionNotFound { id: unknown })
     );
 
-    // An unknown substream on a live connection retains the transport's
-    // explicit not-found classification.
     assert_eq!(
         pair.dialer.send_stream(id, stream, Bytes::from(vec![1])),
         Err(TransportError::StreamNotFound {
@@ -1266,8 +1171,6 @@ fn unknown_connections_and_substreams_are_rejected() {
         })
     );
 
-    // An id congruent to a live substream modulo 2^32 must be rejected rather
-    // than truncated onto it.
     let live = pair.dialer.open_stream(id).expect("open substream");
     let aliased = StreamId::new(live.as_u64() + (1u64 << 32));
     assert_eq!(
@@ -1278,8 +1181,6 @@ fn unknown_connections_and_substreams_are_rejected() {
         })
     );
 
-    // An empty write is a no-op on a live connection, but is not a way to
-    // address one that does not exist.
     assert_eq!(pair.dialer.send_stream(id, live, Bytes::new()), Ok(()));
     assert_eq!(
         pair.dialer.send_stream(unknown, live, Bytes::new()),
@@ -1297,8 +1198,6 @@ fn addresses_and_inbound_sources_are_reported_through_the_provider() {
         "an outbound-only node binds nothing"
     );
 
-    // Only accepted connections count: a hole-punch responder uses this to tell
-    // a real inbound packet from its own simultaneous dial.
     let sources = pair.listener.active_inbound_connection_sources();
     assert_eq!(sources.len(), 1);
     assert!(
@@ -1371,8 +1270,6 @@ fn a_dial_past_the_ceiling_is_refused_and_costs_nothing() {
         ),
         "a refused dial should say what ran out, got {error:?}"
     );
-    // The check comes before anything with a side effect, so nothing is spent
-    // on a dial that was never going to happen.
     assert_eq!(
         dialer.connection_ids().len(),
         1,
@@ -1417,9 +1314,6 @@ fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
         }
     }
 
-    // One peer gets in; the other is shed where it stands. Nothing was ever
-    // announced about it, so there is no id to report a failure against --
-    // saying anything would name a connection the host has never heard of.
     let inbound = announced
         .iter()
         .filter(|event| matches!(event, TransportEvent::IncomingConnection { .. }))
@@ -1436,9 +1330,6 @@ fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
 fn a_connection_that_never_authenticates_is_dropped_on_its_deadline() {
     const PATIENCE: u64 = 5_000;
     let net = VirtualNetwork::new();
-    // Bound, so the byte stream comes up -- and then never polled, so the peer
-    // takes the connection and says nothing. That is the shape that a ceiling
-    // alone cannot handle: the slot is held for as long as the socket lives.
     let mut silent = node(&net, identity(2), 20);
     silent.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
@@ -1487,9 +1378,6 @@ fn an_established_connection_is_no_longer_on_the_handshake_clock() {
         },
         TcpConfig::default(),
     );
-    // The countdown bounds the upgrade, not the connection. A transport that
-    // kept it running would tear down healthy connections on a timer, and wake
-    // an idle host to do it.
     assert_eq!(
         pair.dialer.next_deadline(),
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
@@ -1555,7 +1443,6 @@ fn a_keepalive_timeout_ends_open_streams_with_the_connection() {
         .expect("send");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The listener is never polled again: the ping goes unanswered.
     let sent = KEEPALIVE_INTERVAL_MS;
     let _ = pair.dialer.poll(Now::from_millis(sent)).expect("ping");
     let _ = pair.dialer.poll(Now::from_millis(sent)).expect("hand-off");
@@ -1629,7 +1516,6 @@ fn completing_an_upgrade_arms_the_keepalive_deadline() {
 
 #[test]
 fn a_zero_send_buffer_still_upgrades_and_carries_data() {
-    // Zero cannot mean "never pull": it holds one frame at a time instead.
     let config = TcpConfig {
         max_buffered_send: 0,
         ..TcpConfig::default()
@@ -1657,8 +1543,6 @@ fn closing_a_connection_drops_its_queued_writable() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The send pulls frames into the socket buffer, freeing Yamux's cap, so a
-    // Writable may already be queued when the connection closes.
     assert!(matches!(
         pair.dialer
             .send_stream(id, stream, Bytes::from(vec![3u8; 64 * 1024])),
@@ -1688,12 +1572,10 @@ fn a_write_the_socket_takes_does_not_restart_the_keepalive_clock() {
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
 
-    // A socket with room takes bytes for a dead peer too: the deadline stands.
     let stream = pair.dialer.open_stream(id).expect("open substream");
     pair.dialer
         .send_stream(id, stream, Bytes::from_static(b"hello"))
         .expect("send");
-    // The first poll only hands back the queued `StreamOpened`.
     pair.dialer
         .poll(Now::from_millis(LATER))
         .expect("drain events");
@@ -1703,7 +1585,6 @@ fn a_write_the_socket_takes_does_not_restart_the_keepalive_clock() {
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
 
-    // A frame from the peer is dated by the poll that reads it.
     let listener_id = pair.listener.connection_ids()[0];
     let back = pair.listener.open_stream(listener_id).expect("open back");
     pair.listener
@@ -1720,7 +1601,6 @@ fn a_write_the_socket_takes_does_not_restart_the_keepalive_clock() {
 
 #[test]
 fn a_backed_up_connection_to_a_silent_peer_times_out() {
-    // No stall timeout: only keepalive can notice the peer is gone.
     let config = TcpConfig {
         max_buffered_send: 1,
         send_stall_timeout_ms: None,
@@ -1731,7 +1611,6 @@ fn a_backed_up_connection_to_a_silent_peer_times_out() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The peer stops reading, and a frame fills the outbound buffer.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
         .send_stream(id, stream, Bytes::from(vec![7u8; 1024]))
@@ -1745,7 +1624,6 @@ fn a_backed_up_connection_to_a_silent_peer_times_out() {
         "the keepalive deadline holds while writes are backed up"
     );
 
-    // The ping comes due but cannot be handed off to the full buffer.
     let events = pair.dialer.poll(Now::from_millis(due)).expect("ping due");
     assert!(events.is_empty(), "{events:?}");
     assert_eq!(
@@ -1769,7 +1647,6 @@ fn a_backed_up_connection_to_a_silent_peer_times_out() {
 
 #[test]
 fn a_socket_that_keeps_draining_is_a_live_peer_until_it_stops() {
-    // No stall timeout: only keepalive can notice the peer is gone.
     let config = TcpConfig {
         send_stall_timeout_ms: None,
         ..TcpConfig::default()
@@ -1779,8 +1656,6 @@ fn a_socket_that_keeps_draining_is_a_live_peer_until_it_stops() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // A bulk upload over a slow link: the socket takes 1 KiB a second, and
-    // nothing the peer sends back arrives (it is all queued behind data).
     pair.dialer
         .provider_mut()
         .set_in_flight_capacity(Some(1024));
@@ -1799,9 +1674,6 @@ fn a_socket_that_keeps_draining_is_a_live_peer_until_it_stops() {
         );
     }
 
-    // The peer dies: the socket stops draining. Keepalive is again the
-    // bound, measured from the last drain: the ping comes due a quiet
-    // interval later and cannot be handed off to the full socket.
     let mut now = ALIVE_UNTIL;
     let closed_at = loop {
         let events = pair.dialer.poll(Now::from_millis(now)).expect("poll");
@@ -1834,9 +1706,6 @@ fn a_socket_with_room_to_spare_is_no_sign_of_life() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // A dead peer's socket still takes bytes while its buffer has room, so
-    // writes that never fill it say nothing: the ping goes out and goes
-    // unanswered.
     let mut now = 0;
     let closed_at = loop {
         pair.listener.provider_mut().discard_received();
@@ -1872,7 +1741,6 @@ fn each_connection_is_woken_for_its_own_deadline() {
     let mut pair = upgraded_pair_with(config, TcpConfig::default());
     let established = pair.connection;
 
-    // A second listener that takes the byte stream and never answers.
     let silent_addr = addr("/ip4/127.0.0.1/tcp/4002");
     let mut silent = node(&pair.net, identity(3), 30);
     silent.listen(&silent_addr).expect("silent listener binds");
@@ -1940,9 +1808,6 @@ fn churn_once(net: &VirtualNetwork, dialer: &mut Node, listener: &mut Node) -> O
 
 #[test]
 fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
-    // ADR 0012 (#356): the receive bound outlives the connection. A reader
-    // that never acknowledges holds the slot, so reconnect churn cannot grow
-    // the data it holds; acknowledging after close releases it.
     let net = VirtualNetwork::new();
     let mut listener = node_with(
         &net,
@@ -1973,7 +1838,6 @@ fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
         Err(TransportError::ResourceExhausted { .. })
     ));
 
-    // The first connection's id: the only one the listener ever admitted.
     let first = ConnectionId::namespaced(listener.namespace(), 1).expect("id");
     listener
         .ack_stream(first, held, 2)
@@ -1996,7 +1860,6 @@ fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
         .ack_stream(first, held, 1)
         .expect("settled: a no-op");
 
-    // The slot is free again; this time abandon the bytes instead.
     let held = churn_once(&net, &mut dialer, &mut listener).expect("admitted again");
     assert_eq!(
         churn_once(&net, &mut dialer, &mut listener),

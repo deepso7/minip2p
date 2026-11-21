@@ -180,8 +180,6 @@ impl Shared {
         now: Now,
         deadline_ms: u64,
     ) -> Result<(), String> {
-        // Expired entries only accumulate when handshakes silently die;
-        // prune them here so the map stays bounded without a timer.
         self.pending_session_dials
             .retain(|_, (_, expires)| *expires > now.monotonic_ms);
         let (token, _) = self.start_dial(swarm, purpose, &addr)?;
@@ -309,14 +307,10 @@ impl Shared {
         let Some(addr) = validated.pop() else {
             return;
         };
-        // A connection's far end is seen at an IP, never a DNS name.
         let Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))) = addr.protocols().first().cloned()
         else {
             return;
         };
-        // The reporter sees us only over this connection's family. A
-        // relayed connection has no IP of its own: the reporter sees the
-        // relay, not us, so it vouches for no family.
         let is_ipv6 = |p: &Protocol| match p {
             Protocol::Ip4(_) => Some(false),
             Protocol::Ip6(_) => Some(true),
@@ -711,8 +705,6 @@ impl NatAgent {
                 conn_id,
                 stream_id,
             } = event
-                // A finished exchange releases its stream at once, so a tail
-                // and FIN still held for it are replayed without ownership.
                 && (swarm.held.is_held(*conn_id, *stream_id)
                     || agent
                         .shared
@@ -724,7 +716,6 @@ impl NatAgent {
                 }
                 return true;
             }
-            // Only stream input accepts a STOP or sends a HOP CONNECT.
             agent.shared.circuits_reserved = agent.circuits_reserved();
             agent.handle(swarm, event, is_circuit, now)
         })
@@ -779,12 +770,6 @@ impl NatAgent {
                 conn_id,
                 info,
             } => {
-                // The remote reports the transport address it sees us from.
-                // Behind a NAT that is our public mapping — the only usable
-                // DCUtR punch candidate, since bound addresses are private.
-                // The event stays application-visible (`handled` = false),
-                // and nothing here can complete a machine (`touched_state`
-                // stays false).
                 self.shared.record_observed_addr(
                     swarm,
                     peer_id,
@@ -863,12 +848,6 @@ impl NatAgent {
                         }
                         handled = true;
                     } else if !trusted_stop {
-                        // All four ids are registered so the client-side NAT
-                        // machines can negotiate outbound streams and advertise
-                        // support through Identify. This node serves only STOP,
-                        // and only for explicitly configured relays; accepting
-                        // the other inbound control protocols would leak them as
-                        // application streams despite reserving their ids.
                         reset(swarm, peer_id, *conn_id, *stream_id, now);
                         self.shared.own_stream(
                             peer_id,
@@ -878,8 +857,6 @@ impl NatAgent {
                         );
                         handled = true;
                     } else {
-                        // A relay is bridging an inbound circuit to us: claim
-                        // the stream and run the responder flow on it.
                         let id = self.next_inbound_id;
                         self.next_inbound_id += 1;
                         self.shared.own_stream(
@@ -952,8 +929,6 @@ impl NatAgent {
                 stream_id,
                 ..
             } => {
-                // Every NAT control stream has to write, so a stopped one is
-                // reset; its `StreamClosed` then retires the owning machine.
                 if self
                     .shared
                     .owned_role(*conn_id, peer_id, *stream_id)
@@ -993,9 +968,6 @@ impl NatAgent {
             }
             _ => {}
         }
-        // Foreign application stream events stop after their single registry
-        // lookup. Only state that actually visited a NAT machine can make an
-        // attempt or inbound circuit reapable.
         if touched_state {
             self.reap_done();
         }
@@ -1073,8 +1045,6 @@ impl NatAgent {
     /// A parked dial now has a connection: track it like a started dial.
     fn dial_started(&mut self, token: NatToken, purpose: DialPurpose, conn_id: ConnectionId) {
         match purpose.connect_id() {
-            // The attempt ended while the name resolved. Close the handshake
-            // so it cannot land after the attempt is gone.
             Some(id) if !self.attempts.contains_key(&id) => {
                 self.shared.push_action(NatAction::CloseCircuit { conn_id });
             }
@@ -1091,12 +1061,6 @@ impl NatAgent {
         now: Now,
     ) {
         if let Some((peer, _)) = self.shared.pending_session_dials.remove(&token) {
-            // A failed session dial is no longer in flight. Attempts that
-            // were sharing it must issue their own dial now: nothing else
-            // re-enters a waiting relay leg, so they would otherwise burn
-            // their leg deadline on a dial that already failed. The owner
-            // learns through its own routing below, and housekeeping
-            // waiters fall back to their acquire/probe deadlines.
             let owner = purpose.connect_id();
             for (id, attempt) in self.attempts.iter_mut() {
                 if owner.as_ref() != Some(id) {
@@ -1211,8 +1175,6 @@ impl NatAgent {
                             .find_map(|circuit| circuit.circuit_claim(conn))
                     })
             };
-            // A circuit no machine promoted, replacing an attempt's circuit,
-            // carries that attempt's relayed path on.
             claim_of(conn_id).or_else(|| {
                 let old = replaced?;
                 self.attempts
@@ -1228,14 +1190,9 @@ impl NatAgent {
             self.shared
                 .ledger
                 .attribute(conn_id, peer, is_circuit, claim, now.monotonic_ms);
-        // The dial that made this connection is done.
         if let Some((token, _)) = self.shared.ledger.finish_dial(conn_id) {
             self.shared.pending_session_dials.remove(&token);
         }
-        // While the peer is still connected, every other session dial toward
-        // it has done its job too: further dials would replace the
-        // connection. A buffered establishment the swarm has already closed
-        // again leaves newer dials, started after that close, in flight.
         if swarm.connection(peer).is_some() {
             self.shared
                 .pending_session_dials
@@ -1303,12 +1260,8 @@ impl NatAgent {
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) {
-        // `old`'s records go before machines see `new`: a direct `old` must
-        // not make a relayed `new` look redundant.
         let old_path = self.forget_connection(old);
         let taken = self.connection_up(peer, new, is_circuit, Some(old), swarm, now);
-        // A circuit another attempt or an inbound circuit promoted stays
-        // its owner's: adopting it would let this attempt close it on cancel.
         let new_owned = self.attempts.values().any(|a| a.promotes(new))
             || self.inbound.values().any(|c| c.promotes(new));
         for attempt in self.attempts.values_mut() {
@@ -1319,9 +1272,6 @@ impl NatAgent {
         self.housekeeping
             .on_connection_replaced(peer, old, swarm, &mut self.shared, now);
 
-        // A machine that took `new` reported it with its own event.
-        // Otherwise a direct `new` that retires a relayed path is reported
-        // once, against whatever created that path.
         if taken {
             return;
         }
@@ -1356,7 +1306,6 @@ impl NatAgent {
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) -> bool {
-        // Guardrail: streams we don't own are none of our business.
         let Some(role) = self.shared.owned_role(conn_id, peer, stream) else {
             return false;
         };

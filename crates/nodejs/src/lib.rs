@@ -14,8 +14,6 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
 
-// napi-rs's default MaxQueueSize of 0 is intentionally unbounded. The FFI core
-// coalesces doorbells, so this wakeup must never block the network driver.
 type DoorbellFunction = ThreadsafeFunction<(), (), (), Status, false>;
 
 struct NodeDoorbell(Arc<DoorbellFunction>);
@@ -195,7 +193,6 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             inbound_stream_limits: config.inbound_stream_limits.unwrap_or_default(),
             discovery: config.discovery.map(convert_discovery).transpose()?,
             mdns: config.mdns.map(convert_mdns).transpose()?,
-            // Converted by the constructor, which tags limit errors.
             limits: None,
             timeouts: config.timeouts.map(convert_timeouts).transpose()?,
         })
@@ -289,7 +286,6 @@ fn convert_quic_limits(
             .map(|name| convert_congestion_controller(&name))
             .transpose()?,
         packet_threshold: options.packet_threshold,
-        // The native threshold is an `f32`; its validation sees the rounding.
         time_threshold: options.time_threshold.map(|threshold| threshold as f32),
     })
 }
@@ -739,8 +735,6 @@ fn native_error(env: &Env, error: FfiError) -> Error {
         }
         Ok(Error::from(js_error.to_unknown()))
     };
-    // Building the JS value only fails if the engine is unusable; the message
-    // alone is still the most useful thing to throw then.
     tagged().unwrap_or_else(|_| Error::from_reason(error.to_string()))
 }
 

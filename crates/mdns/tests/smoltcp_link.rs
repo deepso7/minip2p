@@ -37,8 +37,6 @@ const MAX_STEPS: usize = 4_000;
 /// How far the harness clock moves per step.
 const STEP_MS: u64 = 5;
 
-// ---------------------------------------------------------------- the link
-
 type Frames = Rc<RefCell<VecDeque<Vec<u8>>>>;
 
 /// Whether a node's link is currently refusing frames, shared so a test can
@@ -70,9 +68,6 @@ impl Bus {
 
     fn broadcast(&self, from: &Frames, frame: Vec<u8>) {
         for inbox in self.inboxes.borrow().iter() {
-            // Not back to the sender: a real link does not hand a host its own
-            // frame back, and an mDNS agent that heard itself would answer
-            // its own queries.
             if Rc::ptr_eq(inbox, from) {
                 continue;
             }
@@ -183,8 +178,6 @@ impl BusDevice {
     }
 }
 
-// ------------------------------------------------------------- the nodes
-
 type Driver = MdnsDriver<SmoltcpMdnsIo<BusDevice>>;
 
 fn peer(seed: u8) -> PeerId {
@@ -270,8 +263,6 @@ impl Node {
             device,
             iface,
             SmoltcpMdnsConfig {
-                // IPv4 only: the bus carries whatever smoltcp puts on it, and
-                // one family is enough to pin the seam.
                 enable_ipv6: false,
                 ..SmoltcpMdnsConfig::default()
             },
@@ -327,8 +318,6 @@ fn run_until(
     ))
 }
 
-// ----------------------------------------------------------------- tests
-
 #[test]
 fn two_nodes_find_each_other_over_multicast() {
     let bus = Bus::default();
@@ -340,9 +329,6 @@ fn two_nodes_find_each_other_over_multicast() {
     })
     .expect("both nodes discover each other");
 
-    // What each learned is what the other actually listens on -- the whole
-    // point of the exchange, and the part no fake could have got right by
-    // accident.
     for (learner, subject, id) in [(&first, &second, peer(2)), (&second, &first, peer(1))] {
         let learned = learner.observed(&id).expect("the other node was observed");
         assert!(
@@ -365,10 +351,6 @@ fn a_node_that_leaves_says_so_on_the_wire() {
     })
     .expect("first node observes the second");
 
-    // A goodbye is a claim with a zero TTL, and it has to reach the peer: an
-    // unsent one costs it a full TTL of pointing at a host that has gone.
-    // The carrier is dropped as the shutdown ends, so anything still queued
-    // in it then is lost.
     second
         .driver
         .shutdown(Now::from_millis(1_000))
@@ -393,9 +375,6 @@ fn an_idle_link_lets_the_host_sleep() {
     let mut first = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
     let mut second = Node::new(&bus, Ipv4Address::new(192, 168, 1, 2), 2);
 
-    // Drive until nothing is left on the wire, then ask what is owed. A
-    // device that runs on a battery sleeps between packets, and this is the
-    // number that lets it.
     let mut idle_at = None;
     for step in 0..200u64 {
         let now = step * STEP_MS;
@@ -408,16 +387,6 @@ fn an_idle_link_lets_the_host_sleep() {
     }
     let now = idle_at.expect("the link never went quiet");
 
-    // The answer is the soonest of everything the driver combines: its next
-    // interface re-enumeration, the agent's next
-    // scheduled word, and whatever the carrier owes -- nothing, on an idle
-    // link, but taken from the carrier rather than assumed, so a carrier that
-    // claimed a deadline it did not have is caught shortening this instead of
-    // breaking the comparison. Asserting the number rather than "more than
-    // zero" is what makes this a bound; a driver that ignored the carrier's
-    // deadlines would not be caught here at all, which is what the next test
-    // is for.
-    // The refresh is armed by the first tick, which was at zero.
     let now = Now::from_millis(now);
     let refresh = Deadline::from_millis(MdnsConfig::default().interface_refresh_ms);
     let expected = [
@@ -443,9 +412,6 @@ fn a_carrier_that_still_owes_work_keeps_the_host_awake() {
     let bus = Bus::default();
     let mut only = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
 
-    // A link that will not take a frame. The announcement is queued inside
-    // smoltcp and goes nowhere, which is precisely when a host must not be
-    // told it may sleep: nothing in this stack moves while it does.
     only.link.set(true);
     only.tick(0);
     assert_eq!(
@@ -454,9 +420,6 @@ fn a_carrier_that_still_owes_work_keeps_the_host_awake() {
         "a datagram stuck in the carrier is owed a poll now"
     );
 
-    // And once it drains, the host is back to sleeping on mDNS's own schedule
-    // -- so the "now" above came from the carrier and not from something the
-    // driver always says.
     only.link.set(false);
     only.tick(1);
     let now = Now::from_millis(1);
@@ -471,18 +434,13 @@ fn a_carrier_that_still_owes_work_keeps_the_host_awake() {
 #[test]
 fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
     let bus = Bus::default();
-    // A second node, so there is an inbox for a frame to arrive in.
     let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
     let mut io = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
-    // Joining a group is itself something to say on the wire; this test is
-    // about what happens after that.
     io.poll(0).expect("poll");
     bus.drain();
 
     io.send(&datagram()).expect("queue a datagram");
 
-    // Queued is not sent: nothing leaves a stack like this until it is
-    // driven, so a host told it could sleep would sleep on an unsent packet.
     assert_eq!(
         io.next_deadline(Now::from_millis(0)),
         Some(Deadline::IMMEDIATE),
@@ -585,9 +543,6 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     let mut io = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
     io.poll(0).expect("poll");
 
-    // A stack like this drains only when it is driven, so a burst queued
-    // inside one tick fills the ring long before anything empties it. The
-    // driver sends up to 128 datagrams a turn into four slots.
     io.stack().borrow_mut().device.block(true);
     let slots = SmoltcpMdnsConfig::default().packet_slots;
     for slot in 0..slots {
@@ -603,9 +558,6 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
          failure because a device spoke faster than its link could carry"
     );
 
-    // And the datagram that would not fit fits once the link takes frames
-    // again -- without the caller having polled, because a send that finds no
-    // room drains the ring itself before giving up.
     io.stack().borrow_mut().device.block(false);
     io.send(&datagram())
         .expect("the drain inside the send made room");
@@ -616,10 +568,6 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
 fn a_datagram_bigger_than_the_send_buffer_is_never_going_to_fit() {
     let bus = Bus::default();
     let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
-    // A device that shrank its buffers below what its own claims need. The
-    // documented cost of that is a dropped claim, and the only thing that
-    // makes it one is saying so differently from a ring that is merely full:
-    // the driver comes back for congestion, so this would be retried forever.
     let mut io = carrier_with(
         &bus,
         &[Ipv4Address::new(192, 168, 1, 1)],
@@ -642,8 +590,6 @@ fn a_datagram_bigger_than_the_send_buffer_is_never_going_to_fit() {
         "a buffer that could never hold it is not a buffer that is momentarily full"
     );
 
-    // And a drain says nothing new about it, which is the whole difference: an
-    // empty ring is exactly what a parked datagram would be waiting for.
     io.poll(1).expect("poll");
     assert_eq!(
         io.send(&datagram())
@@ -674,14 +620,11 @@ fn a_socket_with_no_packet_slots_is_permanently_unable_to_send() {
 
 #[test]
 fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
-    // One node: what it cannot send, nobody has to receive.
     let bus = Bus::default();
     let io = carrier_with(
         &bus,
         &[Ipv4Address::new(192, 168, 1, 1)],
         SmoltcpMdnsConfig {
-            // Smaller than any claim this host can encode, which is the
-            // shrunk-to-fit device the configuration invites.
             tx_payload_bytes: 32,
             enable_ipv6: false,
             ..SmoltcpMdnsConfig::default()
@@ -692,10 +635,6 @@ fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
     let mut driver = MdnsDriver::new(agent, io, &MdnsConfig::default());
     let addrs = vec![addr("/ip4/192.168.1.1/udp/4001/quic-v1")];
 
-    // The promise is a dropped claim, not a broken host: the driver keeps
-    // running and, once the link is quiet, has something to sleep on. A
-    // datagram parked as congestion instead would be handed back to the same
-    // buffer every turn and keep this at zero for good.
     for step in 0..200u64 {
         let now = step * STEP_MS;
         driver.tick(Now::from_millis(now), &addrs);
@@ -720,12 +659,8 @@ fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
 #[test]
 fn an_address_that_arrives_later_reaches_the_agent() {
     let bus = Bus::default();
-    // An interface with nothing on it yet, which is where a host that waits
-    // for DHCP or SLAAC starts.
     let mut io = carrier(&bus, &[]);
 
-    // Not an interface mDNS can speak on: no source to claim, and nothing
-    // on-link to accept.
     assert!(io.interfaces().is_empty());
     assert_eq!(
         io.send(&datagram())
@@ -735,7 +670,6 @@ fn an_address_that_arrives_later_reaches_the_agent() {
          and saying so is what makes it drop the packet instead of stopping"
     );
 
-    // The lease lands. Nothing tells mDNS about it but the next refresh.
     io.stack().borrow_mut().interface.update_ip_addrs(|addrs| {
         addrs
             .push(IpCidr::new(Ipv4Address::new(192, 168, 1, 5).into(), 24))
@@ -761,7 +695,6 @@ fn an_address_that_arrives_later_reaches_the_agent() {
         "and an interface that did not move is not a change"
     );
 
-    // A lease that expires is the same story backwards.
     io.stack()
         .borrow_mut()
         .interface
@@ -773,8 +706,6 @@ fn an_address_that_arrives_later_reaches_the_agent() {
         MdnsError::UnknownInterface { interface: IPV4 }
     );
 }
-
-// ------------------------------------------------- an ingress-driven host
 
 /// A host with no fixed step: it ticks mDNS only when its device has input
 /// or mDNS says something is due now. Anything this misses would sit until
@@ -839,8 +770,6 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     sender.poll(0).expect("sender joins");
     let (mut driver, stack, inbox, defer) = idle_receiver(&bus);
 
-    // Another user of the shared stack (a TCP provider, say) polls the
-    // interface on ingress first, moving the frame into mDNS's socket.
     sender.send(&datagram()).expect("queue");
     sender.poll(0).expect("put it on the bus");
     assert!(!inbox.borrow().is_empty());
@@ -864,8 +793,6 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     driver.tick(Now::from_millis(0), &[]);
     assert!(!carrier_owes(&driver, 0), "and that tick read it");
 
-    // A frame that lands between a tick's two carrier polls is taken in by
-    // the final one, after mDNS has stopped reading.
     sender.send(&datagram()).expect("queue");
     sender.poll(0).expect("put it on the bus");
     defer.set(1);
@@ -889,8 +816,6 @@ fn smoltcps_own_timers_are_reported_on_the_callers_timeline() {
     io.poll(0).expect("poll");
     bus.drain();
 
-    // Another user of the shared stack with a timer of its own: a TCP
-    // connect that nobody answers, so smoltcp owes it a retransmit.
     let stack = io.stack().clone();
     {
         let mut shared = stack.borrow_mut();
@@ -911,7 +836,6 @@ fn smoltcps_own_timers_are_reported_on_the_callers_timeline() {
             .expect("connect");
     }
 
-    // smoltcp says how long; the carrier says when, on the caller's clock.
     let now = Now::from_millis(1_000);
     io.poll(now.monotonic_ms).expect("poll");
     bus.drain();
@@ -926,6 +850,4 @@ fn smoltcps_own_timers_are_reported_on_the_callers_timeline() {
     };
     assert!(delay > 0);
     assert_eq!(io.next_deadline(now), Some(now.deadline_after(delay)));
-    // Saturation near the end of the caller's clock is pinned by the
-    // carrier's unit tests: smoltcp's own TCP timers overflow out there.
 }

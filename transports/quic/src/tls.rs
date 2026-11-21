@@ -257,7 +257,6 @@ impl ResolvesServerCert for AlpnResolver {
         if let Some(libp2p) = self.libp2p.as_ref().filter(|_| offers_libp2p) {
             return Some(Arc::clone(libp2p));
         }
-        // A writer that panicked left a whole certificate behind.
         let current = match self.webtransport.read() {
             Ok(current) => Arc::clone(&current),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
@@ -578,7 +577,6 @@ mod tests {
             expected: None,
             client_auth_mandatory: true,
         };
-        // Inside the vector's validity window (1975 to 4096).
         let now = UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000));
         let error = verifier
             .verify_client_cert(&CertificateDer::from(cert), &[], now)
@@ -602,8 +600,6 @@ mod tests {
         let mut server = listener.server_config().expect("server");
         server.cert_resolver = Arc::new(SingleCertAndKey::from(certified(cert, other_key)));
 
-        // The certificate itself is a valid libp2p certificate; only the
-        // handshake signature betrays that the peer does not hold its key.
         let result = handshake(dialer.client_config(None).expect("client"), server);
         assert!(
             matches!(&result, Err(rustls::Error::InvalidCertificate(error))
@@ -617,8 +613,6 @@ mod tests {
         let time = Arc::new(HostTime::default());
         let (dialer, _) = identity(&time);
         let (listener, _) = identity(&time);
-        // Generated certificates are valid for a hundred years from now; the
-        // system clock accepts them, a host two centuries ahead does not.
         time.set(Some(system_time().as_secs() + 200 * 365 * 24 * 60 * 60));
 
         let message = rejection(handshake(

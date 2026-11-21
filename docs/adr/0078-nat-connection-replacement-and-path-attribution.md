@@ -1,0 +1,9 @@
+# NatAgent connection replacement and path attribution
+
+When the swarm replaces a peer's connection (`NatAgent::connection_replaced`) or a connection is established late, the agent keeps path reporting and circuit ownership consistent:
+
+- **`old` is forgotten before machines see `new`.** `forget_connection(old)` runs before `connection_up(new)`, so a direct `old` cannot make a relayed `new` look redundant.
+- **A promoted circuit stays its promoter's.** If another attempt or an inbound circuit promoted `new`, other attempts do not adopt it (`new_owned`); adopting it would let them close it on cancel. A circuit no machine promoted that replaces an attempt's circuit carries that attempt's Relayed path on (`Attempt::circuit_claim`). Only the circuit an attempt itself promoted announces `Path::Relayed`; an adopted one continues the path already announced.
+- **A replacement is reported once.** A machine that took `new` reports it with its own event; otherwise a direct `new` retiring a relayed path is reported once, against whatever created that path (`PathLedger::replaced`).
+- **Work bound to `old` ends with it, waiting does not.** A DCUtR round whose exchange lived on `old` fails; HOP work on exactly that connection fails. Waiting for relay readiness is not bound to a connection: a replacement's `PeerReady` continues it, and a real loss is bounded by the relay deadline. When the promoted circuit closes, the bridge goes with it (`RelayLeg::Failed`, so a later relay-connection loss reports nothing); an open punch window may still land a direct connection, and its end fails the attempt otherwise.
+- **A dial whose attempt is gone is closed.** If a name resolution finishes after its attempt ended (`dial_started` with an unknown `ConnectId`), the agent closes the handshake so it cannot land later.

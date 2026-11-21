@@ -14,15 +14,6 @@ check | clippy | test | list) ;;
 *) usage ;;
 esac
 
-# name | package | default features | explicit features | test tier
-#
-# Every operation runs the `ci` rows by default, which PRs and pushes to main
-# test; `full` runs every row (CI lints them all, releases test them all), and
-# a row name runs just that row. The `ci` rows plus the workspace run already
-# list every test the full matrix does (1,975 distinct package/binary/test
-# identities), so the `release` rows only re-run those tests under other
-# feature combinations: a bug that needs one of those combinations at runtime
-# is caught at release time, not on PRs. `list` prints the rows as a table.
 matrix=$(cat <<'EOF'
 autonat|minip2p-rs|default|autonat|ci
 relay|minip2p-rs|default|relay|release

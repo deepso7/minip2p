@@ -58,8 +58,6 @@ fn wait_with_a_passed_instant_drives_a_connect_to_settlement() {
         .expect("bind dialer");
     let _listener = Driven::new(listener);
 
-    // A loop whose own timer has gone stale: every call gets a past
-    // deadline, yet each call must still drive the endpoint.
     let connect_id = dialer.connect(&listen_addr).expect("connect");
     let stale = past_instant();
     let give_up = std::time::Instant::now() + Duration::from_secs(10);
@@ -104,7 +102,6 @@ fn a_caller_clock_check_ends_a_fixed_deadline_loop_while_events_keep_arriving() 
     };
     let deadline = std::time::Instant::now() + Duration::from_millis(50);
     loop {
-        // The documented guard: `wait` serves events past the deadline.
         if std::time::Instant::now() >= deadline {
             break;
         }
@@ -115,7 +112,6 @@ fn a_caller_clock_check_ends_a_fixed_deadline_loop_while_events_keep_arriving() 
         ));
     }
     assert!(std::time::Instant::now() < deadline + Duration::from_secs(1));
-    // Without the guard, a steady stream keeps the loop going.
     arrive(&mut endpoint);
     assert!(matches!(
         endpoint.wait(deadline).expect("wait past deadline"),
@@ -133,8 +129,6 @@ fn a_pending_interrupt_is_reported_once_even_past_the_deadline() {
     endpoint.wait_handle().interrupt();
     endpoint.wait_handle().interrupt();
 
-    // A pending interrupt outranks an expired deadline, so a host's
-    // non-blocking pump still notices it; the two calls are one.
     assert!(matches!(
         endpoint.wait(past_instant()).expect("wait past deadline"),
         EndpointWaitOutcome::Interrupted
@@ -163,7 +157,6 @@ fn a_stream_of_wakes_does_not_hold_a_wait_past_its_deadline() {
             }
         })
     };
-    // The stream is flowing before the wait starts.
     while sent.load(std::sync::atomic::Ordering::Relaxed) < 100 {
         std::thread::yield_now();
     }
@@ -176,7 +169,6 @@ fn a_stream_of_wakes_does_not_hold_a_wait_past_its_deadline() {
         matches!(outcome, EndpointWaitOutcome::Deadline),
         "{outcome:?}"
     );
-    // The one drive every wait makes, plus at most one for a wake.
     assert!(batches <= 2, "ran {batches} batches past the deadline");
 }
 
@@ -436,8 +428,6 @@ fn capability_events_leave_once_in_endpoint_order() {
             detail: "test diagnostic".into(),
         }));
 
-    // A Peer-ID target with no route settles inside `connect`; its
-    // terminal must still follow the capability events already queued.
     let settled_id = endpoint
         .connect(Ed25519Keypair::generate().peer_id())
         .expect("admit route-less connect");
@@ -455,8 +445,6 @@ fn capability_events_leave_once_in_endpoint_order() {
             _ => None,
         })
         .collect();
-    // FellBackToRelay is an attempt terminal the engine reports as
-    // ConnectSettled; it is not repeated as a NAT event.
     assert_eq!(order, ["relay-server", "nat", "gossipsub", "settled"]);
 }
 

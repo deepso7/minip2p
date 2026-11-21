@@ -105,11 +105,7 @@ impl<T: Transport> Host<T> {
                 ..minip2p::GossipsubConfig::default()
             });
         }
-        // `force_relay` without a relay still submits the config, so the
-        // endpoint's validation refuses it rather than dropping the flag.
         if !relays.is_empty() || config.force_relay {
-            // A browser is never publicly reachable and cannot hole punch:
-            // it always reserves, and its relayed paths never upgrade.
             builder = builder.nat_config(NatConfig {
                 force_relay: config.force_relay,
                 dcutr: false,
@@ -120,8 +116,6 @@ impl<T: Transport> Host<T> {
         for relay in relays {
             builder = builder.relay(relay);
         }
-        // The binding acknowledges stream data as its reader consumes it
-        // (`stream_consumed`), not as the pump pulls the event.
         for protocol in config.protocols {
             builder = builder.manual_ack_protocol(protocol);
         }
@@ -173,7 +167,6 @@ impl<T: Transport> Host<T> {
             Ok(events) => {
                 let mut ring = false;
                 let mut events = events.into_iter().peekable();
-                // Each ingest takes a bounded batch, as the carry expects.
                 while events.peek().is_some() {
                     let batch: Vec<_> = events.by_ref().take(PUMP_DRAIN_LIMIT).collect();
                     let converted = batch.into_iter().filter_map(convert_endpoint_event);
@@ -357,8 +350,6 @@ impl<T: Transport> Host<T> {
             .at(now)
             .open_stream(&peer, &protocol_id)
             .map_err(map_driver_error)?;
-        // The binding knows this connection now, so the carry must not
-        // elide its events, its end above all.
         self.carry.mark_connection_seen(stream.conn_id().as_u64());
         Ok(stream.into())
     }
@@ -418,8 +409,6 @@ impl<T: Transport> Host<T> {
         else {
             return abandoned.map_err(map_driver_error);
         };
-        // After a reset this is moot, and a stream closed on a live
-        // connection is released by it.
         if dropped_data > 0 {
             match endpoint.stream_consumed(stream, dropped_data) {
                 Ok(()) | Err(_) => {}

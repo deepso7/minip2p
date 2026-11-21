@@ -112,8 +112,6 @@ fn a_one_packet_request_with_fin_is_delivered_without_further_traffic() {
     let mut server = listening_server(QuicLimits::default());
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
 
-    // Opening, data and FIN in one packet: the stream's first frame raises
-    // only `Opened` in the engine, so the adapter has to scan it at once.
     let raw = peer.open();
     peer.write(raw, b"request");
     peer.finish(raw);
@@ -141,7 +139,6 @@ fn a_one_packet_request_with_fin_is_delivered_without_further_traffic() {
         ]
     );
 
-    // Closing the local half then closes the stream.
     server.close_stream_write(id, stream).expect("close write");
     let events = server.poll(now()).expect("poll");
     assert_eq!(
@@ -159,7 +156,6 @@ fn a_fin_at_the_budget_boundary_surfaces_while_gated() {
     let (mut peer, _) = accept(&mut server, &mut [], |_| {});
     let raw = peer.open();
 
-    // Exactly one window and then FIN, never acknowledged.
     let mut finished = false;
     let payload = vec![7u8; stream_window()];
     let mut sent = 0;
@@ -231,10 +227,8 @@ fn an_exact_window_stays_gated_and_resumes_on_ack_without_a_packet() {
     let mut events = send_window(&mut server, &mut peer, raw, stream_window(), |events| {
         delivered(events, raw) == stream_window()
     });
-    // No FIN and nothing behind the window: the probe finds no data.
     assert!(server.connections[&id].is_gated(stream));
 
-    // More arrives behind the spent budget and stays in the engine.
     let start = Instant::now();
     let mut more = 0;
     while more < 10 {
@@ -255,7 +249,6 @@ fn an_exact_window_stays_gated_and_resumes_on_ack_without_a_packet() {
     assert_eq!(delivered(&events, raw), stream_window());
     assert!(server.connections[&id].is_gated(stream));
 
-    // The acknowledgement alone reads it: no packet, no engine event.
     server.ack_stream(id, stream, stream_window()).expect("ack");
     assert_eq!(stream_bytes(&server.pending_events, raw), [9u8; 10]);
     assert!(!server.connections[&id].is_gated(stream));
@@ -291,8 +284,6 @@ fn reset_and_stop_in_one_packet_report_the_stop_before_the_close() {
         events.extend(server.poll(now()).expect("poll"));
     }
     let stream_events = stream_events(&events, raw);
-    // The reset may or may not overtake the byte; the stop always comes
-    // first and nothing follows the close.
     assert_eq!(
         stream_events.first(),
         Some(&TransportEvent::IncomingStream {
@@ -402,7 +393,6 @@ fn a_peer_reset_releases_the_send_half_and_returns_stream_credit() {
         },
     );
     assert_eq!(server.connections[&id].pending_write_bytes(), 0);
-    // The engine reset its send half too, discarding what it buffered.
     await_peer_reset(&mut server, &mut peer);
 
     server.ack_stream(id, stream, 2).expect("settle");
@@ -438,7 +428,6 @@ fn a_stop_after_stream_closed_still_drops_its_queued_writes() {
     );
 
     peer.stop(raw, 3);
-    // Like `await_peer_reset`, but keeping every event the stop produces.
     let start = Instant::now();
     while peer.conn().stats().frame_rx.reset_stream == 0 {
         assert!(
@@ -489,10 +478,8 @@ fn stop_sending_resets_the_send_half_keeps_the_read_half_and_frees_the_slot() {
         },
     );
     assert_eq!(server.connections[&id].pending_write_bytes(), 0);
-    // RESET_STREAM reaches the peer, so the engine dropped its buffer.
     await_peer_reset(&mut server, &mut peer);
 
-    // The read half still works.
     peer.write(raw, b"more");
     peer.finish(raw);
     drive_until(
@@ -521,8 +508,6 @@ fn tiny_reads_are_copied_into_allocations_of_their_own_length() {
 
     let mut seen = 0;
     for round in 0..20u8 {
-        // Each write leaves in its own packet, a slice of a much larger
-        // receive buffer in the engine.
         peer.write(raw, &[round; 3]);
         peer.pump();
         std::thread::sleep(Duration::from_millis(2));
@@ -552,7 +537,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
         control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     });
-    // The peer grants no streams until told to.
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
         config.max_concurrent_bidi_streams(VarInt::from_u32(0));
     });
@@ -571,8 +555,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
     };
     assert_eq!(unsent, second_payload);
 
-    // Resetting the pending stream releases its queue now and wakes the
-    // other writer, with one StreamClosed.
     server.reset_stream(id, first).expect("reset pending");
     assert_eq!(server.connections[&id].pending_write_bytes(), 0);
     let mut events = server.poll(now()).expect("poll");
@@ -581,7 +563,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
         stream_id: second
     }));
 
-    // Its reservation holds until it opens, so the cap still counts it.
     let third = server.open_stream(id).expect("third");
     assert_eq!(server.connections[&id].local_slots_used(), 3);
     assert!(matches!(
@@ -614,7 +595,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
             finished[index] |= fin;
         }
     }
-    // Every stream bound to the id it was given.
     assert_eq!((first, second, third), (1.into(), 5.into(), 9.into()));
     assert_eq!(received[0], second_payload);
     assert_eq!(received[1], b"third");
@@ -716,7 +696,6 @@ fn keepalive_holds_a_live_idle_pair_and_a_dead_peer_still_times_out() {
         ..QuicLimits::default()
     });
 
-    // Several idle periods, both sides polled as their deadlines ask.
     let until = Instant::now() + Duration::from_millis(4 * IDLE_MS);
     while Instant::now() < until {
         for node in [&mut server, &mut client] {
@@ -731,7 +710,6 @@ fn keepalive_holds_a_live_idle_pair_and_a_dead_peer_still_times_out() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // The server goes silent; the client's keepalives go unanswered.
     let silent_from = Instant::now();
     let mut closed = false;
     while !closed {
@@ -761,7 +739,6 @@ fn idle_polls_service_no_connection_and_traffic_services_only_its_own() {
         let (peer, _) = accept(&mut server, &mut [], |_| {});
         peers.push(peer);
     }
-    // Let every handshake's trailing packets and acknowledgements settle.
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(10));
         for peer in &mut peers {
@@ -797,14 +774,12 @@ fn ending_a_write_side_reports_a_closing_connection_as_closed() {
     let live = client.open_stream(client_id).expect("open");
     let ended = client.open_stream(client_id).expect("open");
     client.close_stream_write(client_id, live).expect("close");
-    // Closing a write side twice is a real fault, not an ended target.
     assert!(matches!(
         client.close_stream_write(client_id, live),
         Err(TransportError::StreamCloseWriteFailed { .. })
     ));
 
     client.close(client_id).expect("close");
-    // A closing connection is terminal: its `Closed` reports the end.
     for result in [
         client.close_stream_write(client_id, ended),
         client.send_stream(client_id, ended, Bytes::from_static(b"late")),

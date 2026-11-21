@@ -43,20 +43,12 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
 }
 
 impl SwarmState {
-    // -----------------------------------------------------------------------
-    // Application-facing intents
-    // -----------------------------------------------------------------------
-
     /// Closes the connection to `peer_id`.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), SwarmError> {
         let conn_id = self.require_conn(peer_id)?;
         self.actions.push_back(Action::CloseConnection { conn_id });
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Connection / peer lookups (`SwarmCore` exposes these)
-    // -----------------------------------------------------------------------
 
     /// Returns the peers that have been surfaced to the application as connected.
     pub fn connected_peers(&self) -> Vec<PeerId> {
@@ -204,10 +196,6 @@ impl SwarmState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
-
     pub(super) fn require_conn(&self, peer_id: &PeerId) -> Result<ConnectionId, SwarmError> {
         self.peer_to_conn
             .get(peer_id)
@@ -345,8 +333,6 @@ impl SwarmState {
             if self.peer_to_conn.get(&peer_id) == Some(&conn_id) {
                 self.peer_to_conn.remove(&peer_id);
             }
-            // Placeholder peers from pre-identity Connected may already hold
-            // ping/identify state; drop only that non-established bookkeeping.
             self.discard_placeholder(&peer_id);
         }
         self.conn_to_remote_addr.remove(&conn_id);
@@ -380,7 +366,6 @@ impl SwarmState {
             if event.peer_id() != Some(peer_id) {
                 return true;
             }
-            // Dropped data is never delivered, so the state acknowledges it.
             if let SwarmEvent::StreamData {
                 conn_id,
                 stream_id,
@@ -412,7 +397,6 @@ impl SwarmState {
             IDENTIFY_PROTOCOL_ID,
             ProtocolKind::IdentifyInitiator,
         ) {
-            // An identity upgrade can find the connection ready already.
             Ok(()) if !self.ready_peers.contains(peer_id) => {
                 let deadline_ms = now_ms.saturating_add(self.timeouts.identify_ms);
                 self.first_identify
@@ -462,16 +446,10 @@ impl SwarmState {
         old: ConnectionId,
         now_ms: u64,
     ) -> Option<[u8; PING_PAYLOAD_LEN]> {
-        // The core feeds transport events before the tick of the same
-        // poll, so a ping already due here would otherwise miss its
-        // timeout. Only this peer's ping is timed out: another peer's reply
-        // may still be later in the batch.
         let overdue = self
             .pings
             .get(peer_id)
             .is_some_and(|attempt| attempt.deadline_ms <= now_ms);
-        // The in-flight payload lives in Ping's per-peer state; read it
-        // before that state is reset.
         let ping_intent = if overdue {
             self.pings.remove(peer_id);
             self.events.push_back(SwarmEvent::PingFailed {
@@ -580,8 +558,6 @@ impl SwarmState {
         if self.conn_to_peer.contains_key(&id) {
             return;
         }
-        // Last connection wins: a newer connection to the same peer replaces
-        // the existing one, unless it loses a connection race.
         let old = self
             .peer_to_conn
             .get(&peer_id)
@@ -591,7 +567,6 @@ impl SwarmState {
             self.reject_race_loser(id);
             return;
         }
-        // Read before retiring `old` drops its remote address.
         let old = old.map(|old| (old, self.connection_path(old)));
         let ping_intent =
             old.and_then(|(old, _)| self.retire_for_replacement(&peer_id, old, now_ms));
@@ -611,9 +586,6 @@ impl SwarmState {
             return;
         }
 
-        // An already connected peer is handed over exactly as on
-        // `Connected`: the upgraded connection is the newest and wins, unless
-        // it loses a connection race.
         let old = self
             .peer_to_conn
             .get(&new_peer_id)
@@ -625,19 +597,14 @@ impl SwarmState {
             self.reject_race_loser(conn_id);
             return;
         }
-        // Read before retiring `old` drops its remote address.
         let old = old.map(|old| (old, self.connection_path(old)));
         let ping_intent =
             old.and_then(|(old, _)| self.retire_for_replacement(&new_peer_id, old, now_ms));
 
         if let Some(stale) = existing {
-            // State gathered under the placeholder belongs to this
-            // connection, so it moves to the verified peer.
             self.peer_to_conn.remove(&stale);
             self.ping.migrate_peer(&stale, &new_peer_id);
             self.identify.migrate_peer(&stale, &new_peer_id);
-            // The ping attempt moves with the protocol state, before the
-            // drain looks for attempts that lost their stream.
             if let Some(attempt) = self.pings.remove(&stale) {
                 self.pings.insert(new_peer_id, attempt);
             }
@@ -670,10 +637,6 @@ impl SwarmState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: connection close
-    // -----------------------------------------------------------------------
-
     /// Ends a connection with at most one event: `DialFailed` for our
     /// pending dial, `ConnectionClosed` for an established connection, and
     /// otherwise -- a connection that failed before it ever established, such
@@ -684,7 +647,6 @@ impl SwarmState {
         conn_id: ConnectionId,
         reason: ConnectionCloseReason,
     ) {
-        // Our close after a failed first Identify says so.
         let reason = match self.first_identify.remove(&conn_id) {
             Some(FirstIdentify::Failed(cause)) if reason == ConnectionCloseReason::Local => {
                 ConnectionCloseReason::Error(format!("{cause}"))
@@ -705,8 +667,6 @@ impl SwarmState {
                 });
                 true
             }
-            // Whatever closed it unannounced already reported it, or needed
-            // no report.
             Some(ConnPhase::Closing) => true,
             None => false,
         };
@@ -726,9 +686,6 @@ impl SwarmState {
                 });
                 reported = true;
             } else {
-                // Connected-without-identity synthesizes a placeholder peer
-                // the application never saw established, so there is no
-                // ConnectionClosed for it.
                 self.discard_placeholder(&peer_id);
             }
         }
@@ -761,8 +718,6 @@ impl SwarmState {
             .retain(|(cid, _), _| *cid != conn_id);
         self.outbound_negotiators
             .retain(|(cid, _), _| *cid != conn_id);
-        // A queued open for the connection would only open a stream nobody
-        // owns.
         self.actions.retain(
             |action| !matches!(action, Action::OpenStream { conn_id: c, .. } if *c == conn_id),
         );

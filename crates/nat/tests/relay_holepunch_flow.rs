@@ -43,13 +43,8 @@ use minip2p_relay::{
 };
 use minip2p_test_support::{ConnectRequestOutcome, RelayEmulator, RelayEvent};
 
-// ---------------------------------------------------------------------------
-// The actual test
-// ---------------------------------------------------------------------------
-
 #[test]
 fn full_relay_plus_hole_punch_flow_succeeds() {
-    // Peer identities (PeerIds) for A and B.
     let peer_a_key = Ed25519Keypair::generate();
     let peer_b_key = Ed25519Keypair::generate();
     let peer_a = peer_a_key.peer_id();
@@ -57,11 +52,8 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
 
     let mut relay = RelayEmulator::new();
 
-    // ---- Step 1: B reserves on the relay ----------------------------------
-
     let mut b_reservation = HopReservation::new();
 
-    // B sends RESERVE. Relay stores reservation and responds with STATUS:OK.
     let reserve_bytes = reserve_flush(&mut b_reservation);
     assert!(
         relay
@@ -70,7 +62,6 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
             .is_empty()
     );
 
-    // B receives the relay's response on its HOP stream.
     let relay_to_b = relay.drain_hop_bytes_for(&peer_b);
     let reservation_outcome = reserve_feed(&mut b_reservation, relay_to_b);
     assert!(b_reservation.is_done());
@@ -83,15 +74,10 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         RelayEvent::ReservationStored { peer: peer_b }
     );
 
-    // ---- Step 2: A asks the relay to CONNECT it to B ----------------------
-
     let mut a_connect = HopConnect::new(peer_b.to_bytes()).unwrap();
 
-    // A sends HOP CONNECT(peer=B).
     let connect_bytes = connect_flush(&mut a_connect);
 
-    // The relay forwards a STOP CONNECT to B and remembers to send A a
-    // STATUS:OK once B acks.
     let mut initiator_inbox: Vec<u8> = Vec::new();
     let connect_request = relay
         .on_connect_request(&peer_a, &connect_bytes, &mut initiator_inbox)
@@ -103,18 +89,13 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     ));
     assert_eq!(initiator_inbox, Vec::<u8>::new(), "no refusal expected");
 
-    // ---- Step 3: B receives STOP CONNECT, accepts, relay bridges ---------
-
     let mut b_stop = StopResponder::new();
     let stop_to_b = relay.drain_stop_bytes_for(&peer_b);
     let b_stop_request = stop_feed(&mut b_stop, stop_to_b);
-    // The source peer id in the STOP CONNECT must be A.
     assert_eq!(b_stop_request.source_peer_id, peer_a.to_bytes());
 
-    // B accepts; outbound STATUS:OK goes back to the relay.
     let b_stop_ok = stop_accept_flush(&mut b_stop);
 
-    // Relay forwards the ack to A as HOP STATUS:OK.
     let ConnectRequestOutcome::Bridging { pending_id, .. } = connect_request else {
         unreachable!("CONNECT was checked as bridging above")
     };
@@ -123,7 +104,6 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         .unwrap();
     assert!(stop_trailing.is_empty());
 
-    // A receives the HOP STATUS:OK: the stream is now bridged.
     let connect_outcome = connect_feed(&mut a_connect, initiator_inbox);
     assert!(a_connect.is_done());
     assert!(matches!(
@@ -131,21 +111,15 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         minip2p_relay::ConnectOutcome::Bridged { .. }
     ));
 
-    // Sanity check: the relay recorded both the CONNECT bridge and the final
-    // STATUS:OK forward.
     assert!(relay.events.iter().any(
         |e| matches!(e, RelayEvent::ConnectBridgedBetween { initiator, target }
             if initiator == &peer_a && target == &peer_b)
     ));
     assert!(relay.events.contains(&RelayEvent::StatusOkSentToInitiator));
 
-    // ---- Step 4: Over the bridge, A (initiator) runs DCUtR ---------------
-
-    // Represent "the bridge" as two byte pipes between A and B.
     let mut a_to_b: VecDeque<u8> = VecDeque::new();
     let mut b_to_a: VecDeque<u8> = VecDeque::new();
 
-    // A advertises its observed addresses; B advertises its own.
     let a_observed: Vec<Multiaddr> =
         vec![Multiaddr::from_str("/ip4/203.0.113.1/udp/12345/quic-v1").unwrap()];
     let b_observed: Vec<Multiaddr> =
@@ -154,14 +128,11 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut dcutr_a = DcutrInitiator::new(&a_observed).unwrap();
     let mut dcutr_b = DcutrResponder::new(&b_observed).unwrap();
 
-    // A sends CONNECT over the bridge.
     push_bytes(&mut a_to_b, &dcutr_initiator_flush(&mut dcutr_a));
 
-    // B receives CONNECT, queues a reply, emits ConnectReceived event.
     let bytes = drain_pipe(&mut a_to_b);
     dcutr_responder_feed(&mut dcutr_b, bytes);
 
-    // B flushes its CONNECT reply toward A.
     push_bytes(&mut b_to_a, &dcutr_responder_flush(&mut dcutr_b));
 
     let events_b = dcutr_responder_events(&mut dcutr_b);
@@ -171,7 +142,6 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
             if *remote_addrs == a_observed
     ));
 
-    // A receives CONNECT reply, records remote addrs and RTT.
     let bytes = drain_pipe(&mut b_to_a);
     let simulated_rtt_ms = 42;
     let initiator_outcome = dcutr_initiator_feed(&mut dcutr_a, bytes, simulated_rtt_ms);
@@ -187,28 +157,15 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         }
     }
 
-    // A sends SYNC over the bridge and (in a real system) immediately dials
-    // B's observed addresses directly.
     push_bytes(&mut a_to_b, &dcutr_send_sync_flush(&mut dcutr_a));
     assert!(dcutr_a.is_done());
 
-    // B receives SYNC: in a real system it would now send random UDP to A's
-    // addresses after an RTT/2 delay.
     let bytes = drain_pipe(&mut a_to_b);
     dcutr_responder_feed(&mut dcutr_b, bytes);
     let events_b = dcutr_responder_events(&mut dcutr_b);
     assert_eq!(events_b.as_slice(), [ResponderEvent::SyncReceived]);
     assert!(dcutr_b.is_done());
-
-    // Both state machines are complete. A would now dial B directly on
-    // b_observed; B would open its NAT binding by sending random UDP to
-    // a_observed. That final step is out of scope for this in-memory test
-    // but is covered by the CLI example.
 }
-
-// ---------------------------------------------------------------------------
-// Additional focused scenarios
-// ---------------------------------------------------------------------------
 
 #[test]
 fn connect_refused_when_target_not_reserved() {
@@ -256,10 +213,6 @@ fn dcutr_rtt_is_reported_back_to_initiator() {
         InitiatorOutcome::DialNow { rtt_ms, .. } => assert_eq!(rtt_ms, 123),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Byte-pipe helpers
-// ---------------------------------------------------------------------------
 
 fn push_bytes(pipe: &mut VecDeque<u8>, bytes: &[u8]) {
     pipe.extend(bytes.iter().copied());
@@ -364,7 +317,6 @@ fn dcutr_responder_events(flow: &mut DcutrResponder) -> Vec<ResponderEvent> {
 /// path used in this integration test.
 #[test]
 fn dcutr_frame_decode_round_trips() {
-    // Just asserting the crate's own helpers are in scope and work here.
     use minip2p_nat::dcutr::{HolePunch, HolePunchType, encode_frame};
     let msg = HolePunch {
         kind: HolePunchType::Sync,

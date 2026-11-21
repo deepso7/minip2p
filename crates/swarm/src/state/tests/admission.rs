@@ -157,7 +157,6 @@ fn queued_reset_is_silent_and_acknowledges_discarded_bytes() {
         )
     );
     assert!(drain_events(&mut state).is_empty());
-    // A queued stream leaves the FIFO immediately, even while the cap is full.
     assert_eq!(
         state.inbound_order[LIMITED].iter().collect::<Vec<_>>(),
         [&(conn, c)]

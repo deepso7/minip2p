@@ -217,8 +217,6 @@ fn a_pumped_host_connects_rings_once_and_reports_its_deadline() {
         vec![peer(2).to_base58()]
     );
     assert!(a.is_peer_ready(peer(2).to_base58()).expect("ready"));
-    // Gossipsub's heartbeat keeps a timer, so an idle host still has a
-    // deadline; without pubsub nothing is due until I/O arrives.
     let idle = a.pump(Now::from_millis(40)).next_deadline;
     assert_eq!(idle.is_some(), cfg!(feature = "pubsub"), "{idle:?}");
 }
@@ -283,8 +281,6 @@ fn a_ping_and_a_stream_echo_cross_the_hosts() {
             .any(|event| matches!(event, P2pEvent::StreamRemoteWriteClosed { .. })),
         "{b_events:?}"
     );
-    // The binding acknowledges what its reader consumed: the bytes stay
-    // unacknowledged until then, so acknowledging more fails.
     assert!(matches!(
         b.stream_consumed(remote.0, remote.1, 3, Now::from_millis(80)),
         Err(FfiError::Transport { .. })
@@ -322,7 +318,6 @@ fn close_carries_endpoint_closed_last_and_stops_commands() {
         Err(FfiError::Stopped)
     ));
     assert!(a.pump(Now::from_millis(33)).next_deadline.is_none());
-    // A second close is a no-op.
     a.close(Now::from_millis(34));
     assert!(a.drain_events(LIMIT).is_empty());
 }
@@ -427,8 +422,6 @@ fn connected_breakable(
         a.drain_events(LIMIT);
         b.drain_events(LIMIT);
     }
-    // `b` is returned, not dropped: dropping an endpoint disconnects it,
-    // and these tests need a peer that stays connected but silent.
     (a, b, mode)
 }
 

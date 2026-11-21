@@ -1,0 +1,10 @@
+# Gossipsub agent: send queue, stream roles and backoff
+
+Decisions in `GossipsubAgent` (`minip2p-pubsub`, `gossipsub/agent.rs`) that a reader could otherwise "simplify":
+
+- **Subscriptions and control go in separate RPCs.** When a peer's sender has both pending subscription changes and control items, each frame carries one category only. Each acknowledgement then commits atomically to one kind of work (`FrameCommit`), at the cost of one extra write after a stream reopen; within a category the frame is still packed greedily to `MAX_RPC_SIZE`.
+- **Oversized control items never enter the buffer.** `control_item_fits` filters items (a hostile, nearly frame-sized message id) before `ControlBuffer::insert`, so `ControlBuffer::take_frame` returning `None` for a non-empty buffer is unreachable in practice rather than a case to handle.
+- **`PeerState::queued_work` counts in-flight control, not subscription resync.** Subscription resync is connection-scoped bookkeeping, not dropped application or control payload. Published messages stay at the queue front while in flight; only control moves into the commit record, so only it is added back.
+- **Stream roles decide what input means.** Data on our own outbound stream, or on an inbound stream we refused, is acknowledged and dropped. A close for a stale outbound stream (one the sender already moved past) does not touch the current sender. An inbound stream that closes mid-frame discards the unfinished frame and acknowledges its bytes, so the closed stream settles (ADR 0012). A write-stop on an inbound stream needs no action, since we never write to inbound streams.
+- **PRUNE backoff is recorded only for joined topics or live entries.** A PRUNE's backoff is stored when we are joined to the topic, or extends an existing entry (such as the one `unsubscribe` records, so a resubscribe still waits); otherwise a peer could grow the `backoff` map one topic at a time.
+- **Refusing a GRAFT during backoff re-arms our backoff for that peer**, so a peer that keeps grafting early keeps being refused.

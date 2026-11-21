@@ -257,8 +257,6 @@ fn connect_to(client: &mut Client, transport: &str, offered: Option<Vec<Multihas
     });
     responder.start().expect("start");
     let mut events = Vec::new();
-    // Message one, then message two back, then message three, each as far
-    // as the platform's in-flight cap lets it go per round.
     for _ in 0..20 {
         let io = client.io_mut();
         while !io.stream(noise).in_flight.is_empty() {
@@ -302,14 +300,11 @@ fn small_limits() -> WebTransportLimits {
 #[test]
 fn hash_free_dials_trust_the_platform_and_accept_any_server_certhashes() {
     let mut client = client(WebTransportLimits::default());
-    // A /dns name passes through untouched; the server lists a hash the
-    // dial never named.
     connect_to(
         &mut client,
         "/dns/relay.example/udp/443/quic-v1/webtransport",
         Some(certhashes()),
     );
-    // The server sends no Noise extensions at all.
     connect_to(
         &mut client,
         "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport",
@@ -341,7 +336,6 @@ fn grants_never_exceed_the_window_counting_outstanding_grants() {
 
     client.io_mut().deliver(handle, 600);
     poll(&mut client);
-    // 600 delivered and unacked, 400 still granted: nothing more to give.
     assert_eq!(client.io_mut().stream(handle).granted, 400);
     client.ack_stream(conn.id, stream, 100).expect("ack");
     assert_eq!(
@@ -403,7 +397,6 @@ fn stream_churn_without_acks_stays_within_the_stream_cap_times_the_window() {
     assert_eq!(incoming, 4, "refused streams have no event");
     assert_eq!(delivered(&events), 4 * 1_000);
 
-    // Closing one stream frees nothing until its bytes are acknowledged.
     let stream = StreamId::new(admitted[0].0);
     client.close_stream_write(conn.id, stream).expect("fin");
     assert!(fill_incoming(&mut client, conn.session, &mut events).is_none());
@@ -496,7 +489,6 @@ fn the_connection_cap_covers_bytes_in_flight_in_the_platform() {
     let mut client = client(small_limits());
     let conn = connect(&mut client);
     let streams: Vec<_> = (0..4).map(|_| open(&mut client, &conn)).collect();
-    // Application streams share 300 - 50 reserved = 250 bytes.
     let refused: Vec<usize> = streams
         .iter()
         .map(|(stream, _)| send(&mut client, &conn, *stream, 100))
@@ -508,7 +500,6 @@ fn the_connection_cap_covers_bytes_in_flight_in_the_platform() {
         .sum();
     assert_eq!(in_flight, 250, "every accepted byte is in the platform");
 
-    // One write completing frees the shared cap for both waiting streams.
     client.io_mut().complete(streams[0].1);
     let events = poll(&mut client);
     assert_eq!(writable(&events), [streams[2].0, streams[3].0]);
@@ -519,13 +510,11 @@ fn promoting_a_full_stream_to_control_wakes_it_into_the_reserve() {
     let mut client = client(small_limits());
     let conn = connect(&mut client);
     let streams: Vec<_> = (0..4).map(|_| open(&mut client, &conn).0).collect();
-    // Application streams fill their 250-byte share, so the fourth is Full.
     assert_eq!(send(&mut client, &conn, streams[0], 100), 0);
     assert_eq!(send(&mut client, &conn, streams[1], 100), 0);
     assert_eq!(send(&mut client, &conn, streams[2], 50), 0);
     assert_eq!(send(&mut client, &conn, streams[3], 1), 1);
 
-    // As a control stream it may use the 50-byte reserve.
     client.set_control_stream(conn.id, streams[3], true);
     assert_eq!(writable(&poll(&mut client)), [streams[3]]);
 }
@@ -541,11 +530,9 @@ fn interleaved_partial_completions_release_exactly_their_bytes() {
     assert_eq!(send(&mut client, &conn, b, 100), 0);
     assert_eq!(client.io_mut().in_flight(a_handle), 30, "70 wait in Rust");
 
-    // B's completion frees nothing of A's stream cap.
     client.io_mut().complete(b_handle);
     poll(&mut client);
     assert_eq!(send(&mut client, &conn, a, 1), 1);
-    // A's 30 bytes free exactly 30, and the next 30 move into flight.
     client.io_mut().complete(a_handle);
     poll(&mut client);
     assert_eq!(client.io_mut().in_flight(a_handle), 30);
@@ -586,7 +573,6 @@ fn late_callbacks_after_reset_or_close_are_ignored() {
     ];
     client.io_mut().events.extend(late.clone());
     assert!(poll(&mut client).is_empty());
-    // The reset freed A's bytes; the late completion freed nothing more.
     assert_eq!(send(&mut client, &conn, b, 100), 0);
     let (c, _) = open(&mut client, &conn);
     assert_eq!(send(&mut client, &conn, c, 100), 0);
@@ -687,7 +673,6 @@ fn a_peer_reset_resets_the_platform_stream_and_frees_its_writes() {
         stream: a_handle,
         code: 0,
     });
-    // Held for the grace a session end gets to arrive in.
     assert!(poll(&mut client).is_empty());
     assert_eq!(
         client.next_deadline(),
@@ -706,7 +691,6 @@ fn a_peer_reset_resets_the_platform_stream_and_frees_its_writes() {
         client.io_mut().stream(a_handle).reset,
         "our side is reset too"
     );
-    // A's 100 pending bytes are free again.
     let (b, _) = open(&mut client, &conn);
     let (c, _) = open(&mut client, &conn);
     assert_eq!(send(&mut client, &conn, b, 100), 0);
@@ -750,7 +734,6 @@ fn unpinned(payload: Bytes) -> bool {
 fn queued_tails_never_pin_more_than_twice_their_bytes() {
     let mut client = client(small_limits());
     let conn = connect(&mut client);
-    // The platform takes nothing: the accepted 100 bytes wait in Rust.
     client.io_mut().in_flight_cap = 0;
     let (a, _) = open(&mut client, &conn);
     let payload = Bytes::from(vec![1u8; 10_000]);
@@ -762,7 +745,6 @@ fn queued_tails_never_pin_more_than_twice_their_bytes() {
     drop(refused);
     assert!(unpinned(payload), "100 queued bytes pin 10 000");
 
-    // A tail the platform shrinks below half is copied out too.
     client.io_mut().in_flight_cap = 30;
     let (b, b_handle) = open(&mut client, &conn);
     let payload = Bytes::from(vec![2u8; 100]);
@@ -800,7 +782,6 @@ fn stop_sending_after_stream_closed_still_frees_in_flight_writes() {
         ]
     );
 
-    // The browser rejects the write in flight: no WriteCompleted follows.
     client.io_mut().events.push_back(IoEvent::StopSending {
         stream: a_handle,
         code: 0,
@@ -837,7 +818,6 @@ fn a_write_the_platform_refuses_fails_the_send() {
 #[test]
 fn a_noise_write_the_platform_later_refuses_fails_the_handshake() {
     let mut client = client(small_limits());
-    // Message one goes out in parts.
     client.io_mut().in_flight_cap = 10;
     let server = Ed25519Keypair::generate();
     let addr: PeerAddr = format!(
@@ -856,7 +836,6 @@ fn a_noise_write_the_platform_later_refuses_fails_the_handshake() {
     let noise = StreamHandle(client.io_mut().next);
     assert_eq!(client.io_mut().in_flight(noise), 10, "a partial write");
 
-    // The platform drops the Noise stream with the rest still queued.
     client.io_mut().stream(noise).refuse = true;
     client.io_mut().complete(noise);
     assert_eq!(
@@ -876,7 +855,6 @@ fn a_queued_write_the_platform_later_refuses_stops_the_write_side() {
     client.io_mut().in_flight_cap = 30;
     let (a, a_handle) = open(&mut client, &conn);
     assert_eq!(send(&mut client, &conn, a, 100), 0);
-    // 70 bytes wait in Rust; the platform then drops the stream.
     client.io_mut().stream(a_handle).refuse = true;
     client.io_mut().complete(a_handle);
     assert_eq!(
@@ -986,7 +964,6 @@ fn stop_sending_on_a_pending_noise_stream_fails_the_handshake() {
         [TransportEvent::Closed { id: got, reason: ConnectionCloseReason::Error(_) }] if *got == id
     ));
     assert_eq!(client.io_mut().closed_sessions, [session.0]);
-    // The queued tail went with the session: completions write nothing more.
     client.io_mut().complete(noise);
     assert_eq!(poll(&mut client), []);
     assert_eq!(client.io_mut().stream(noise).written.len(), 10);
@@ -1040,8 +1017,6 @@ fn a_reset_after_both_halves_closed_ends_the_wait_for_the_fin() {
             }
         ]
     );
-    // Both halves closed, nothing unacknowledged: the stream is retired,
-    // with its FIN still with the platform.
     assert!(client.has_pending_writes());
 
     client.io_mut().events.push_back(IoEvent::Reset {

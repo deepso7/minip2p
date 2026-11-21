@@ -255,7 +255,6 @@ impl WriteQueue {
         let data = self.admit(stream, data)?;
         let mut counted = data.len();
         let tail = match self.streams.get(&stream) {
-            // Nothing to queue, and nothing to charge.
             Some(_) if data.is_empty() => return Ok(()),
             Some(_) => data,
             None => match SendOutcome::from_send(send(data))? {
@@ -275,13 +274,9 @@ impl WriteQueue {
                 close_after: false,
             })
             .chunks;
-        // Small appends join the last chunk, so a slow reader's tiny writes
-        // cost their bytes, not one queue entry each.
         if let Some((last, last_counted)) = chunks.back_mut()
             && last.len() + tail.len() <= COALESCE_LIMIT
         {
-            // Grown in place while the queue owns the buffer alone, so a run
-            // of tiny appends is amortized, not a copy of the chunk each.
             let mut merged = match core::mem::take(last).try_into_mut() {
                 Ok(owned) => owned,
                 Err(shared) => BytesMut::from(&shared[..]),
@@ -449,8 +444,6 @@ impl WriteQueue {
                     *chunk = unsent;
                     return None;
                 }
-                // The stream is gone; its own terminal event says why, and
-                // aborts the queue after it.
                 Err(_) => {
                     self.failed.insert(stream);
                     return None;
@@ -461,8 +454,6 @@ impl WriteQueue {
         self.streams.remove(&stream);
         if close_after {
             self.wake.remove(&stream);
-            // A refused FIN means the stream already ended, which its own
-            // terminal event reports.
             match core.close_stream_write(&peer_id, stream.conn_id(), stream.stream_id(), now_ms) {
                 Ok(()) | Err(_) => {}
             }
@@ -503,7 +494,6 @@ mod tests {
         assert_eq!(queue.streams[&stream].chunks.len(), 1);
         assert_eq!(queue.held_bytes(), 4);
 
-        // A deferred close still refuses it.
         assert!(queue.defer_close(stream));
         assert!(matches!(
             queue.send(stream, peer_id, Bytes::new(), |_| panic!(

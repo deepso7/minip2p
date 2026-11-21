@@ -90,8 +90,6 @@ requireNamedExport(
   "Minip2p"
 );
 
-// The browser SDK runs in Node too: its manual entry, given the packaged
-// `.wasm`, builds a real endpoint.
 if (webManifest.dependencies?.["@minip2p/core"] !== coreManifest.version) {
   throw new Error(
     `installed @minip2p/web requires core ${webManifest.dependencies?.["@minip2p/core"] ?? "missing"}, but ${coreManifest.version} is installed`

@@ -96,7 +96,6 @@ fn break_first_identify(how: IdentifyBreak) -> (SwarmState, PeerId, ConnectionId
         IdentifyBreak::BadNegotiation => data(&mut core, b"\x05nope\n".to_vec()),
         IdentifyBreak::Malformed => {
             data(&mut core, accept);
-            // A header declaring a frame far beyond Identify's limit.
             let mut frame = Vec::new();
             minip2p_core::write_uvarint(u64::from(u32::MAX), &mut frame);
             data(&mut core, frame);
@@ -166,8 +165,6 @@ fn a_failed_first_identify_is_reported_and_closes_its_connection() {
         );
         assert_eq!(core.next_deadline(Now::from_millis(0)), None, "{how:?}");
 
-        // Nothing more until the transport reports the close, which names
-        // Identify; the peer never becomes ready.
         core.handle_tick(10 * IDENTIFY_TIMEOUT_MS);
         feed(
             &mut core,
@@ -196,7 +193,6 @@ fn a_failed_identify_blocks_a_late_reply_from_making_the_peer_ready() {
     let (mut core, peer, conn) = break_first_identify(IdentifyBreak::NegotiatedThenSilent);
     core.handle_tick(IDENTIFY_TIMEOUT_MS);
     drain_events(&mut core);
-    // The reply arrives before the transport closes the connection.
     let info = IdentifyMessage {
         protocol_version: None,
         agent_version: None,
@@ -232,8 +228,6 @@ fn a_ready_connection_survives_later_identify_failures() {
     identify_on(&mut core, conn, StreamId::new(1), &[]);
     assert_eq!(ready_conns(&drain_events(&mut core)), [conn]);
 
-    // Past the deadline, then a second Identify request the responder
-    // refuses: neither ends the ready connection.
     core.handle_tick(10 * IDENTIFY_TIMEOUT_MS);
     for stream in [StreamId::new(2), StreamId::new(4)] {
         feed(
@@ -275,5 +269,3 @@ fn a_ready_connection_survives_later_identify_failures() {
     );
     assert!(core.is_peer_ready(&peer));
 }
-
-// --- Every ping attempt ends in one ping event (#495) ---

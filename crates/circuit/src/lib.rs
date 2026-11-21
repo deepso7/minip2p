@@ -50,9 +50,6 @@ use minip2p_transport::{
 };
 use thiserror::Error;
 
-// A retired bridge suppresses late inner-transport events after the circuit's
-// public `Closed`. Keep this finite because a peer may never finish closing
-// its half of a gracefully closed bridge.
 const MAX_RETIRED_BRIDGES: usize = 1024;
 
 /// Which endpoint initiated the relayed connection.
@@ -347,16 +344,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             remote_peer: adoption.remote_peer,
             role: adoption.role,
             session,
-            // Copied, so a short prefix sliced from a larger allocation
-            // cannot keep that allocation alive while the bridge is Full.
             bridge_tail: (!adoption.unsent_prefix.is_empty()).then(|| {
                 let len = adoption.unsent_prefix.len();
                 (Bytes::copy_from_slice(&adoption.unsent_prefix), len)
             }),
         };
 
-        // Consume the sequence only here: an adoption that failed above
-        // (entropy, validation) must leave the id space untouched.
         let consumed = self.circuit_id_allocator.allocate();
         debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
 
@@ -377,8 +370,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             self.fail_circuit(id, teardown.0);
             return Ok(id);
         }
-        // Whoever read these bytes past the CONNECT response already
-        // acknowledged them on the bridge.
         if !adoption.pending_data.is_empty() {
             self.feed_bridge(key, adoption.pending_data);
         }
@@ -417,8 +408,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         };
         let result = self.with_circuit(id, |this, circuit| {
             let fed = circuit.session.handle_input(data.into());
-            // Pump either way: bytes the session queued before failing, and
-            // events it already produced, are the caller's regardless.
             let pumped = this.pump(circuit);
             fed.map_err(Teardown::from).and(pumped)
         });
@@ -517,9 +506,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             let id = circuit.id;
             let event = match output {
                 SessionOutput::Established { peer, .. } => {
-                    // The session leaves this policy to its host, and here the
-                    // host is this wrapper: a verified direct connection
-                    // outranks a relayed one, so the circuit loses.
                     if self
                         .direct_by_peer
                         .get(&peer)
@@ -626,8 +612,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let reset_result = self
             .inner
             .reset_stream(circuit.inner_conn, circuit.bridge_stream);
-        // The circuit is already retired. A failed bridge reset cannot revive
-        // it or replace the close below.
         match reset_result {
             Ok(()) | Err(_) => {}
         }
@@ -654,7 +638,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             })
             .collect();
         for circuit_id in losers {
-            // A direct connection outranks a relayed one: our own decision.
             self.fail_circuit(circuit_id, ConnectionCloseReason::Local);
         }
     }
@@ -675,8 +658,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         self.active_inner.remove(&id);
         self.remove_direct(id);
         let close_result = self.inner.close(id);
-        // The colliding connection is removed from circuit bookkeeping;
-        // cleanup failure must not hide the namespace violation.
         match close_result {
             Ok(()) | Err(_) => {}
         }
@@ -746,8 +727,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 if self.bridge_index.contains_key(&key) {
                     self.inject_bridge_data(id, stream_id, data);
                 } else if self.retired_bridges.contains(&key) {
-                    // A closed circuit's late bytes are discarded, which
-                    // consumes them.
                     self.ack_bridge(id, stream_id, data.len());
                 } else {
                     self.pending.push_back(TransportEvent::StreamData {
@@ -863,7 +842,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 id,
                 stream_id: stream,
             }),
-            // Temporary send pressure: retryable, never a fault.
             Err(SessionError::Yamux(YamuxError::Full { stream, unsent })) => {
                 Err(TransportError::Full {
                     id,
@@ -886,13 +864,9 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 acked,
                 unacked,
             }),
-            // Yamux refused the operation — a closed write side, an unknown
-            // substream — but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
-            // The session failed: a local reset of a peer-opened stream
-            // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_circuit(id, ConnectionCloseReason::Error(reason.clone()));
@@ -911,7 +885,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         let id = self.inner.dial(address)?;
         if id.is_circuit() {
             let close_result = self.inner.close(id);
-            // The dial is rejected regardless of best-effort inner cleanup.
             match close_result {
                 Ok(()) | Err(_) => {}
             }
@@ -974,8 +947,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                     reason,
                 })
             });
-        // Writable never follows the end of a write side, even one a Full
-        // queued before its call returned.
         self.pending
             .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
         result
@@ -989,7 +960,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
-        // Abandoning a stream of an ended circuit only settles it.
         if self.unsettled.abandon(id, stream_id) {
             return Ok(());
         }
@@ -1002,8 +972,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                     reason,
                 })
             });
-        // Writable never follows the end of a write side, even one a Full
-        // queued before its call returned.
         self.pending
             .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
         result
@@ -1019,7 +987,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.ack_stream(id, stream_id, bytes);
         }
         if !self.circuits.contains_key(&id) {
-            // An ended circuit's bytes are released without credit.
             return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
         self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
@@ -1029,8 +996,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.set_control_stream(id, stream_id, control);
         }
-        // Nothing returns to the caller, so a circuit the mark's flush fails
-        // is torn down with the failure as its close reason.
         if !self.circuits.contains_key(&id) {
             return;
         }
@@ -1053,8 +1018,6 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
         self.retire_bridge(key);
-        // A circuit still negotiating has no Yamux session to shut down, so
-        // `go_away` refuses and the bridge is reset instead.
         let announced = circuit.session.go_away(0).is_ok();
         let flushed = self.pump(&mut circuit).is_ok()
             && circuit.bridge_tail.is_none()
@@ -1069,13 +1032,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             let reset_result = self
                 .inner
                 .reset_stream(circuit.inner_conn, circuit.bridge_stream);
-            // The connection is closed even if best-effort bridge cleanup
-            // fails, so preserve the single `Closed` event below.
             match reset_result {
                 Ok(()) | Err(_) => {}
             }
         }
-        // Every write side ended with the connection.
         self.pending
             .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
         self.pending.push_back(TransportEvent::Closed {
@@ -1124,18 +1084,11 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
 
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
-            // Buffered circuit events are due regardless of what the host's
-            // clock reads, so this needs no retained time sample.
             return Some(Deadline::IMMEDIATE);
         }
         let mut deadline = self.inner.next_deadline();
         for circuit in self.circuits.values() {
             let session_deadline = circuit.session.next_deadline().or_else(|| {
-                // An externally injected bridge read can complete the upgrade
-                // while `Connected` is pending. The pending-event fast path
-                // then returns before `session.poll` gets a time sample, so
-                // keepalive is not armed yet. Wake once more immediately to
-                // stamp the newly established Yamux session.
                 circuit
                     .session
                     .is_established()

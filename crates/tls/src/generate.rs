@@ -92,28 +92,23 @@ pub(crate) fn build_certificate(
         TlsError::CertificateGeneration(format!("{e}"))
     }
 
-    // 1. Generate an ephemeral ECDSA P-256 signing key.
     let ephemeral_signing_key = SigningKey::generate_from_rng(rng);
     let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
 
-    // 2. Get the SubjectPublicKeyInfo DER of the ephemeral key.
     let spki_doc = ephemeral_verifying_key
         .to_public_key_der()
         .map_err(gen_err)?;
     let spki_der = spki_doc.as_bytes();
 
-    // 3. Sign "libp2p-tls-handshake:" || SPKI_DER with the Ed25519 host key.
     let mut sign_message = Vec::with_capacity(SIGNATURE_PREFIX.len() + spki_der.len());
     sign_message.extend_from_slice(SIGNATURE_PREFIX);
     sign_message.extend_from_slice(spki_der);
     let host_signature = keypair.sign(&sign_message);
 
-    // 4. Build the SignedKey extension value (DER-encoded ASN.1 SEQUENCE).
     let public_key_protobuf = keypair.public_key().encode_protobuf();
     let signed_key_der =
         encode_signed_key(&public_key_protobuf, &host_signature).map_err(gen_err)?;
 
-    // 5. Build the self-signed X.509 certificate.
     let serial_number = SerialNumber::new(&[0x49, 0x96, 0x02, 0xd2]).map_err(gen_err)?;
 
     let spki_owned =
@@ -135,7 +130,6 @@ pub(crate) fn build_certificate(
 
     let cert_der = cert.to_der().map_err(gen_err)?;
 
-    // 6. Encode the ephemeral private key as PKCS#8 DER.
     let key_doc = ephemeral_signing_key.to_pkcs8_der().map_err(gen_err)?;
 
     Ok((cert_der, key_doc.as_bytes().to_vec()))
@@ -155,13 +149,11 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
     let pk = OctetStringRef::new(public_key)?;
     let sig = OctetStringRef::new(signature)?;
 
-    // Calculate the total encoded length of the SEQUENCE contents.
     let pk_encoded_len = pk.encoded_len()?;
     let sig_encoded_len = sig.encoded_len()?;
     let content_len = (pk_encoded_len + sig_encoded_len)?;
 
     let mut buf = Vec::new();
-    // SEQUENCE tag + length (DER encoding)
     buf.push(0x30);
     #[expect(
         clippy::map_err_ignore,
@@ -179,7 +171,6 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
         buf.push((len_val & 0xff) as u8);
     }
 
-    // Encode the two OCTET STRINGs into the remaining space.
     let offset = buf.len();
     buf.resize(offset + len_val, 0);
     let mut writer = der::SliceWriter::new(
@@ -192,8 +183,6 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
 
     Ok(buf)
 }
-
-// -- Custom builder profile for libp2p certificates --
 
 /// Builder profile for libp2p TLS certificates.
 ///
@@ -220,8 +209,6 @@ impl x509_cert::builder::profile::BuilderProfile for Libp2pProfile {
         Ok(vec![])
     }
 }
-
-// -- Custom extension type for the libp2p Public Key Extension --
 
 /// Wrapper for the libp2p extension value.
 struct Libp2pExtension(Vec<u8>);

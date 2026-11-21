@@ -1,0 +1,10 @@
+# Relay HOP/STOP flows: framing faults, pipelined bridge bytes, and vouchers
+
+The sans-I/O circuit-relay v2 flows in `minip2p-relay` (`HopReservation`, `HopConnect`, `StopResponder` on the client side; `HopResponder`, `StopInitiator` on the server side) follow these rules:
+
+- **Framing faults reset; malformed messages get a status.** A bad length prefix or an oversized frame is unrecoverable and resets the stream, while a well-framed message that fails to decode (missing or unknown `type`, missing or invalid peer id) is answered with `MALFORMED_MESSAGE`. `HopResponder::on_data` and `StopInitiator::on_data` therefore carry the decode result out of the framer separately from the framing result.
+- **A declared length above `MAX_MESSAGE_SIZE` fails at once.** The flow fails with `FrameTooLarge` as soon as the header is read, rather than buffering while it waits for bytes that can never form a valid frame.
+- **Bytes after the final control frame belong to the bridge.** A relay (or source) may pipeline the first bridged bytes into the same read as the STATUS or STOP CONNECT frame, so on success `HopConnect` and `StopResponder` move whatever the framer still buffers into bridge data. A coalesced read can carry a maximal frame plus more than `MAX_MESSAGE_SIZE` of bridge bytes; the receive path must not fail the flow over the total buffered, only over a single frame's size.
+- **A failed flow never bridges.** Once a flow is done with an error or refusal, later input is ignored and never surfaces as bridge data.
+- **Oversized requests fail at construction.** `HopConnect::new` encodes the CONNECT frame up front and returns `MessageTooLarge` if the target peer id would push it past `MAX_MESSAGE_SIZE`, so the caller learns before any I/O.
+- **The relay server never emits reservation vouchers.** Vouchers are outside minip2p's relay server contract, so `HopResponder::accept_reservation` clears `Reservation::voucher` even if a host passes in a client-decoded `Reservation` that carried one.

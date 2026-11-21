@@ -142,7 +142,6 @@ mod tests {
             chain: dir.path().join("fullchain.pem"),
             key: dir.path().join("privkey.pem"),
         };
-        // Explicit times: a filesystem's mtime granularity can hide a rewrite.
         let write = |path: &Path, contents: &[u8], secs: u64| {
             std::fs::write(path, contents).unwrap();
             std::fs::File::options()

@@ -341,8 +341,6 @@ impl TcpProvider for VirtualProvider {
         net.next_handle += 1;
 
         let Some(target) = net.listeners.get(&addr.to_string()).copied() else {
-            // A refused connect is reported through `Closed`, not returned, so
-            // the transport exercises the same path a real one would.
             net.sockets.insert(client, (u64::MAX, 0));
             net.ready
                 .entry(self.node)
@@ -454,8 +452,6 @@ impl TcpProvider for VirtualProvider {
         {
             local.gone = true;
         }
-        // The provider owes nothing further for an aborted handle, so drop it
-        // from this node's roster before it can be polled again.
         if let Some(handles) = net.owned.get_mut(&self.node) {
             handles.retain(|handle| *handle != socket.get());
         }
@@ -495,8 +491,6 @@ impl TcpProvider for VirtualProvider {
                 let data: Vec<u8> = local.inbox.drain(..).collect();
                 events.push(TcpEvent::Received { socket, data });
             }
-            // Received before the FIN, and the FIN before the close: the peer's
-            // last bytes are still readable after it stops writing.
             if peer.write_closed && local.inbox.is_empty() && !local.reported_fin {
                 local.reported_fin = true;
                 events.push(TcpEvent::RemoteWriteClosed { socket });

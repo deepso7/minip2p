@@ -416,9 +416,6 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
     if let Some(mut agent) = relay_server {
         let core = &mut engine.core;
         minip2p_relay_server::RelayServerAgent::register_swarm_roles(core)?;
-        // Derived from the bound transport, not configured: a rejection is
-        // queued as `AddrsRejected` and drained with the first batch, like
-        // any later listener refresh.
         drop(
             agent.set_listener_addrs(crate::relay_server::concrete_relay_listener_addrs(
                 core.transport().local_addresses(),
@@ -434,7 +431,6 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
             core.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
             core.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
             core.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-            // As the agent itself decides: a forced relay never upgrades.
             if config.dcutr && !config.force_relay && platform.runs_dcutr {
                 core.add_protocol(minip2p_nat::DCUTR_PROTOCOL_ID)?;
             }
@@ -448,7 +444,6 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
             .map(|relay| (*relay.peer_id(), relay.transport().clone()))
             .collect();
         let jitter_seed = core.entropy_mut().next_u64()?;
-        // The driver seeds the agent's listen addresses on its first turn.
         let agent = minip2p_nat::NatAgent::new(*core.local_peer_id(), config);
         let driver = NatDriver::new(agent, relay_addrs, jitter_seed);
         #[cfg(feature = "relay")]
@@ -490,7 +485,6 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
             .subscribe(beacon.topic(), 0)
             .map_err(SetupError::Topic)?;
     }
-    // `mdns` builds the peer book without signed beacons.
     #[cfg(all(feature = "pubsub", feature = "_peer-book", not(feature = "discovery")))]
     let beacon = None;
     #[cfg(feature = "pubsub")]

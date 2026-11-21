@@ -58,7 +58,6 @@ fn a_stream_without_peer_credit_cannot_keep_other_streams_from_writable() {
     let stuck = server.open_stream(id).expect("stuck stream");
     let other = server.open_stream(id).expect("other stream");
 
-    // The peer never reads `stuck`, so it keeps its backlog for good.
     let payload = Bytes::from(vec![7; 9 * 1024 * 1024]);
     let taken = accepted(&payload, server.send_stream(id, stuck, payload.clone()));
     let stream_cap = QuicLimits::default().max_pending_bytes_per_stream;
@@ -71,7 +70,6 @@ fn a_stream_without_peer_credit_cannot_keep_other_streams_from_writable() {
         Err(TransportError::Full { .. })
     ));
 
-    // Reading `other` frees its share; `stuck` keeps holding its own.
     drive_reading(&mut server, &mut peer, &[other], "Writable", |events, _| {
         events.contains(&TransportEvent::StreamWritable {
             id,
@@ -83,8 +81,6 @@ fn a_stream_without_peer_credit_cannot_keep_other_streams_from_writable() {
 #[test]
 fn backlogged_streams_share_scarce_connection_credit() {
     let mut server = server_with_idle_timeout(30_000);
-    // Generous stream credit but a 4,000-byte connection window, so the
-    // two streams compete for every MAX_DATA the peer grants.
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
         config.receive_window(VarInt::from_u32(4_000));
     });
@@ -103,7 +99,6 @@ fn backlogged_streams_share_scarce_connection_credit() {
         "40,000 bytes delivered",
         |_, read| read.iter().sum::<usize>() >= 40_000,
     );
-    // Draining in a fixed order would hand every grant to one stream.
     assert!(
         read.iter().all(|&bytes| bytes >= 10_000),
         "both streams progress: {read:?}"
@@ -125,8 +120,6 @@ fn control_streams_write_through_the_reserve_when_application_streams_fill_the_q
     let control = streams[3];
     server.set_control_stream(id, control, true);
 
-    // The peer never reads, so once each takes its stream credit, the
-    // application streams fill everything but the reserve.
     let payload = Bytes::from(vec![7; 10_000]);
     for &stream in &streams[..3] {
         while accepted(&payload, server.send_stream(id, stream, payload.clone())) > 0 {}
@@ -157,8 +150,6 @@ fn a_full_control_stream_wakes_once_a_small_reserve_frees() {
         while accepted(&payload, server.send_stream(id, stream, payload.clone())) > 0 {}
     }
 
-    // Only the reserve is left. Once the engine takes the queued part, the
-    // reserve is free again, which must be enough to wake the stream.
     assert!(matches!(
         server.send_stream(id, control, Bytes::from(vec![1; 3_000])),
         Err(TransportError::Full { .. })

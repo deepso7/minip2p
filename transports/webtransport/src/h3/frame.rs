@@ -111,8 +111,6 @@ impl FrameDecoder {
                     let Some(session_id) = self.reader.read(input) else {
                         return Ok(None);
                     };
-                    // Nothing after this is framed; park in `Skip` so that a
-                    // stray `decode` call cannot misparse application data.
                     self.state = State::Skip {
                         remaining: u64::MAX,
                     };
@@ -122,22 +120,17 @@ impl FrameDecoder {
                     let Some(len) = self.reader.read(input) else {
                         return Ok(None);
                     };
-                    // Reported, not skipped, so callers can reject DATA
-                    // where RFC 9114 forbids it whatever its length.
                     if ty == frame_type::DATA && len == 0 {
                         self.state = State::Type;
                         return Ok(Some(Frame::Data(&[])));
                     }
                     self.state = self.start_payload(ty, len)?;
                 }
-                // Never zero: an empty DATA frame is reported from `Length`.
                 State::Data { remaining } => {
                     if input.is_empty() {
                         return Ok(None);
                     }
                     let chunk = take(input, remaining);
-                    // Leave the frame with its last chunk, so the decoder is
-                    // at a boundary as soon as that chunk is returned.
                     self.state = match remaining - chunk.len() as u64 {
                         0 => State::Type,
                         remaining => State::Data { remaining },
@@ -202,8 +195,6 @@ impl FrameDecoder {
                 Error::ExcessiveLoad
             });
         }
-        // The buffer grows with what arrives: a declared length alone
-        // reserves nothing.
         self.buf = Vec::new();
         Ok(State::Buffer { ty, len })
     }
@@ -343,10 +334,8 @@ mod tests {
     #[test]
     fn decodes_settings_headers_data_and_goaway() {
         let bytes = [
-            0x04, 0x04, 0x08, 0x01, 0x33, 0x01, // SETTINGS 0x08=1, 0x33=1
-            0x01, 0x03, 0x00, 0x00, 0xd9, // HEADERS :status 200
-            0x00, 0x02, 0xaa, 0xbb, // DATA
-            0x07, 0x01, 0x04, // GOAWAY 4
+            0x04, 0x04, 0x08, 0x01, 0x33, 0x01, 0x01, 0x03, 0x00, 0x00, 0xd9, 0x00, 0x02, 0xaa,
+            0xbb, 0x07, 0x01, 0x04,
         ];
         let mut decoder = FrameDecoder::new();
         let frames = decode_all(&mut decoder, &bytes).unwrap();
@@ -398,7 +387,6 @@ mod tests {
 
     #[test]
     fn unknown_frames_are_skipped_without_buffering() {
-        // A reserved (GREASE) type 0x21 with a 1 MiB length claim.
         let mut decoder = FrameDecoder::new();
         let mut header: &[u8] = &[0x21, 0x80, 0x10, 0x00, 0x00];
         assert_eq!(decoder.decode(&mut header), Ok(None));
@@ -440,7 +428,6 @@ mod tests {
 
     #[test]
     fn push_control_frames_are_reported_not_skipped() {
-        // CANCEL_PUSH 1, then MAX_PUSH_ID 2^14 (a two-byte varint).
         let mut decoder = FrameDecoder::new();
         assert_eq!(
             decode_all(
@@ -449,7 +436,6 @@ mod tests {
             ),
             Ok(alloc::vec![Frame::CancelPush(1), Frame::MaxPushId(1 << 14)])
         );
-        // A trailing byte after the push id is malformed.
         let mut decoder = FrameDecoder::new();
         assert_eq!(
             decode_all(&mut decoder, &[0x0d, 0x02, 0x01, 0x00]),
@@ -459,7 +445,6 @@ mod tests {
 
     #[test]
     fn oversized_frames_are_rejected_before_buffering() {
-        // HEADERS of 16 KiB + 1 and SETTINGS of 4 KiB + 1, payload never sent.
         let mut decoder = FrameDecoder::new();
         assert_eq!(
             decode_all(&mut decoder, &[0x01, 0x80, 0x00, 0x40, 0x01]),
@@ -509,7 +494,6 @@ mod tests {
         }
         assert_eq!(Settings::decode_payload(&[0x08]), Err(Error::Frame));
         assert_eq!(Settings::decode_payload(&[0x08, 0x40]), Err(Error::Frame));
-        // GOAWAY with trailing bytes is malformed.
         let mut decoder = FrameDecoder::new();
         assert_eq!(
             decode_all(&mut decoder, &[0x07, 0x02, 0x04, 0x00]),
@@ -529,9 +513,7 @@ mod tests {
         assert_eq!(
             out,
             [
-                0x04, 0x0f, // SETTINGS, 15 bytes
-                0xab, 0x60, 0x37, 0x42, 0x00, // ENABLE_WEBTRANSPORT = 0
-                0x6b, 0x61, 0xd0, 0, 0, 0, 0, 0, 0, 0, // WT_INITIAL_MAX_DATA = 2^60
+                0x04, 0x0f, 0xab, 0x60, 0x37, 0x42, 0x00, 0x6b, 0x61, 0xd0, 0, 0, 0, 0, 0, 0, 0,
             ]
         );
         let mut decoder = FrameDecoder::new();

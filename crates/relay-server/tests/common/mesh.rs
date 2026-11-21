@@ -170,7 +170,6 @@ impl Mesh {
             .enumerate()
             .map(|(i, config)| {
                 let mut node = mesh_node(i, config);
-                // Disjoint stream ids, so both ends of a link can open.
                 node.swarm.next_stream = i as u64 * 100_000;
                 node
             })
@@ -188,8 +187,6 @@ impl Mesh {
             }
         }
         mesh.pump(at(0));
-        // A clean start: every member verified and up, and each whose
-        // directory arrived synced empty.
         for (i, node) in mesh.nodes.iter_mut().enumerate() {
             let events = node.events();
             let others = (0..count).filter(|&j| j != i);
@@ -381,7 +378,6 @@ impl Mesh {
         node.establish(client, stream.conn_id);
         node.hop_ready(client, stream, now);
         node.data(client, stream, &frame(reserve_request()), now);
-        // A CONNECT waiting on it can be answered in the same step.
         let events = node.events();
         assert!(
             matches!(
@@ -391,8 +387,6 @@ impl Mesh {
             "{events:?}"
         );
         self.pump(now);
-        // Only the RESERVE exchange is dropped; a waiting CONNECT's answer
-        // stays for the test to read.
         self.client_calls[i].retain(|call| match call {
             Call::Send { stream: on, .. }
             | Call::Close { stream: on, .. }
@@ -434,7 +428,6 @@ impl Mesh {
         self.nodes[i].stop_ready(client, stop, now);
         self.nodes[i].stop_status(client, stop, status, now);
         self.pump(now);
-        // The STOP exchange is not what callers check.
         self.calls(i);
         stop
     }

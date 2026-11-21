@@ -357,7 +357,6 @@ mod tests {
             .protocol(PROTOCOL)
             .into_identify_config();
         assert!(identify.protocols.iter().any(|p| p == PROTOCOL));
-        // Built-ins stay advertised alongside the user protocol.
         assert!(identify.protocols.iter().any(|p| p == IDENTIFY_PROTOCOL_ID));
         assert!(identify.protocols.iter().any(|p| p == PING_PROTOCOL_ID));
     }
@@ -422,8 +421,6 @@ mod tests {
             .build(NoopTransport)
             .expect("user protocol id is not reserved");
 
-        // A registered protocol fails with NotConnected (no such peer), not
-        // ProtocolNotRegistered -- proving registration reached the core.
         let peer_id = Ed25519Keypair::generate().peer_id();
         assert!(matches!(
             swarm.open_stream(&peer_id, PROTOCOL),

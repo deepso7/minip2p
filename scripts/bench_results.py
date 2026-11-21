@@ -16,7 +16,6 @@ SCHEMA_VERSION = 1
 TIERS = ("rust-micro", "rust-wall", "node-ffi")
 
 
-# Fixed registry: every row's metric must be listed here. Any tier may use any metric.
 METRICS = {
     "Ir",
     "median_ns",
@@ -33,12 +32,6 @@ METRICS = {
     "rtt_us_p50",
     "rtt_us_p99",
 }
-# Changed/notable thresholds (%) of the deterministic metrics, all lower is
-# better: instruction counts, and allocations of isolated agent operations
-# with fixed inputs (`router_allocs` asserts two runs agree). A
-# comparison labels only these rows; every other metric (wall clock,
-# throughput, latency, allocations over real transports) is informational,
-# since code-identical runs on the bench instance move it by tens of percent.
 BANDS = {
     "Ir": (1.0, 2.0),
     "allocs_per_msg": (1.0, 2.0),
@@ -89,9 +82,6 @@ GUNGRAUN_NAMES = {
     },
 }
 EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
-# Rows a bench measures itself (for example throughput or allocations), keyed by
-# (tier, name, metric). Each such bench writes a JSON array of rows into the
-# `custom` collector's root; list every row it emits here.
 EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
     *{
         ("rust-wall", f"endpoint_idle/{variant}", metric)
@@ -330,7 +320,6 @@ def reachable_lock(lock: bytes, seeds: set[str]) -> set[tuple]:
     for package in packages:
         by_name.setdefault(package["name"], []).append(package)
 
-    # A dependency is written `name`, `name version` or `name version (source)`.
     def resolve(reference: str) -> dict[str, Any]:
         name, _, rest = reference.partition(" ")
         version, _, source = rest.partition(" ")
@@ -374,7 +363,6 @@ def ir_pins_note(base_source: Path, head_source: Path) -> str | None:
             raise BenchError(f"cannot read {path}") from error
 
     try:
-        # The head's IR benches: the base may not have a new one yet.
         seeds = ir_seeds(read(head_source, "bench/targets"))
         if reachable_lock(read(base_source, "Cargo.lock"), seeds) != reachable_lock(read(head_source, "Cargo.lock"), seeds):
             return "`Cargo.lock` differs between base and head for the IR benches"
@@ -396,8 +384,6 @@ class ComparedRow:
     base: float | int | None
     head: float | int | None
     delta: float | None
-    # `notable`, `changed` or `negligible` for a banded row; `informational`
-    # for every other row both sides have; `new` or `removed` otherwise.
     classification: str
     direction: str = ""
 
@@ -424,7 +410,6 @@ def compare_rows(base: dict[str, Any], head: dict[str, Any]) -> list[ComparedRow
             continue
         direction = "regressed" if new > old else "improved"
         changed, notable = thresholds
-        # A zero base has no percentage; any change from it is notable.
         magnitude = abs(delta) if delta is not None else 0.0 if new == old else math.inf
         classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "negligible"
         compared.append(ComparedRow(*key, old, new, delta, classification, "" if classification == "negligible" else direction))

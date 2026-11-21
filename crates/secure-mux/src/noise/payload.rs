@@ -194,8 +194,6 @@ mod tests {
 
     #[test]
     fn extensions_encode_matches_libp2p_proto_bytes() {
-        // message NoiseExtensions { repeated bytes webtransport_certhashes = 1;
-        //                           repeated string stream_muxers = 2; }
         let extensions = NoiseExtensions {
             webtransport_certhashes: alloc::vec![Multihash::wrap(0x12, &[0xab; 32]).unwrap()],
             stream_muxers: alloc::vec!["/yamux/1.0.0".into()],
@@ -210,7 +208,6 @@ mod tests {
 
     #[test]
     fn extensions_decode_skips_unknown_fields_and_rejects_bad_multihashes() {
-        // Field 3 (varint) is unknown and skipped.
         assert_eq!(
             NoiseExtensions::decode(&[0x18, 0x01]),
             Ok(NoiseExtensions::default())
@@ -257,7 +254,6 @@ mod tests {
         let key = Ed25519Keypair::from_secret_key_bytes([3; 32]).public_key();
         let encoded = NoiseHandshakePayload::new(key, [7; 64], None).encode();
 
-        // Field 0 (varint and LEN), then field 2^29, each ahead of a valid payload.
         let cases: [(&[u8], u64); 3] = [
             (&[0x00, 0x00], 0),
             (&[0x02, 0x00], 0),

@@ -229,8 +229,6 @@ impl P2pEndpoint {
             .tcp_config(limits.tcp)
             .circuit_limits(limits.circuit)
             .write_budget(crate::BINDING_WRITE_BUDGET);
-        // The binding acknowledges stream data as its reader consumes it
-        // (`stream_consumed`), not as this driver pulls the event.
         for protocol in config.protocols {
             builder = builder.manual_ack_protocol(protocol);
         }
@@ -240,12 +238,6 @@ impl P2pEndpoint {
                 .manual_ack_protocol(protocol);
         }
 
-        // Endpoint setup picks the NAT defaults from the relays and AutoNAT
-        // servers alone. A base config carries only what has no setter:
-        // `force_relay`, and `max_circuits`, which only relays use.
-        // `force_relay` without a relay still submits it, so setup refuses it
-        // rather than dropping the flag. Without a relay there is nothing to
-        // reserve on.
         let custom_circuits = limits.max_circuits != NatConfig::default().max_circuits;
         if config.force_relay || (custom_circuits && !relays.is_empty()) {
             let reservation_policy = if relays.is_empty() {
@@ -445,8 +437,6 @@ impl P2pEndpoint {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         match state.lifecycle {
-            // Only a stop from `Created` releases the endpoint here; a
-            // running driver releases it on exit.
             Lifecycle::Created(_) => self.shared.finish_stop(state),
             Lifecycle::Running(_) => self
                 .shared
@@ -471,8 +461,6 @@ impl P2pEndpoint {
         if is_stopped(*self.shared.lock_stopped()) {
             return true;
         }
-        // A zero timeout is a pure poll: skip the thread-identity check, which
-        // interrupts the driver and takes `state`, since there's nothing to wait on.
         if timeout.is_zero() {
             return false;
         }
@@ -485,8 +473,6 @@ impl P2pEndpoint {
                 return false;
             }
         }
-        // Sleeps on the stopped latch rather than on `state`: an idle driver
-        // holds `state` until something is due, which could be never.
         let mut stopped = self.shared.lock_stopped();
         loop {
             if is_stopped(*stopped) {
@@ -582,8 +568,6 @@ impl P2pEndpoint {
             let stream = endpoint
                 .open_stream(&peer, &protocol_id)
                 .map_err(map_driver_error)?;
-            // The binding knows this connection now, so the carry must not
-            // elide its events, its end above all.
             self.shared
                 .lock_events()
                 .carry
@@ -652,13 +636,8 @@ impl P2pEndpoint {
     pub fn abandon_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
         let (raw_conn, raw_stream) = (conn_id, stream_id);
         let stream = stream_key(conn_id, stream_id);
-        // The Endpoint drops a held tail only once it accepts the request,
-        // so a rejected call (a stale connection id) cannot lose a pending
-        // write.
         self.with_endpoint_mut(|endpoint| {
             let abandoned = endpoint.abandon_stream(stream);
-            // The events lock is released at the end of this statement,
-            // before `stream_consumed` drives the Endpoint again.
             let dropped = self.shared.lock_events().carry.abandon_stream(
                 raw_conn,
                 raw_stream,
@@ -667,8 +646,6 @@ impl P2pEndpoint {
             let Some(dropped_data) = dropped else {
                 return abandoned.map_err(map_driver_error);
             };
-            // After a reset or a settlement this is moot, and a stream
-            // closed on a live connection is released by it.
             if dropped_data > 0 {
                 match endpoint.stream_consumed(stream, dropped_data) {
                     Ok(()) | Err(_) => {}
@@ -840,7 +817,6 @@ impl P2pEndpoint {
             Arc<dyn EventDoorbell>,
         ) -> std::io::Result<std::thread::ThreadId>,
     ) -> Result<(), FfiError> {
-        // A second `start` finds the driver parked on the lock.
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         state.lifecycle = match std::mem::replace(&mut state.lifecycle, Lifecycle::Stopped) {
@@ -855,7 +831,6 @@ impl P2pEndpoint {
             }
         };
 
-        // The driver parks on `state` until this returns.
         match spawn(Arc::clone(&self.shared), doorbell) {
             Ok(doorbell_thread_id) => {
                 state.doorbell_thread_id = Some(doorbell_thread_id);
@@ -1035,13 +1010,9 @@ impl<'a> PendingCommand<'a> {
 
 impl Drop for PendingCommand<'_> {
     fn drop(&mut self) {
-        // SeqCst pairs with `wait_for_commands`: either the driver sees this
-        // decrement before waiting, or this sees it waiting and notifies.
         if self.shared.pending_commands.fetch_sub(1, Ordering::SeqCst) == 1
             && self.shared.driver_waiting.load(Ordering::SeqCst)
         {
-            // Taken so the notify cannot fall between the driver's check
-            // and its wait.
             let _idle = self
                 .shared
                 .commands_idle
@@ -1084,9 +1055,6 @@ fn map_bind_error(error: BindError) -> FfiError {
         | BindError::MdnsSocket(_)
         | BindError::ReadinessPoll { .. } => FfiError::Transport { detail },
         BindError::Invariant { .. } => FfiError::Internal { detail },
-        // Bind errors of capabilities this binding does not enable (the
-        // relay server), and variants added later: an unmapped construction
-        // path, not a caller mistake.
         _ => FfiError::Internal { detail },
     }
 }
@@ -1111,8 +1079,6 @@ fn map_options_error(error: EndpointOptionsError) -> FfiError {
             capability: ConfigCapability::Options,
             detail,
         },
-        // Options of capabilities this binding does not enable (relay-server
-        // announce addresses), and options added later.
         _ => FfiError::InvalidConfig {
             capability: ConfigCapability::Options,
             detail,

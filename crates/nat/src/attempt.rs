@@ -218,7 +218,6 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
-        // Transport input can arrive before the tick that expires a budget.
         self.dcutr = Some(DcutrExchange {
             conn,
             stream,
@@ -235,8 +234,6 @@ impl ConnectAttempt {
                 reason: "the remote started the next round".into(),
             });
         }
-        // `accepts_dcutr` checked the round cap and the spent-budget check
-        // above the overall deadline, so the round begins.
         if let Some(budget) = self.budget.as_mut() {
             budget.begin_round(now.monotonic_ms);
         }
@@ -302,8 +299,6 @@ impl ConnectAttempt {
                     );
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
-                    // The exchange is done; only the punch window bounds
-                    // the rest of the round.
                     if let Some(budget) = self.budget.as_mut() {
                         budget.end_exchange();
                     }
@@ -360,8 +355,6 @@ impl ConnectAttempt {
             budget.end_exchange();
         }
         self.punch_deadline = None;
-        // Punch dials left from this round must not land as a late
-        // `Punched` path while the next round runs.
         shared.abort_attempt_dials(self.id, &self.peer, swarm);
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
@@ -465,10 +458,6 @@ impl ConnectAttempt {
         self.done = true;
     }
 
-    // -----------------------------------------------------------------------
-    // Inputs routed from the agent
-    // -----------------------------------------------------------------------
-
     /// What this attempt claims about the establishing circuit `conn_id`:
     /// that it is the one the attempt promoted, Relayed through its relay.
     pub(crate) fn circuit_claim(&self, conn_id: ConnectionId) -> Option<Claim> {
@@ -507,8 +496,6 @@ impl ConnectAttempt {
             return false;
         };
         if let Path::Relayed { .. } = attribution.path {
-            // Only the circuit this attempt promoted announces its path; an
-            // adopted one carries on the path already announced.
             if self.promoted != Some(conn_id) {
                 return false;
             }
@@ -543,7 +530,6 @@ impl ConnectAttempt {
                     new_conn_id: conn_id,
                 });
             }
-            // A second direct connection replacing the first — nothing new.
             Some(_) => return false,
         }
         self.punch_deadline = None;
@@ -581,7 +567,6 @@ impl ConnectAttempt {
         if self.done || *peer != self.peer || self.promoted != Some(old) {
             return;
         }
-        // `old` retires with the swarm; there is nothing left to close.
         self.promoted = (!new_owned).then_some(new);
         if !new_owned && let Some((_, path_conn)) = self.best.as_mut() {
             *path_conn = new;
@@ -590,7 +575,6 @@ impl ConnectAttempt {
             let reason = "another attempt's circuit took over the peer's connection".into();
             self.settle_relayed(UpgradeStop::Aborted { reason }, swarm, shared, now);
         } else if self.dcutr.is_some() {
-            // The round's exchange lived on `old`.
             self.fail_round("DCUtR circuit was replaced".into(), swarm, shared, now);
         }
     }
@@ -609,16 +593,11 @@ impl ConnectAttempt {
         if self.promoted == Some(conn_id) {
             let error = NatError::DialFailed("promoted circuit closed".into());
             if self.best.is_none() {
-                // The circuit closed before it carried a path.
                 self.fail_bridge(error, swarm, shared, now);
                 return;
             }
             self.promoted = None;
-            // The bridge went with the circuit: a later loss of the relay
-            // connection has nothing left to report.
             self.leg = RelayLeg::Failed;
-            // An open punch window may still land a direct connection; its
-            // end fails the attempt otherwise.
             if self.punch_deadline.is_some() {
                 self.last_error = Some(error);
                 return;
@@ -629,17 +608,11 @@ impl ConnectAttempt {
         if !self.is_relay_peer(peer) {
             return;
         }
-        // Only work on exactly this connection ends. Waiting for relay
-        // readiness is not bound to a connection: a replacement's
-        // `PeerReady` continues it, and a real loss is bounded by the relay
-        // deadline.
         match self.leg {
             RelayLeg::WaitHopReady { conn, stream, .. }
             | RelayLeg::AwaitHopStatus { conn, stream, .. }
                 if conn == conn_id =>
             {
-                // The owning connection is terminal: release local state
-                // without a reset.
                 shared.release_stream(conn, stream);
                 self.leg = RelayLeg::Failed;
                 self.fail_relay_leg(
@@ -684,7 +657,6 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
-        // The start deadline runs until the target's first round.
         let waiting = !self.done
             && &self.peer == peer
             && self.promoted == Some(conn)
@@ -736,16 +708,8 @@ impl ConnectAttempt {
             return;
         };
         if acquire::can_become_ready(relay.peer_id(), swarm, shared, now) {
-            // The shared connection landed anyway, or an earlier-woken
-            // waiter already re-dialed; keep waiting on that.
             return;
         }
-        // The entry gets the full dial-flight lifetime even when this leg's
-        // own deadline is nearer: it models the handshake in flight, not
-        // the attempt's patience. A connection landing after the leg gives
-        // up still lifts the gate (`ConnectionEstablished` clears the
-        // peer's entries), whereas a shorter lifetime would re-open the
-        // duplicate-dial window while the handshake is still under way.
         let deadline_ms = shared.config.relay_timeout_ms;
         let purpose = DialPurpose::Relay(self.id, relay.clone());
         if let Err(reason) = shared.session_dial(swarm, purpose, relay, now, deadline_ms) {
@@ -766,10 +730,6 @@ impl ConnectAttempt {
         if self.done {
             return;
         }
-        // A dial failure matters only while the leg waits on it: once
-        // another connection to the relay landed (`PeerReady` or the
-        // address deadline decides from there), or the leg moved on, the
-        // failure is stale.
         match purpose {
             DialPurpose::Relay(_, dialed)
                 if matches!(self.leg, RelayLeg::WaitRelayReady)
@@ -778,9 +738,6 @@ impl ConnectAttempt {
             {
                 self.fail_relay_leg(NatError::DialFailed(reason), swarm, shared, now);
             }
-            // An earlier address of the current relay gave up after the
-            // leg moved on to this one, which was waiting on that dial:
-            // dial this address now that nothing is in flight.
             DialPurpose::Relay(_, dialed) if self.is_relay_peer(dialed.peer_id()) => {
                 self.redrive_relay_leg(swarm, shared, now);
             }
@@ -820,7 +777,6 @@ impl ConnectAttempt {
                             self.leg = RelayLeg::WaitHopReady { conn, stream, hop };
                         }
                         Err(error) => {
-                            // Nothing will speak on the opened stream.
                             reset(swarm, &relay_peer, conn, stream, now);
                             return Err(NatError::Protocol(error.to_string()));
                         }
@@ -853,8 +809,6 @@ impl ConnectAttempt {
         if self.done {
             return;
         }
-        // A bridged stream was released to the circuit transport at
-        // promotion, so only HOP streams still route here.
         match (&self.leg, input) {
             (RelayLeg::WaitHopReady { stream: s, .. }, StreamInput::Ready) if *s == stream => {
                 self.flush_hop_connect(swarm, shared, now);
@@ -869,10 +823,6 @@ impl ConnectAttempt {
                 | RelayLeg::AwaitHopStatus { stream: s, .. },
                 StreamInput::RemoteWriteClosed,
             ) if *s == stream => {
-                // A remote half-close still permits local protocol writes.
-                // Let the sans-I/O machine consume it rather than treating
-                // it as a full circuit teardown; it may have a complete
-                // frame buffered already.
                 self.on_hop_input(HopConnect::on_remote_write_closed, swarm, shared, now);
             }
             (_, StreamInput::Closed) => {
@@ -899,16 +849,8 @@ impl ConnectAttempt {
             self.on_relay_timeout(deadline, swarm, shared, now);
         }
 
-        // A shared dial the leg was waiting on can vanish without a result
-        // when its owner stalls: the entry expires exactly at the owner's
-        // own flight deadline, so a tick is guaranteed to run then — this
-        // re-drive is what keeps a stalled owner from stranding the leg.
         self.redrive_relay_leg(swarm, shared, now);
 
-        // A budget that ran out keeps the Relayed path; the one that ran out
-        // first names why. It is checked before the punch window, so a
-        // window the upgrade budget cut short is not reported as a failed
-        // round.
         if self.settle_if_budget_spent(swarm, shared, now) {
             return;
         }
@@ -933,7 +875,6 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) -> bool {
-        // Only while the circuit still carries the Relayed path.
         if self.done || self.promoted.is_none() {
             return false;
         }
@@ -960,7 +901,6 @@ impl ConnectAttempt {
         let stage = match self.leg {
             RelayLeg::WaitHopReady { .. } => RelayStage::HopNegotiation,
             RelayLeg::AwaitHopStatus { .. } => RelayStage::HopStatus,
-            // Adopted, its circuit still handshaking (or its bridge lost).
             _ if self.handshaking() => RelayStage::CircuitHandshake,
             _ => RelayStage::RelayDial,
         };
@@ -971,8 +911,6 @@ impl ConnectAttempt {
             budget_ms: deadline.saturating_sub(self.relay_started_at),
         };
         if self.handshaking() {
-            // The circuit never finished its handshake: close it and move
-            // on like any other bridge failure.
             if let Some(conn_id) = self.promoted.take() {
                 shared.push_action(NatAction::CloseCircuit { conn_id });
             }
@@ -981,10 +919,6 @@ impl ConnectAttempt {
             self.fail_relay_leg(error, swarm, shared, now);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Relay leg
-    // -----------------------------------------------------------------------
 
     /// Starts on the next untried relay entry. A relay reached for the first
     /// time gets [`NatConfig::relay_timeout_ms`](crate::NatConfig::relay_timeout_ms)
@@ -1014,9 +948,6 @@ impl ConnectAttempt {
             self.relay_started_at = now.monotonic_ms;
             self.relay = Some(relay.clone());
 
-            // Connected, or another machine (reservation, probe) is already
-            // dialing this relay: the acquisition waits for `PeerReady` on that
-            // connection instead of dialing again.
             let purpose = DialPurpose::Relay(self.id, relay.clone());
             let deadline_ms = shared.config.relay_timeout_ms;
             let result = acquire::start(
@@ -1028,8 +959,6 @@ impl ConnectAttempt {
                 shared,
                 now,
             );
-            // A relay refused at once never started a route: it reports
-            // `RelayFailed` only, like a refused direct candidate.
             let Err(error) = self.take_acquired(result, swarm, shared, now) else {
                 shared.push_event(NatEvent::RelayStarted {
                     connect_id: self.id,
@@ -1108,8 +1037,6 @@ impl ConnectAttempt {
                 return;
             }
         };
-        // Secure-mux bytes coalesced behind STATUS:OK follow the `Bridged`
-        // outcome; they go to the circuit transport with the bridge.
         let mut pending_data = Vec::new();
         for output in &outputs {
             if let HopConnectOutput::BridgeData(bytes) = output {
@@ -1159,7 +1086,6 @@ impl ConnectAttempt {
         let Some(relay) = self.relay_peer().cloned() else {
             return;
         };
-        // The relay's budget stays armed through the circuit handshake.
         shared.release_stream(conn, stream);
         self.leg = RelayLeg::Bridged { conn };
         let handoff = BridgeHandoff {
@@ -1175,8 +1101,6 @@ impl ConnectAttempt {
         match swarm.promote_bridge(handoff, now.monotonic_ms) {
             Ok(conn_id) => self.promoted = Some(conn_id),
             Err(PromoteError::PeerAlreadyDirect) => {
-                // The peer is direct already; the relay has nothing left to
-                // time out.
                 self.leg = RelayLeg::Failed;
                 self.relay_deadline = None;
             }
@@ -1191,7 +1115,6 @@ impl ConnectAttempt {
             let Ok(peer_addr) = PeerAddr::new(addr.clone(), self.peer) else {
                 continue;
             };
-            // A refused punch dial just does not race; the window decides.
             let _refused = shared.start_dial(swarm, DialPurpose::Punch(self.id), &peer_addr);
         }
     }
@@ -1349,7 +1272,6 @@ impl ConnectAttempt {
     fn teardown_relay_leg(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         shared.abort_attempt_dials(self.id, &self.peer, swarm);
         self.teardown_dcutr_stream(swarm, shared, now);
-        // A bridged stream already belongs to the circuit transport.
         if let RelayLeg::WaitHopReady { conn, stream, .. }
         | RelayLeg::AwaitHopStatus { conn, stream, .. } = self.leg
         {
@@ -1407,7 +1329,6 @@ fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<Peer
         if order.iter().any(|seen| seen.peer_id() == relay.peer_id()) {
             continue;
         }
-        // Keep a relay's addresses together so it is tried as one run.
         for entry in ordered.iter().filter(|e| e.peer_id() == relay.peer_id()) {
             if !order.contains(entry) {
                 order.push_back((*entry).clone());

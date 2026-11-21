@@ -134,8 +134,6 @@ impl<T: Transport, E: EntropySource> RelaySwarm for SwarmCore<T, E> {
 
     fn ack_stream(&mut self, stream: StreamKey, bytes: usize) {
         match SwarmCore::ack_stream(self, stream.conn_id, stream.stream_id, bytes) {
-            // A stream or connection that is gone (or torn down by this
-            // ack's flush) released its bytes with it.
             Ok(())
             | Err(DriverError::Transport(
                 TransportError::StreamNotFound { .. }
@@ -143,8 +141,6 @@ impl<T: Transport, E: EntropySource> RelaySwarm for SwarmCore<T, E> {
                 | TransportError::ConnectionClosed { .. }
                 | TransportError::PollError { .. },
             )) => {}
-            // Anything else (an ack past what was delivered, say) breaks the
-            // agent's accounting.
             Err(error) => debug_assert!(false, "relay ack refused: {error}"),
         }
     }
@@ -171,7 +167,6 @@ impl<T: Transport, E: EntropySource> RelaySwarm for SwarmCore<T, E> {
         now_ms: u64,
     ) -> Result<(), RelaySwarmError> {
         match SwarmCore::reset_stream(self, peer, stream.conn_id, stream.stream_id, now_ms) {
-            // A stream that is gone (or whose connection is) is already reset.
             Ok(()) | Err(DriverError::Swarm(SwarmError::StreamNotFound { .. })) => Ok(()),
             Err(error) => Err(error.into()),
         }

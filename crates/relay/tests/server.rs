@@ -24,8 +24,6 @@ fn decode_hop_frame(frame: &[u8]) -> HopMessage {
 
 #[test]
 fn decoder_preserves_an_unknown_status_value() {
-    // Hop STATUS (type=2), status=777. This literal is independent of the
-    // encoder so an accidental proto3-default mapping cannot satisfy it.
     let decoded = HopMessage::decode(&[0x08, 0x02, 0x28, 0x89, 0x06]).unwrap();
 
     assert_eq!(decoded.status, Some(Status::Unknown(777)));
@@ -496,7 +494,6 @@ fn hop_reservation_acceptance_carries_metadata_then_closes_write() {
 fn hop_semantic_errors_receive_status_while_bad_framing_resets() {
     let cases = [
         (
-            // CONNECT with no peer field.
             hop_frame(HopMessage {
                 kind: HopMessageType::Connect,
                 peer: None,
@@ -507,7 +504,6 @@ fn hop_semantic_errors_receive_status_while_bad_framing_resets() {
             Status::MalformedMessage,
         ),
         (
-            // CONNECT with a present but invalid peer id.
             hop_frame(HopMessage {
                 kind: HopMessageType::Connect,
                 peer: Some(Peer {
@@ -520,16 +516,8 @@ fn hop_semantic_errors_receive_status_while_bad_framing_resets() {
             }),
             Status::MalformedMessage,
         ),
-        (
-            // A well-framed body with an absent type field.
-            encode_frame(&[]),
-            Status::MalformedMessage,
-        ),
-        (
-            // A well-framed body with type=99.
-            encode_frame(&[0x08, 99]),
-            Status::MalformedMessage,
-        ),
+        (encode_frame(&[]), Status::MalformedMessage),
+        (encode_frame(&[0x08, 99]), Status::MalformedMessage),
     ];
 
     for (input, expected) in cases {
@@ -575,8 +563,6 @@ fn hop_responder_accepts_fragmented_and_exact_limit_frames() {
         Some(HopResponderOutput::Request(HopRequest::Reserve))
     );
 
-    // RESERVE plus an unknown length-delimited field fills an exact 8 KiB
-    // protobuf body without relying on the decoder under test for the size.
     let mut body = vec![0x08, 0x00, 0x4a, 0xfb, 0x3f];
     body.resize(MAX_MESSAGE_SIZE, 0xab);
     assert_eq!(body.len(), 8192);
@@ -997,7 +983,6 @@ fn stop_initiator_accepts_fragmented_and_exact_limit_responses() {
         Some(StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted))
     );
 
-    // STOP STATUS:OK plus one unknown field fills an exact 8 KiB body.
     let mut body = vec![0x08, 0x01, 0x20, 0x64, 0x4a, 0xf9, 0x3f];
     body.resize(MAX_MESSAGE_SIZE, 0xcd);
     let mut exact = StopInitiator::new(peer(), None);

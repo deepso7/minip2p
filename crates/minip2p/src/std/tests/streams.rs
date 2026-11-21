@@ -33,7 +33,6 @@ fn abandoning_a_closed_stream_acks_data_left_in_the_endpoint_queue() {
             break stream;
         }
     };
-    // The reader closes first, so the writer's FIN closes the stream.
     reader.close_stream_write(stream).expect("reader close");
     loop {
         assert!(std::time::Instant::now() < give_up, "reader FIN lost");
@@ -53,10 +52,6 @@ fn abandoning_a_closed_stream_acks_data_left_in_the_endpoint_queue() {
     writer.close_stream_write(out_stream).expect("writer close");
     writer.next_event(tick).expect("flush writer");
 
-    // Stage what a `wait` cut short leaves behind: the batch's data and
-    // its close still in the Endpoint queue, the close already gone from
-    // the swarm. Data and FIN may arrive separately, so pull until the
-    // close.
     loop {
         assert!(std::time::Instant::now() < give_up, "stream never closed");
         writer.next_event(tick).expect("drive writer");
@@ -83,8 +78,6 @@ fn abandoning_a_closed_stream_acks_data_left_in_the_endpoint_queue() {
     }
 
     reader.abandon_stream(stream).expect("abandon");
-    // Its three bytes were acknowledged, so the stream settled and an
-    // over-acknowledgement is a no-op rather than `AckExceedsDelivered`.
     reader.stream_consumed(stream, 4).expect("stream settled");
 }
 
@@ -126,8 +119,6 @@ fn a_half_close_forgets_a_bare_writer_waiting_on_writable() {
         .try_send_stream(stream, vec![0; 16 * 1024 * 1024])
         .expect("try send");
     assert!(!outcome.is_accepted(), "past the stream's send window");
-    // Nothing is queued, so the FIN goes out now and no Writable follows
-    // to clear the waiting writer's marker.
     writer.close_stream_write(stream).expect("close write");
     assert!(!writer.is_write_pending(stream));
     assert!(writer.engine.writes.wake.is_empty());

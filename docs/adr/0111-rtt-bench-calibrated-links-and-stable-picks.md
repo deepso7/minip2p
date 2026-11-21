@@ -1,0 +1,12 @@
+# RTT bench: calibrated links and stable window picks
+
+`endpoint_rtt` (in `crates/minip2p/benches/`) measures bulk throughput over an emulated link (the `support::delay` proxy) and picks the smallest flow-control window that reaches a cutoff. Its numbers are only worth comparing when the link behaved as configured and the pick is not noise, so:
+
+- **Transfer size scales with the link.** The default total is 2.5 s or 25 round trips at the link rate, whichever is longer, so a long RTT's slow start and credit ramp stay a small share of the measured time.
+- **Sweep order rotates every run**, so drift over a sweep does not always land on the same candidate windows.
+- **The candidates either side of the cutoff get as many runs again, interleaved**, and since extra runs can move the cutoff, `pick` is re-run until both sides of wherever it lands have them. A pick is reported as ambiguous when its own runs dip below the cutoff or the next smaller candidate's runs reach it.
+- **Calibration is checked per sample** (`calibration_problems`), not on a sweep-wide median, so one point measured on a slower link cannot hide. A PR-mode row whose link failed calibration is still emitted, so the results pipeline keeps its shape, with an `INVALID` warning next to it.
+- **Loss is counted between two quiet points.** Pings are switched off and the link quiesced before each snapshot, so nothing in flight at either snapshot is miscounted; a ping still outstanding when the next is due is ignored rather than failing the run.
+- **In-flight cap from the windows.** The sender may run ahead of the sink by at least twice the windows the point configures (stream windows cap what an unlimited connection window admits), so the bench measures the stack, not the harness's throttle.
+- **The proxy treats socket trouble as loss for calibration to report.** Growing its receive buffer is best effort (a host cap shows up as loss), and a refused `send_to` (nothing listening yet) is loss, not a reason to stop. The TCP forwarder has a 10 s write timeout so a far end that stopped reading cannot keep a drop waiting forever, and it shuts its write side only once everything before the end of stream was delivered.
+- **`endpoint_idle` never silently drops a variant.** A variant it cannot run (no IPv6 loopback) prints why and emits no rows; the results collector requires every variant's rows, so the run still fails loudly.

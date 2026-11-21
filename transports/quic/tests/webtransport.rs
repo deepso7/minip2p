@@ -172,7 +172,6 @@ fn a_client_connects_and_both_ends_agree_who_and_which_connection() {
     assert!(server_end.peer_id().is_some());
     assert!(server_end.token().is_some());
     assert_eq!(server_end.token(), client_end.token());
-    // The client's address is a WebTransport one, without a certhash.
     let port = client_end
         .transport()
         .protocols()
@@ -224,7 +223,6 @@ fn echo_with(options: Options) {
         incoming_stream(&seen.server).is_some_and(|s| remote_closed(&seen.server, s))
     });
     let inbound = incoming_stream(&seen.server).expect("incoming");
-    // The prefix is the server's own: only the caller's bytes arrive.
     assert_eq!(stream_bytes(&seen.server, inbound), b"hello");
     server.ack_stream(server_conn, inbound, 5).expect("ack");
 
@@ -316,8 +314,6 @@ fn failed_dial_on(
 
 #[test]
 fn a_dialed_certhash_the_server_does_not_list_fails_the_client() {
-    // The certificate verifies against the real hash; Noise then lacks the
-    // second one.
     let reason = failed_dial(|addr| {
         let (mut transport, peer) = addr.into_parts();
         transport.push(Protocol::Certhash(minip2p_tls::webtransport::certhash(
@@ -410,14 +406,12 @@ fn local_addresses_report_the_bound_shapes_and_relisten_ignores_certhashes() {
     assert_eq!(addrs.len(), 2, "{addrs:?}");
     assert!(addrs[0].is_quic_transport());
     assert!(addrs[1].is_webtransport());
-    // The current and the next period's certificates.
     assert_eq!(addrs[1].certhashes().count(), 2);
     assert_eq!(
         addrs[1].without_certhashes().protocols()[..3],
         addrs[0].protocols()[..]
     );
 
-    // Re-listening matches the socket whatever certhashes the address has.
     assert_eq!(transport.listen(&addrs[1]), Ok(addrs[1].clone()));
     let mut stale = addrs[1].without_certhashes();
     stale.push(Protocol::Certhash(minip2p_tls::webtransport::certhash(
@@ -538,7 +532,6 @@ fn a_server_close_keeps_quic_open_for_the_closing_phase() {
         "QUIC closed {:?} after a local close",
         start.elapsed()
     );
-    // The client ended the session well before that.
     assert_eq!(
         closed(&seen.client),
         Some(ConnectionCloseReason::Remote { code: 0 })
@@ -559,8 +552,6 @@ fn a_client_close_is_orderly_on_the_server() {
         Some(ConnectionCloseReason::Remote { code: 0 })
     );
     assert!(!has_error(&seen.server));
-    // Our FIN reaches the client before QUIC closes: the close in the same
-    // service would otherwise discard it.
     let events = wire.events();
     let ended = events
         .iter()
@@ -582,8 +573,6 @@ fn a_new_browser_stream_during_closing_is_refused_without_events() {
     let (client_conn, _) = connected(&seen.client).expect("client connected");
     let before = seen.server.len();
 
-    // The stream leaves the client before the server closes, and reaches
-    // the server only once it is closing.
     let stream = client.open_stream(client_conn).expect("open");
     client
         .send_stream(client_conn, stream, Bytes::from_static(b"too late"))
@@ -598,7 +587,6 @@ fn a_new_browser_stream_during_closing_is_refused_without_events() {
         .filter(|event| !matches!(event, TransportEvent::Closed { .. }))
         .collect();
     assert!(after.is_empty(), "{after:?}");
-    // It was refused, not ignored.
     assert!(
         wire.events()
             .contains(&WireEvent::StopSending { code: wt_zero() }),
@@ -756,7 +744,6 @@ fn a_period_boundary_rotates_the_certificate_and_keeps_live_connections() {
         advertised(&server),
         [certhash_of(&key, k), certhash_of(&key, k + 1)]
     );
-    // The boundary is the transport's next deadline.
     let before = server_now(Some(boundary - 5));
     let deadline = server.next_deadline().expect("a rotation deadline");
     assert!(deadline <= before.deadline_after(5_000), "{deadline:?}");
@@ -782,11 +769,9 @@ fn a_period_boundary_rotates_the_certificate_and_keeps_live_connections() {
         listening(&seen.server),
         [webtransport_addr(&server).transport().clone()]
     );
-    // Only once.
     let later = server.poll(server_now(Some(boundary + 1))).expect("poll");
     assert!(listening(&later).is_empty(), "{later:?}");
 
-    // The live connection still carries streams.
     let stream = live.open_stream(client_conn).expect("open");
     live.send_stream(client_conn, stream, Bytes::from_static(b"after"))
         .expect("send");
@@ -798,7 +783,6 @@ fn a_period_boundary_rotates_the_certificate_and_keeps_live_connections() {
         |seen| incoming_stream(&seen.server).is_some(),
     );
 
-    // An address from the previous period still dials.
     let mut late = client(Options::default());
     let mut late_seen = Seen {
         server_unix: Some(boundary + 1),
@@ -820,8 +804,6 @@ fn clock_jumps_and_restarts_yield_the_current_periods_hashes() {
     let k = 2_000;
     let mut server = server_at(&key, k * webtransport::PERIOD_SECS + 10);
 
-    // Forward across several periods, then back: straight to the clock's
-    // period, announced once.
     for period in [k + 5, k + 2] {
         let unix = period * webtransport::PERIOD_SECS + 100;
         let events = server.poll(server_now(Some(unix))).expect("poll");
@@ -830,7 +812,6 @@ fn clock_jumps_and_restarts_yield_the_current_periods_hashes() {
         assert_eq!(listening(&events).len(), 1, "{events:?}");
     }
 
-    // A restart exactly at a boundary matches a node that kept running.
     let boundary = (k + 3) * webtransport::PERIOD_SECS;
     server.poll(server_now(Some(boundary))).expect("poll");
     let restarted = server_at(&key, boundary);
@@ -895,8 +876,6 @@ fn a_ca_signed_certificate_serves_webpki_clients_and_libp2p_keeps_its_own() {
     let (_, client_end) = connect(&mut server, &mut client, &mut seen);
     assert_eq!(client_end.peer_id(), Some(&server.local_peer_id()));
 
-    // A libp2p peer on the same socket verifies the libp2p certificate,
-    // which the CA-signed one is not.
     let mut peer = QuicTransport::bind(
         QuicNodeConfig::generate(),
         &["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
@@ -962,7 +941,6 @@ fn a_provided_certificate_never_rotates() {
     server.poll(server_now(Some(boundary - 5))).expect("poll");
     let addrs = server.local_addresses();
     let revision = server.local_addresses_revision();
-    // Idle with no connections: nothing is due, so no rotation either.
     assert_eq!(server.next_deadline(), None);
 
     for unix in [boundary, boundary + 365 * 24 * 60 * 60] {
@@ -1019,7 +997,6 @@ fn a_replaced_certificate_serves_new_handshakes_and_keeps_live_connections() {
     assert_eq!(webtransport_addr(&server), addr);
     assert_eq!(server.local_addresses_revision(), revision);
 
-    // The live connection still carries streams, and no address changed.
     seen.server.clear();
     let stream = live.open_stream(live_conn).expect("open");
     live.send_stream(live_conn, stream, Bytes::from_static(b"after"))
@@ -1033,17 +1010,12 @@ fn a_replaced_certificate_serves_new_handshakes_and_keeps_live_connections() {
     );
     assert!(listening(&seen.server).is_empty(), "{:?}", seen.server);
 
-    // New handshakes present the new leaf and Noise lists its hash; WebPKI
-    // still verifies it.
     dial_ok(
         &mut server,
         Options::default(),
         &pinned_to(LOCALHOST, addr.clone()),
     );
     dial_ok(&mut server, webpki(CA, "localhost"), &addr);
-    // Noise still lists the previous leaf, for a handshake that straddled
-    // the swap, even after the same leaf is loaded again: a dial pinned to
-    // both hashes needs both listed.
     server
         .replace_webtransport_certificate(pem_certs(LOCALHOST), pem_key(LOCALHOST_KEY))
         .expect("reload the same leaf");
@@ -1075,7 +1047,6 @@ fn a_rejected_replacement_keeps_the_current_certificate() {
     let addr = webtransport_addr(&server);
     dial_ok(&mut server, Options::default(), &pinned_to(CHAIN, addr));
 
-    // A transport deriving its own certificates has none to replace.
     assert_eq!(
         server_with(QuicNodeConfig::generate())
             .replace_webtransport_certificate(pem_certs(LOCALHOST), pem_key(LOCALHOST_KEY)),

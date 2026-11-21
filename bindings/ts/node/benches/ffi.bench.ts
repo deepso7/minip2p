@@ -33,7 +33,6 @@ beforeAll(async () => {
   cleanup.push(() => sdkB.close());
   awaitTransferred = receiveTransfers(sdkB);
   sdkB.on("stream", (stream) => {
-    // Match the raw remote, which drains ready events without rejecting them.
     void stream;
   });
   await sdkA.connect(firstAddr(sdkB.listenAddrs()), { timeoutMs: TIMEOUT_MS });
@@ -77,8 +76,6 @@ describe("node-ffi", () => {
     }).run();
   });
 
-  // Per-write and per-chunk cost: 1 MiB in 16 KiB writes, read by a flowing
-  // `data` handler on the remote.
   test("sdk_stream_transfer", async ({ bench }) => {
     await bench("sdk_stream_transfer", async () => {
       const received = awaitTransferred(
@@ -91,8 +88,6 @@ describe("node-ffi", () => {
     }).run();
   });
 
-  // Waits on the doorbell between drains, as an embedder would; a timer
-  // poll would round each wait up to the event loop's ~1 ms timer.
   test("raw_drain_events", async ({ bench }) => {
     await bench("raw_drain_events", async () => {
       const streams = Array.from({ length: BURST }, () =>
@@ -110,7 +105,6 @@ describe("node-ffi", () => {
           if (seen === BURST) {
             return;
           }
-          // The doorbell rings only when the queue turns non-empty.
           if (events.length < 256) {
             await rawADoorbell();
           }
