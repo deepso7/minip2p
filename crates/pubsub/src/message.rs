@@ -12,12 +12,14 @@
 //! encoding`. The received bytes (`RawMessage::raw`) are kept only so
 //! forwarding can embed them verbatim.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{
     PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field,
-    read_len_delimited, read_string, read_tag, read_varint_value, skip_field,
+    read_len_delimited, read_string, read_tag, read_varint_value, skip_field, uvarint_len,
+    write_uvarint,
 };
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
@@ -246,9 +248,16 @@ impl RawMessage {
             signature: None,
             key: None,
         };
-        let signature = keypair.sign(&message.sign_bytes());
+        let mut raw =
+            Vec::with_capacity(message.fields_len(false) + bytes_field_len(SIGNATURE_LEN));
+        message.write_fields(&mut raw, false);
+        let mut sign_bytes = Vec::with_capacity(SIGN_PREFIX.len() + raw.len());
+        sign_bytes.extend_from_slice(SIGN_PREFIX);
+        sign_bytes.extend_from_slice(&raw);
+        let signature = keypair.sign(&sign_bytes);
+        encode_bytes_field(&mut raw, 5, &signature);
         message.signature = Some(signature.to_vec());
-        message.raw = message.encode_fields(true);
+        message.raw = raw;
         message
     }
 
@@ -264,10 +273,9 @@ impl RawMessage {
     /// so the rules only diverge on hand-crafted input — where including
     /// everything fails toward rejection, the safe direction.
     pub(crate) fn sign_bytes(&self) -> Vec<u8> {
-        let body = self.encode_fields(false);
-        let mut out = Vec::with_capacity(SIGN_PREFIX.len() + body.len());
+        let mut out = Vec::with_capacity(SIGN_PREFIX.len() + self.fields_len(false));
         out.extend_from_slice(SIGN_PREFIX);
-        out.extend_from_slice(&body);
+        self.write_fields(&mut out, false);
         out
     }
 
@@ -275,38 +283,66 @@ impl RawMessage {
     /// present (decoded or built messages), otherwise a fresh canonical
     /// encoding of the fields.
     pub fn to_wire(&self) -> Vec<u8> {
+        self.wire().into_owned()
+    }
+
+    /// [`Self::to_wire`] without copying preserved `raw` bytes.
+    fn wire(&self) -> Cow<'_, [u8]> {
         if self.raw.is_empty() {
-            self.encode_fields(true)
+            Cow::Owned(self.encode_fields(true))
         } else {
-            self.raw.clone()
+            Cow::Borrowed(&self.raw)
         }
     }
 
     /// Encodes fields 1–4 in field order, plus `signature`/`key` when
     /// `include_signature` is set.
     fn encode_fields(&self, include_signature: bool) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.fields_len(include_signature));
+        self.write_fields(&mut out, include_signature);
+        out
+    }
+
+    /// Exact length of [`Self::encode_fields`].
+    fn fields_len(&self, include_signature: bool) -> usize {
+        let optional =
+            |field: &Option<Vec<u8>>| field.as_ref().map_or(0, |v| bytes_field_len(v.len()));
+        let mut len = optional(&self.from)
+            + optional(&self.data)
+            + optional(&self.seqno)
+            + self
+                .topic_ids
+                .iter()
+                .map(|topic| bytes_field_len(topic.len()))
+                .sum::<usize>();
+        if include_signature {
+            len += optional(&self.signature) + optional(&self.key);
+        }
+        len
+    }
+
+    /// Appends [`Self::encode_fields`] to `out`.
+    fn write_fields(&self, out: &mut Vec<u8>, include_signature: bool) {
         if let Some(from) = &self.from {
-            encode_bytes_field(&mut out, 1, from);
+            encode_bytes_field(out, 1, from);
         }
         if let Some(data) = &self.data {
-            encode_bytes_field(&mut out, 2, data);
+            encode_bytes_field(out, 2, data);
         }
         if let Some(seqno) = &self.seqno {
-            encode_bytes_field(&mut out, 3, seqno);
+            encode_bytes_field(out, 3, seqno);
         }
         for topic in &self.topic_ids {
-            encode_bytes_field(&mut out, 4, topic.as_bytes());
+            encode_bytes_field(out, 4, topic.as_bytes());
         }
         if include_signature {
             if let Some(signature) = &self.signature {
-                encode_bytes_field(&mut out, 5, signature);
+                encode_bytes_field(out, 5, signature);
             }
             if let Some(key) = &self.key {
-                encode_bytes_field(&mut out, 6, key);
+                encode_bytes_field(out, 6, key);
             }
         }
-        out
     }
 
     /// Decodes a Message submessage body, preserving `input` as `raw`.
@@ -642,7 +678,7 @@ impl Rpc {
             encode_bytes_field(&mut out, 1, &sub.encode());
         }
         for message in &self.publish {
-            encode_bytes_field(&mut out, 2, &message.to_wire());
+            encode_bytes_field(&mut out, 2, &message.wire());
         }
         if let Some(control) = &self.control {
             encode_bytes_field(&mut out, 3, &control.encode());
@@ -701,6 +737,28 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
         "frame payload exceeds MAX_RPC_SIZE"
     );
     minip2p_core::encode_frame(payload)
+}
+
+/// Length of a field-`1..=15` length-delimited field carrying `len` bytes.
+fn bytes_field_len(len: usize) -> usize {
+    1 + uvarint_len(len as u64) + len
+}
+
+/// The framed single-message RPC carrying `message`: byte-identical to
+/// [`encode_frame`] over an [`Rpc`] whose only content is `message`, in one
+/// exact-sized allocation that borrows preserved `raw` bytes.
+///
+/// Returns `None` when the RPC body would exceed [`MAX_RPC_SIZE`].
+pub(crate) fn encode_publish_frame(message: &RawMessage) -> Option<Vec<u8>> {
+    let wire = message.wire();
+    let body_len = bytes_field_len(wire.len());
+    if body_len > MAX_RPC_SIZE {
+        return None;
+    }
+    let mut out = Vec::with_capacity(uvarint_len(body_len as u64) + body_len);
+    write_uvarint(body_len as u64, &mut out);
+    encode_bytes_field(&mut out, 2, &wire);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -975,6 +1033,63 @@ mod tests {
         let mut over = Vec::new();
         write_uvarint(MAX_RPC_SIZE as u64 + 1, &mut over);
         assert!(matches!(decode_frame(&over), FrameDecode::TooLarge { .. }));
+    }
+
+    fn publish_rpc_frame(message: &RawMessage) -> Vec<u8> {
+        encode_frame(
+            &Rpc {
+                subscriptions: Vec::new(),
+                publish: vec![message.clone()],
+                control: None,
+            }
+            .encode(),
+        )
+    }
+
+    #[test]
+    fn publish_frame_matches_rpc_framing() {
+        let signed = RawMessage::build_signed(&keypair(), "chat", vec![0x5a; 300], 42);
+        assert_eq!(
+            encode_publish_frame(&signed).as_deref(),
+            Some(publish_rpc_frame(&signed).as_slice())
+        );
+
+        let fields_only = RawMessage {
+            raw: Vec::new(),
+            ..signed
+        };
+        assert_eq!(
+            encode_publish_frame(&fields_only).as_deref(),
+            Some(publish_rpc_frame(&fields_only).as_slice())
+        );
+    }
+
+    #[test]
+    fn publish_frame_size_limit_is_exact() {
+        let with_raw_len = |len: usize| RawMessage {
+            raw: vec![0x5a; len],
+            ..RawMessage::default()
+        };
+        let at_limit = with_raw_len(MAX_RPC_SIZE - 1 - uvarint_len(MAX_RPC_SIZE as u64));
+        let frame = encode_publish_frame(&at_limit).expect("body of exactly MAX_RPC_SIZE");
+        assert_eq!(frame, publish_rpc_frame(&at_limit));
+        assert!(matches!(
+            decode_frame(&frame),
+            FrameDecode::Complete { payload, .. } if payload.len() == MAX_RPC_SIZE
+        ));
+
+        let over = with_raw_len(at_limit.raw.len() + 1);
+        assert_eq!(encode_publish_frame(&over), None);
+    }
+
+    #[test]
+    fn build_signed_raw_is_the_canonical_encoding() {
+        let message = RawMessage::build_signed(&keypair(), "chat", vec![0x5a; 300], 42);
+        assert_eq!(message.raw, message.encode_fields(true));
+        let mut expected_sign_bytes = SIGN_PREFIX.to_vec();
+        expected_sign_bytes.extend_from_slice(&message.encode_fields(false));
+        assert_eq!(message.sign_bytes(), expected_sign_bytes);
+        message.verify(false).expect("built message verifies");
     }
 
     #[test]
