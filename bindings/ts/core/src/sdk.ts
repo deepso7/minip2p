@@ -1471,7 +1471,7 @@ export class Minip2pBase {
    * unnoticed meanwhile. Resuming recovers the relay reservation at once
    * instead of at its scheduled retry or renewal: a held reservation is
    * renewed, and reported lost and reacquired if the relay does not answer.
-   * Without a relay reservation it does nothing.
+   * It does nothing unless the reservation policy wants a relay reservation.
    */
   resume(): void {
     this.#assertOpen();

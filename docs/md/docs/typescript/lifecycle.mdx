@@ -106,7 +106,7 @@ Keep the configuration factory pure and stable. React may render a component wit
 
 ## Resuming after a pause
 
-A suspended app or a throttled tab stops answering its peers, so its relay connection can die while it is away, sometimes unnoticed until well after it comes back. Call `endpoint.resume()` when the host returns: the relay reservation then recovers at once instead of at its scheduled retry or renewal. A held reservation is renewed, and is reported lost and reacquired if the relay does not answer. Without a relay reservation `resume()` does nothing. Servers never need it.
+A suspended app or a throttled tab stops answering its peers, so its relay connection can die while it is away, sometimes unnoticed until well after it comes back. Call `endpoint.resume()` when the host returns: the relay reservation then recovers at once instead of at its scheduled retry or renewal. A held reservation is renewed, and is reported lost and reacquired if the relay does not answer. `resume()` does nothing unless the reservation policy wants a relay reservation. Servers never need it.
 
 ### Foreground and background
 

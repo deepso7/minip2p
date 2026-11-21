@@ -999,12 +999,12 @@ impl NatAgent {
     /// waiting retry runs at once, and a held reservation is renewed at
     /// once. The renewal doubles as a liveness check: if the relay does not
     /// answer within [`NatConfig::relay_timeout_ms`], the reservation is
-    /// reported lost and reacquired.
+    /// reported lost and reacquired. Nothing happens unless the reservation
+    /// policy wants a reservation.
     pub fn resume<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
         self.holding(swarm, |agent, swarm| {
             agent.housekeeping.resume(swarm, &mut agent.shared, now);
         });
-        self.reap_done();
     }
 
     /// Whether a dial the host parked ([`DialStart::Deferred`]) is still

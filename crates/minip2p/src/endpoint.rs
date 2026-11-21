@@ -374,8 +374,8 @@ impl<P: Platform> Endpoint<P> {
     /// a pending retry runs at once, its backoff starts over, and a held
     /// reservation is renewed at once. If the relay does not answer the
     /// renewal within `NatConfig::relay_timeout_ms`, the reservation is
-    /// reported lost and reacquired. Without a relay reservation this does
-    /// nothing.
+    /// reported lost and reacquired. This does nothing unless the
+    /// reservation policy wants a relay reservation.
     pub fn resume(&mut self) {
         let now = self.now();
         self.engine.resume(now);
