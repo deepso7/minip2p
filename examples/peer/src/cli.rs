@@ -18,7 +18,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use minip2p::{ConnectOutcome, EndpointEvent, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p::{
+    ConnectOutcome, ConnectionId, EndpointEvent, IdentifyMessage, Multiaddr, PeerAddr, PeerId,
+    Protocol,
+};
 use minip2p_example_common::{CliError, print_nat_event};
 
 /// The modes the CLI dispatches to.
@@ -37,6 +40,14 @@ pub enum Mode {
         relay: Option<PeerAddr>,
         /// Stop after this many pings (graceful exit + summary).
         count: Option<u64>,
+        options: RunOptions,
+    },
+    /// Connect to `target`, print its Identify result, and exit. The
+    /// one-shot counterpart to `dial`, for inspecting a peer — including a
+    /// foreign implementation — without starting a ping run.
+    Id {
+        target: DialTarget,
+        relay: Option<PeerAddr>,
         options: RunOptions,
     },
 }
@@ -71,6 +82,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode, CliError> {
     match subcommand.as_str() {
         "listen" => parse_listen(args),
         "dial" => parse_dial(args),
+        "id" => parse_id(args),
         "-h" | "--help" | "help" => Err(CliError(usage())),
         other => Err(CliError(format!(
             "unknown subcommand '{other}'\n\n{}",
@@ -90,7 +102,9 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
     })
 }
 
-fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
+/// Splits argv into positionals and `--flag <value>` pairs. Shared by the
+/// two subcommands that take a `<target>`.
+fn split_positional(args: Vec<String>) -> Result<(Vec<String>, Vec<String>), CliError> {
     let mut positional: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut args = args.iter();
@@ -105,7 +119,31 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
             positional.push(arg.clone());
         }
     }
+    Ok((positional, rest))
+}
 
+fn parse_id(args: Vec<String>) -> Result<Mode, CliError> {
+    let (positional, rest) = split_positional(args)?;
+    let flags = Flags::from(rest.as_slice())?;
+    if flags.count.is_some() {
+        return Err(CliError("--count is only valid with `dial`".into()));
+    }
+    match positional.as_slice() {
+        [raw] => Ok(Mode::Id {
+            target: parse_dial_target(raw)?,
+            relay: flags.relay,
+            options: flags.options,
+        }),
+        [] => Err(CliError("`id` requires a <target> address".into())),
+        many => Err(CliError(format!(
+            "expected exactly one positional <target>, got {}",
+            many.len()
+        ))),
+    }
+}
+
+fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
+    let (positional, rest) = split_positional(args)?;
     let flags = Flags::from(rest.as_slice())?;
     match positional.as_slice() {
         [raw] => Ok(Mode::Dial {
@@ -276,6 +314,31 @@ fn require_supported_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result
     }
 }
 
+/// Prints one Identify result in the CLI's one-line format.
+///
+/// Shared by [`print_event`] and `id`, which reads the same message back
+/// from `Endpoint::peer_readiness` rather than catching the event, so both
+/// paths cannot drift into printing different fields.
+pub fn print_identify(
+    role: &str,
+    peer_id: &PeerId,
+    conn_id: &ConnectionId,
+    info: &IdentifyMessage,
+) {
+    let agent = info.agent_version.as_deref().unwrap_or("?");
+    let nprotos = info.protocols.len();
+    let protocols = format_protocols(&info.protocols);
+    let observed = info
+        .observed_addr
+        .as_deref()
+        .and_then(|bytes| Multiaddr::from_bytes(bytes).ok())
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "?".into());
+    println!(
+        "[{role}] identify peer={peer_id} conn={conn_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
+    );
+}
+
 /// Prints an [`EndpointEvent`] in the CLI's one-event-per-line format.
 ///
 /// `role` is the tag shown in brackets at the start of the line
@@ -299,20 +362,7 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
             peer_id,
             conn_id,
             info,
-        } => {
-            let agent = info.agent_version.as_deref().unwrap_or("?");
-            let nprotos = info.protocols.len();
-            let protocols = format_protocols(&info.protocols);
-            let observed = info
-                .observed_addr
-                .as_deref()
-                .and_then(|bytes| Multiaddr::from_bytes(bytes).ok())
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "?".into());
-            println!(
-                "[{role}] identify peer={peer_id} conn={conn_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
-            );
-        }
+        } => print_identify(role, peer_id, conn_id, info),
         EndpointEvent::PeerReady {
             peer_id,
             conn_id,
@@ -430,6 +480,7 @@ pub fn usage() -> String {
 USAGE:
     minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
     minip2p-peer dial   <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <transport-multiaddr>]
+    minip2p-peer id     <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
 
 NOTES:
     <target>           circuit address from the listener's `circuit=` line
@@ -439,6 +490,8 @@ NOTES:
     --relay            extra relay for the NAT agent (optional in both modes)
     --autonat          AutoNAT server used for reachability probes
     --count            dial only: stop after n pings, print a summary, exit
+    id                 connect, print the peer's Identify result, exit 0;
+                       non-zero if the connection or Identify fails
     --key              persistent Ed25519 raw-secret file (hex)
     --listen           QUIC or TCP bind multiaddr; default is dual-stack QUIC on UDP/0
 
@@ -611,6 +664,71 @@ mod tests {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
         let err = parse(v(&["listen", "--relay", &raw])).unwrap_err();
         assert!(err.0.contains("QUIC or TCP"));
+    }
+
+    #[test]
+    fn id_with_direct_peer_addr() {
+        match parse(v(&["id", PEER_ADDR])).unwrap() {
+            Mode::Id {
+                target: DialTarget::Direct(addr),
+                relay,
+                options,
+            } => {
+                assert_eq!(addr.to_string(), PEER_ADDR);
+                assert!(relay.is_none());
+                assert_eq!(options, RunOptions::default());
+            }
+            other => panic!("expected direct Id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_accepts_a_circuit_target() {
+        match parse(v(&["id", &circuit_addr()])).unwrap() {
+            Mode::Id {
+                target: DialTarget::Circuit { relay, peer },
+                ..
+            } => {
+                assert_eq!(relay.to_string(), PEER_ADDR);
+                assert_eq!(peer.to_string(), PEER_ID);
+            }
+            other => panic!("expected circuit Id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_accepts_the_shared_flags() {
+        match parse(v(&[
+            "id",
+            PEER_ADDR,
+            "--relay",
+            PEER_ADDR,
+            "--key",
+            "./peer.key",
+            "--listen",
+            QUIC_ADDR,
+        ]))
+        .unwrap()
+        {
+            Mode::Id { relay, options, .. } => {
+                assert_eq!(relay.unwrap().to_string(), PEER_ADDR);
+                assert_eq!(options.key_path, Some(PathBuf::from("./peer.key")));
+                assert_eq!(options.listen_addr.unwrap().to_string(), QUIC_ADDR);
+            }
+            other => panic!("expected Id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_rejects_count() {
+        let err = parse(v(&["id", PEER_ADDR, "--count", "3"])).unwrap_err();
+        assert!(err.0.contains("--count"));
+    }
+
+    #[test]
+    fn id_without_target_errors() {
+        let err = parse(v(&["id"])).unwrap_err();
+        assert!(err.0.contains("<target>"));
     }
 
     #[test]
