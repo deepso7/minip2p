@@ -3,7 +3,7 @@
 //! flow-control windows are measured at a real RTT (#361).
 //!
 //! By default (the per-PR bench) it measures one-way goodput over QUIC and
-//! over TCP + Yamux on the 100 Mbit/s, 100 ms profile with the default
+//! over TCP + Yamux on the 100 Mbit/s, 100 ms profile with the std Endpoint's default
 //! limits: per case, a fresh connection, a warm-up transfer, then
 //! [`PR_RUNS`] timed transfers of 32 MiB on fresh streams, reporting the
 //! median as `endpoint_rtt/{quic,tcp}/100m_100ms` `mb_per_s` in
@@ -146,7 +146,7 @@ fn pr_bench() {
             transport,
             streams: 1,
             quic: QuicLimits::default(),
-            tcp: TcpConfig::default(),
+            tcp: TcpConfig::std_default(),
         };
         let runs = if support::quick::quick() { 1 } else { PR_RUNS };
         let samples = measure(profile, &point, PR_TOTAL, runs);
