@@ -66,6 +66,60 @@ fn open_streams(server: &mut QuicTransport, peer: &mut RawPeer, payloads: &[&[u8
 }
 
 #[test]
+fn queued_writes_leave_send_room_for_admitted_streams() {
+    let mut server = listening_server(QuicLimits {
+        max_streams_per_connection: 1,
+        max_pending_bytes_per_stream: 64,
+        max_pending_connection_bytes: 64,
+        control_stream_reserve_bytes: 0,
+        ..QuicLimits::default()
+    });
+    let (mut peer, id) = accept(&mut server, &mut [], small_stream_window);
+    let first = server.open_stream(id).expect("admitted first");
+    let queued = server.open_stream(id).expect("queued second");
+    server
+        .send_stream(id, queued, Bytes::new())
+        .expect("empty write");
+    let blocked = server.send_stream(id, queued, Bytes::from_static(&[7; 64]));
+    let active = server.send_stream(id, first, Bytes::from_static(b"finish"));
+    assert!(
+        active.is_ok(),
+        "queued write {blocked:?} blocked admitted write: {active:?}"
+    );
+    assert!(matches!(blocked, Err(TransportError::Full { unsent, .. }) if unsent.len() == 64));
+    assert_eq!(pending_write_bytes(&server, id), 0);
+    let mut events = server.poll(now()).expect("poll");
+    assert!(!events.contains(&TransportEvent::StreamWritable {
+        id,
+        stream_id: queued
+    }));
+    server.close_stream_write(id, first).expect("finish first");
+    let start = Instant::now();
+    while !events.contains(&TransportEvent::StreamWritable {
+        id,
+        stream_id: queued,
+    }) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "queued stream never became writable: {events:?}"
+        );
+        peer.pump();
+        events.extend(server.poll(now()).expect("poll"));
+        if peer.read(first.as_u64()).1 {
+            peer.finish(first.as_u64());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(events.contains(&TransportEvent::StreamOpened {
+        id,
+        stream_id: queued
+    }));
+    server
+        .send_stream(id, queued, Bytes::from_static(&[7; 64]))
+        .expect("retry after admission");
+}
+
+#[test]
 fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     let mut server = server_with_idle_timeout(1_000);
     let (mut stopper, stopper_id) = accept(&mut server, &mut [], small_stream_window);

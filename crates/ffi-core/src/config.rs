@@ -87,6 +87,7 @@ pub struct QuicLimitsOptions {
     /// Bound locally initiated bidirectional streams per connection.
     /// Excess opens wait FIFO with an immediate ID. The pending queue is
     /// unbounded and local-caller-only, so peers cannot use it for DoS.
+    /// Writes return Full until admission; FIN may queue while waiting.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_streams_per_connection: Option<u64>,
     /// Bytes queued per stream beyond what the engine accepts; non-zero.
@@ -168,8 +169,8 @@ pub struct YamuxOptions {
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_frame_len: Option<u32>,
     /// Active and unsettled streams at once, for TCP or circuits.
-    /// Excess local opens wait FIFO with writes and FIN buffered within the
-    /// send caps. The queue is unbounded and local-caller-only, not remote.
+    /// Excess local opens wait FIFO; writes return Full until admission,
+    /// while FIN may queue. The queue is unbounded and local-caller-only, not remote.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_streams: Option<u64>,
     /// Per-stream cap on accepted, unpulled send bytes; non-zero.

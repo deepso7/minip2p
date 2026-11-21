@@ -1192,8 +1192,12 @@ impl QuicConnection {
     }
 
     /// Bytes stream `raw` may still queue: the smaller of what is left of
-    /// its own cap and of the connection cap it may fill.
+    /// its own cap and of the connection cap it may fill. Unbound streams
+    /// cannot queue bytes needed by bound streams to finish and free a slot.
     fn send_room(&self, raw: u64, control: bool) -> usize {
+        if self.is_unbound(raw) {
+            return 0;
+        }
         let stream_pending = self.send_queues.get(&raw).map_or(0, |queue| queue.pending);
         self.caps
             .room(stream_pending, self.pending_write_bytes, control)

@@ -294,13 +294,22 @@ fn reset_open_past_local_stream_limit_consumes_its_tombstone() {
     client
         .reset_stream(client_conn, first)
         .expect("reset first");
-    client
-        .send_stream(client_conn, third, Bytes::from_static(b"third"))
-        .expect("queue third payload");
+    let mut sent = false;
     let start = std::time::Instant::now();
     loop {
         let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
         events.extend(client_events);
+        if !sent
+            && events.contains(&TransportEvent::StreamOpened {
+                id: client_conn,
+                stream_id: third,
+            })
+        {
+            client
+                .send_stream(client_conn, third, Bytes::from_static(b"third"))
+                .expect("send admitted third");
+            sent = true;
+        }
         if server_events.iter().any(|event| {
             matches!(event,
                 TransportEvent::StreamData { id, stream_id, data }
@@ -888,32 +897,31 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     );
 }
 
-/// Opens a stream from `client` and writes to it; reports whether that
-/// worked, and whether the server announced the stream.
+/// Opens a stream and retries its write; reports whether it worked and the server announced it.
 fn open_and_watch(
     server: &mut QuicTransport,
     client: &mut QuicTransport,
     client_conn: ConnectionId,
 ) -> (bool, bool) {
-    let mut stream = None;
+    let stream = client.open_stream(client_conn).expect("open");
+    let mut sent = false;
     for _ in 0..100 {
-        if stream.is_none()
-            && let Ok(opened) = client.open_stream(client_conn)
+        if !sent
             && client
-                .send_stream(client_conn, opened, Bytes::from_static(b"hi"))
+                .send_stream(client_conn, stream, Bytes::from_static(b"hi"))
                 .is_ok()
         {
-            stream = Some(opened);
+            sent = true;
         }
         let (server_events, _) = drive_pair_once(server, client);
         if server_events
             .iter()
-            .any(|event| matches!(event, TransportEvent::IncomingStream { stream_id, .. } if Some(*stream_id) == stream))
+            .any(|event| matches!(event, TransportEvent::IncomingStream { stream_id, .. } if *stream_id == stream))
         {
-            return (true, true);
+            return (sent, true);
         }
     }
-    (stream.is_some(), false)
+    (sent, false)
 }
 
 #[test]

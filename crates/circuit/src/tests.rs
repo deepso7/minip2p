@@ -1622,9 +1622,10 @@ fn circuit_opens_wait_for_yamux_capacity_and_cancel_without_a_syn() {
     b.poll(Now::from_millis(0)).unwrap();
     let cancelled = a.open_stream(circuit_id).expect("queued second");
     let third = a.open_stream(circuit_id).expect("queued third");
-    a.send_stream(circuit_id, third, Bytes::from_static(b"queued"))
-        .unwrap();
-    a.close_stream_write(circuit_id, third).unwrap();
+    assert!(matches!(
+        a.send_stream(circuit_id, third, Bytes::from_static(b"queued")),
+        Err(TransportError::Full { .. })
+    ));
     a.reset_stream(circuit_id, cancelled).unwrap();
     let events = a.poll(Now::from_millis(0)).unwrap();
     assert!(!events.contains(&opened(cancelled)));
@@ -1636,6 +1637,9 @@ fn circuit_opens_wait_for_yamux_capacity_and_cancel_without_a_syn() {
             .unwrap()
             .contains(&opened(third))
     );
+    a.send_stream(circuit_id, third, Bytes::from_static(b"queued"))
+        .unwrap();
+    a.close_stream_write(circuit_id, third).unwrap();
     let mut events = Vec::new();
     for _ in 0..4 {
         events.extend(b.poll(Now::from_millis(0)).unwrap());

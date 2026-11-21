@@ -59,6 +59,7 @@ pub struct QuicLimits {
     /// Opens beyond this cap receive an ID immediately and wait FIFO for
     /// local capacity and peer stream credit. Pending opens are unbounded:
     /// only local callers enqueue them, so peers cannot use the queue for DoS.
+    /// Writes return Full until bound; FIN may queue while waiting.
     /// Closed streams with unacknowledged bytes retain their bound slot.
     /// Also sets the concurrent bidirectional stream credit granted to peers.
     pub max_streams_per_connection: u64,

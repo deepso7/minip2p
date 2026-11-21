@@ -116,7 +116,7 @@ pub struct YamuxConfig {
     /// Local opens beyond this cap receive IDs immediately and wait FIFO;
     /// their SYNs leave only after a slot frees. The pending queue is unbounded
     /// and local-caller-only, so peers cannot enqueue it for DoS. Pending
-    /// streams may buffer writes and FIN within the ordinary send caps.
+    /// streams return Full on writes until admitted; FIN may queue while waiting.
     pub max_streams: usize,
     /// Per-stream cap for bytes [`YamuxSession::send`] accepted that have not
     /// been pulled as frames yet, whether or not remote credit allows them.

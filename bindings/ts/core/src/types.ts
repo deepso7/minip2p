@@ -61,6 +61,7 @@ export interface Minip2pQuicLimits {
    * Bound locally initiated bidirectional streams per connection (default 128).
    * Excess opens wait FIFO for local capacity and peer credit. The pending
    * queue has no length cap: only local callers enqueue, not remote peers.
+   * Writes return backpressure until admission; FIN may queue while waiting.
    */
   readonly maxStreamsPerConnection?: number;
   /** Bytes queued per stream beyond what the engine accepts; non-zero. */
@@ -116,7 +117,7 @@ export interface Minip2pYamuxLimits {
   readonly maxFrameLen?: number;
   /**
    * Active and unsettled streams at once (default 256), for TCP or circuits.
-   * Excess local opens wait FIFO; writes and FIN buffer within the send caps.
+   * Excess local opens wait FIFO; writes backpressure until admission, FIN may queue.
    * The queue is unbounded and local-caller-only, not remotely enqueueable.
    */
   readonly maxStreams?: number;

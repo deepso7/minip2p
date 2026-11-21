@@ -23,12 +23,121 @@ fn config() -> YamuxConfig {
 }
 
 #[test]
+fn pre_syn_writes_reserve_a_slot_without_bypassing_fifo() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+    let first = client.open_stream().unwrap();
+    let second = client.open_stream().unwrap();
+    assert!(matches!(
+        client.send(second, Bytes::from_static(b"wait")),
+        Err(YamuxError::Full { .. })
+    ));
+    client.send(first, Bytes::from_static(b"first")).unwrap();
+    client
+        .handle_data(&Frame::data(2, FLAG_SYN, Vec::new()).unwrap().encode())
+        .unwrap();
+    let refused = decode(&outbound(&mut client));
+    assert_eq!(refused.stream_id(), 2);
+    assert_eq!(refused.flags(), FLAG_RST);
+    assert_eq!(decode(&outbound(&mut client)).payload(), b"first");
+    client.reset(first).unwrap();
+    let third = client.open_stream().unwrap();
+    assert!(matches!(
+        client.send(third, Bytes::from_static(b"wait")),
+        Err(YamuxError::Full { .. })
+    ));
+    outbound(&mut client);
+    assert_eq!(decode(&outbound(&mut client)).stream_id(), second);
+    assert!(client.poll_frame().is_none());
+}
+
+#[test]
+fn queued_writes_leave_send_room_for_admitted_streams() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    limits.max_buffered_send = 64;
+    limits.max_total_buffered_send = 64;
+    let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+    let first = client.open_stream().unwrap();
+    outbound(&mut client);
+    client.poll_events();
+    let queued = client.open_stream().unwrap();
+    client.send(queued, Bytes::new()).unwrap();
+    let blocked = client.send(queued, Bytes::from_static(&[7; 64]));
+    let active = client.send(first, Bytes::from_static(b"finish"));
+    assert!(
+        active.is_ok(),
+        "queued write {blocked:?} blocked admitted write: {active:?}"
+    );
+    assert!(matches!(blocked, Err(YamuxError::Full { unsent, .. }) if unsent.len() == 64));
+    assert_eq!(decode(&outbound(&mut client)).payload(), b"finish");
+    assert!(
+        client.poll_events().is_empty(),
+        "queued stream is not writable yet"
+    );
+    client.reset(first).unwrap();
+    outbound(&mut client);
+    assert!(
+        client
+            .poll_events()
+            .iter()
+            .all(|event| !matches!(event, YamuxOutput::Writable { .. }))
+    );
+    assert_eq!(decode(&outbound(&mut client)).stream_id(), queued);
+    assert_eq!(
+        client.poll_events(),
+        [
+            YamuxOutput::StreamOpened { stream: queued },
+            YamuxOutput::Writable { stream: queued }
+        ]
+    );
+    client.send(queued, Bytes::from_static(&[7; 64])).unwrap();
+    assert_eq!(decode(&outbound(&mut client)).payload(), &[7; 64]);
+}
+
+#[test]
+fn empty_queued_fin_counts_as_unsent_until_admission() {
+    let mut limits = config();
+    limits.max_streams = 1;
+    let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+    let first = client.open_stream().unwrap();
+    outbound(&mut client);
+    let queued = client.open_stream().unwrap();
+    client.close_write(queued).unwrap();
+    assert!(!client.has_frames());
+    assert!(
+        client.has_unsent(),
+        "queued empty FIN must keep flush pending"
+    );
+    client.reset(first).unwrap();
+    outbound(&mut client);
+    let fin = decode(&outbound(&mut client));
+    assert_eq!(fin.stream_id(), queued);
+    assert_eq!(fin.flags(), FLAG_SYN | FLAG_FIN);
+    assert!(!client.has_unsent());
+    let cancelled = client.open_stream().unwrap();
+    client.close_write(cancelled).unwrap();
+    assert!(client.has_unsent());
+    client.reset(cancelled).unwrap();
+    assert!(!client.has_unsent());
+    let abandoned = client.open_stream().unwrap();
+    client.close_write(abandoned).unwrap();
+    client.go_away(0);
+    outbound(&mut client);
+    assert!(!client.has_unsent());
+}
+
+#[test]
 fn local_opens_wait_for_settled_capacity() {
     let mut limits = config();
     limits.max_streams = 1;
     let mut server = server_with_delivered(limits, 10, FLAG_FIN);
     let second = server.open_stream().expect("second open queues");
-    server.send(second, Bytes::from_static(b"queued")).unwrap();
+    assert!(matches!(
+        server.send(second, Bytes::from_static(b"queued")),
+        Err(YamuxError::Full { .. })
+    ));
     server.close_write(second).unwrap();
     server.close_write(1).unwrap();
     while server.poll_frame().is_some() {}
@@ -42,7 +151,7 @@ fn local_opens_wait_for_settled_capacity() {
     let opening = decode(&outbound(&mut server));
     assert_eq!(opening.stream_id(), second);
     assert_eq!(opening.flags(), FLAG_SYN | FLAG_FIN);
-    assert_eq!(opening.payload(), b"queued");
+    assert!(opening.payload().is_empty());
 }
 
 #[test]
@@ -54,20 +163,26 @@ fn cancelling_a_queued_open_sends_nothing_and_keeps_syns_ordered() {
     assert_eq!(decode(&outbound(&mut client)).stream_id(), first);
     let cancelled = client.open_stream().expect("queued second");
     let third = client.open_stream().expect("queued third");
-    client
-        .send(cancelled, Bytes::from_static(b"discard"))
-        .unwrap();
+    assert!(matches!(
+        client.send(cancelled, Bytes::from_static(b"discard")),
+        Err(YamuxError::Full { .. })
+    ));
     client.close_write(cancelled).unwrap();
-    client.send(third, Bytes::from_static(b"third")).unwrap();
+    assert!(matches!(
+        client.send(third, Bytes::from_static(b"third")),
+        Err(YamuxError::Full { .. })
+    ));
     client.reset(cancelled).unwrap();
-    assert_eq!(client.total_buffered_send(), 5);
+    assert_eq!(client.total_buffered_send(), 0);
     assert!(client.poll_frame().is_none());
     client.reset(first).unwrap();
     assert_eq!(decode(&outbound(&mut client)).flags(), FLAG_RST);
     let opening = decode(&outbound(&mut client));
     assert_eq!(opening.stream_id(), third);
     assert_eq!(opening.flags(), FLAG_SYN);
-    assert_eq!(opening.payload(), b"third");
+    assert!(opening.payload().is_empty());
+    client.send(third, Bytes::from_static(b"third")).unwrap();
+    assert_eq!(decode(&outbound(&mut client)).payload(), b"third");
     assert!(client.poll_frame().is_none());
     let queued = client.open_stream().unwrap();
     client.go_away(0);
