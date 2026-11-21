@@ -200,7 +200,7 @@ pub enum YamuxOutput {
         /// Stream carrying the bytes.
         stream: u32,
         /// Data-frame payload.
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// The remote sent `FIN`; no more inbound bytes will arrive on the stream.
     RemoteWriteClosed {
