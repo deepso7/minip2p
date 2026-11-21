@@ -462,7 +462,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "minip2p-circuit"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-core"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "base64ct",
  "bytes",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-discovery"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identify"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identity"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-mdns"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "if-addrs",
  "minip2p-core",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-multistream-select"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-nat"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-relay",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-ping"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-pubsub"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-quic"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "minip2p-core",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-relay"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-relay-server"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-rs"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "minip2p-circuit",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-secure-mux"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "chacha20poly1305",
  "hmac",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-swarm"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identify",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-tcp"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-tls"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "const-oid",
  "der",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-transport"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "mio",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-webtransport"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
