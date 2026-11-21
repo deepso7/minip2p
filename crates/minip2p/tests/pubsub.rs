@@ -93,7 +93,6 @@ fn two_endpoints_exchange_messages_over_real_quic() {
     b.subscribe(TOPIC).expect("b subscribes");
     a.connect(&b_addr).expect("a connects to b");
 
-    // Both sides learn of each other's subscription first.
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
@@ -128,8 +127,6 @@ fn star_center_forwards_between_leaves() {
     alice.connect(&hub_addr).expect("alice connects to hub");
     bob.connect(&hub_addr).expect("bob connects to hub");
 
-    // The hub must know both leaves' subscriptions, and each leaf the
-    // hub's, before a publish can traverse the star.
     drive_until(
         &mut [&mut hub, &mut alice, &mut bob],
         Duration::from_secs(20),
@@ -144,8 +141,6 @@ fn star_center_forwards_between_leaves() {
         },
     );
 
-    // Alice's message reaches bob THROUGH the hub (they are not connected),
-    // and the hub delivers it locally too. Exactly once each.
     alice.publish(TOPIC, b"across the star").expect("publishes");
     let all = drive_until(
         &mut [&mut hub, &mut alice, &mut bob],
@@ -177,7 +172,6 @@ fn unsubscribe_stops_delivery() {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
 
-    // B withdraws; A must observe it and stop sending.
     assert!(b.unsubscribe(TOPIC).expect("unsubscribe"));
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         all[0]
@@ -187,7 +181,6 @@ fn unsubscribe_stops_delivery() {
 
     a.publish(TOPIC, b"into the void")
         .expect("publish succeeds");
-    // Drive for a while: nothing may arrive at B.
     let until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < until {
         let all = drive(&mut [&mut a, &mut b]);
@@ -222,7 +215,6 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
             heartbeat_interval_ms: 0,
             ..GossipsubConfig::default()
         })
-        // TEST-NET-1 is never a local address, so this bind would fail.
         .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()

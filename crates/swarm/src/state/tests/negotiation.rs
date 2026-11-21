@@ -85,7 +85,6 @@ fn an_unanswered_outbound_negotiation_fails_at_its_deadline() {
     );
     assert_eq!(core.next_deadline(Now::from_millis(due)), None);
 
-    // The reset's own close adds nothing.
     feed(
         &mut core,
         TransportEvent::StreamClosed {
@@ -445,7 +444,6 @@ fn the_core_acks_what_it_consumes_and_leaves_application_bytes_unacked() {
     );
     drain_actions(&mut core);
 
-    // Negotiation and the first application bytes arrive in one chunk.
     let mut chunk = multistream_frame(MULTISTREAM_PROTOCOL_ID);
     chunk.extend_from_slice(&multistream_frame(PROTOCOL));
     let negotiation = chunk.len();
@@ -468,7 +466,6 @@ fn the_core_acks_what_it_consumes_and_leaves_application_bytes_unacked() {
         Output::Event(SwarmEvent::StreamData { data, .. }) if &data[..] == b"app bytes"
     )));
 
-    // Later application bytes are the application's to acknowledge.
     feed(
         &mut core,
         TransportEvent::StreamData {
@@ -506,7 +503,6 @@ fn inbound_streams_are_control_until_they_negotiate_an_application_protocol() {
                 stream_id,
             },
         );
-        // Marked before negotiation writes anything on it.
         let actions = drain_actions(&mut core);
         assert!(matches!(
             actions.first(),
@@ -546,7 +542,6 @@ fn an_outbound_application_stream_is_control_only_while_it_negotiates() {
     let opens = drain_actions(&mut core);
     core.opened(opens, conn_id, "/app/1", stream_id);
     let mut actions = drain_actions(&mut core);
-    // Marked before the negotiation's first write.
     assert!(matches!(
         actions.first(),
         Some(Action::SetControlStream { control: true, .. })
@@ -588,7 +583,7 @@ fn inbound_multistream_accepts_fallback_after_na_on_same_stream() {
             stream_id,
         },
     );
-    core.actions.clear(); // listener's multistream header
+    core.actions.clear();
 
     let mut first_offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
     first_offer.extend_from_slice(&multistream_frame(MESHSUB_V1_2));

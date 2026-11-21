@@ -44,9 +44,6 @@ impl StreamConns {
                     self.0.remove(&key);
                 }
             }
-            // A stream whose negotiation failed is reset without a
-            // `StreamClosed`. The error may not name the peer, but the
-            // connection and stream id identify the stream.
             SwarmEvent::Error(SwarmRuntimeError {
                 kind:
                     SwarmErrorKind::Multistream
@@ -59,7 +56,6 @@ impl StreamConns {
                 self.0
                     .retain(|(_, stream), conn| stream != stream_id || conn != conn_id);
             }
-            // Streams end with their connection without per-stream events.
             SwarmEvent::ConnectionClosed { conn_id, .. }
             | SwarmEvent::ConnectionReplaced { old: conn_id, .. } => {
                 self.0.retain(|_, conn| conn != conn_id);
@@ -113,7 +109,6 @@ mod tests {
         assert_eq!(conns.get(&peer_id, stream_id), None);
 
         conns.opened(&peer_id, new, stream_id);
-        // A late close for the old connection's stream 3 leaves the new one.
         conns.observe(&SwarmEvent::StreamClosed {
             peer_id,
             conn_id: old,
@@ -138,7 +133,6 @@ mod tests {
             })
         };
 
-        // Another connection's stream 3 failing leaves this one.
         conns.observe(&failed(ConnectionId::new(2), stream_id));
         assert_eq!(conns.get(&peer_id, stream_id), Some(conn_id));
 

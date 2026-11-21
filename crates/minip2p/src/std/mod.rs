@@ -101,8 +101,6 @@ const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
     reason = "EndpointEvent ownership avoids a heap allocation on the ready path."
 )]
 #[must_use = "handle the wait outcome; an EndpointEvent has been removed from the endpoint"]
-// Non-exhaustive, so a later outcome is not a breaking change: match
-// `Event` and `Deadline`, and treat the rest (today, `Interrupted`) with `_`.
 #[non_exhaustive]
 pub enum EndpointWaitOutcome {
     /// An application event from the Endpoint event stream.
@@ -223,7 +221,6 @@ fn harvest(
         .map_err(|error| TransportError::io("waiting for readiness", &error).into())
 }
 
-// The ffi-core detached driver moves the endpoint onto its own thread.
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<Endpoint>();
@@ -271,7 +268,6 @@ impl Endpoint {
     /// [`listen_all`](Self::listen_all) to see them all.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
         let mut addrs = self.listen_all()?;
-        // `listen_all` fails rather than return nothing, so there is one here.
         addrs.drain(..).next().ok_or(Error::Invariant {
             reason: "a successful listen reported no address",
         })
@@ -360,19 +356,9 @@ impl Endpoint {
         deadline: impl Into<WaitDeadline>,
     ) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
-        // A passed deadline still drives the endpoint once, which is what
-        // lets a stale timer make progress. Only once, so a continuous event
-        // stream cannot keep this wait running past its deadline.
         let mut drove_past_deadline = false;
-        // A blocking harvest already collected this batch's readiness; a
-        // zero-timeout one right behind it would only cost a syscall.
         let mut harvested = false;
-        // A taken host wake owes one more batch, which is what reads the
-        // edge-triggered mDNS sockets; a passed deadline must not skip it.
         let mut woken = false;
-        // Past the deadline only one such batch runs: a steady stream of
-        // wakes (packets mDNS reads and drops) must not hold the caller.
-        // Newer wakes stay pending for the next call.
         let mut woke_past_deadline = false;
         loop {
             if let Some(event) = self.engine.pop_event() {
@@ -384,9 +370,6 @@ impl Endpoint {
             if !harvested {
                 self.harvest(Duration::ZERO)?;
             }
-            // The batch applies finished lookups (a lookup thread is what
-            // woke the last sleep, unless the caller did) and starts the
-            // lookups it parks before this can sleep.
             let now = self.now();
             drove_past_deadline |= deadline.has_passed();
             woke_past_deadline |= woken && deadline.has_passed();
@@ -396,9 +379,6 @@ impl Endpoint {
                 harvested = false;
                 continue;
             }
-            // A pending interrupt outranks an expired deadline, so a host's
-            // non-blocking pump still notices it. Checked before sleeping
-            // even when its `Waker` event was already harvested.
             if self.platform.poll.take_interrupt() {
                 return Ok(EndpointWaitOutcome::Interrupted);
             }
@@ -604,12 +584,9 @@ impl Endpoint {
             errors: Vec::new(),
         };
         report.events.extend(self.engine.events.drain(..));
-        // The failure is queued as an event too, and drained below.
         #[cfg(feature = "mdns")]
         drop(self.shutdown_mdns());
         let drain_by = std::time::Instant::now() + timeout;
-        // Accepted writes go out before the connections close. A failed
-        // flush is the drain's failure; teardown still runs.
         if let Err(error) = self.flush(drain_by) {
             report.errors.push(error);
             report.outcome = CloseOutcome::Failed;
@@ -622,13 +599,10 @@ impl Endpoint {
                 let now = self.now();
                 self.engine.shutdown_backbone(now);
             }
-            // Out of time or failed: hand over what the swarm already queued
-            // (a disconnect's close failure, say) without polling again.
             let (polled, mut last, now) = if std::time::Instant::now() >= drain_by {
                 (self.engine.core.take_buffered_events(), true, self.now())
             } else {
                 let harvested = if self.close_drain_busy() {
-                    // Interrupts only end this sleep early.
                     self.block(WaitDeadline::from(drain_by))
                 } else {
                     Ok(false)
@@ -649,15 +623,9 @@ impl Endpoint {
                 }
             };
             let quiet = polled.is_empty();
-            // No agent tick or discovery sweep runs while closing, so only
-            // connection, attempt and capability events (a relay
-            // reservation closing, say) are returned.
             for event in polled {
                 self.engine.ingest(event, now);
             }
-            // A relay mesh's backbone closes alongside, and its timers are
-            // in the drain's sleep budget, so it is polled here too.
-            // A failure there ends the drain, as a public swarm's does.
             if let Err(error) = self.engine.drive_backbone(now) {
                 report.errors.push(error);
                 report.outcome = CloseOutcome::Failed;
@@ -671,22 +639,17 @@ impl Endpoint {
                 break;
             }
         }
-        // The last pass's own work (a driver's reset the transport refused,
-        // say) can queue more swarm events: hand them over without polling.
         let now = self.now();
         for event in self.engine.core.take_buffered_events() {
             self.engine.ingest(event, now);
         }
         self.engine.settle(now);
-        // Queued writes the transport has not ended yet die with the endpoint.
         let aborted = self.engine.writes.abort_all();
         self.engine.events.extend(aborted);
         report.events.extend(self.engine.events.drain(..));
         report.unfinished = self.tracked_connections();
         #[cfg(all(feature = "relay-server", feature = "quic"))]
         report.unfinished.extend(self.engine.backbone_connections());
-        // A TCP socket still waiting for its peer's close is cut off too,
-        // though its connection is no longer tracked.
         let lingering =
             minip2p_transport::Transport::has_pending_writes(self.engine.core.transport());
         if report.outcome == CloseOutcome::Drained && (!report.unfinished.is_empty() || lingering) {
@@ -696,9 +659,6 @@ impl Endpoint {
     }
 
     fn close_drain_busy(&self) -> bool {
-        // A TCP socket closed gracefully counts as a pending write until the
-        // peer closes its side; dropping it sooner can reset the stream and
-        // lose what the peer had not read yet.
         let busy = !self.engine.core.connected_peers().is_empty()
             || self.engine.core.has_tracked_connections()
             || minip2p_transport::Transport::has_pending_writes(self.engine.core.transport());

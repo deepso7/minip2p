@@ -255,9 +255,6 @@ impl World {
                             false,
                             now,
                         );
-                        // Identify over the relay connection reports the
-                        // side's public mapping — the real-world source of
-                        // cross-NAT punch candidates.
                         let public = match side {
                             Side::A => A_PUBLIC,
                             Side::B => B_PUBLIC,
@@ -265,7 +262,6 @@ impl World {
                         identify_observed(agent, &relay, &maddr(public), now);
                     }
                 } else {
-                    // A dial toward the other agent.
                     match side {
                         Side::A => {
                             self.punch_dials_from_a += 1;
@@ -394,8 +390,6 @@ impl World {
                     self.blasts_from_b += 1;
                 }
             }
-            // The side's fake swarm adopted the bridge; its circuit's
-            // handshake completes at once.
             Out::PromoteBridge {
                 remote_peer,
                 result,
@@ -461,8 +455,6 @@ impl World {
                     assert!(trailing.is_empty(), "no pipelining before the bridge");
                     assert!(initiator_inbox.is_empty(), "bridge awaits STOP ack");
 
-                    // Mark A's stream as the relay side of the bridge and
-                    // open the queued STOP stream toward B.
                     self.set_role(side, stream, EmuStream::HopBridge);
                     let stop_stream = self.next_inbound_stream();
                     self.streams.push((Side::B, stop_stream, EmuStream::Stop));
@@ -486,7 +478,6 @@ impl World {
                 }
             },
             Some(EmuStream::Stop) if !self.bridged => {
-                // B's answer to STOP CONNECT.
                 let mut initiator_inbox = Vec::new();
                 let (a_bridge, _, pending_id) = self.bridge.expect("bridge pending");
                 let trailing = self
@@ -495,8 +486,6 @@ impl World {
                     .expect("B auto-accepts with STOP STATUS:OK");
                 self.bridged = true;
                 self.deliver(Side::A, a_bridge, initiator_inbox);
-                // Anything B pipelined behind its STATUS already belongs to
-                // the bridge.
                 if !trailing.is_empty() {
                     self.deliver(Side::A, a_bridge, trailing);
                 }
@@ -506,7 +495,6 @@ impl World {
                 self.deliver(Side::B, b_stop, data);
             }
             Some(EmuStream::Stop) => {
-                // Post-bridge bytes from B flow to A's bridge stream.
                 let (a_bridge, _, _) = self.bridge.expect("bridged");
                 self.deliver(Side::A, a_bridge, data);
             }
@@ -589,8 +577,6 @@ fn two_agents_punch_to_a_direct_connection() {
     world.settle_reservation();
 
     let id = world.start_connect();
-    // The whole circuit + DCUtR exchange ran inside the pump; A holds a
-    // relayed path and has already dialed B's observed address.
     let events = drain_events(&mut world.a);
     assert!(
         matches!(
@@ -626,9 +612,6 @@ fn two_agents_punch_to_a_direct_connection() {
         "B records the inbound relayed path, got {events:?}"
     );
 
-    // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).
-    // A responder dial would race A's — when both land, the second
-    // connection replaces the first and ends its streams.
     assert_eq!(
         world.punch_dials_from_b, 0,
         "the responder must not dial: {:?}",
@@ -637,7 +620,6 @@ fn two_agents_punch_to_a_direct_connection() {
     world.advance(100);
     assert!(world.blasts_from_b > 0, "B blasts random UDP");
 
-    // Now the network lets a dial land: both sides converge on direct.
     world.deliver_direct = true;
     world.establish_direct();
     world.pump();
@@ -701,8 +683,6 @@ fn two_agents_fall_back_to_the_relay_when_the_punch_never_lands() {
     drain_events(&mut world.a);
     drain_events(&mut world.b);
 
-    // Walk through all three punch windows (3s each) with no direct
-    // connection ever appearing; B's blasts run and exhaust meanwhile.
     let mut a_events = Vec::new();
     for _ in 0..10 {
         world.advance(1_000);
@@ -722,7 +702,6 @@ fn two_agents_fall_back_to_the_relay_when_the_punch_never_lands() {
         ),
         "the relayed path is the final result: {a_events:?}"
     );
-    // Neither side emits anything further; the bridge belongs to the apps.
     assert!(drain_events(&mut world.b).is_empty());
     world.advance(60_000);
     assert!(drain_events(&mut world.a).is_empty());

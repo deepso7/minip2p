@@ -113,7 +113,6 @@ fn bind(variant: Variant) -> Endpoint {
         builder = builder.relay_server().gossipsub();
     }
     if variant.mdns {
-        // Nearby mDNS peers must not be dialed: the endpoint stays peerless.
         builder = builder.mdns().peer_discovery_config(PeerDiscoveryConfig {
             auto_dial: false,
             ..PeerDiscoveryConfig::default()
@@ -137,7 +136,7 @@ fn drive(endpoint: &mut Endpoint, until: Instant) {
                 "an idle endpoint connected: {event:?}"
             ),
             EndpointWaitOutcome::Deadline => return,
-            _ => {} // interrupted by a WaitHandle
+            _ => {}
         }
     }
 }
@@ -177,8 +176,6 @@ fn main() {
         if variant.ipv6
             && let Err(error) = std::net::UdpSocket::bind("[::1]:0")
         {
-            // The collector requires this variant's rows, so a skip still
-            // fails a results run loudly; the reason is printed for it.
             println!(
                 "endpoint_idle/{}: skipped, cannot bind IPv6 loopback: {error}",
                 variant.name

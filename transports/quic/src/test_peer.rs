@@ -459,7 +459,6 @@ pub(crate) fn accept(
             _ => None,
         })
         .expect("connected");
-    // Let the handshake's trailing packets settle.
     for _ in 0..3 {
         std::thread::sleep(Duration::from_millis(2));
         peer.pump();

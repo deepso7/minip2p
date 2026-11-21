@@ -9,10 +9,6 @@ use crate::{
     StopMessage, StopMessageType, describe_status, handshake_frames, queue_control,
 };
 
-// ---------------------------------------------------------------------------
-// HopReservation: RESERVE flow (client -> relay)
-// ---------------------------------------------------------------------------
-
 /// Outcome of a RESERVE exchange with a relay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReservationOutcome {
@@ -196,10 +192,6 @@ impl Default for HopReservation {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HopConnect: CONNECT flow (client -> relay)
-// ---------------------------------------------------------------------------
-
 /// Outcome of a CONNECT exchange with a relay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectOutcome {
@@ -365,9 +357,6 @@ impl HopConnect {
             ConnectState::Done
         };
         self.outcome = Some(if status == Status::Ok {
-            // Any bytes buffered after the STATUS frame belong to the bridged
-            // stream. This catches the case where the relay pipelines the
-            // first bytes of the bridged connection into the same packet.
             self.bridge_bytes.append(&mut self.frames.take_buffered());
             ConnectOutcome::Bridged { limit: msg.limit }
         } else {
@@ -379,10 +368,6 @@ impl HopConnect {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// StopResponder: incoming STOP CONNECT flow (relay -> us)
-// ---------------------------------------------------------------------------
 
 /// A STOP CONNECT request from a relay, waiting for acceptance or rejection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -596,10 +581,6 @@ impl Default for StopResponder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
 /// Decodes the relay's HOP response, if a whole frame is buffered, and
 /// checks that it is a STATUS.
 fn next_hop_status(frames: &mut FrameExchange) -> Result<Option<HopMessage>, RelayError> {
@@ -631,10 +612,6 @@ fn unexpected_stop_reason(actual: StopMessageType, expected: &str) -> String {
         actual
     )
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -720,8 +697,6 @@ mod tests {
         HopMessage::decode(payload).unwrap()
     }
 
-    // --- HopReservation -----------------------------------------------------
-
     #[test]
     fn reservation_sends_reserve_and_accepts_ok_response() {
         let mut flow = HopReservation::new();
@@ -729,7 +704,6 @@ mod tests {
         let req = decode_hop(&reservation_request(&mut flow));
         assert_eq!(req.kind, HopMessageType::Reserve);
 
-        // Simulate relay response: STATUS:OK with reservation.
         let response = frame_hop(HopMessage {
             reservation: Some(Reservation {
                 expire: Some(2_000_000_000),
@@ -841,8 +815,6 @@ mod tests {
 
     #[test]
     fn reservation_rejects_oversized_declared_frame_length() {
-        // A tiny header declaring an impossible payload length must fail
-        // immediately instead of stalling while waiting for more bytes.
         let mut flow = HopReservation::new();
         reservation_request(&mut flow);
 
@@ -861,13 +833,10 @@ mod tests {
         let mut flow = HopReservation::new();
         reservation_request(&mut flow);
 
-        // A well-framed payload with no `type` field.
         let err = flow.on_data(&encode_frame(&[])).unwrap_err();
         assert_eq!(err, RelayError::Malformed(RelayMessageError::MissingType));
         assert!(flow.is_done());
     }
-
-    // --- HopConnect ---------------------------------------------------------
 
     #[test]
     fn connect_sends_connect_and_bridges_on_ok() {
@@ -910,9 +879,6 @@ mod tests {
 
     #[test]
     fn connect_coalesced_bridge_bytes_beyond_frame_cap_are_captured() {
-        // A coalesced read can carry the STATUS frame plus more bridged
-        // bytes than one maximal frame; the receive path must not tear
-        // the flow down over the buffer total.
         let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
         connect_request(&mut flow);
 
@@ -986,15 +952,12 @@ mod tests {
             }
         );
         assert!(flow.is_done());
-        // A failed flow never turns later bytes into bridge data.
         flow.on_data(b"after-failure").unwrap();
         assert!(flow.poll_output().is_none());
     }
 
     #[test]
     fn connect_constructor_refuses_an_oversized_target_peer_id() {
-        // The oversized frame is never built: the caller learns at
-        // construction, with no input needed to surface the error.
         assert!(matches!(
             HopConnect::new(vec![0u8; MAX_MESSAGE_SIZE + 1]),
             Err(RelayError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
@@ -1003,10 +966,6 @@ mod tests {
 
     #[test]
     fn connect_at_exact_max_size_still_encodes() {
-        // Peer id sized so the encoded CONNECT payload is exactly
-        // MAX_MESSAGE_SIZE: 2 bytes type field + 1 tag + 2-byte length
-        // varint for the nested Peer + (1 tag + 2-byte length varint +
-        // 8184 id bytes).
         let id = vec![0u8; 8184];
         let mut flow = HopConnect::new(id.clone()).unwrap();
         let bytes = connect_request(&mut flow);
@@ -1015,20 +974,16 @@ mod tests {
         };
         assert_eq!(payload.len(), MAX_MESSAGE_SIZE);
 
-        // One more byte and the frame must be refused.
         assert!(matches!(
             HopConnect::new(vec![0u8; 8185]).err(),
             Some(RelayError::MessageTooLarge { len }) if len == MAX_MESSAGE_SIZE + 1
         ));
     }
 
-    // --- StopResponder ------------------------------------------------------
-
     #[test]
     fn stop_receives_connect_accepts_and_bridges() {
         let mut flow = StopResponder::new();
 
-        // Incoming CONNECT from relay.
         let connect = frame_stop(StopMessage {
             limit: Some(Limit {
                 duration: Some(300),
@@ -1044,7 +999,6 @@ mod tests {
         assert_eq!(request.source_peer_id, b"source-peer");
         assert_eq!(request.limit.as_ref().and_then(|l| l.duration), Some(300));
 
-        // Accept and verify outbound is STATUS:OK.
         flow.accept().unwrap();
         let Some(StopResponderOutput::Outbound(outbound)) = flow.poll_output() else {
             panic!("STATUS should be queued");
@@ -1056,7 +1010,6 @@ mod tests {
         assert_eq!(response.kind, StopMessageType::Status);
         assert_eq!(response.status, Some(Status::Ok));
 
-        // Subsequent data is bridged.
         flow.on_data(b"relayed-peer-traffic").unwrap();
         assert_eq!(
             flow.poll_output(),
@@ -1091,8 +1044,6 @@ mod tests {
 
     #[test]
     fn stop_accepts_an_exactly_max_connect_with_pipelined_bytes() {
-        // A STOP CONNECT whose payload is exactly MAX_MESSAGE_SIZE, with
-        // bridge bytes coalesced behind it in one read.
         let connect = stop_connect(&[0u8; 8184]);
         assert_eq!(connect.encode().len(), MAX_MESSAGE_SIZE);
         let mut coalesced = frame_stop(connect);

@@ -28,14 +28,11 @@ fn connection_state_updates_before_establishment_event_is_queued() {
         },
     );
 
-    // State must reflect the transition before any application drain.
     assert!(
         core.connected_peers().contains(&peer_id),
         "connected_peers reflects the peer before the event is drained"
     );
     assert_eq!(core.connection_id(&peer_id), Some(conn_id));
-    // The event is still sitting in the output queue — state was updated
-    // before queueing, so getters are never behind an already-emitted event.
     assert!(
         !core.events.is_empty(),
         "the matching event remains queued after state was updated"
@@ -73,7 +70,6 @@ fn peer_ready_state_updates_before_event_is_queued() {
         },
     );
 
-    // Connected auto-opens identify. Complete the outbound initiator path.
     let actions = drain_actions(&mut core);
     let stream_id = StreamId::new(1);
     core.opened(actions, conn_id, IDENTIFY_PROTOCOL_ID, stream_id);
@@ -146,7 +142,6 @@ fn transport_loss_reports_connection_closed_with_its_reason() {
         },
     );
 
-    // The failure is the close's reason, with no separate error event.
     assert!(matches!(
         drain_events(&mut core).as_slice(),
         [SwarmEvent::ConnectionClosed { conn_id: closed, reason, .. }]
@@ -449,7 +444,6 @@ fn refused_identify_bytes_reset_the_owned_stream() {
     core.insert_stream_owner(original_conn, stream_id, ProtocolKind::IdentifyInitiator);
     core.identify.register_inbound_stream(peer_id, stream_id);
 
-    // A header declaring a frame far beyond identify's limit.
     let mut data = Vec::new();
     minip2p_core::write_uvarint(u64::from(u32::MAX), &mut data);
     core.identify.on_stream_data(peer_id, stream_id, &data);

@@ -318,7 +318,6 @@ impl AutoNatClient {
     }
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
-        // At most one response: anything pipelined behind it is ignored.
         if self.state == FlowState::Done {
             return Ok(());
         }
@@ -354,8 +353,6 @@ impl AutoNatClient {
                 status: response.status,
                 reason,
             },
-            // A refusal says nothing about our reachability: the server may
-            // simply be rate limiting.
             ResponseStatus::DialRefused
             | ResponseStatus::BadRequest
             | ResponseStatus::InternalError => Reachability::Unknown {
@@ -902,7 +899,6 @@ mod tests {
             "/ip6/2001:db8::1/udp/4001/quic-v1",
             "/ip4/203.0.113.7/tcp/4001",
         ));
-        // The deprecated IPv4-compatible form is not an IPv4 host.
         assert!(!forwards(
             "/ip6/::203.0.113.7/udp/4001/quic-v1",
             "/ip4/203.0.113.7/tcp/4001",
@@ -926,7 +922,6 @@ mod tests {
     fn a_request_over_a_relayed_connection_is_refused() {
         let relayed = "/ip4/198.51.100.1/udp/4001/quic-v1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC/p2p-circuit";
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        // Even an address on the relay's own IP is not dialed.
         let offered = addrs(&["/ip4/198.51.100.1/udp/4001/quic-v1"]);
         assert_eq!(
             refusal(dial(server_at(relayed), &peer_id, &offered)),
@@ -1002,7 +997,6 @@ mod tests {
     fn client_rejects_a_declared_length_above_the_maximum() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let mut client = AutoNatClient::new(&peer_id, &[]);
-        // A header declaring MAX + 1, rejected before any payload arrives.
         let mut framed = Vec::new();
         write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
 
@@ -1056,7 +1050,6 @@ mod tests {
         let mut client = AutoNatClient::new(&peer_id, &[]);
         let oversized = vec![0u8; 2 * MAX_MESSAGE_SIZE + 3];
 
-        // The limit is one maximal frame (2-byte prefix) plus its trailing allowance.
         assert_eq!(
             client.on_data(&oversized),
             Err(AutoNatError::MessageTooLarge {
@@ -1088,7 +1081,6 @@ mod tests {
         assert!(0 < kept && kept < addrs.len());
         assert_eq!(request.addrs, addrs[..kept], "a prefix, in order");
 
-        // The boundary is exact: one more address would not have fit.
         let one_more = Message {
             kind: MessageType::Dial,
             dial: Some(Dial {
@@ -1109,7 +1101,6 @@ mod tests {
         let long = Multiaddr::from_str(&alloc::format!("/dns4/{}.example/tcp/1", "a".repeat(200)))
             .unwrap();
         let short = Multiaddr::from_str("/ip4/203.0.113.7/tcp/1").unwrap();
-        // Room for exactly the short address.
         let body_len = MAX_MESSAGE_SIZE - field_len(short.to_bytes().len());
 
         let fitting = fitting_addrs(&[long, short.clone()], body_len, |len| len);
@@ -1195,19 +1186,15 @@ mod tests {
         let mut with_peer = asked_addr.clone();
         with_peer.push(Protocol::P2p(PeerId::from_str(PEER_ID).unwrap()));
 
-        // Unrelated addresses are dropped, and a /p2p suffix naming us
-        // still matches what we asked about.
         assert!(matches!(
             public_outcome(&[asked], &[other.clone(), with_peer.clone()]),
             Reachability::Public { addrs, .. } if addrs == vec![asked_addr]
         ));
-        // A requested address that already names us matches itself.
         let with_peer_text = with_peer.to_string();
         assert!(matches!(
             public_outcome(&[&with_peer_text], core::slice::from_ref(&with_peer)),
             Reachability::Public { addrs, .. } if addrs == vec![with_peer.clone()]
         ));
-        // Only unrelated, or nothing at all: no evidence either way.
         for returned in [vec![other], Vec::new()] {
             assert!(
                 matches!(
@@ -1344,7 +1331,6 @@ mod tests {
 
     #[test]
     fn dial_encode_matches_known_bytes() {
-        // type=DIAL, nested Dial { Peer { id = [0xaa], no addrs } }
         let msg = Message {
             kind: MessageType::Dial,
             dial: Some(Dial {
@@ -1357,12 +1343,7 @@ mod tests {
         };
         assert_eq!(
             msg.encode(),
-            vec![
-                0x08, 0x00, // type = DIAL
-                0x12, 0x05, // dial LEN 5
-                0x0a, 0x03, // peer LEN 3
-                0x0a, 0x01, 0xaa, // peer.id
-            ]
+            vec![0x08, 0x00, 0x12, 0x05, 0x0a, 0x03, 0x0a, 0x01, 0xaa,]
         );
     }
 
@@ -1380,11 +1361,8 @@ mod tests {
         assert_eq!(
             msg.encode(),
             vec![
-                0x08, 0x01, // type = DIAL_RESPONSE
-                0x1a, 0x0d, // dialResponse LEN 13
-                0x08, 0x00, // status = OK
-                0x12, 0x02, b'o', b'k', // statusText
-                0x1a, 0x05, 0x04, 127, 0, 0, 1, // addr
+                0x08, 0x01, 0x1a, 0x0d, 0x08, 0x00, 0x12, 0x02, b'o', b'k', 0x1a, 0x05, 0x04, 127,
+                0, 0, 1,
             ]
         );
     }
@@ -1398,7 +1376,6 @@ mod tests {
                 offset: 0
             })
         );
-        // Field 2^29 after a valid `type` field.
         assert_eq!(
             Message::decode(&[0x08, 0x00, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]).unwrap_err(),
             AutoNatError::Wire(WireError::InvalidFieldNumber {
@@ -1410,7 +1387,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_field_numbers_in_nested_peer_info() {
-        // type = DIAL, dial { peer { field 0 } }: offset is relative to PeerInfo.
         let input = [0x08, 0x00, 0x12, 0x04, 0x0a, 0x02, 0x00, 0x00];
         assert_eq!(
             Message::decode(&input).unwrap_err(),

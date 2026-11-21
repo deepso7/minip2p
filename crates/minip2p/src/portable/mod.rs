@@ -13,24 +13,9 @@ pub use minip2p_core::{
 };
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_swarm::{
-    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
-    // re-exported so portable callers can name them without a direct swarm
-    // dependency.
-    DriverError,
-    // The default first-Identify deadline (`SwarmTimeouts::identify_ms`).
-    IDENTIFY_TIMEOUT_MS,
-    IdentifyFailure,
-    IdentifyMessage,
-    // The default negotiation deadline (`SwarmTimeouts::negotiation_ms`).
-    OUTBOUND_NEGOTIATION_TIMEOUT_MS,
-    // Part of `EndpointEvent::PingFailed`.
-    PingFailure,
-    SwarmError,
-    SwarmErrorKind,
-    SwarmEvent,
-    SwarmRuntimeError,
-    // The negotiation, first-Identify and ping deadlines the builders take.
-    SwarmTimeouts,
+    DriverError, IDENTIFY_TIMEOUT_MS, IdentifyFailure, IdentifyMessage,
+    OUTBOUND_NEGOTIATION_TIMEOUT_MS, PingFailure, SwarmError, SwarmErrorKind, SwarmEvent,
+    SwarmRuntimeError, SwarmTimeouts,
 };
 pub use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, StreamKey, Transport,
@@ -223,18 +208,12 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
 
     /// [`Endpoint::close`] on a portable platform; see its docs.
     pub(crate) fn close_portable(mut self) -> CloseReport {
-        // One sample for the whole teardown (and the `Drop` after it), as
-        // the caller's `now` was.
         let now = self.now();
         self.closed_at = Some(now);
-        // The failure is queued as an event too.
         #[cfg(feature = "mdns")]
         drop(self.engine.shutdown_mdns(now));
         let mut errors = self.disconnect_established(now);
         let mut outcome = CloseOutcome::Drained;
-        // Two final drives: the first runs the swarm's deferred closes, the
-        // second puts them on the wire (a smoltcp provider sends its FINs
-        // only when polled).
         for _ in 0..2 {
             if let Err(error) = self.engine.drive(now, &mut Concrete) {
                 errors.push(error);
@@ -242,16 +221,12 @@ impl<T: Transport, E: EntropySource, C: Clock> Endpoint<Portable<T, E, C>> {
                 break;
             }
         }
-        // Hand over what the swarm queued without polling again: a failed
-        // drive's leftovers (a disconnect's close failure, say), or what the
-        // final drive's own work produced.
         for event in self.engine.core.take_buffered_events() {
             self.engine.ingest(event, now);
         }
         #[cfg(feature = "pubsub")]
         self.engine.collect_agent_events();
         self.engine.settle(now);
-        // Queued writes the transport has not ended yet die with the endpoint.
         let aborted = self.engine.writes.abort_all();
         self.engine.events.extend(aborted);
         let unfinished = self.tracked_connections();
@@ -451,7 +426,6 @@ impl<E: EntropySource, C: Clock> EndpointBuilder<PortableBuilderState<E, C>> {
             &state.identity.peer_id(),
         )?;
         let (swarm, parts) = common.into_parts(&state.identity)?;
-        // The swarm owns the entropy from here on; capabilities draw from it.
         let mut engine = parts.engine(swarm.build_core(transport, state.entropy)?);
         setup::install(
             &mut engine,

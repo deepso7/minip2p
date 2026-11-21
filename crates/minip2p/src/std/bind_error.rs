@@ -256,9 +256,6 @@ impl From<SetupError> for BindError {
             SetupError::NatConfig(error) => Self::NatConfig(error),
             #[cfg(feature = "pubsub")]
             SetupError::Gossipsub(error) => Self::Gossipsub(error),
-            // The beacon setters validate the topic, so pubsub refusing it
-            // is a bug; the portable builder takes its config unchecked and
-            // reports it as `PortableBuildError::Topic`.
             #[cfg(feature = "discovery")]
             SetupError::Topic(_) => Self::Invariant {
                 reason: "validated discovery topic was rejected by pubsub",

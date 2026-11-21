@@ -96,7 +96,6 @@ export interface AdapterContractHarness {
 const PEER = "12D3KooWPeer";
 const QUIC = `/ip4/127.0.0.1/udp/4001/quic-v1/p2p/${PEER}`;
 const TCP = `/ip4/127.0.0.1/tcp/4001/p2p/${PEER}`;
-// Native connect IDs are small; connection IDs span the full u64 range.
 const CONNECT_ID = 30n;
 const CONN_ID = 2n ** 63n + 1n;
 const NEXT_CONN_ID = 2n ** 63n + 2n;
@@ -133,7 +132,6 @@ export function describeAdapterContract(
       vi.useFakeTimers();
       const endpoint = harness.create();
       const native = harness.native();
-      // A handshake with no peer yet names none; a peer is listed once.
       native.setCloseUnfinished([
         { connId: CONN_ID, peerId: PEER },
         { connId: NEXT_CONN_ID },
@@ -298,7 +296,6 @@ export function describeAdapterContract(
         remoteAddr: "/p2p/relay/p2p-circuit",
       });
 
-      // The queue dropped this circuit's `ConnectionEstablished`.
       native.deliver([
         {
           inner: {
@@ -431,8 +428,6 @@ export function describeAdapterContract(
       endpoint.on("inboundDirectUpgrade", ({ oldConnId }) =>
         upgrades.push(oldConnId)
       );
-      // Seen before it is replaced: an unseen connection would fold into
-      // its successor instead.
       native.deliver([
         {
           inner: { connId: CONN_ID, peerId: PEER },
@@ -440,7 +435,6 @@ export function describeAdapterContract(
         },
       ]);
       await drained();
-      // Lifecycle events come first in a batch, then the path events.
       native.deliver([
         {
           inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
@@ -489,8 +483,6 @@ export function describeAdapterContract(
       native.setLiveConnection(CONN_ID);
       await stream.write("before");
 
-      // The new connection reuses stream id 4, and its ConnectionReplaced
-      // is not drained yet, so the SDK still treats the stream as open.
       native.setLiveConnection(NEXT_CONN_ID);
       await expect(stream.write("after")).rejects.toThrow();
 
@@ -520,7 +512,6 @@ export function describeAdapterContract(
       const stream = await opening;
       const whole = new Uint8Array([1, 2, 3, 4]);
       await stream.write(whole);
-      // A view of part of a buffer reaches native as exactly its bytes.
       await stream.write(whole.subarray(1, 3));
 
       const [first, second] = native.writtenData;
@@ -558,8 +549,6 @@ export function describeAdapterContract(
         }
       });
 
-      // The adapter drains both events before the SDK dispatches the data,
-      // so the reply runs after the old connection's identity is released.
       native.deliver([
         {
           inner: {
@@ -606,8 +595,6 @@ export function describeAdapterContract(
       const stream = await opening;
       expect(native.consumed).toEqual([]);
 
-      // The closed stream's IDs are retired, yet its unread bytes still
-      // hold a native stream slot until this read acknowledges them.
       expect([...((await stream.read()) ?? [])]).toEqual([1, 2, 3]);
       expect(native.consumed).toEqual([
         { bytes: 3, connId: CONN_ID, streamId: 4n },
@@ -616,10 +603,6 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
-    // ADR 0012 (#356): bytes a stream delivered hold its ended connection's
-    // native slot until acknowledged or abandoned, so every path the SDK
-    // settles them on must still reach native after the adapter released
-    // the connection's identity.
     const lateStream = { connId: CONN_ID, peerId: PEER, streamId: 4n };
     const closedConnection: NativeEventLiteral = {
       inner: { connId: CONN_ID, peerId: PEER, reason: { tag: "Local" } },
@@ -630,8 +613,6 @@ export function describeAdapterContract(
       vi.useFakeTimers();
       const endpoint = harness.create();
       const native = harness.native();
-      // No handler claims the stream, so the SDK abandons it, then discards
-      // its data as untracked: both after the close was normalized.
       native.deliver([
         {
           inner: {
@@ -681,8 +662,6 @@ export function describeAdapterContract(
       await drained();
       await opening;
 
-      // The connection ended, so the unread bytes are discarded: released
-      // through the handle the stream took while its events were in flight.
       expect(native.consumed).toEqual([
         { bytes: 3, connId: CONN_ID, streamId: 4n },
       ]);
@@ -712,7 +691,6 @@ export function describeAdapterContract(
       const codes: bigint[] = [];
       stream.on("writeStopped", ({ errorCode }) => codes.push(errorCode));
 
-      // QUIC stop codes are 62-bit varints.
       const errorCode = 2n ** 62n - 1n;
       native.deliver([
         {
@@ -760,7 +738,6 @@ export function describeAdapterContract(
         relays: [],
       });
 
-      // Absent listen leaves the choice to the native defaults.
       harness.create().close();
       expect(harness.native().config).toMatchObject({ listen: undefined });
 

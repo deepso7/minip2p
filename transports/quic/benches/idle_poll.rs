@@ -15,9 +15,6 @@ fn idle_poll(c: &mut Criterion) {
 
     for &count in COUNTS {
         let (mut server, _client) = establish(count);
-        // Measured as a std host drives it (ADR 0013): attached to a shared
-        // poll, with a zero-timeout harvest before each poll. Unattached, the
-        // transport would treat its socket as always possibly ready.
         let mut readiness = SharedPoll::new().expect("open readiness poll");
         readiness.attach(&mut server).expect("attach server");
 

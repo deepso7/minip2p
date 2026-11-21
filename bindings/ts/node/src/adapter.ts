@@ -18,8 +18,6 @@ function nodeBackend(config: Minip2pConfig): Minip2pBackend {
   );
   return new SerdeBackend(endpoint, {
     circuitAddress,
-    // One check-phase turn keeps native callbacks out of the caller's stack
-    // without paying the timer granularity for every bounded batch.
     schedule: (task) => {
       setImmediate(task);
     },

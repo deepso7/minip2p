@@ -1,0 +1,9 @@
+# Pubsub host: stream bookkeeping and how stream-action errors reach the agent
+
+The Endpoint runs the Gossipsub agent against the swarm in `crates/minip2p/src/pubsub.rs`, and `StreamConns` (`stream_conns.rs`) maps the agent's `(peer, stream id)` to the connection. The errors each `GossipsubAction` can hit are routed deliberately:
+
+- **A closing stream's mapping outlives the event that closes it.** `ingest` skips `StreamConns::observe` for `StreamClosed` until the agent has handled it: the agent acknowledges an unfinished frame it discards on close (`AckStream`), and that ack needs the stream's connection.
+- **A synchronously rejected `SendStream` is reported to the agent** (`send_result`): otherwise the stream's eventual close would commit work whose frame was never accepted. A `DriverError::Full` is not a failure: the frame stays in flight with its tail (`send_full`), and the stream's `Writable` resends it.
+- **A failed half-close after an accepted write is ignored.** The frame may well have been delivered, so failing the work there could report it twice; the agent's send deadline and close handling settle it.
+- **`AckStream` and `ResetStream` on a stream already gone are ignored.** A gone stream has nothing left to settle, and a reset races ordinary teardown, so an already-closed stream is successful cleanup, not a second error.
+- **`StreamConns` forgets streams on the swarm's terminal events, which are not all per-stream.** A stream whose negotiation failed (`SwarmErrorKind::Multistream`, `UnsupportedProtocol`, `OpenStreamFailed`) is reset without a `StreamClosed`, and the error may not name the peer, so it is matched by connection and stream id. Streams that end with their connection (`ConnectionClosed`, `ConnectionReplaced`'s `old`) get no per-stream event, so they are dropped by connection.

@@ -11,9 +11,6 @@ fn builder_protocol_registers_for_stream_routing() {
         .bind()
         .expect("bind loopback endpoint");
 
-    // A registered protocol fails with NotConnected for an unknown
-    // peer, not ProtocolNotRegistered -- proving the builder wired the
-    // protocol into user-stream routing.
     let peer_id = Ed25519Keypair::generate().peer_id();
     assert!(matches!(
         endpoint.open_stream(&peer_id, PROTOCOL),
@@ -80,7 +77,6 @@ fn bind_errors_name_what_failed() {
                 EndpointOptionsError::RelayAnnounceWithoutServer
             ))
         ));
-        // Valid for the peer it names, but this endpoint is another one.
         let Some(BindError::RelayServerAnnounce(error)) = quic()
             .relay_server()
             .relay_server_announce_addrs(vec![announce])
@@ -116,12 +112,9 @@ fn builder_rejects_reserved_protocol_ids() {
 
 #[test]
 fn builder_rejects_reserved_protocol_ids_before_binding() {
-    // An unbindable address must not mask the configuration error:
-    // validation happens before any socket is allocated.
     let error = Endpoint::builder()
         .protocol(RESERVED_PROTOCOL_IDS[0])
-        // TEST-NET-1 is never a local address, so this bind would fail.
-        .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+        .listen_on(UNBINDABLE_QUIC)
         .expect("quic listen address")
         .bind()
         .err()
@@ -139,8 +132,7 @@ fn builder_rejects_a_zero_timeout_before_binding() {
             identify_ms: 0,
             ..SwarmTimeouts::default()
         })
-        // TEST-NET-1 is never a local address, so this bind would fail.
-        .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+        .listen_on(UNBINDABLE_QUIC)
         .expect("quic listen address")
         .bind()
         .err()
@@ -209,7 +201,6 @@ fn relay_mesh_is_checked_before_any_socket_opens() {
             .relay_mesh(mesh(&public, Vec::new())),
     );
     assert_eq!(error, EndpointOptionsError::RelayMeshPublicIdentity);
-    // Backbone transports take `/ip4|ip6` QUIC only: no names, no TCP.
     for transport in [
         "/dns4/relay.example/udp/19877/quic-v1",
         "/ip4/127.0.0.1/tcp/19877",
@@ -392,8 +383,6 @@ fn relay_server_webtransport_announces_follow_the_certificate_mode() {
         format!("{hash_free}/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g")
             .parse()
             .unwrap();
-    // Announce addresses are set before the certificate: the mode is
-    // checked at bind, once every option is in.
     let relay = |announce: &Multiaddr, ca: bool| {
         let builder = Endpoint::builder()
             .relay_server()
@@ -424,7 +413,6 @@ fn relay_server_webtransport_announces_follow_the_certificate_mode() {
         RelayServerAddressErrorKind::UnexpectedCerthash
     );
 
-    // At runtime too, and a refused replacement keeps the override.
     let mut ca = relay(&hash_free, true).expect("CA mode announces hash-free");
     let error = ca
         .set_relay_server_announce_addrs(vec![hashed.clone()])
@@ -516,7 +504,6 @@ fn nat_and_relay_address_contributions_form_a_stable_first_wins_union() {
         .agent
         .replace_announce_addrs(vec![duplicate.clone(), relay_only.clone()])
         .unwrap();
-    // One batch merges the contributions; the next advertises them.
     endpoint.poll().expect("merge address contributions");
     endpoint.poll().expect("refresh identify snapshot");
     let advertised = endpoint.core().local_addresses();

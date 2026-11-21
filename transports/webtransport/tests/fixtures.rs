@@ -99,6 +99,10 @@ fn capsules(frame: &[u8]) -> Vec<Capsule> {
     capsules
 }
 
+const PRE_RFC_H3_DATAGRAM: u64 = 0xff_d277;
+const GREASE_SETTING: u64 = 0x1b_4f7f_0738;
+const DRAFT_15_WT_ENABLED: u64 = 0x2c7c_f000;
+
 #[test]
 fn chrome_control_stream_settings() {
     assert_eq!(
@@ -108,9 +112,9 @@ fn chrome_control_stream_settings() {
             (setting::MAX_FIELD_SECTION_SIZE, 16_384),
             (setting::QPACK_BLOCKED_STREAMS, 100),
             (setting::H3_DATAGRAM, 1),
-            (0xff_d277, 1), // pre-RFC H3_DATAGRAM
+            (PRE_RFC_H3_DATAGRAM, 1),
             (setting::ENABLE_WEBTRANSPORT, 1),
-            (0x1b_4f7f_0738, 0xcb5d_05f4), // GREASE
+            (GREASE_SETTING, 0xcb5d_05f4),
         ]
     );
 }
@@ -123,7 +127,7 @@ fn firefox_control_stream_settings() {
             (setting::QPACK_MAX_TABLE_CAPACITY, 65_536),
             (setting::QPACK_BLOCKED_STREAMS, 20),
             (setting::ENABLE_WEBTRANSPORT, 1),
-            (0xff_d277, 1),
+            (PRE_RFC_H3_DATAGRAM, 1),
             (setting::H3_DATAGRAM, 1),
             (setting::ENABLE_CONNECT_PROTOCOL, 1),
         ]
@@ -139,7 +143,7 @@ fn webtransport_go_control_stream_settings() {
             (setting::H3_DATAGRAM, 1),
             (setting::ENABLE_CONNECT_PROTOCOL, 1),
             (setting::ENABLE_WEBTRANSPORT, 1),
-            (0x2c7c_f000, 1), // draft-15+ WT_ENABLED
+            (DRAFT_15_WT_ENABLED, 1),
             (setting::WT_MAX_SESSIONS, varint::MAX),
         ]
     );

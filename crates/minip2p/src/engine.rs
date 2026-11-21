@@ -197,10 +197,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.mdns.is_some()
     }
 
-    // ---------------------------------------------------------------------
-    // Commands
-    // ---------------------------------------------------------------------
-
     /// Admits one Connection attempt. A Peer-ID target resolves through the
     /// discovery book when there is one, and every address the book knows
     /// for the peer steers the relay leg. Whatever settles at once is queued
@@ -355,8 +351,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             stream.stream_id(),
             now.monotonic_ms,
         )?;
-        // No Writable follows a FIN, so none can clear a waiting bare writer,
-        // and one still queued here is stale.
         self.writes.unwant_writable(stream);
         self.drop_queued_writable(&peer_id, stream);
         Ok(())
@@ -650,10 +644,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Driving
-    // ---------------------------------------------------------------------
-
     /// Settles attempts whose deadline passed. [`Self::drive`] does this
     /// before it applies Name-resolution answers, so a late answer cannot
     /// turn a Timeout into another outcome.
@@ -775,8 +765,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         mdns.tick(now, self.core.local_addresses());
         self.collect_mdns_events(now);
         if self.mdns_shares_transport {
-            // The carrier drives the shared interface, which may have put
-            // bytes into a socket after the transport was serviced.
             self.ingest_transport(now)?;
         }
         Ok(())
@@ -810,8 +798,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// queues it unless one of them claimed it. Its capability and
     /// Connection-attempt output follows at the end of the batch.
     pub(crate) fn ingest(&mut self, mut event: SwarmEvent, now: Now) {
-        // The swarm reports a replaced connection's punch as Direct: refine
-        // `old` before NAT forgets its punch on this event...
         if let SwarmEvent::ConnectionReplaced { old, old_path, .. } = &mut event {
             *old_path = refine_punched(*old_path, is_punched(&self.nat, *old));
         }
@@ -819,12 +805,9 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             .connect
             .observe(&event, &mut self.core, now.monotonic_ms)
             || self.ingest_into_drivers(&event, now);
-        // ...and `new` after NAT has recorded it.
         if let SwarmEvent::ConnectionReplaced { new, new_path, .. } = &mut event {
             *new_path = refine_punched(*new_path, is_punched(&self.nat, *new));
         }
-        // The write queue follows every swarm event, claimed or not: a
-        // connection a driver claims can still end streams it queued for.
         let (writable_claimed, follow) =
             self.writes
                 .observe(&mut self.core, &event, now.monotonic_ms);
@@ -833,8 +816,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 .push_back(EndpointEvent::from_swarm(event, &mut self.protocols));
         }
         self.events.extend(follow);
-        // NAT output reaches the Connection engine in step with the swarm
-        // events that caused it.
         self.route_nat(now);
     }
 
@@ -1036,8 +1017,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_mut() {
             let listeners = concrete_relay_listener_addrs(self.core.transport().local_addresses());
-            // A rejected source keeps its previous addresses; the agent
-            // queues `AddrsRejected` (and later `AddrsRestored`) instead.
             drop(relay_server.agent.set_listener_addrs(listeners));
             #[cfg(feature = "autonat")]
             if let Some(nat) = self.nat.as_ref() {

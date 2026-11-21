@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Checks that a built relay image starts: its metadata, `--version`, both
-# TCP and QUIC listeners, and that its identity survives a container
-# replacement on the same /data volume. Used by test-relay-container.sh and by
-# the publish workflow on the release image before it is pushed.
-#
-# PLATFORM (e.g. linux/arm64) runs a foreign-arch image under QEMU.
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
@@ -35,8 +29,6 @@ jq -e '.[0].Config.ExposedPorts | has("19876/udp")' <<<"$metadata" >/dev/null
 jq -e '.[0].Config.Volumes | has("/data")' <<<"$metadata" >/dev/null
 test "$(docker run --rm "${platform[@]}" "$image" --version)" = "minip2p-relay $version"
 
-# Starts the relay on the volume and prints its peer ID once both listeners
-# are up.
 start_relay() {
   docker container rm --force "$container" >/dev/null 2>&1 || true
   docker run --detach "${platform[@]}" \

@@ -79,14 +79,12 @@ fn inbound_bytes_are_acknowledged_once_their_frame_is_decoded() {
         data: Bytes::copy_from_slice(bytes),
     };
 
-    // Half a frame is held, unacknowledged; completing it acks it all.
     let (head, tail) = frame.split_at(1);
     assert!(agent.handle_event(&data(head), 0));
     assert_eq!(acks_of(&mut agent), []);
     assert!(agent.handle_event(&data(tail), 0));
     assert_eq!(acks_of(&mut agent), [(stream, frame.len())]);
 
-    // A partial frame the stream closes on is discarded, which consumes it.
     assert!(agent.handle_event(&data(head), 0));
     assert!(agent.handle_event(
         &SwarmEvent::StreamClosed {
@@ -317,7 +315,6 @@ fn build_time_subscribe_does_not_arm_heartbeat() {
         agent.next_deadline(Now::from_millis(50_000)),
         Some(Deadline::from_millis(51_000))
     );
-    // Due exactly at its ms; an overdue heartbeat keeps its past value.
     assert!(Deadline::from_millis(51_000).is_expired_at(Now::from_millis(51_000)));
     assert_eq!(
         agent.next_deadline(Now::from_millis(60_000)),
@@ -342,7 +339,6 @@ fn prefers_v11_but_encodes_for_the_actually_negotiated_version() {
         action,
         GossipsubAction::OpenStream { protocol_id, .. } if protocol_id == MESHSUB_PROTOCOL_ID_V11
     )));
-    // Put the action back through the manual ready sequence using its token.
     let token = open
         .iter()
         .find_map(|action| match action {
@@ -459,29 +455,22 @@ fn a_full_send_holds_its_tail_until_writable_and_blocks_later_frames() {
     remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 0);
     drain_events(&mut agent);
 
-    // The subscription frame is accepted only in part.
     agent.subscribe("room", 1).unwrap();
     let (frame, token, _) = sent(&drain_actions(&mut agent)).expect("subscription frame");
     let tail = Bytes::from(frame.get(3..).expect("frame tail").to_vec());
-    // The host reports Full instead of a send result; the GRAFT queued
-    // behind the frame waits for it.
     agent.send_full(&remote, stream, token, tail.clone());
     agent.handle_tick(1);
     assert!(sent(&drain_actions(&mut agent)).is_none());
 
-    // Writable resends exactly the held tail, under a fresh token.
     assert!(agent.handle_event(&writable, 2));
     let (resent, retry, resent_on) = sent(&drain_actions(&mut agent)).expect("tail resent");
     assert_eq!((resent.as_slice(), resent_on), (tail.as_ref(), stream));
     assert_ne!(retry, token);
-    // The retired token no longer settles anything.
     agent.send_result(&remote, stream, token, Ok(()), 2);
     assert!(sent(&drain_actions(&mut agent)).is_none());
-    // A second Writable has nothing left to resend.
     assert!(agent.handle_event(&writable, 2));
     assert!(sent(&drain_actions(&mut agent)).is_none());
 
-    // Once the tail is accepted, the queued GRAFT follows.
     agent.send_result(&remote, stream, retry, Ok(()), 2);
     let graft = drain_actions(&mut agent);
     assert_eq!(
@@ -1024,7 +1013,6 @@ fn stale_close_of_a_failed_stream_keeps_the_ready_replacement_sending() {
         1_000,
     );
 
-    // The old stream's close arrives late, after stream 8 is ready.
     assert!(agent.handle_event(
         &SwarmEvent::StreamClosed {
             peer_id: remote,
@@ -1106,7 +1094,6 @@ fn write_stop_resets_the_outbound_stream_and_is_claimed_on_inbound() {
         stream_id,
         error_code: 0,
     };
-    // We never write to an inbound stream, so its stop needs no action.
     assert!(agent.handle_event(&stopped(inbound), 1));
     assert!(drain_actions(&mut agent).is_empty());
 
@@ -1935,7 +1922,6 @@ fn replacement_drops_undrained_actions_for_the_old_connection() {
     let other = peer(3);
     connect(&mut agent, &other, &[MESHSUB_PROTOCOL_ID_V11], 0);
 
-    // Both peers' opens are still queued when `remote` is handed over.
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: remote,

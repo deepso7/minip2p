@@ -134,8 +134,6 @@ type ConnectTerminal =
       readonly error: Error;
     };
 
-// A tracked Connection attempt holds either its not-yet-consumed terminal or
-// at most one local wait. The attempt outlives a wait that ends early.
 interface ConnectAttempt {
   terminal?: ConnectTerminal;
   settle?: (terminal: ConnectTerminal) => void;
@@ -231,7 +229,6 @@ class Fifo<Item> {
     const item = this.#items[this.#head];
     this.#items[this.#head] = undefined;
     this.#head += 1;
-    // Drop the consumed prefix once it is at least half the array.
     if (this.#head * 2 >= this.#items.length) {
       this.#items = this.#items.slice(this.#head);
       this.#head = 0;
@@ -451,7 +448,6 @@ class EventQueue {
       newest === undefined ? undefined : coalesceData(newest, item);
     if (merged !== undefined && this.#newest !== undefined) {
       this.#items.set(this.#newest, merged);
-      // The absorbed event is handled: its adapter state goes now.
       this.#release(item);
       return undefined;
     }
@@ -897,8 +893,6 @@ export class Stream {
       this.#emitData(chunk);
       return;
     }
-    // Unbounded here, because native delivers at most one receive window
-    // that has not been consumed.
     this.#fifo.push(chunk);
     this.#fifoBytes += chunk.byteLength;
   }
@@ -957,8 +951,6 @@ export class Stream {
     }
     this.#closed = true;
     this.#failWrites(error);
-    // StreamClosed carries no cause. Once the remote FIN establishes EOF,
-    // later full closure cannot reinterpret that receive-side outcome.
     const hasRemoteEof =
       options.preserveRemoteEof === true && this.#receiveState.kind === "eof";
     if (!hasRemoteEof) {
@@ -1049,7 +1041,6 @@ export class Stream {
 
   /** Hands `chunk` to every `data` handler; it is consumed once they return. */
   #emitData(chunk: Uint8Array): void {
-    // Counted first: a handler may transfer the buffer, detaching it.
     const bytes = chunk.byteLength;
     this.#emit("data", chunk);
     this.#consumed(bytes);
@@ -1519,7 +1510,6 @@ export class Minip2pBase {
     readonly peerId: string;
     readonly protocols: readonly string[];
   }> {
-    // One snapshot, so readiness, connection and protocols agree.
     const info = this.connectionInfo(peerId);
     if (info?.readyProtocols !== undefined) {
       return Promise.resolve({ peerId, protocols: info.readyProtocols });
@@ -1532,9 +1522,6 @@ export class Minip2pBase {
       controller.abort();
     });
     const timeoutMs = options.timeoutMs ?? this.#readyTimeoutMs;
-    // Events trail the native state, so a queued `peerReady` counts only if
-    // its connection is still the peer's current one; a replaced
-    // connection's readiness never resolves the wait.
     const ready = this.waitFor("peerReady", {
       ...options,
       predicate: (event) =>
@@ -1543,9 +1530,6 @@ export class Minip2pBase {
       signal: controller.signal,
       timeoutMs,
     }).then(({ protocols }) => ({ peerId, protocols }));
-    // The failed connection may already be gone natively, so a failure
-    // counts if it names the peer's current connection or, once native has
-    // none, the last one this wait knew.
     let knownConnId = info?.connId;
     const identifyFailed = this.waitFor("identifyFailed", {
       ...options,
@@ -1591,13 +1575,8 @@ export class Minip2pBase {
     this.#assertOpen();
     let operation = this.#pings.get(peerId);
     if (operation === undefined) {
-      // Native events are flushed asynchronously, so none can arrive before
-      // the operation below listens.
       this.#backend.ping(peerId);
       operation = this.#runPing(peerId);
-      // Kept until its terminal event, even after every caller stops
-      // waiting: a later call joins the native attempt still running, so an
-      // older attempt's result never settles a newer one.
       this.#pings.set(peerId, operation);
       const current = operation;
       void operation.promise.then(
@@ -1623,7 +1602,6 @@ export class Minip2pBase {
     let identity: { readonly connId: number; readonly streamId: number };
     try {
       identity = this.#backend.openStream(peerId, protocolId);
-      // The application now knows the connection: its end must reach it.
       this.#queue.markConnectionSeen(identity.connId);
     } catch (error) {
       return Promise.reject(
@@ -1698,7 +1676,6 @@ export class Minip2pBase {
     options: ConnectOptions = {}
   ): Promise<ConnectResult> {
     this.#assertOpen();
-    // Validate before admitting, so a bad option never orphans an attempt.
     assertTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     if (options.signal?.aborted === true) {
       return Promise.reject(new AbortError());
@@ -1744,15 +1721,12 @@ export class Minip2pBase {
         removeAbort?.();
         attempt.settle = undefined;
       };
-      // Abort only requests cancellation. Drop the local timeout so it cannot
-      // reject with TimeoutError before the terminal settles this wait.
       const cancelForAbort = () => {
         clearTimeout(timer);
         this.#requestCancel(connectId);
       };
       const removeAbort = listenAbort(options.signal, cancelForAbort);
       if (timeoutMs > 0) {
-        // Ends this wait only; the attempt stays tracked for its terminal.
         timer = setTimeout(() => {
           stopWaiting();
           reject(new TimeoutError(timeoutMs));
@@ -1861,8 +1835,6 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
-    // Connection attempts correlate exactly: only a dropped terminal, or a
-    // dropped native loss report naming it, settles its attempt.
     if (dropped.source === "native") {
       const { event } = dropped;
       if (isConnectTerminal(event)) {
@@ -1961,7 +1933,6 @@ export class Minip2pBase {
   }
 
   #dispatchNative(event: P2pEvent): void {
-    // Backends resolve `close` with it instead of delivering it.
     if (event.tag === P2pEvent_Tags.EndpointClosed) {
       return;
     }
@@ -1994,8 +1965,6 @@ export class Minip2pBase {
       );
     }
     if (event.tag === P2pEvent_Tags.ConnectionReplaced) {
-      // Native ends the replaced connection's streams without per-stream
-      // terminal events, so they end here.
       this.#connectionEnded(
         event.inner.oldConnId,
         new StreamClosedError("The stream's connection was replaced"),
@@ -2009,8 +1978,6 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
       this.#connectResultsLost(event.inner.terminalConnectIds);
-      // A ping's result may be among the lost events, and a ping kept
-      // without it would never settle, so end every pending ping.
       for (const ping of this.#pings.values()) {
         ping.cancel(new EventQueueOverflowError());
       }
@@ -2033,7 +2000,6 @@ export class Minip2pBase {
       : never
   ): boolean {
     let claimed = false;
-    // Built only once a waiter of this type is found.
     let result: ({ readonly type: Kind } & typeof payload) | undefined;
     for (const waiter of this.#waiters.size > 0 ? [...this.#waiters] : []) {
       if (waiter.type !== type) {
@@ -2068,7 +2034,6 @@ export class Minip2pBase {
       }
     }
     if (type !== "stream" && this.#catchAll.size > 0) {
-      // Its own object: a waiter's resolved event is never a catch-all's.
       const catchEvent = eventResult(
         type as keyof Minip2pCatchAllEventMap,
         catchPayload as Minip2pCatchAllEventMap[keyof Minip2pCatchAllEventMap]
@@ -2155,9 +2120,6 @@ export class Minip2pBase {
       });
     } else if (event.tag === P2pEvent_Tags.StreamData) {
       if (stream === undefined) {
-        // Nothing will read it, so it is consumed now: an abandon that
-        // native refused (the stream had already closed there) leaves the
-        // bytes holding the native stream slot otherwise.
         consumeUntracked(this.#backend, event.inner);
       } else {
         stream.receive(event.inner.data);
@@ -2252,9 +2214,6 @@ export class Minip2pBase {
     this.#settleConnect(event.inner.connectId, attempt, terminal);
   }
 
-  // Terminals dropped by either event carry settle exactly their attempts
-  // with a delivery-loss error so waits cannot hang. Both carries name every
-  // dropped terminal, so every other attempt still receives its own.
   #connectResultsLost(connectIds: readonly number[]): void {
     for (const connectId of connectIds) {
       const attempt = this.#connects.get(connectId);
@@ -2268,7 +2227,6 @@ export class Minip2pBase {
     }
   }
 
-  // Hands a terminal to the pending wait, or keeps it for a later one.
   #settleConnect(
     connectId: number,
     attempt: ConnectAttempt,
@@ -2292,9 +2250,6 @@ export class Minip2pBase {
     }
   }
 
-  // Cancellation requested from a signal or timer has no caller to throw to.
-  // Native cancel fails only once the endpoint stops, and teardown then
-  // settles the wait.
   #requestCancel(connectId: number): void {
     if (this.#closed) {
       return;
@@ -2363,8 +2318,6 @@ export class Minip2pBase {
     this.#dropped = 0;
     this.#named.clear();
     this.#catchAll.clear();
-    // Native is asked to close before anything below can call back in: a
-    // re-entrant close returns this promise.
     let closed: Promise<BackendClosed>;
     try {
       closed = this.#backend.close(timeoutMs);
@@ -2439,7 +2392,6 @@ function isConnectTerminal(event: P2pEvent): event is ConnectTerminalEvent {
   );
 }
 
-// A string starting with `/` is a multiaddress; any other string is a peer ID.
 function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
   if (typeof target !== "string") {
     return { addresses: [...target], kind: "addresses" };
@@ -2519,7 +2471,6 @@ function normalizeEvent(
   payload: AnyPayload;
 } {
   const type = SDK_EVENT_NAMES[event.tag];
-  // A native variant without fields arrives without `inner`.
   let payload: unknown = "inner" in event ? event.inner : {};
   if (event.tag === P2pEvent_Tags.PathEstablished) {
     payload = { ...event.inner, path: normalizePath(event.inner.path) };

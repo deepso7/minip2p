@@ -38,10 +38,6 @@ use thiserror::Error;
 
 use crate::MAX_MESSAGE_SIZE;
 
-// ---------------------------------------------------------------------------
-// Enums
-// ---------------------------------------------------------------------------
-
 /// HopMessage type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HopMessageType {
@@ -141,10 +137,6 @@ impl Status {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Nested messages
-// ---------------------------------------------------------------------------
-
 /// `Peer` message: identifies a remote peer by id and addresses.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Peer {
@@ -174,10 +166,6 @@ pub struct Limit {
     pub data: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
-// Top-level messages
-// ---------------------------------------------------------------------------
-
 /// `HopMessage`: client <-> relay protocol messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HopMessage {
@@ -197,10 +185,6 @@ pub struct StopMessage {
     pub status: Option<Status>,
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 /// Errors that can occur while decoding relay messages.
 ///
 /// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
@@ -218,10 +202,6 @@ pub enum RelayMessageError {
     InvalidMessageType { value: u64 },
 }
 
-// ---------------------------------------------------------------------------
-// Length-prefixed framing
-// ---------------------------------------------------------------------------
-
 pub use minip2p_core::{FrameDecode, encode_frame};
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
@@ -233,10 +213,6 @@ pub use minip2p_core::{FrameDecode, encode_frame};
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
     minip2p_core::decode_frame(input, MAX_MESSAGE_SIZE)
 }
-
-// ---------------------------------------------------------------------------
-// Peer encode/decode
-// ---------------------------------------------------------------------------
 
 impl Peer {
     /// Encodes the Peer message body (without length prefix).
@@ -270,10 +246,6 @@ impl Peer {
         Ok(msg)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Reservation encode/decode
-// ---------------------------------------------------------------------------
 
 impl Reservation {
     /// Encodes the Reservation message body (without length prefix).
@@ -314,10 +286,6 @@ impl Reservation {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Limit encode/decode
-// ---------------------------------------------------------------------------
-
 impl Limit {
     /// Encodes the Limit message body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
@@ -349,10 +317,6 @@ impl Limit {
         Ok(msg)
     }
 }
-
-// ---------------------------------------------------------------------------
-// HopMessage encode/decode
-// ---------------------------------------------------------------------------
 
 impl HopMessage {
     /// Encodes the HopMessage body (without length prefix).
@@ -426,10 +390,6 @@ impl HopMessage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// StopMessage encode/decode
-// ---------------------------------------------------------------------------
-
 impl StopMessage {
     /// Encodes the StopMessage body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
@@ -492,10 +452,6 @@ impl StopMessage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Status name helper
-// ---------------------------------------------------------------------------
-
 /// Builds a human-readable description of a non-OK status response.
 pub(crate) fn describe_status(status: Status) -> String {
     use alloc::string::ToString;
@@ -519,10 +475,6 @@ pub(crate) fn describe_status(status: Status) -> String {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -615,7 +567,6 @@ mod tests {
 
     #[test]
     fn hop_message_missing_type_fails() {
-        // Encode only a peer field with no type.
         let mut buf = Vec::new();
         encode_bytes_field(&mut buf, 2, &Peer::default().encode());
 
@@ -625,7 +576,6 @@ mod tests {
 
     #[test]
     fn hop_message_invalid_type_fails() {
-        // Encode type=99 (invalid).
         let mut buf = Vec::new();
         encode_varint_field(&mut buf, 1, 99);
 
@@ -638,7 +588,7 @@ mod tests {
 
     #[test]
     fn wire_failures_preserve_relay_context_in_display() {
-        let input = [0x0a, 0x05, b'a', b'b']; // field 1 LEN, length 5, only 2 bytes
+        let input = [0x0a, 0x05, b'a', b'b'];
         let err = Peer::decode(&input).unwrap_err();
         assert!(matches!(
             err,
@@ -666,7 +616,6 @@ mod tests {
             HopMessage::decode(&[0x00, 0x00]).unwrap_err(),
             invalid(0, 0)
         );
-        // type = RESERVE, then field 2^29.
         assert_eq!(
             HopMessage::decode(&[0x08, 0x00, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]).unwrap_err(),
             invalid(1 << 29, 2)
@@ -679,7 +628,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_field_numbers_in_nested_peer() {
-        // type = CONNECT, peer { id = [7], field 0 }: offset is relative to Peer.
         let mut peer = Vec::new();
         encode_bytes_field(&mut peer, 1, &[7]);
         peer.extend_from_slice(&[0x00, 0x00]);
@@ -697,14 +645,10 @@ mod tests {
 
     #[test]
     fn decoder_skips_unknown_fields() {
-        // RESERVE message with unknown field 99 before and after the type.
         let mut buf = Vec::new();
 
-        // Unknown field 99, LEN: "extra"
         encode_bytes_field(&mut buf, 9, b"extra");
-        // type=RESERVE
         encode_varint_field(&mut buf, 1, 0);
-        // Unknown field 10, VARINT: 42
         encode_varint_field(&mut buf, 10, 42);
 
         let decoded = HopMessage::decode(&buf).unwrap();
@@ -748,8 +692,6 @@ mod tests {
             data: Some(100),
         };
         let encoded = msg.encode();
-        // Should only contain the `data` field (tag 2, varint value 100).
-        // Tag byte = (2 << 3) | 0 = 0x10
         assert_eq!(encoded, vec![0x10, 100]);
     }
 
@@ -783,11 +725,8 @@ mod tests {
             }
             .encode(),
             [
-                0x08, 0x01, // type = CONNECT
-                0x12, 0x18, // peer LEN=24
-                0x0a, 0x16, // Peer.id LEN=22
-                b's', b'o', b'm', b'e', b'-', b'p', b'e', b'e', b'r', b'-', b'i', b'd', b'-', b'm',
-                b'u', b'l', b't', b'i', b'h', b'a', b's', b'h',
+                0x08, 0x01, 0x12, 0x18, 0x0a, 0x16, b's', b'o', b'm', b'e', b'-', b'p', b'e', b'e',
+                b'r', b'-', b'i', b'd', b'-', b'm', b'u', b'l', b't', b'i', b'h', b'a', b's', b'h',
             ],
         );
 
@@ -799,10 +738,7 @@ mod tests {
                 status: Some(Status::Ok),
             }
             .encode(),
-            [
-                0x08, 0x01, // type = STATUS
-                0x20, 0x64, // status = OK (100)
-            ],
+            [0x08, 0x01, 0x20, 0x64,],
         );
     }
 }

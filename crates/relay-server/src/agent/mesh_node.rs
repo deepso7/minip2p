@@ -289,7 +289,6 @@ impl RelayServerAgent {
         );
         mesh.proof_deadlines
             .set(conn_id, io.now_ms().saturating_add(MEMBER_PROOF_TIMEOUT_MS));
-        // A failed open leaves the exchange to its deadline.
         if let Some(stream) = self.open_backbone(io, &peer, conn_id, MEMBER_PROTOCOL_ID)
             && let Some(pending) = self
                 .mesh
@@ -353,8 +352,6 @@ impl RelayServerAgent {
         true
     }
 
-    // --- Member proofs ---
-
     /// This node's member stream finished negotiating: sends the proof and
     /// half-closes. One whose connection is gone is reset.
     pub(super) fn on_member_ready(&mut self, io: &mut Io<'_>, peer: &PeerId, stream: StreamKey) {
@@ -362,7 +359,6 @@ impl RelayServerAgent {
             return;
         };
         if !mesh.is_member_stream(stream) {
-            // Its connection was retired or rejected while it negotiated.
             self.rejected_hop_streams.insert(stream, *peer);
             self.reset(io, *peer, stream);
             return;
@@ -373,7 +369,6 @@ impl RelayServerAgent {
             .send_stream(peer, stream, proof.to_vec().into(), io.now_ms())
             .and_then(|()| io.swarm.close_stream_write(peer, stream, io.now_ms()));
         if let Err(error) = sent {
-            // The exchange is left to its deadline.
             self.runtime_error(
                 RelayServerRuntimeErrorKind::SendStream,
                 Some(*peer),
@@ -403,7 +398,6 @@ impl RelayServerAgent {
                 self.reset(io, *peer, stream);
                 self.reject(io, stream.conn_id, MeshRejectionReason::DuplicateProof);
             }
-            // A verified link proves itself once.
             None => {
                 self.rejected_hop_streams.insert(stream, *peer);
                 self.reset(io, *peer, stream);
@@ -480,7 +474,6 @@ impl RelayServerAgent {
                     )
                     .and_then(|()| io.swarm.close_stream_write(&peer, stream, io.now_ms()));
                 if let Err(error) = answered {
-                    // The peer's side is left to its deadline.
                     self.runtime_error(
                         RelayServerRuntimeErrorKind::SendStream,
                         Some(peer),
@@ -553,8 +546,6 @@ impl RelayServerAgent {
             return;
         };
         if io.swarm.connection_peer(conn_id) != Some(&peer) {
-            // Its queued `ConnectionReplaced` or `ConnectionClosed` moves or
-            // removes the directory entry.
             return;
         }
         let holds_entry = mesh
@@ -621,15 +612,12 @@ impl RelayServerAgent {
         );
         mesh.reopen.remove(&peer);
         mesh.directory.member_connected(peer);
-        // Only each member's latest counts, so a host that never takes
-        // them holds one per member.
         mesh.verified.retain(|(member, _)| *member != peer);
         mesh.verified.push((peer, conn_id));
         if !in_directory {
             self.events
                 .push_back(RelayServerEvent::MeshMemberUp { member: peer });
         }
-        // Kept like any connection, so circuits and workers on it end with it.
         self.connections.insert(
             conn_id,
             Connection {
@@ -640,8 +628,6 @@ impl RelayServerAgent {
         );
         self.open_directory(io, peer);
     }
-
-    // --- Directory, sender side ---
 
     fn open_directory(&mut self, io: &mut Io<'_>, member: PeerId) {
         let Some(conn_id) = self
@@ -661,7 +647,6 @@ impl RelayServerAgent {
                     mesh.publishing.insert(stream, member);
                 }
             }
-            // A retired link goes with its queued lifecycle event.
             None => self.schedule_reopen(io, &member),
         }
     }
@@ -726,7 +711,6 @@ impl RelayServerAgent {
             .get_mut(&member)
             .filter(|link| link.stream == Some(stream))
         else {
-            // A stream given up while it negotiated.
             self.reset(io, member, stream);
             return true;
         };
@@ -803,8 +787,6 @@ impl RelayServerAgent {
             .swarm
             .send_stream(member, stream, data.into(), io.now_ms())
         {
-            // Nothing is left queued, so the snapshot is in the transport:
-            // the next lost stream reopens from the shortest backoff.
             Ok(()) => link.backoff.reset(),
             Err(RelaySwarmError(DriverError::Full { unsent, .. })) => {
                 link.blocked = true;
@@ -841,8 +823,6 @@ impl RelayServerAgent {
         let backlog = core::mem::take(&mut link.backlog);
         self.send_directory(io, &member, backlog);
     }
-
-    // --- Directory, receiver side, and stream ends ---
 
     /// An inbound mesh stream finished negotiating. A member stream joins
     /// its pending connection's proof exchange. Directory and forward
@@ -935,7 +915,6 @@ impl RelayServerAgent {
         io.ack(stream, data.len());
         match mesh.directory.stream_data(&member, &stream, data) {
             DirectoryInput::Ignored => {}
-            // A new claim can serve a CONNECT waiting on another member.
             DirectoryInput::Applied => self.resolve_waiting(io, None),
             DirectoryInput::Synced => {
                 let entries = mesh.directory.entry_count(&member);
@@ -979,7 +958,6 @@ impl RelayServerAgent {
         let Some(member) = mesh.publishing.get(&stream).cloned() else {
             return false;
         };
-        // The receiver never writes, so its half-close changes nothing.
         if closed {
             mesh.publishing.remove(&stream);
             if mesh
@@ -992,8 +970,6 @@ impl RelayServerAgent {
         }
         true
     }
-
-    // --- CONNECT resolution, entry side ---
 
     /// Picks a CONNECT's destination leg (Decision 4): the local
     /// reservation, else the next untried remote claim (latest expiry
@@ -1033,8 +1009,6 @@ impl RelayServerAgent {
             .collect();
         for (member, link) in claims {
             resolution.tried.push((member, link));
-            // A claim whose link is gone, or replaced under the agent, is a
-            // failed one.
             let opened = link
                 .and_then(|conn_id| self.open_backbone(io, &member, conn_id, FORWARD_PROTOCOL_ID));
             match opened {
@@ -1062,8 +1036,6 @@ impl RelayServerAgent {
         let destination = circuit.destination_peer_id;
         let source_ip = circuit.source_ip.clone();
         let held_ip = circuit.destination_ip.clone();
-        // The destination may have reserved here since admission. Its IP
-        // then joins the circuit's accounting, under the same cap.
         let local_ip = self
             .live_reservation(&destination)
             .and_then(|conn_id| self.connection_ip(conn_id));
@@ -1082,7 +1054,6 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
             return;
         };
-        // Only a mesh node resolves, and its CONNECTs carry mesh state.
         let mut resolution = circuit
             .mesh
             .as_mut()
@@ -1200,8 +1171,6 @@ impl RelayServerAgent {
         match decode_mesh_frame(reply, ForwardMessage::decode) {
             Ok(None) => 0,
             Ok(Some((ForwardMessage::Status(Status::Ok), consumed))) => {
-                // Bytes past the STATUS can only be from this read: an
-                // earlier one held no complete frame.
                 let pipelined = reply.split_off(consumed);
                 let kept = !pipelined.is_empty()
                     && self.append_pending_payload(
@@ -1229,8 +1198,6 @@ impl RelayServerAgent {
         }
     }
 
-    // --- Forward protocol, holding side ---
-
     /// Reads a member's forward request. Request bytes are consumed as
     /// read; payload pipelined behind it stays unacknowledged with the
     /// pending circuit.
@@ -1250,7 +1217,6 @@ impl RelayServerAgent {
             return;
         };
         if *request_known {
-            // The request was refused; nothing after it matters.
             io.ack(stream, data.len());
             return;
         }

@@ -147,12 +147,9 @@ else
   echo "release: regenerating lockfiles"
   cargo metadata --format-version 1 >/dev/null
   cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
-  # Its Dockerfile builds with --locked, so the pinned minip2p versions must follow the bump.
   cargo metadata --manifest-path tests/interop/unified-testing/Cargo.toml --format-version 1 >/dev/null
   pnpm install --lockfile-only --ignore-scripts
 
-  # wasm-bindgen's import shim names hash the crate version, so the committed
-  # web glue changes with every bump.
   echo "release: regenerating web wasm glue"
   node bindings/ts/web/scripts/build-wasm.mjs
 
@@ -361,8 +358,6 @@ verify_npm_package() {
   local display_name="$2"
   local attempt found
 
-  # npm can take a while to expose a freshly published version; the ~30 MB
-  # @minip2p/react-native tarball took ~18 minutes for v0.10.1, so allow 30.
   for attempt in $(seq 1 180); do
     found="$(curl -fsSL "https://registry.npmjs.org/$encoded_name/$version" 2>/dev/null |
       jq -r '.version // empty' 2>/dev/null || true)"

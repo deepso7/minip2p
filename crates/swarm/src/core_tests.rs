@@ -81,9 +81,6 @@ struct BrokenEntropy;
 
 impl EntropySource for BrokenEntropy {
     fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
-        // Partially written and then failed: per the `EntropySource`
-        // contract the buffer holds no entropy, so this is exactly the
-        // payload a driver that ignored the error would put on the wire.
         output.fill(0);
         Err(EntropyError::unavailable("no RNG in this test"))
     }
@@ -221,8 +218,6 @@ impl Transport for ScriptedTransport {
             return Err(TransportError::ConnectionClosed { id, reason });
         }
         let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
-            // Negotiation is done (or was never scripted): this is
-            // protocol payload, which is what tests assert on.
             self.sent.push((stream_id, data.to_vec()));
             return Ok(());
         };
@@ -244,8 +239,6 @@ impl Transport for ScriptedTransport {
         if negotiated.is_some() {
             self.negotiators.remove(&stream_id);
         }
-        // The dialer only learns the protocol was accepted on its next
-        // poll, so hand the answer back as inbound stream data.
         let answers = if self.answer_at_ms.is_some() {
             &mut self.held
         } else {
@@ -421,13 +414,10 @@ fn core_drives_without_a_clock_or_os_entropy() {
         )),
         "expected the connection to surface: {events:?}"
     );
-    // Identify started, so an action really was dispatched to the
-    // transport during that poll.
     assert!(swarm.transport().opened > 0);
     assert!(swarm.connected_peers().contains(&peer));
     assert!(swarm.state.is_idle(), "core must settle after the open");
 
-    // ...and the close half of the lifecycle, on the same timeline.
     swarm.transport_mut().initial = vec![TransportEvent::Closed {
         id: ConnectionId::new(1),
         reason: ConnectionCloseReason::Local,
@@ -466,8 +456,6 @@ fn an_operation_that_ends_its_connection_is_reported_once() {
         SeqEntropy(1),
     );
 
-    // Identify's negotiation write ends the connection during this poll;
-    // the next one delivers its close.
     let mut events = swarm.poll(Now::from_millis(5_000)).expect("poll");
     events.extend(swarm.poll(Now::from_millis(5_001)).expect("poll"));
     assert!(
@@ -539,8 +527,6 @@ fn arm_negotiation_timer(swarm: &mut SwarmCore<ScriptedTransport, SeqEntropy>, n
 
 #[test]
 fn core_timers_are_reported_at_their_absolute_due_time() {
-    // At a realistic uptime a timer armed now must be reported at
-    // now + timeout, not as an already expired small value.
     let now = Now::from_millis(3_600_000);
     let mut swarm = swarm(Vec::new());
     swarm.poll(now).expect("poll");
@@ -586,8 +572,6 @@ fn queued_work_is_reported_as_immediately_due() {
     swarm.poll(now).expect("poll");
     assert_eq!(swarm.next_deadline(now), None);
 
-    // A deferred action has no timer of its own; without this a host
-    // would idle until unrelated I/O happened to wake it.
     swarm.state.deferred_closes.push_back(ConnectionId::new(1));
     assert_eq!(swarm.next_deadline(now), Some(Deadline::IMMEDIATE));
 
@@ -615,11 +599,8 @@ fn ping_draws_from_the_injected_entropy_source() {
     swarm.poll(Now::from_millis(0)).expect("poll");
 
     let before = swarm.entropy.0;
-    // Reaches the core rather than failing for want of an OS RNG.
     swarm.ping(&peer, 1_000).expect("ping queues");
 
-    // The nonce came from the injected source, not `getrandom`: the
-    // counter advanced by exactly one payload.
     assert_eq!(
         swarm.entropy.0,
         before.wrapping_add(PING_PAYLOAD_LEN as u8),
@@ -648,8 +629,6 @@ fn ping_is_refused_when_the_entropy_source_fails() {
         "expected DriverError::Entropy, got {error:?}"
     );
 
-    // And nothing weak escaped: driving the swarm on cannot flush a
-    // payload the caller was told was never generated.
     settle(&mut swarm, 2_000);
     assert!(
         swarm.transport().ping_frames().is_empty(),
@@ -669,7 +648,6 @@ fn ping_sends_the_payload_the_entropy_source_produced() {
     swarm.ping(&peer, 1_000).expect("ping queues");
     settle(&mut swarm, 2_000);
 
-    // SeqEntropy(0xA0) hands out 0xA0, 0xA1, ... one byte at a time.
     let expected: [u8; PING_PAYLOAD_LEN] = core::array::from_fn(|i| 0xA0u8.wrapping_add(i as u8));
     assert_eq!(
         swarm.transport().ping_frames(),
@@ -786,8 +764,6 @@ fn queued_actions_on_an_already_ended_target_are_not_runtime_errors() {
         stream_id,
         data: proposal(protocol),
     };
-    // Negotiating answers with a send; an Identify reply then closes its
-    // write side; a stop on a stream still negotiating resets it.
     let scenarios = [
         ("send", vec![opened.clone(), propose("/app/1")]),
         (
@@ -869,8 +845,6 @@ fn a_reset_of_an_ended_stream_leaves_no_reset_pending() {
     let peer = Ed25519Keypair::generate().peer_id();
     for ended in [stream_not_found, connection_not_found, connection_closed] {
         let (mut swarm, conn, stream_id) = ended_user_stream(&peer, ended);
-        // No terminal event follows: the reset alone must clear its
-        // marker, so a second reset reaches the transport again.
         for at in [2, 3] {
             swarm
                 .reset_stream(&peer, conn, stream_id, at)
@@ -914,8 +888,6 @@ fn application_writes_and_closes_on_an_ended_stream_still_fail() {
     let peer = Ed25519Keypair::generate().peer_id();
     for (ended, terminal) in ended_targets(ConnectionId::new(1), StreamId::new(7)) {
         let (mut swarm, conn, stream_id) = ended_user_stream(&peer, ended);
-        // Before the swarm reads the end, the transport's refusal is the
-        // caller's: the write must not look accepted.
         let write = swarm.send_stream(&peer, conn, stream_id, Bytes::from_static(b"x"), 2);
         assert!(
             write.as_ref().is_err_and(DriverError::is_stream_gone),
@@ -1016,8 +988,6 @@ fn became_ready(events: &[(u64, SwarmEvent)]) -> bool {
 
 #[test]
 fn the_default_first_identify_deadline_covers_a_slow_negotiation() {
-    // 15 s negotiating, 25 s in all: past the negotiation deadline, inside
-    // the Identify one.
     let events = identify_a_slow_peer(
         SwarmTimeouts::default(),
         15_000,
@@ -1057,8 +1027,6 @@ fn a_raised_identify_deadline_alone_lets_a_slower_peer_become_ready() {
     );
     assert!(!became_ready(&defaults), "{defaults:?}");
 
-    // The negotiation deadline stays at its 30 s default, which the 35 s
-    // answer also exceeds.
     let raised = identify_a_slow_peer(
         SwarmTimeouts {
             identify_ms: 40_000,
@@ -1085,8 +1053,6 @@ fn negotiation_deadline_starts_when_the_transport_opens_the_stream() {
     }]);
     swarm.add_protocol("/app/1").expect("protocol");
     swarm.poll(Now::from_millis(0)).expect("connect");
-    // The transport holds the open (no `StreamOpened`), as QUIC does
-    // while it waits for the peer's stream credit.
     let (conn_id, stream_id) = swarm.open_stream(&peer, "/app/1", 0).expect("open");
     let timed_out = |events: &[SwarmEvent]| {
         events.iter().any(
@@ -1136,8 +1102,6 @@ fn abort_dial_restores_pending_when_close_fails() {
         SeqEntropy(1),
     );
     let conn_id = swarm.dial(&addr).expect("dial");
-    // Record a transport error before the failed abort so restore must
-    // keep last_error — not rebuild via note_dial (which clears it).
     swarm.transport_mut().initial.push(TransportEvent::Error {
         id: conn_id,
         message: String::from("refused"),
@@ -1147,8 +1111,6 @@ fn abort_dial_restores_pending_when_close_fails() {
         swarm.abort_dial(conn_id).is_err(),
         "close refusal must surface"
     );
-    // Pending dial was restored: a later close still emits DialFailed,
-    // not a silent half-aborted dial that can still establish.
     swarm.transport_mut().initial.push(TransportEvent::Closed {
         id: conn_id,
         reason: ConnectionCloseReason::Local,
@@ -1185,7 +1147,6 @@ fn a_failed_abort_retry_keeps_the_veto() {
     let conn_id = swarm.dial(&addr).expect("dial");
     swarm.abort_dial(conn_id).expect_err("close refused");
     swarm.veto_establish(conn_id);
-    // The host retries the abort, and closing fails again.
     swarm.abort_dial(conn_id).expect_err("close refused");
     swarm
         .transport_mut()
@@ -1197,8 +1158,6 @@ fn a_failed_abort_retry_keeps_the_veto() {
                 peer,
             )),
         });
-    // The rejection's own close is refused too, which surfaces as a
-    // runtime error beside the DialFailed.
     let events = swarm.poll(Now::from_millis(1)).expect("late connected");
     assert!(
         events.iter().any(|event| matches!(
@@ -1222,8 +1181,6 @@ fn an_aborted_dial_that_connects_anyway_never_establishes() {
     .expect("peer addr");
     let mut swarm = swarm_with(ScriptedTransport::default(), SeqEntropy(1));
     let conn_id = swarm.dial(&addr).expect("dial");
-    // The transport has already queued the handshake's completion when
-    // the host aborts; `close` does not drop it.
     swarm
         .transport_mut()
         .initial
@@ -1379,7 +1336,6 @@ fn a_rotated_listen_address_is_reported_once_and_advertised_by_the_same_poll() {
     ];
     assert_eq!(listen_changes(&events), [expected]);
     assert_eq!(swarm.listened_addrs(), [quic, webtransport(2)]);
-    // Identify built from this poll's events already advertises it.
     assert!(swarm.local_addresses().contains(&webtransport(2)));
     assert!(!swarm.local_addresses().contains(&webtransport(1)));
 }

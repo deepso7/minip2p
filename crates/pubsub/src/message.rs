@@ -395,10 +395,6 @@ impl RawMessage {
             .try_into()
             .map_err(|_| MessageVerifyError::InvalidSignatureLength)?;
 
-        // The signing key must correspond to `from`, whichever way it was
-        // conveyed: an embedded `key` that hashes to a different peer id is
-        // a forgery vector, and a recovered key trivially satisfies the
-        // check only when `from` really inlines it.
         let public_key = match self.key.as_deref() {
             Some(key) =>
             {
@@ -681,10 +677,6 @@ impl Rpc {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Length-prefixed framing
-// ---------------------------------------------------------------------------
-
 pub use minip2p_core::FrameDecode;
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
@@ -728,8 +720,6 @@ mod tests {
     fn tag(field: u8, wire: u8) -> u8 {
         tag_byte(field, wire).expect("test field numbers fit in one byte")
     }
-
-    // -- protobuf round-trips ------------------------------------------------
 
     #[test]
     fn empty_rpc_round_trips_as_empty_bytes() {
@@ -785,21 +775,9 @@ mod tests {
     #[test]
     fn control_golden_vector_matches_hand_encoding() {
         let expected: &[u8] = &[
-            0x1a, 0x27, // RPC.control: 39-byte ControlMessage
-            0x0a, 0x0a, // ihave: 10-byte ControlIHave
-            0x0a, 0x01, b't', // topic_id = "t"
-            0x12, 0x02, 0xaa, 0xbb, // message_ids[0]
-            0x12, 0x01, 0xff, // message_ids[1] (arbitrary non-UTF-8 bytes)
-            0x12, 0x04, // iwant: 4-byte ControlIWant
-            0x0a, 0x02, 0x01, 0x02, // message_ids[0]
-            0x1a, 0x03, // graft: 3-byte ControlGraft
-            0x0a, 0x01, b't', // topic_id = "t"
-            0x22, 0x0e, // prune: 14-byte ControlPrune
-            0x0a, 0x01, b't', // topic_id = "t"
-            0x12, 0x07, // peers: 7-byte PeerInfo
-            0x0a, 0x02, 0x01, 0x02, // peer_id
-            0x12, 0x01, 0x03, // signed_peer_record
-            0x18, 0x3c, // backoff = 60
+            0x1a, 0x27, 0x0a, 0x0a, 0x0a, 0x01, b't', 0x12, 0x02, 0xaa, 0xbb, 0x12, 0x01, 0xff,
+            0x12, 0x04, 0x0a, 0x02, 0x01, 0x02, 0x1a, 0x03, 0x0a, 0x01, b't', 0x22, 0x0e, 0x0a,
+            0x01, b't', 0x12, 0x07, 0x0a, 0x02, 0x01, 0x02, 0x12, 0x01, 0x03, 0x18, 0x3c,
         ];
         let control = ControlMessage {
             ihave: vec![ControlIHave {
@@ -872,7 +850,6 @@ mod tests {
 
     #[test]
     fn control_rejects_invalid_field_numbers_and_skips_unknown_fields() {
-        // Control messages reject invalid field numbers and still skip unknown tags.
         assert_eq!(
             ControlMessage::decode(&[0x00, 0x01]),
             Err(invalid_field(0, 0))
@@ -898,7 +875,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_malformed_control() {
-        // control { graft { field 0 } }: offset is relative to the GRAFT body.
         let mut graft = Vec::new();
         encode_bytes_field(&mut graft, 1, b"t");
         graft.extend_from_slice(&[0x00, 0x01]);
@@ -921,18 +897,9 @@ mod tests {
 
     #[test]
     fn golden_vector_matches_hand_encoding() {
-        // RPC { subscriptions: [SubOpts { subscribe: true, topic_id: "t" }],
-        //       publish: [Message { from: [0xAB], data: [1, 2],
-        //                           seqno: 1u64 BE, topic_ids: ["t"] }] }
         let expected: &[u8] = &[
-            0x0a, 0x05, // subscriptions: 5-byte SubOpts
-            0x08, 0x01, // subscribe = true
-            0x12, 0x01, b't', // topic_id = "t"
-            0x12, 0x14, // publish: 20-byte Message
-            0x0a, 0x01, 0xab, // from = [0xAB]
-            0x12, 0x02, 0x01, 0x02, // data = [1, 2]
-            0x1a, 0x08, 0, 0, 0, 0, 0, 0, 0, 1, // seqno = 1u64 BE
-            0x22, 0x01, b't', // topic_ids = ["t"]
+            0x0a, 0x05, 0x08, 0x01, 0x12, 0x01, b't', 0x12, 0x14, 0x0a, 0x01, 0xab, 0x12, 0x02,
+            0x01, 0x02, 0x1a, 0x08, 0, 0, 0, 0, 0, 0, 0, 1, 0x22, 0x01, b't',
         ];
         let rpc = Rpc {
             subscriptions: vec![SubOpts {
@@ -962,7 +929,6 @@ mod tests {
             topic_id: Some(String::from("t")),
         }
         .encode();
-        // Append field 15, wire type LEN, 3 bytes.
         encoded.extend_from_slice(&[tag(15, WIRE_LEN), 3, 0xde, 0xad, 0xbe]);
         let decoded = SubOpts::decode(&encoded).unwrap();
         assert_eq!(decoded.subscribe, Some(true));
@@ -980,7 +946,6 @@ mod tests {
 
     #[test]
     fn invalid_field_numbers_are_rejected() {
-        // Tag 0x00 = field 0, wire type varint: protobuf-illegal.
         let encoded = [0x00, 0x01];
         assert_eq!(RawMessage::decode(&encoded), Err(invalid_field(0, 0)));
         assert_eq!(SubOpts::decode(&encoded), Err(invalid_field(0, 0)));
@@ -994,8 +959,6 @@ mod tests {
     fn invalid_field(field: u64, offset: usize) -> GossipsubWireError {
         GossipsubWireError::Wire(WireError::InvalidFieldNumber { field, offset })
     }
-
-    // -- framing -------------------------------------------------------------
 
     /// Wrapper binds [`MAX_RPC_SIZE`]; generic framing goldens live in
     /// `minip2p_core::frame`.
@@ -1013,8 +976,6 @@ mod tests {
         write_uvarint(MAX_RPC_SIZE as u64 + 1, &mut over);
         assert!(matches!(decode_frame(&over), FrameDecode::TooLarge { .. }));
     }
-
-    // -- signing -------------------------------------------------------------
 
     #[test]
     fn signed_message_verifies_and_yields_identity() {
@@ -1061,8 +1022,6 @@ mod tests {
         message.key = Some(kp.public_key().encode_protobuf());
         message.verify(false).expect("matching key field verifies");
 
-        // A forged key that verifies the signature but hashes to a different
-        // peer id must be rejected: otherwise anyone could impersonate `from`.
         let attacker = other_keypair();
         let mut forged = RawMessage {
             raw: Vec::new(),
@@ -1106,13 +1065,10 @@ mod tests {
         assert_eq!(seqno, 9u64.to_be_bytes().to_vec());
         assert!(!signed);
 
-        // Seqno length is implementation-defined: rust-libp2p floodsub emits 20
-        // random bytes. Anything 1..=64 is accepted.
         let mut rust_seqno = unsigned.clone();
         rust_seqno.seqno = Some(vec![7; 20]);
         rust_seqno.verify(true).expect("20-byte seqno verifies");
 
-        // Even unsigned, the dedup id fields stay mandatory and bounded.
         let mut no_from = unsigned.clone();
         no_from.from = None;
         assert_eq!(no_from.verify(true), Err(MessageVerifyError::MissingFrom));
@@ -1147,15 +1103,9 @@ mod tests {
 
     #[test]
     fn verification_recanonicalizes_instead_of_trusting_raw() {
-        // A sender may serialize with unknown fields; upstream verifies the
-        // canonical re-encoding of the KNOWN fields, so the message must
-        // verify iff the canonical encoding is what was signed — while `raw`
-        // still carries the original bytes verbatim for forwarding.
         let kp = keypair();
         let signed = RawMessage::build_signed(&kp, "chat", b"hi".to_vec(), 7);
         let mut wire = signed.encode_fields(true);
-        // Unknown field 12 appended by the hypothetical sender AFTER signing
-        // the canonical fields (matches upstream behavior).
         wire.extend_from_slice(&[tag(12, WIRE_LEN), 2, 0xca, 0xfe]);
 
         let decoded = RawMessage::decode(&wire).unwrap();

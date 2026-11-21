@@ -107,7 +107,6 @@ fn run_config(path: &std::path::Path) -> Vec<String> {
     lines
 }
 
-// Persistent keys need unix file permissions.
 #[cfg(unix)]
 #[test]
 fn a_config_file_runs_the_relay_with_a_persistent_identity() {
@@ -258,7 +257,6 @@ fn a_ca_certificate_prints_the_announced_hash_free_address_and_its_expiry() {
     relay.kill().unwrap();
     relay.wait().unwrap();
 
-    // Only the announced address: the listener's IP fails the certificate's name.
     assert_eq!(webtransport.len(), 1, "{webtransport:?}");
     assert!(
         webtransport[0].starts_with("/dns/localhost/udp/19876/quic-v1/webtransport/p2p/"),
@@ -280,7 +278,6 @@ fn a_renewed_ca_certificate_is_served_without_a_restart() {
         dir.path().join("fullchain.pem"),
         dir.path().join("privkey.pem"),
     );
-    // Explicit times: a filesystem's mtime granularity can hide a rewrite.
     let install = |from: &str, to: &std::path::Path, secs: u64| {
         std::fs::copy(fixture(from), to).unwrap();
         std::fs::File::options()
@@ -323,7 +320,6 @@ fn a_renewed_ca_certificate_is_served_without_a_restart() {
     };
 
     let started = wait_for("[relay] webtransport_certificate_not_after=");
-    // The certbot deploy hook's order: chain first, then key.
     install("localhost.pem", &chain, 2);
     install("localhost.key", &key, 2);
     let reloaded = wait_for("[relay] webtransport certificate reloaded ");
@@ -363,9 +359,6 @@ fn two_mesh_nodes_report_each_other_up_and_synced() {
     let dir = tempfile::tempdir().unwrap();
     let public = dir.path().join("identity.key");
     write_key(&public, &minip2p::Ed25519Keypair::generate());
-    // Ports no socket holds once the probes drop, so each node can list
-    // the other. Both probes stay open until both ports are picked, so the
-    // two differ.
     let probes: Vec<_> = (0..2)
         .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
         .collect();

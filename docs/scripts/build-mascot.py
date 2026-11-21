@@ -18,15 +18,13 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PX = 10  # grid unit, half a logo pixel so the pupil can move inside the eye
+PX = 10
 FILL = "#b96c45"
 
-# Cell frame in logo coordinates: the logo plus headroom for effects, padded evenly
-# on each axis so the dino sits centred in the frame.
 X0, Y0, W, H = -50, -110, 840, 700
 
-EYE = (60, 8)  # top-left grid cell of the 4x4 eye
-HEAD_X, HEAD_Y = 54, 20  # head = cells right of x=540 and above y=200
+EYE = (60, 8)
+HEAD_X, HEAD_Y = 54, 20
 
 
 def rasterise(svg: str) -> set[tuple[int, int]]:
@@ -125,15 +123,15 @@ def reactions(logo):
         return cells
 
     return [
-        frame(SLIT),  # blink
-        frame(CARET, (HEART, 69, -7)),  # heart
-        frame(pupil(1, 0), (PLUS, 70, -8), (DOT, 75, -2), (DOT, 63, -4)),  # sparkle
-        frame(WIDE, (BANG, 72, -8), mouth=True),  # surprised
-        frame(CARET, (DOT, 72, -3)),  # wink
-        frame(pupil(1, 2), (SLASHES, 62, 14, "cut"), head=(0, 1)),  # bashful
-        frame(SLIT, (SMALL_Z, 65, -3), (BIG_Z, 70, -9)),  # sleepy
-        frame(CROSS, (DOT, 57, -3), (DOT, 65, -6), (DOT, 73, -3)),  # dizzy
-        frame(CARET, (PLUS, 71, -8), (HEART, 61, -7), mouth=True),  # delighted
+        frame(SLIT),
+        frame(CARET, (HEART, 69, -7)),
+        frame(pupil(1, 0), (PLUS, 70, -8), (DOT, 75, -2), (DOT, 63, -4)),
+        frame(WIDE, (BANG, 72, -8), mouth=True),
+        frame(CARET, (DOT, 72, -3)),
+        frame(pupil(1, 2), (SLASHES, 62, 14, "cut"), head=(0, 1)),
+        frame(SLIT, (SMALL_Z, 65, -3), (BIG_Z, 70, -9)),
+        frame(CROSS, (DOT, 57, -3), (DOT, 65, -6), (DOT, 73, -3)),
+        frame(CARET, (PLUS, 71, -8), (HEART, 61, -7), mouth=True),
     ]
 
 

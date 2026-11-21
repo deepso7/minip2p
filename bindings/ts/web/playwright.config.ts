@@ -2,9 +2,6 @@ import { defineConfig, devices } from "@playwright/test";
 
 const PORT = 4317;
 
-// Browser e2e: `@minip2p/web` in Chromium and Firefox against native nodes
-// on `localhost`. Needs `pnpm build:bindings` and the Node addon
-// (`pnpm --filter @minip2p/node native:build`) first.
 export default defineConfig({
   forbidOnly: process.env.CI !== undefined,
   projects: [
@@ -20,6 +17,5 @@ export default defineConfig({
     reuseExistingServer: process.env.CI === undefined,
     url: `http://localhost:${PORT}/`,
   },
-  // The native peers bind real sockets; keep one browser at a time.
   workers: 1,
 });

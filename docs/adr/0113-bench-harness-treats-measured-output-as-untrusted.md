@@ -1,0 +1,14 @@
+# Bench harness scripts treat measured output as untrusted and survive cancellation
+
+`scripts/run-bench-container.sh` runs code from the measured ref (a PR head, under ADR 0025's trust boundary) and must stay in control of the host and the artifact:
+
+- **The pass script comes from the trusted checkout.** `run-container-benches.sh` is passed as the `bash -c` argument of `docker exec`, so the measured ref never supplies it; inside, each tier runs the measured tree's own harness and registries, so a base and a head tree each validate their own rows.
+- **Result markers are quarantined and bounded before anything reaches the artifact.** `take_marker` rejects a base64 marker longer than the 50 MB limit plus slack instead of decoding it, bounds decompression with `head -c` (a gzip bomb never reaches `tar`), extracts with `--no-same-owner --no-same-permissions`, rejects anything but regular files and directories, and rejects hard links, which `du` counts once but `cp` copies once per link.
+- **Each pass's output is capped** (256 MB). `head` exits at the cap and the container is killed to end the exec.
+- **Containers run with `--network none`** (every bench is loopback or in-process; IPv6 loopback is re-enabled by sysctl for `endpoint_idle`'s dual-stack variant), `seccomp=unconfined` so Gungraun can disable ASLR with personality(2), a 6 GB memory cap so a runaway run cannot take the host down, and `nofile=65536` because the socket sweeps open more than Docker's default soft limit of 1024 descriptors. Each container idles and runs one exec'd pass at a time.
+- **Cancellation fits GitHub's ~10 s budget** (SIGINT, 7.5 s, SIGTERM): the signal handler only force-removes the containers, and the next job's hook removes the images. Other exits also remove both images, since two images at once are most of the disk a run uses. Both keep `bench.log` and the latest `pass.log`, which holds the output of a pass the cancellation cut short.
+- **Long waits are background jobs joined with `wait`**, because bash defers traps while a foreground command runs.
+- **Image builds skip provenance attestation and layer compression**: the images never leave the host, and together these were most of the export (87 s to 9 s).
+- **`bench/targets` is read on fd 3** in `run-benches.sh` and `build-benches.sh`, so a benchmark or cargo can never consume the list from stdin. `build-benches.sh` groups lines with awk rather than an associative array so it runs on macOS's Bash 3.2.
+- **`rtt-sweep.sh` runs one command per line**, never `a && b`, because `set -e` does not stop on a failure inside `&&`.
+- **`check-bench-ids.py` derives Gungraun ids from source**: a `#[library_benchmark]` function reports one id per `#[bench::<id>(...)]` attribute, or its own name when it has none, matching the `id` or `function_name` in `summary.json` that `bench_results.py gungraun` reads.

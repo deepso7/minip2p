@@ -245,7 +245,6 @@ fn a_failing_mdns_carrier_is_an_event_not_a_poll_error() {
         peer,
     )
     .expect("peer addr");
-    // The transport refuses the dial, so the attempt settles at once.
     let id = endpoint
         .at(Now::from_millis(0))
         .connect(target)
@@ -276,7 +275,6 @@ fn a_failing_mdns_carrier_is_an_event_not_a_poll_error() {
         )),
         "{events:?}"
     );
-    // The retry fails the same way: still running, nothing new to report.
     let retried = endpoint
         .at(Now::from_millis(1 + MDNS_FAILURE_RETRY))
         .poll()
@@ -414,8 +412,6 @@ fn every_established_connection_has_its_own_path() {
         "a pending handshake"
     );
 
-    // The accepted direct connection identifies the peer and replaces
-    // the circuit.
     endpoint
         .engine
         .core
@@ -473,8 +469,6 @@ fn a_settled_attempt_keeps_its_path_after_the_connection_is_replaced() {
         .expect("endpoint configuration is valid");
     endpoint.at(Now::from_millis(0)).poll().expect("poll");
 
-    // Settles at once on the circuit; a direct connection replaces it
-    // before the terminal is read.
     let target = PeerAddr::new(direct_addr.clone(), peer).expect("peer addr");
     let id = endpoint
         .at(Now::from_millis(1))
@@ -791,8 +785,6 @@ fn smoltcp_shutdown_returns_gossipsub_events_still_in_the_agent() {
         .build()
         .expect("embedded endpoint builds");
 
-    // An inbound meshsub stream carrying a subscribe leaves
-    // `PeerSubscribed` in the agent; nothing has polled it out yet.
     let peer = Ed25519Keypair::from_secret_key_bytes([71; 32]).peer_id();
     let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(1));
     let agent = &mut endpoint.engine.gossipsub.as_mut().expect("gossipsub").agent;

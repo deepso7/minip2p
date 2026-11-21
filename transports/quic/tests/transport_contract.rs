@@ -113,10 +113,6 @@ fn connect_pair(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Connection lifecycle
-// ---------------------------------------------------------------------------
-
 #[test]
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let mut listener = loopback(QuicNodeConfig::generate());
@@ -155,15 +151,12 @@ fn connected_token(events: &[TransportEvent], conn: ConnectionId) -> Option<Conn
 
 #[test]
 fn both_ends_of_a_connection_share_its_token() {
-    // The default config validates addresses with a Retry, so this also
-    // covers a handshake through Retry. The token is a TLS exporter value.
     let (mut server, mut client, peer_addr) = setup_pair();
     let (server_conn, client_conn, server_events, client_events) =
         connect_pair(&mut server, &mut client, &peer_addr);
     let token = connected_token(&client_events, client_conn).expect("dialer token");
     assert_eq!(connected_token(&server_events, server_conn), Some(token));
 
-    // A second connection between the same pair gets a token of its own.
     let (second_server, second_client, server_events, client_events) =
         connect_pair(&mut server, &mut client, &peer_addr);
     let second = connected_token(&client_events, second_client).expect("second token");
@@ -233,7 +226,6 @@ fn outbound_dial_allocates_unique_ids() {
         "transport must allocate unique connection ids"
     );
 
-    // Drive to avoid dangling state.
     for _ in 0..20 {
         drive_pair_once(&mut server, &mut client);
     }
@@ -320,7 +312,6 @@ fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
         max_pending_bytes_per_stream: 0,
         ..QuicLimits::default()
     };
-    // Application streams would have no room at all.
     let reserve_is_everything = QuicLimits {
         max_pending_connection_bytes: 4_096,
         control_stream_reserve_bytes: 4_096,
@@ -454,9 +445,6 @@ fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // 9 bytes exceed the queue cap but fit the engine's send capacity on an
-    // idle connection, so the write goes straight to the engine instead of
-    // failing.
     client
         .send_stream(client_conn, stream, Bytes::from(vec![7; 9]))
         .expect("write above the queue cap must succeed via direct send");
@@ -518,8 +506,6 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // Beyond the peer's stream credit plus the queue cap: the transport
-    // keeps what fits and hands back exactly the rest.
     let payload: Vec<u8> = (0..2 * stream_window() as u32)
         .map(|i| (i % 251) as u8)
         .collect();
@@ -541,8 +527,6 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     );
     assert_eq!(&unsent[..], &payload[payload.len() - unsent.len()..]);
 
-    // Resend the tail each time the stream reports writable; the server must
-    // see the original byte stream exactly once.
     let mut held = Some(unsent);
     let mut received = Vec::new();
     let mut remote_closed = false;
@@ -630,9 +614,6 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
         .err()
         .and_then(TransportError::into_unsent);
 
-    // The reader takes what arrives and acknowledges none of it: one window
-    // is delivered, the engine buffers at most another, and the sender
-    // stalls.
     let mut received = Vec::new();
     let mut quiet_rounds = 0;
     while quiet_rounds < 40 {
@@ -653,7 +634,6 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     assert_eq!(received.len(), stream_window(), "exactly one budget");
     assert!(held.is_some(), "the sender still holds its tail");
 
-    // One acknowledgement resumes delivery at once, without another packet.
     server
         .ack_stream(server_conn, stream, received.len())
         .expect("ack");
@@ -776,7 +756,6 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     let peer_addr = peer_addr(&server);
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    // A stream that delivers ten bytes and closes in both directions, unread.
     let first = client.open_stream(client_conn).expect("open");
     client
         .send_stream(client_conn, first, Bytes::from_static(b"0123456789"))
@@ -809,16 +788,12 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
         })
     );
 
-    // Unsettled, it keeps the only slot: the next inbound stream is refused.
-    // The engine itself already freed the slot, so the client can open and
-    // write; it is the transport that refuses.
     assert_eq!(
         open_and_watch(&mut server, &mut client, client_conn),
         (true, false),
         "an unsettled stream holds its slot"
     );
 
-    // Acknowledging the closed stream releases it, and the slot with it.
     server.ack_stream(server_conn, first, 10).expect("ack");
     server
         .ack_stream(server_conn, first, 10)
@@ -864,8 +839,6 @@ fn queued_stream_writes_preserve_order_behind_direct_sends() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // The first write exceeds the initial congestion window, so part of it
-    // queues; the second write must land behind that queued remainder.
     let first: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let second = vec![0xEEu8; 1_000];
     client
@@ -929,9 +902,6 @@ fn dial_enforces_max_connections() {
 
 #[test]
 fn quic_deadline_is_exposed_and_driven_without_socket_input() {
-    // Long enough that a stall between the handshake and the check below
-    // cannot expire the connection and leave no timer armed. What this proves
-    // is that the timer fires without socket input, not how soon.
     let limits = QuicLimits {
         idle_timeout_ms: 1_000,
         ..QuicLimits::default()
@@ -943,9 +913,6 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
         "connected QUIC session must arm a timer"
     );
 
-    // The close is what this waits for, so the loop ends when it arrives. The
-    // cap is a failure backstop: under load the idle timer is driven by however
-    // many polls this thread gets, not by how long it sat here.
     let backstop = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut closed = false;
     while !closed && std::time::Instant::now() < backstop {
@@ -968,12 +935,6 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 
 #[test]
 fn quiet_pair_stays_up_past_idle_timeout() {
-    // The window has to outlast the engine's effective idle timeout,
-    // max(idle, 3×PTO), for the test to prove anything. This test runs alone
-    // (see `.config/nextest.toml`), which keeps PTO near loopback scale and so
-    // the effective timeout near the configured one, and keeps a descheduled
-    // thread from expiring the connection. That is mitigation, not a bound: a
-    // pause from outside the suite during the handshake can still stretch PTO.
     const IDLE_MS: u64 = 1_000;
     /// Twice the idle timeout: reaching the end of it without a close is
     /// itself the proof that the keepalive held the pair up.
@@ -1011,9 +972,6 @@ fn quiet_pair_stays_up_past_idle_timeout() {
         }
     }
 
-    // A stall can carry the loop past its deadline, leaving a `Closed` that
-    // arrived during the stall unread. Poll once more before judging, or the
-    // test passes exactly when it should fail.
     for (node, id) in [(&mut server, server_id), (&mut client, client_id)] {
         closed |= node
             .poll(common::now())
@@ -1033,7 +991,6 @@ fn close_rejects_further_stream_operations() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    // Open a stream first so we can test send after close.
     let stream_id = client.open_stream(client_conn).expect("open stream");
     client
         .send_stream(client_conn, stream_id, Bytes::from_static(b"data"))
@@ -1041,15 +998,9 @@ fn close_rejects_further_stream_operations() {
 
     client.close(client_conn).expect("close");
 
-    // After close(), the connection is in Closing state. Opening new streams
-    // or sending on existing ones should fail.
     let err = client.open_stream(client_conn);
     assert!(err.is_err(), "open_stream must fail after close");
 }
-
-// ---------------------------------------------------------------------------
-// Stream lifecycle
-// ---------------------------------------------------------------------------
 
 #[test]
 fn open_stream_emits_stream_opened() {
@@ -1216,10 +1167,6 @@ fn acking_a_locally_reset_stream_is_a_no_op() {
         .expect("acking a reset stream is a no-op");
 }
 
-// ---------------------------------------------------------------------------
-// Error conditions
-// ---------------------------------------------------------------------------
-
 #[test]
 fn open_stream_on_unknown_connection_returns_not_found() {
     let mut transport = loopback(QuicNodeConfig::generate());
@@ -1253,8 +1200,6 @@ fn events_buffered_outside_poll_report_as_due_work() {
     let mut transport = loopback(QuicNodeConfig::generate());
     transport.listen_on_bound_addrs().expect("listen");
 
-    // No time sample has been taken (no `poll` yet) and no datagram is
-    // queued, so the buffered event is the only thing that can answer here.
     let deadline = transport
         .next_deadline()
         .expect("a queued event must arm a deadline before the first poll");
@@ -1263,7 +1208,6 @@ fn events_buffered_outside_poll_report_as_due_work() {
         "a buffered event is due on any timeline, got {deadline:?}"
     );
 
-    // And the event really is there to collect.
     let events = transport.poll(common::now()).expect("poll");
     assert!(
         events
@@ -1272,7 +1216,6 @@ fn events_buffered_outside_poll_report_as_due_work() {
         "the promised work must be the buffered Listening event: {events:?}"
     );
 
-    // Once drained, the idle transport goes back to reporting no work.
     assert!(
         transport
             .next_deadline()

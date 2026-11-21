@@ -24,7 +24,6 @@ const TEST_DEADLINE: Duration = Duration::from_secs(20);
 fn listen_and_dial_complete_counted_ping_run() {
     let bin = env!("CARGO_BIN_EXE_minip2p-peer");
 
-    // --- 1. Spawn the listener and read its peer-addr from stdout. ---
     let mut listener = KillOnDrop(
         Command::new(bin)
             .arg("listen")
@@ -39,7 +38,6 @@ fn listen_and_dial_complete_counted_ping_run() {
     let peer_addr = read_bound_line(listener_stdout, TEST_DEADLINE)
         .expect("listener should print a 'bound=...' line");
 
-    // --- 2. Spawn the dialer, wait for exit, capture stdout. ---
     let dialer = Command::new(bin)
         .arg("dial")
         .arg(&peer_addr)
@@ -74,17 +72,11 @@ fn listen_and_dial_complete_counted_ping_run() {
         );
     }
 
-    // A plain direct dial must open its echo stream on the first try: the
-    // dial's own queued `ConnectionEstablished` must not be misread as a
-    // replacing punch connection (which would reset the stream and log
-    // a spurious retry).
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("direct channel setup failed"),
         "direct dial retried its echo stream setup; stderr:\n{stderr}",
     );
-
-    // Listener is killed on drop.
 }
 
 #[test]
@@ -127,13 +119,8 @@ fn id_prints_the_listener_identify_and_exits() {
     for needle in [
         "path-established path=direct",
         "[id] identify peer=",
-        // The agent string and the echo protocol come from the listener's
-        // own Identify payload, so this is the remote's answer and not
-        // something the prober could have printed from its own config.
         "agent=minip2p-peer/0.1.0",
         "/minip2p/echo/1",
-        // A standard libp2p protocol in the advertised set: what makes the
-        // same command useful against a foreign implementation.
         "/ipfs/ping/1.0.0",
     ] {
         assert!(
@@ -142,9 +129,6 @@ fn id_prints_the_listener_identify_and_exits() {
         );
     }
 
-    // Exactly one Identify line: the result is read back from
-    // `peer_readiness` rather than echoed from the event, so a one-shot
-    // never prints its answer twice.
     assert_eq!(
         stdout
             .lines()
@@ -153,8 +137,6 @@ fn id_prints_the_listener_identify_and_exits() {
         1,
         "id should print exactly one identify line; got:\n{stdout}",
     );
-
-    // Listener is killed on drop.
 }
 
 /// Scans `reader` line-by-line for the listener's `bound=<peer-addr>`
@@ -171,7 +153,6 @@ fn read_bound_line<R: std::io::Read + Send + 'static>(
         loop {
             line.clear();
             if buf.read_line(&mut line).unwrap_or(0) == 0 {
-                // EOF: listener died before printing its bound line.
                 if !sent_bound && tx.send(None).is_err() {
                     return;
                 }
@@ -197,7 +178,6 @@ fn wait_with_deadline(mut child: Child, deadline: Duration) -> Option<std::proce
             return child.wait_with_output().ok();
         }
         if start.elapsed() >= deadline {
-            // The child may have exited between `try_wait` and cleanup.
             drop(child.kill());
             drop(child.wait());
             return None;

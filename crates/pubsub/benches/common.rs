@@ -212,8 +212,6 @@ pub fn setup() -> (GossipsubAgent, Vec<u8>) {
     (subscribed_mesh(PEER_COUNT), vec![0x5a; PAYLOAD_LEN])
 }
 
-// --- Forwarding --------------------------------------------------------------
-
 /// Payload of the forwarded message.
 const FORWARD_PAYLOAD_LEN: usize = 1024;
 
@@ -281,19 +279,6 @@ pub fn assert_forwarded(recipients: &BTreeSet<PeerId>, actions: Vec<GossipsubAct
     assert_eq!(&sent, recipients, "sent to the non-source mesh");
 }
 
-// --- Heartbeat ---------------------------------------------------------------
-//
-// 1,000 peers and 100 topics `t0..t99`, all joined by the agent. Peer `i`
-// subscribes to topics `i mod 100` and `(i + 1) mod 100`, so each topic has 20
-// subscribers. The config is the default (`d = 6`, `d_lazy = 6`,
-// `mcache_len = 5`, `mcache_gossip = 3`) except `d_low = d`, so joining grafts
-// each mesh up to `d`. The agent then publishes one 1 KiB message per topic
-// into each of the 5 cache windows (500 cached messages, under the 512 cap),
-// with a heartbeat between windows, and acknowledges every send. The measured
-// heartbeat keeps every mesh as is, sends IHAVE for the 3 newest windows
-// (3 ids per topic) to 6 non-mesh subscribers per topic, and expires the
-// oldest window.
-
 const HEARTBEAT_PEERS: u16 = 1_000;
 const HEARTBEAT_TOPICS: u16 = 100;
 const HEARTBEAT_CACHE_WINDOWS: u64 = 5;
@@ -340,6 +325,16 @@ fn heartbeat_message_id(window: u64, topic: u16) -> Vec<u8> {
     id
 }
 
+/// Heartbeat fixture: 1,000 peers and 100 topics `t0..t99`, all joined by the
+/// agent. Peer `i` subscribes to topics `i mod 100` and `(i + 1) mod 100`, so
+/// each topic has 20 subscribers. The config is the default (`d = 6`,
+/// `d_lazy = 6`, `mcache_len = 5`, `mcache_gossip = 3`) except `d_low = d`, so
+/// joining grafts each mesh up to `d`. The agent then publishes one 1 KiB
+/// message per topic into each of the 5 cache windows (500 cached messages,
+/// under the 512 cap), with a heartbeat between windows, and acknowledges every
+/// send. The measured heartbeat keeps every mesh as is, sends IHAVE for the 3
+/// newest windows (3 ids per topic) to 6 non-mesh subscribers per topic, and
+/// expires the oldest window.
 pub fn heartbeat_fixture() -> GossipsubAgent {
     let mut config = GossipsubConfig::default();
     config.d_low = config.d;
@@ -353,7 +348,6 @@ pub fn heartbeat_fixture() -> GossipsubAgent {
     for topic in &topics {
         agent.subscribe(topic, 0).expect("subscribe");
     }
-    // The first event arms the heartbeat for `HEARTBEAT_INTERVAL_MS`.
     for i in 0..HEARTBEAT_PEERS {
         join_peer(&mut agent, FIRST_PEER + i, &heartbeat_peer_topics(i));
     }
@@ -410,7 +404,6 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
             HEARTBEAT_AT_MS + HEARTBEAT_INTERVAL_MS
         ))
     );
-    // topic -> peer -> advertised ids
     let mut gossip: BTreeMap<String, BTreeMap<PeerId, BTreeSet<Vec<u8>>>> = BTreeMap::new();
     let mut ihave_ids = 0;
     while let Some(action) = agent.poll_action() {
@@ -438,7 +431,6 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
     let gossip_peers = GossipsubConfig::default().d_lazy;
     let newest = HEARTBEAT_CACHE_WINDOWS - HEARTBEAT_GOSSIP_WINDOWS as u64..HEARTBEAT_CACHE_WINDOWS;
     assert_eq!(gossip.len(), usize::from(HEARTBEAT_TOPICS), "IHAVE topics");
-    // The per-peer sets below would hide duplicates, so count every id sent.
     assert_eq!(
         ihave_ids,
         usize::from(HEARTBEAT_TOPICS) * gossip_peers * HEARTBEAT_GOSSIP_WINDOWS,

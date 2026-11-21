@@ -1,11 +1,5 @@
 /* oxlint-disable func-style -- Use named function declarations for script helpers. */
 
-// Post-processes ubrn's generated TurboModule. `customizeGenerated` adds the
-// mDNS hooks, which must land before React Native codegen reads the spec;
-// `normalizeGenerated` trims whitespace once every generator has run.
-// `generate-codegen.mjs` runs both around codegen; running this file directly
-// (as `build` does) runs both back to back.
-
 import {
   existsSync,
   readdirSync,

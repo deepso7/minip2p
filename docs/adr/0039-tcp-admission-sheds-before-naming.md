@@ -1,0 +1,8 @@
+# TCP transport admission: shed before naming, spend ids before failing
+
+`TcpTransport` hands out a `ConnectionId` only to a connection the host will hear the whole lifecycle of, and never hands one out twice.
+
+- **Inbound connections are shed where they stand.** `TcpTransport::accept` checks `at_capacity`, then builds the session (`new_session` can fail on entropy), then allocates the id. Any failure on that path aborts the socket silently. Nothing has been announced about it, so there is nobody to report to: an `Error` names an id the host never saw, with no `Closed` behind it. Allocating the id first would also burn the namespace at whatever rate a peer chose to knock. Ended connections with unsettled bytes still hold their slots (ADR 0012). The listener keeps listening after a refusal.
+- **A refused dial leaves nothing behind.** `TcpTransport::dial` checks the address, `at_capacity` and entropy before anything with a side effect, so a refusal spends no id and leaves no connected socket without an id. Once those pass, the id is spent before the provider's `connect`, because `DialFailed` names it; handing it back for reuse would point two outcomes at one id. A provider `TcpError::Address` from `connect` maps to `TransportError::InvalidAddress`: it is the caller's to fix, not a dial outcome.
+- **The connection token is the Noise handshake hash.** Both ends of a TCP connection share it, so `ConnectionToken::new(handshake_hash)` on `Connected` identifies the same connection on both sides.
+- **`TcpConfig::max_connections` defaults to 1,024**, matching `QuicLimits::max_connections`, so a host that runs both transports budgets them the same way.

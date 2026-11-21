@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# Runs #361's window sweeps over the emulated link (`endpoint_rtt` bench) in
-# order, feeding each pick into the next sweep:
-#
-#   quic-stream -> S*; quic-connection at S* -> C*; quic-send at S* -> W*;
-#   quic-check at (S*, C*, W*); yamux; retry; then quic-check and yamux on
-#   the secondary 1g_20ms profile, recorded only.
-#
-# Logs and JSON lines land in target/bench-results/rtt/. Pass sweep names to
-# run only those (picks then come from MINIP2P_RTT_{STREAM,CONNECTION,SEND}).
-# MINIP2P_RTT_RUNS sets the runs per point (default 5), and
-# MINIP2P_RTT_PROFILE the profile the picks come from (default 100m_100ms;
-# any `<rate>m_<rtt>ms`, such as 100m_300ms).
 set -euo pipefail
 
 out=target/bench-results/rtt
@@ -26,7 +14,6 @@ run() {
     | tee "$out/$sweep-$profile.log" >&2
 }
 
-# The bytes of the value a sweep's summary picked ("pick: 1216K ...").
 pick() {
   local kib
   kib=$(sed -n 's/^pick: \([0-9]*\)K.*/\1/p' "$out/$1-$primary.log")
@@ -42,7 +29,6 @@ if ((${#sweeps[@]} == 0)); then
   sweeps=(quic-stream quic-connection quic-send quic-check yamux retry secondary)
 fi
 for sweep in "${sweeps[@]}"; do
-  # One command per line: `set -e` does not stop on a failure inside `&&`.
   case $sweep in
   quic-stream)
     run quic-stream

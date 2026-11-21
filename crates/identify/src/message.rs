@@ -28,7 +28,6 @@ use minip2p_core::{
 };
 use thiserror::Error;
 
-// Protobuf field numbers for the Identify message.
 const FIELD_PUBLIC_KEY: u64 = 1;
 const FIELD_LISTEN_ADDRS: u64 = 2;
 const FIELD_PROTOCOLS: u64 = 3;
@@ -113,9 +112,6 @@ impl IdentifyMessage {
         let mut msg = IdentifyMessage::default();
         let mut idx = 0;
 
-        // Tags are full varints so field numbers >= 16 cannot alias known
-        // single-byte tags (e.g. field 33 + LEN = 266, which is 0x8A 0x02,
-        // not public_key's 0x0A).
         while let Some((field_number, wire_type)) = read_tag(input, &mut idx)? {
             match (field_number, wire_type) {
                 (FIELD_PUBLIC_KEY, WIRE_LEN) => {
@@ -164,10 +160,6 @@ fn read_identify_string(
         .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -176,7 +168,6 @@ mod tests {
 
     use super::*;
 
-    // Single-byte tags for field numbers < 16 (known-good fixture literals).
     const TAG_PUBLIC_KEY: u8 = ((FIELD_PUBLIC_KEY as u8) << 3) | WIRE_LEN;
     const TAG_LISTEN_ADDRS: u8 = ((FIELD_LISTEN_ADDRS as u8) << 3) | WIRE_LEN;
     const TAG_PROTOCOLS: u8 = ((FIELD_PROTOCOLS as u8) << 3) | WIRE_LEN;
@@ -230,7 +221,6 @@ mod tests {
 
     #[test]
     fn decode_skips_unknown_fields() {
-        // Known, unknown LEN, unknown VARINT, then another known field.
         let mut data = Vec::new();
 
         data.push(TAG_AGENT_VERSION);
@@ -324,12 +314,10 @@ mod tests {
     fn decode_does_not_alias_high_field_numbers_to_known_fields() {
         let mut data = Vec::new();
 
-        // Field 33, wire type LEN, payload "aliased"
         write_uvarint((33 << 3) | (WIRE_LEN as u64), &mut data);
         write_uvarint(7, &mut data);
         data.extend_from_slice(b"aliased");
 
-        // Known field: agentVersion = "real"
         data.push(TAG_AGENT_VERSION);
         data.push(4);
         data.extend_from_slice(b"real");
@@ -351,7 +339,6 @@ mod tests {
                 offset: 0
             }))
         );
-        // agentVersion = "hi", then field 2^29.
         let data = [
             TAG_AGENT_VERSION,
             2,
@@ -375,14 +362,11 @@ mod tests {
 
     #[test]
     fn decode_rejects_unsupported_wire_type_mid_message() {
-        // Field 1 wire type 3 appears AFTER a known field; without the fix
-        // this would silently return a partial message with only the first
-        // field populated.
         let mut data = Vec::new();
         data.push(TAG_AGENT_VERSION);
         data.push(2);
         data.extend_from_slice(b"hi");
-        data.push((2 << 3) | 4); // field 2, "end group" (deprecated)
+        data.push((2 << 3) | 4);
 
         let err = IdentifyMessage::decode(&data).unwrap_err();
         assert!(matches!(
@@ -399,7 +383,6 @@ mod tests {
             let Some((field, wire_type)) = read_tag(data, &mut idx).unwrap() else {
                 break;
             };
-            // Single-byte tags only appear in the encode-order golden.
             tags.push(tag_byte(field as u8, wire_type).expect("spec fields use one-byte tags"));
             skip_field(data, &mut idx, wire_type).unwrap();
         }

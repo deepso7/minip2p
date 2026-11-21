@@ -56,7 +56,6 @@ pub struct PeerStats {
 
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    // Same pinned windows as the quiche adapter (ADR 0012).
     t.stream_receive_window(VarInt::from_u32(1_000_000));
     t.receive_window(VarInt::from_u32(10_000_000));
     t.send_window(10_000_000);
@@ -65,7 +64,6 @@ pub fn transport_config() -> TransportConfig {
     t.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
     t.keep_alive_interval(Some(Duration::from_secs(15)));
     if let Ok(mtu) = std::env::var("QMTU") {
-        // Fixed payload size, no PMTU discovery: matches quiche's 1350.
         let mtu: u16 = mtu.parse().expect("QMTU");
         t.initial_mtu(mtu).min_mtu(mtu).mtu_discovery_config(None);
     }
@@ -301,7 +299,7 @@ impl Peer {
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(_) => true, // treat as lost
+            Err(_) => true,
         }
     }
 

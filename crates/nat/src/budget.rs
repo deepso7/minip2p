@@ -107,7 +107,6 @@ impl UpgradeBudget {
 
     /// The limit that ran out by `now`, per the precedence above.
     pub(crate) fn due(&self, now: u64) -> Option<UpgradeStop> {
-        // At most one stage limit is armed: a round ends the start wait.
         let stage = match (self.start_deadline, self.exchange) {
             (Some(at), _) if now >= at && at < self.deadline => Some(UpgradeStop::StartTimeout {
                 budget_ms: at - self.armed_at,
@@ -173,7 +172,6 @@ mod tests {
         let mut budget = UpgradeBudget::arm(0, &config(), Some(15_000)).awaiting_start(&config());
         assert_eq!(budget.next_deadline(), 10_000);
         assert!(budget.begin_round(8_000));
-        // 8 s + 10 s exchange would run to 18 s.
         assert_eq!(budget.next_deadline(), 15_000);
         assert_eq!(budget.punch_window_end(13_000), 15_000);
         assert_eq!(budget.punch_window_end(1_000), 4_000);
@@ -206,7 +204,6 @@ mod tests {
     #[test]
     fn the_stage_that_expired_first_names_the_stop() {
         let mut budget = UpgradeBudget::arm(0, &config(), None).awaiting_start(&config());
-        // Checked late, past both the start wait and the overall deadline.
         assert_eq!(
             budget.due(25_000),
             Some(UpgradeStop::StartTimeout { budget_ms: 10_000 })

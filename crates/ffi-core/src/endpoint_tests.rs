@@ -48,7 +48,6 @@ impl EventDoorbell for DropThreadDoorbell {
 
 impl Drop for DropThreadDoorbell {
     fn drop(&mut self) {
-        // The receiver may already be gone while the test tears down.
         match self.0.send(std::thread::current().id()) {
             Ok(()) | Err(_) => {}
         }
@@ -157,7 +156,6 @@ fn draining_neither_waits_for_nor_interrupts_the_driver() {
         cause: crate::PingFailure::TimedOut,
     };
     endpoint.shared.lock_events().carry.carry.push(ping.clone());
-    // A driver parked in `wait` holds the state lock.
     let mut parked = endpoint.shared.lock_state();
     let (drained_tx, drained_rx) = std::sync::mpsc::channel();
     let drainer = Arc::clone(&endpoint);
@@ -274,8 +272,6 @@ fn cancelling_a_settled_attempt_is_a_no_op_and_the_terminal_is_delivered_once() 
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Let the driver run a little longer so a duplicate terminal could
-    // not still be in flight.
     let quiet = Instant::now() + Duration::from_millis(200);
     while Instant::now() < quiet {
         drained.extend(a.drain_events(4_096));
@@ -659,7 +655,6 @@ fn connected_peers_follows_connect_and_disconnect() {
 #[test]
 fn connected_peers_neither_waits_for_nor_interrupts_the_driver() {
     let endpoint = endpoint(config()).expect("endpoint");
-    // A driver parked in `wait` holds the state lock.
     let mut parked = endpoint.shared.lock_state();
     let (peers_tx, peers_rx) = std::sync::mpsc::channel();
     let querier = Arc::clone(&endpoint);
@@ -690,7 +685,6 @@ fn connected_peers_reports_a_stopped_endpoint() {
 
 #[test]
 fn a_socket_the_platform_refuses_is_a_transport_failure() {
-    // TEST-NET-1 is never a local address, so the bind itself fails.
     let mut unbindable = config();
     unbindable.listen = Some(vec!["/ip4/192.0.2.1/udp/0/quic-v1".into()]);
     assert!(matches!(
@@ -814,7 +808,6 @@ fn invalid_limits_are_transport_config_errors_naming_the_field() {
 
 #[test]
 fn limits_of_an_unbound_transport_are_ignored() {
-    // QUIC-only listen: no TCP transport is bound to validate against.
     let mut quic_only = config();
     quic_only.limits = Some(crate::LimitsOptions {
         tcp: Some(crate::TcpLimitsOptions {
@@ -964,7 +957,6 @@ fn stopping_delivers_the_drained_connection_close_before_endpoint_closed() {
         addresses: vec![b.listen_addrs()[0].clone()],
     })
     .expect("connect");
-    // The binding takes the connection's events, so the carry keeps its end.
     let deadline = Instant::now() + Duration::from_secs(5);
     let conn_id = loop {
         let established = a
@@ -1006,7 +998,6 @@ fn stopping_delivers_the_drained_connection_close_before_endpoint_closed() {
 fn an_idle_driver_sleeps_until_a_caller_wakes_it() {
     let endpoint = endpoint(config()).expect("endpoint");
     endpoint.start(Arc::new(NoopDoorbell)).expect("start");
-    // Long enough for any fixed polling cadence to show.
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(
         endpoint.driver_stats().iterations,
@@ -1014,8 +1005,6 @@ fn an_idle_driver_sleeps_until_a_caller_wakes_it() {
         "an endpoint with nothing due must not cycle its driver"
     );
 
-    // The parked driver holds the endpoint lock with no deadline, so each
-    // of these would block forever if it failed to wake it.
     let (done, finished) = std::sync::mpsc::channel();
     let caller = Arc::clone(&endpoint);
     std::thread::spawn(move || {
@@ -1199,8 +1188,6 @@ fn fatal_driver_panic_is_reported_before_stopped() {
         })
         .expect("mark running");
 
-    // Panics holding `state`, as a panic inside `pump` would, so the
-    // driver's cleanup runs over a poisoned lock.
     let shared = Arc::clone(&endpoint.shared);
     crate::driver::run_with(
         Arc::clone(&endpoint.shared),

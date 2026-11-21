@@ -143,8 +143,6 @@ impl<S: Eq> Directory<S> {
             return DirectoryInput::Ignored;
         };
 
-        // Decode with a cursor and drop the consumed bytes once at the end, so
-        // a snapshot read in one go costs time linear in its size.
         buffer.extend_from_slice(data);
         let mut consumed = 0;
         let mut became_synced = false;
@@ -220,8 +218,6 @@ impl<S: Eq> Directory<S> {
                 })
             })
             .collect();
-        // Members iterate in peer id order and the sort is stable, so equal
-        // expiries keep the lower peer id first.
         claims.sort_by_key(|claim| core::cmp::Reverse(claim.expires_unix));
         claims
     }
@@ -290,7 +286,6 @@ mod tests {
 
         directory.stream_opened(peer(A), 1);
         let snapshot = [present(1, 10), present(2, 10), synced()].concat();
-        // Split mid-frame to show frames are buffered across reads.
         let (head, tail) = snapshot.split_at(5);
         assert_eq!(
             directory.stream_data(&peer(A), &1, head),
@@ -304,7 +299,6 @@ mod tests {
         assert!(!directory.has_unsynced_member());
         assert_eq!(directory.entry_count(&peer(A)), 2);
 
-        // A fresh stream's snapshot replaces the old entries.
         directory.stream_opened(peer(A), 2);
         assert!(!directory.is_synced(&peer(A)));
         let resnapshot = [present(3, 10), synced()].concat();
@@ -327,7 +321,6 @@ mod tests {
 
         assert!(directory.stream_ended(&peer(A), &1));
         assert_eq!(members(&directory, 2), []);
-        // Still connected, so unsynced until a new stream syncs.
         assert!(directory.has_unsynced_member());
 
         directory.stream_opened(peer(A), 2);
@@ -371,7 +364,6 @@ mod tests {
         );
         assert_eq!(directory.entry_count(&peer(A)), 0);
         assert!(!directory.is_synced(&peer(A)));
-        // The reset stream is no longer current.
         assert_eq!(
             directory.stream_data(&peer(A), &1, &present(1, 10)),
             DirectoryInput::Ignored
@@ -401,7 +393,6 @@ mod tests {
         directory.stream_data(&peer(high), &1, &present(1, 60));
         assert_eq!(members(&directory, 1), [peer(high), peer(low)]);
 
-        // Expired entries are not claims.
         let live: Vec<_> = directory
             .claims(&peer(1), 50)
             .into_iter()

@@ -156,7 +156,6 @@ export class SerdeBackend implements Minip2pBackend {
           });
           return;
         }
-        // The SDK has stopped listening; only `EndpointClosed` matters now.
         if (this.#close.requested) {
           return;
         }
@@ -393,8 +392,6 @@ export class SerdeBackend implements Minip2pBackend {
     };
   }
 
-  // Connect IDs are not mapped because they round-trip into native calls,
-  // and native allocates them well inside the safe integer range.
   connect(target: BackendConnectTarget): number {
     return u64ToNumber(
       this.#native((native) =>
@@ -550,8 +547,6 @@ function normalizeNativeValue(
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublicInEvent(tag, key, BigInt(value));
     }
-    // QUIC stop and close codes are 62-bit varints the remote picks: keep
-    // them whole.
     if (key === "errorCode" || key === "code") {
       return BigInt(value);
     }
@@ -574,8 +569,6 @@ function normalizeNativeValue(
   );
   const { connId, streamId } = record;
   if (typeof streamId === "bigint" || typeof streamId === "number") {
-    // Public stream IDs are allocated per connection. A record without a
-    // connection (an endpoint error, say) cannot name a public stream.
     if (typeof connId === "number") {
       record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
     } else {

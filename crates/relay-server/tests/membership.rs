@@ -127,8 +127,6 @@ fn a_connection_both_proofs_check_out_on_becomes_a_member() {
     let link = conn(1);
     let outbound = member_open(&establish(&mut node, link), link).expect("a member open");
 
-    // This node's own stream carries its proof, then half-closes; the STOP
-    // path never sees it.
     assert!(stream_ready(&mut node, outbound, MEMBER_PROTOCOL_ID, true));
     let calls = node.calls();
     assert_eq!(sends_on(&calls, outbound), [proof(0).to_vec()]);
@@ -137,7 +135,6 @@ fn a_connection_both_proofs_check_out_on_becomes_a_member() {
     node.half_close(&member(PEER), outbound, at(0));
     assert!(node.events().is_empty(), "the peer's proof is still out");
 
-    // The peer's proof, split across reads, is answered with the accept.
     let inbound = stream(link, 9);
     assert!(stream_ready(&mut node, inbound, MEMBER_PROTOCOL_ID, false));
     let peer_proof = proof(PEER);
@@ -172,7 +169,6 @@ fn a_pending_peer_gets_no_snapshot_and_neither_holds_up_nor_takes_a_connect() {
         "no snapshot"
     );
 
-    // Its directory and forward streams are reset, as routine link setup.
     for (id, protocol) in [(3, DIRECTORY_PROTOCOL_ID), (5, FORWARD_PROTOCOL_ID)] {
         let mesh_stream = stream(link, id);
         assert!(stream_ready(&mut node, mesh_stream, protocol, false));
@@ -181,8 +177,6 @@ fn a_pending_peer_gets_no_snapshot_and_neither_holds_up_nor_takes_a_connect() {
     }
     assert!(node.events().is_empty());
 
-    // A CONNECT to a peer reserved nowhere is refused at once: a pending
-    // connection is no directory member to wait on, nor a forward target.
     let bob = peer(b"membership-bob");
     let hop = connect(&mut node, &bob, 20, &peer(b"membership-nobody"));
     let calls = node.calls();
@@ -275,7 +269,6 @@ fn dropped_member_streams_leave_the_connection_to_its_five_second_deadline() {
         Some(Deadline::from_millis(5_000))
     );
 
-    // A reset before EOF, on either side, judges nothing.
     let inbound = stream(link, 9);
     stream_ready(&mut node, inbound, MEMBER_PROTOCOL_ID, false);
     node.data(&member(PEER), inbound, &proof(PEER)[..10], at(0));
@@ -292,7 +285,6 @@ fn dropped_member_streams_leave_the_connection_to_its_five_second_deadline() {
     assert!(closed_connections(&node.calls()).is_empty());
     assert!(node.events().is_empty());
 
-    // With no other traffic, the deadline alone closes it.
     node.handle_tick(at(5_000));
     assert_eq!(closed_connections(&node.calls()), [link]);
     assert_eq!(node.events(), [rejected(MeshRejectionReason::TimedOut)]);
@@ -316,7 +308,6 @@ fn an_oversized_message_is_judged_only_at_its_half_close() {
     let inbound = stream(link, 9);
     stream_ready(&mut node, inbound, MEMBER_PROTOCOL_ID, false);
     node.data(&member(PEER), inbound, &long, at(0));
-    // Reset before EOF, both are dropped; the deadline is what closes it.
     node.stream_closed(&member(PEER), outbound, at(0));
     node.stream_closed(&member(PEER), inbound, at(0));
     assert!(closed_connections(&node.calls()).is_empty());
@@ -364,7 +355,6 @@ fn an_accept_that_did_not_go_out_never_makes_a_member() {
 #[test]
 fn a_directory_stream_the_pending_peer_resets_reopens_on_the_link() {
     let (mut node, first) = node_with_directory(conn(1));
-    // The peer, still pending on its side, reset it.
     node.stream_closed(&member(PEER), first, at(10));
     node.handle_tick(at(1_009));
     assert!(opens(&node.calls(), DIRECTORY_PROTOCOL_ID).is_empty());
@@ -450,7 +440,6 @@ fn a_replacement_replaced_again_hands_on_the_member_until_it_times_out() {
     let mut node = linked(conn(1));
     let hop = waiting_connect(&mut node);
     node.replace(&member(PEER), conn(1), conn(2), false, 1);
-    // The simultaneous-dial tiebreak replaces the pending connection.
     node.replace(&member(PEER), conn(2), conn(3), false, 2);
     assert!(node.events().is_empty());
     node.handle_tick(at(5_001));
@@ -474,14 +463,12 @@ fn a_late_deadline_or_bad_proof_for_an_already_replaced_connection_keeps_the_mem
     let hop = waiting_connect(&mut node);
     node.replace(&member(PEER), conn(1), conn(2), false, 0);
     node.calls();
-    // The swarm replaced conn(2) in this poll; its event is still queued.
     node.swarm.connect(&member(PEER), conn(3));
     send_member_stream(&mut node, PEER, stream(conn(2), 9), &proof(2), at(1));
     node.handle_tick(at(5_000));
     assert!(closed_connections(&node.calls()).is_empty());
     assert!(node.events().is_empty(), "neither rejected nor down");
 
-    // The replacement inherits the member and verifies on its own.
     node.replace(&member(PEER), conn(2), conn(3), false, 5_000);
     let calls = node.calls();
     verify_by_hand(&mut node, PEER, conn(3), &calls, at(5_000));
@@ -496,7 +483,6 @@ fn a_late_deadline_or_bad_proof_for_an_already_replaced_connection_keeps_the_mem
 
 #[test]
 fn opens_meant_for_a_replaced_connection_are_not_made_on_the_replacement() {
-    // Member: the swarm is already on conn(2) when conn(1) comes up.
     let mut node = node();
     node.swarm.connect(&member(PEER), conn(2));
     let established = SwarmEvent::ConnectionEstablished {
@@ -513,14 +499,12 @@ fn opens_meant_for_a_replaced_connection_are_not_made_on_the_replacement() {
         [conn(2)]
     );
 
-    // Directory: a reopen due after the swarm replaced the link.
     let (mut node, directory) = node_with_directory(conn(1));
     node.stream_closed(&member(PEER), directory, at(10));
     node.swarm.connect(&member(PEER), conn(2));
     node.handle_tick(at(1_010));
     assert!(opens(&node.calls(), DIRECTORY_PROTOCOL_ID).is_empty());
 
-    // Forward: a claim on a link the swarm replaced is a failed claim.
     let (mut node, _) = node_with_directory(conn(1));
     let alice = peer(b"membership-alice");
     let inbound = stream(conn(1), 13);

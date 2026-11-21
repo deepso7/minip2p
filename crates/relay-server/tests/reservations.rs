@@ -90,7 +90,6 @@ fn a_failed_reply_creates_no_reservation_and_resets_without_a_fin() {
     let calls = node.calls();
     assert_eq!(resets(&calls), [stream]);
     assert!(closes(&calls).is_empty(), "{calls:?}");
-    // The stream stays the relay's until it closes.
     assert!(node.owns_stream(stream));
     assert!(node.stream_closed(&remote, stream, at(1)));
     assert!(!node.owns_stream(stream));
@@ -106,8 +105,6 @@ fn a_partly_written_control_reply_resets_instead_of_finishing() {
     let mut node = Node::new(RelayServerConfig::default());
     node.establish(&remote, stream.conn_id);
     node.swarm.credit.insert(stream, 1);
-    // CONNECT to a peer with no reservation: the reply is a rejection
-    // followed by a half-close.
     node.feed_hop(&remote, stream, connect_request(&peer(b"absent")), &[]);
 
     let calls = without_acks(node.calls());
@@ -119,7 +116,6 @@ fn a_partly_written_control_reply_resets_instead_of_finishing() {
         ),
         "a truncated reply must not end in a clean FIN: {calls:?}"
     );
-    // Later reads are claimed and consumed, and drive nothing.
     assert!(node.data(&remote, stream, b"late", at(1)));
     assert_eq!(node.calls(), [Call::Ack { stream, bytes: 4 }]);
 }
@@ -261,7 +257,6 @@ fn a_reservation_refused_for_capacity_spends_no_rate_token() {
         }]
     ));
 
-    // The holder leaves, freeing the only slot.
     node.close_connection(&holder, holder_conn, 0);
     node.events();
     node.feed_hop(&waiter, key(351, 2), reserve_request(), &[]);
@@ -285,7 +280,6 @@ fn direct_replacement_rebinds_reservation_with_its_original_expiry() {
     assert_eq!(node.reservation_connection(&remote), Some(new));
     assert!(node.events().is_empty());
 
-    // A stale close for the old connection cannot touch the rebound reservation.
     node.close_connection(&remote, ConnectionId::new(35), 500);
     assert_eq!(node.reservation_connection(&remote), Some(new));
 
@@ -377,7 +371,6 @@ fn rejected_refresh_keeps_prior_addrs_and_reports_failure_transitions() {
         refresh(&mut node, source, "/ip4/0.0.0.0/tcp/9").unwrap();
         assert!(node.events().is_empty());
 
-        // A different error while failing is news.
         let error = refresh(&mut node, source, "/ip4/192.0.2.1/udp/1").unwrap();
         assert_eq!(
             node.events(),
@@ -486,8 +479,6 @@ fn finished_hop_streams_left_open_still_count_against_the_connection_cap() {
     });
     node.establish(&remote, conn_id);
 
-    // Two HOP exchanges run to completion, and the peer never closes either
-    // stream, so both workers stay to claim their streams' events.
     for stream_id in [1, 2] {
         let stream = key(39, stream_id);
         node.feed_hop(&remote, stream, reserve_request(), &[]);
@@ -495,9 +486,6 @@ fn finished_hop_streams_left_open_still_count_against_the_connection_cap() {
     }
     node.calls();
 
-    // A third must be refused. Counting only the workers still waiting on a
-    // reply would let a peer that never closes its streams open one per
-    // muxer slot, on every connection it holds.
     let third = key(39, 3);
     assert!(node.hop_ready(&remote, third, at(0)));
     assert_eq!(resets(&node.calls()), [third]);

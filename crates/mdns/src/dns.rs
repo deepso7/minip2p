@@ -289,9 +289,6 @@ pub(crate) fn encode_response_segments(spec: ResponseSpec) -> Vec<Vec<u8>> {
         groups.push(current);
     }
 
-    // Cache-flush applies to a complete unique RRset. When the set is split
-    // across datagrams, setting it on every fragment makes compliant caches
-    // discard values learned from earlier fragments.
     let txt_cache_flush = spec.txt_cache_flush && groups.len() == 1;
     groups
         .into_iter()

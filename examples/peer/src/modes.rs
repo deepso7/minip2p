@@ -47,8 +47,6 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(3);
 const SETUP_DEADLINE: Duration =
     Duration::from_millis(minip2p::IDENTIFY_TIMEOUT_MS + minip2p::OUTBOUND_NEGOTIATION_TIMEOUT_MS);
 
-// --- shared plumbing -------------------------------------------------------
-
 /// Builds the endpoint both modes share. A relay or an AutoNAT server turns
 /// the NAT agent on; `connect` reports a path either way.
 fn build_endpoint(
@@ -81,8 +79,6 @@ fn build_endpoint(
     }
 }
 
-// --- frame codec -----------------------------------------------------------
-
 fn encode_frame(seq: u64, sent_at_ms: u64) -> [u8; FRAME_LEN] {
     let mut frame = [0u8; FRAME_LEN];
     frame[..8].copy_from_slice(&seq.to_be_bytes());
@@ -106,8 +102,6 @@ struct FrameBuf {
 
 impl FrameBuf {
     fn push(&mut self, data: &[u8]) {
-        // Compact at most once per transport chunk. Draining from the front
-        // for every 16-byte frame would repeatedly shift the unread suffix.
         if self.head != 0 {
             self.buf.copy_within(self.head.., 0);
             self.buf.truncate(self.buf.len() - self.head);
@@ -137,8 +131,6 @@ impl FrameBuf {
     }
 }
 
-// --- listen ----------------------------------------------------------------
-
 /// Runs the listener until interrupted (SIGINT). Echoes every tracked echo
 /// stream — direct streams and relayed bridges alike — byte for byte.
 pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Box<dyn Error>> {
@@ -150,15 +142,12 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     let first = peer_addrs
         .first()
         .ok_or("listen completed without any bound peer addresses")?;
-    // Stdout: the machine-readable event stream the E2E test scans.
     println!("[listen] bound={}", local_dialable_peer_addr(first));
     for addr in &peer_addrs {
         println!("[listen] listen-addr={addr}");
     }
     println!("[listen] us={}", endpoint.peer_id());
 
-    // Echo streams we own: on the dialing peer's connection for direct
-    // streams, on the relay's for bridged circuits.
     let mut echo_streams = Echoes::default();
 
     if let Some(relay) = relays.first() {
@@ -238,15 +227,11 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
         } if protocol_id == ECHO_PROTOCOL => {
             echoes.insert(*stream);
         }
-        // The write queue keeps echoes in order behind what a slow reader
-        // has not taken yet; a peer that sends more than the endpoint's
-        // write budget holds without reading is reset.
         EndpointEvent::StreamData { stream, data, .. } if echoes.contains(stream) => {
             if let Err(e) = endpoint.send_stream(*stream, data.clone()) {
                 drop_echo(endpoint, *stream, echoes, &e.to_string());
             }
         }
-        // Mirror the peer's FIN, behind every echo still queued.
         EndpointEvent::StreamRemoteWriteClosed { stream, .. } if echoes.remove(stream) => {
             if let Err(e) = endpoint.close_stream_write(*stream) {
                 drop_echo(endpoint, *stream, echoes, &e.to_string());
@@ -256,8 +241,6 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
         | EndpointEvent::StreamClosed { stream, .. } => {
             echoes.remove(stream);
         }
-        // A closed or replaced connection ends its streams without
-        // per-stream `StreamClosed` events, so untrack them all here.
         EndpointEvent::ConnectionClosed { conn_id, .. }
         | EndpointEvent::ConnectionReplaced { old: conn_id, .. } => {
             echoes.retain(|stream| stream.conn_id() != *conn_id);
@@ -271,13 +254,10 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
 fn drop_echo(endpoint: &mut Endpoint, stream: StreamKey, echoes: &mut Echoes, why: &str) {
     eprintln!("[listen] echo failed stream={stream}: {why}");
     echoes.remove(&stream);
-    // A stream that is already gone has nothing left to reset.
     match endpoint.reset_stream(stream) {
         Ok(()) | Err(_) => {}
     }
 }
-
-// --- dial ------------------------------------------------------------------
 
 /// Where the dialer's ping frames currently travel. A frame the stream
 /// cannot take at once waits in the endpoint's write queue.
@@ -355,8 +335,6 @@ pub fn run_dial(
     let relays = relays_for(&target, relay);
 
     let mut endpoint = build_endpoint("dial", &relays, &options)?;
-    // Listening seeds the agent's bound addresses — the local half of the
-    // DCUtR candidate set.
     endpoint
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -394,9 +372,6 @@ pub fn run_dial(
     let frames = FrameBuf::default();
     let mut channel =
         establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?;
-    // The path can upgrade while the channel is being set up, and its
-    // `PathUpgraded` is then printed by the setup waits rather than seen by
-    // the ping loop. The State snapshot is authoritative either way.
     channel.direct = !matches!(endpoint.path(&peer), Some(Path::Relayed { .. }));
     println!(
         "[dial] channel-ready path={} elapsed-us={}",
@@ -453,8 +428,6 @@ pub fn run_id(
     let relays = relays_for(&target, relay);
 
     let mut endpoint = build_endpoint("id", &relays, &options)?;
-    // Listening seeds the agent's bound addresses, so a circuit target can
-    // still upgrade to a direct path before Identify lands.
     endpoint
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -599,10 +572,6 @@ fn open_echo_stream(
                 if peer_id == peer && *old == stream.conn_id() =>
             {
                 print_event("dial", &event);
-                // A second punch connection just replaced the one this
-                // stream was opened on; the stream ended with it, so its
-                // `StreamReady` will never arrive. Let the caller retry on
-                // the new connection right away.
                 return Err("connection replaced during echo stream setup".into());
             }
             _ => print_event("dial", &event),
@@ -683,12 +652,7 @@ fn ping_loop(
     let mut outstanding: BTreeSet<u64> = BTreeSet::new();
     let mut seq: u64 = 0;
     let mut next_ping = Instant::now();
-    // Set once the final counted ping went out; the loop then only drains.
     let mut drain_deadline: Option<Instant> = None;
-    // A hole punch is a connection race: when both simultaneous-open dials
-    // land, the swarm keeps the last connection and a stream opened on the
-    // first dies moments after the upgrade. Reopening is routine, but cap
-    // it so a genuinely broken peer cannot loop us forever.
     let mut reopens_left: u32 = 3;
 
     loop {
@@ -702,7 +666,6 @@ fn ping_loop(
             _ => continue,
         };
         let Some(event) = event else {
-            // Deadline tick.
             if let Some(deadline) = drain_deadline {
                 if Instant::now() >= deadline {
                     stats.print_summary();
@@ -711,8 +674,6 @@ fn ping_loop(
                 continue;
             }
             if endpoint.is_write_pending(channel.stream) {
-                // The previous frame is still being accepted; skip a beat
-                // rather than queue behind it.
                 next_ping = next_ping_deadline(Instant::now());
                 continue;
             }
@@ -724,11 +685,6 @@ fn ping_loop(
                     stats.print_summary();
                     return Err(format!("ping send: {e}").into());
                 }
-                // A punch race can replace the direct connection moments
-                // after the upgrade; the stream dies silently and this send
-                // is the first to notice. Reopen on the surviving connection
-                // — the reopen resends every outstanding seq, this one
-                // included.
                 eprintln!("[dial] ping send failed ({e}); reopening the channel");
                 reopens_left -= 1;
                 frames.clear();
@@ -752,13 +708,8 @@ fn ping_loop(
             }
             stats.sent += 1;
             println!("[dial] ping seq={seq} path={}", channel.name());
-            // Schedule from the actual send time. Long-lived event handling
-            // (notably a direct-channel upgrade) must not turn missed ticks
-            // into a burst of catch-up pings.
             next_ping = next_ping_deadline(Instant::now());
             if count == Some(seq) {
-                // Graceful teardown: half-close so the listener echoes
-                // everything already sent, then mirrors the close.
                 channel
                     .close_write(endpoint)
                     .map_err(|e| format!("close after final ping: {e}"))?;
@@ -803,8 +754,6 @@ fn ping_loop(
                     return Ok(());
                 }
                 if channel.direct && reopens_left > 0 {
-                    // Same punch race as the send-failure path, noticed via
-                    // the stream event instead of a failed write.
                     reopens_left -= 1;
                     frames.clear();
                     channel = match establish_direct_channel(
@@ -829,11 +778,6 @@ fn ping_loop(
                 stats.print_summary();
                 return Err("ping channel closed".into());
             }
-            // Connection lifecycle is connection-scoped, while this channel
-            // is peer-scoped. During a QUIC Connection replacement the old circuit can
-            // close just before the replacement direct connection is
-            // delivered. The matching StreamClosed event (or a failed send)
-            // is the authoritative signal that this channel itself died.
             EndpointEvent::Nat(nat_event) => {
                 print_nat_event("dial", nat_event);
                 if let NatEvent::PathUpgraded { peer: upgraded, .. } = nat_event
@@ -844,9 +788,6 @@ fn ping_loop(
                         "[dial] path-upgraded path=punched elapsed-us={}",
                         micros_since(start)
                     );
-                    // The old bridge is already reset by the agent — never
-                    // touch it again. Pongs in flight on it are gone; the
-                    // reopen resends their seqs on the new stream.
                     frames.clear();
                     channel = match establish_direct_channel(
                         endpoint,
@@ -857,8 +798,6 @@ fn ping_loop(
                     ) {
                         Ok(channel) => channel,
                         Err(e) if drain_deadline.is_some() => {
-                            // The remaining pongs could only have arrived on
-                            // the replacement stream; the run is over.
                             eprintln!("[dial] channel switch during drain failed: {e}");
                             stats.print_summary();
                             return Ok(());
@@ -908,8 +847,6 @@ mod tests {
             assert_eq!(decode_frame(&frame), (expected as u64, expected as u64 + 1));
         }
 
-        // Popping advances a cursor; the allocation is not shifted or
-        // shortened once per frame.
         assert_eq!(buffer.buf.len(), input.len());
         assert_eq!(buffer.head, (frames - 1) * FRAME_LEN);
 

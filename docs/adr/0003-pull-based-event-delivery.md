@@ -15,3 +15,9 @@ The FFI driver dispatched events by pushing each one through the listener seam (
 - The RN UniFFI surface changes (listener → doorbell, new drain method), so ADR 0002's regenerate-and-empty-diff check is amended: the bindings are intentionally regenerated, and the extraction's safety net is the React Native test suite instead of an empty diff.
 - Lost wakeups are prevented by protocol, not timing: the doorbell rings only on the empty→non-empty transition, and a binding that hears it must drain until empty.
 - Node process liveness rides the doorbell: a strong ThreadsafeFunction refs the event loop, so a started endpoint keeps the process alive until `close()`, like a listening server.
+
+## Amendments: implementation details
+
+- **The doorbell never blocks the driver.** The Node shell's doorbell (`DoorbellFunction` in `crates/nodejs`) is a `ThreadsafeFunction` with napi-rs's default `MaxQueueSize` of 0, which is unbounded, called with `ThreadsafeFunctionCallMode::NonBlocking`. The FFI core coalesces doorbells (one ring per empty to non-empty transition), so the queue cannot grow without bound, while a bounded queue would let a full queue block the network driver.
+- **The doorbell is advisory and never fails the pump.** ffi-core runs `on_events_ready` under `catch_unwind`, so a panicking foreign callback cannot stop event delivery; the web shell (`WebEndpoint::ring` in `crates/web`) discards an exception thrown by the JS doorbell callback, matching the Node shell.
+- **Node drains on `setImmediate`.** The Node adapter (`node/src/adapter.ts`) schedules each bounded drain batch with `setImmediate`: one check-phase turn keeps native callbacks out of the caller's stack without paying the ~1 ms timer granularity per batch that `setTimeout` would.

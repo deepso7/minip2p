@@ -228,8 +228,6 @@ impl ControlBuffer {
             items.push(item);
         }
         if items.is_empty() {
-            // This can only be reached for a hostile, nearly-frame-sized
-            // message id. Such ids are filtered before entering the buffer.
             return None;
         }
         let body = encode_control_items(&items, version);
@@ -415,9 +413,6 @@ struct PeerState {
 
 impl PeerState {
     fn queued_work(&self) -> usize {
-        // Subscription resync is connection-scoped bookkeeping rather than
-        // dropped application/control payload. Messages remain at the queue
-        // front while in flight; only control moves into the commit record.
         let in_flight_control = match &self.sender {
             SendState::Ready {
                 in_flight:
@@ -1035,7 +1030,6 @@ impl GossipsubAgent {
     ) -> bool {
         match self.role(peer, stream_id) {
             Some(StreamRole::Inbound) => {}
-            // Data on our outbound stream, or one we refused, is dropped.
             Some(_) => {
                 self.ack(peer, stream_id, data.len());
                 return true;
@@ -1198,8 +1192,6 @@ impl GossipsubAgent {
         }
         match role {
             StreamRole::Outbound => {
-                // A stale stream (one the sender already moved past) closes
-                // without touching the current sender.
                 let closed = self
                     .peers
                     .get_mut(peer)
@@ -1220,8 +1212,6 @@ impl GossipsubAgent {
                 }
             }
             StreamRole::Inbound => {
-                // An unfinished frame is discarded with the stream, which
-                // consumes it: the closed stream settles.
                 let unfinished = self
                     .peers
                     .get_mut(peer)
@@ -1384,9 +1374,6 @@ impl GossipsubAgent {
             } else {
                 supplied.min(self.config.max_backoff_ms)
             };
-            // Honour backoff for joined topics, and extend a live entry (e.g.
-            // the one `unsubscribe` recorded) so a resubscribe still waits.
-            // Anything else would let a peer grow `backoff` one topic at a time.
             if self.topics.contains(&topic) || self.is_backed_off(&topic, peer, now_ms) {
                 self.record_backoff(&topic, peer, backoff, now_ms);
             }
@@ -1739,10 +1726,6 @@ impl GossipsubAgent {
         let (frame, commit) = if !subscriptions.is_empty() {
             let mut batch = Vec::new();
             let mut body_len = 0;
-            // Subscription and control commits intentionally occupy separate
-            // RPCs. This keeps each acknowledgement atomic at the cost of one
-            // extra write after a reopen; each category is still packed
-            // greedily to the exact wire limit.
             while let Some(next) = subscriptions.front() {
                 let next_len = nested_field_len(next.encode().len());
                 if body_len + next_len > MAX_RPC_SIZE {
@@ -2055,8 +2038,6 @@ mod tests {
         assert!(buffer.insert(ControlItem::Graft(String::from("topic")), usize::MAX));
         assert_eq!(buffer.len(), 1, "later alias remains independently queued");
 
-        // Failure merges the owned item back and deterministically coalesces
-        // it with the later alias.
         assert_eq!(buffer.restore_older(in_flight, usize::MAX), 0);
         assert_eq!(buffer.len(), 1);
 
@@ -2212,7 +2193,6 @@ mod tests {
 
         agent.process_control(&peer, graft("room"), 120_000);
         assert!(agent.mesh_peers("room").is_empty(), "GRAFT inside backoff");
-        // Refusing that GRAFT re-armed our own backoff for the peer.
         agent.process_control(&peer, graft("room"), 180_001);
         assert_eq!(agent.mesh_peers("room"), alloc::vec![peer]);
     }

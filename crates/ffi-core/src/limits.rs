@@ -354,8 +354,6 @@ mod tests {
 
     #[test]
     fn a_value_past_the_native_range_is_rejected_not_truncated() {
-        // `usize` is 64 bits here, so check the conversion against `u32`, as
-        // a 32-bit platform's `usize` would be.
         let error = checked::<u32>(u64::from(u32::MAX) + 1, "limits.quic.send_window")
             .expect_err("overflow");
         assert!(matches!(
@@ -373,8 +371,6 @@ mod tests {
 
     #[test]
     fn limits_of_an_unbound_transport_are_not_converted() {
-        // An overflow would surface here on a 32-bit platform; the skipped
-        // record never reaches the conversion.
         let tcp_only = resolve_limits(
             Some(LimitsOptions {
                 quic: Some(QuicLimitsOptions {

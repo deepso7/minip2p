@@ -83,8 +83,6 @@ impl HandshakeState {
             Step::InitiatorWriteMessage1 => {
                 let public = public_key(self.local_ephemeral);
                 self.symmetric.mix_hash(&public);
-                // XX message 1 has an empty payload. Noise still runs
-                // EncryptAndHash over it, which advances the handshake hash.
                 let mut message = public.to_vec();
                 self.symmetric.encrypt_and_hash(&mut message, b"")?;
                 self.step = Step::InitiatorReadMessage2;
@@ -304,8 +302,6 @@ impl SymmetricState {
             hash: initial,
             cipher: CipherState::new(),
         };
-        // Noise always mixes the prologue, including an empty prologue. Hashing
-        // `h || []` is not a no-op and is required for libp2p interoperability.
         state.mix_hash(prologue);
         state
     }

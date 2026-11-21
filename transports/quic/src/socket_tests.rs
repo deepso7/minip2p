@@ -82,7 +82,6 @@ fn a_small_retry_queue_holds_whole_transmits_within_its_bound() {
         server.poll(now()).expect("poll");
     }
 
-    // Once the socket takes datagrams again, everything goes out.
     server.socket().blocked = false;
     let mut received = 0;
     let start = Instant::now();
@@ -102,8 +101,6 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
     let mut transport = loopback(QuicNodeConfig::generate());
     let destination = transport.local_addr();
 
-    // Junk the endpoint drops, sent as segmented trains where the platform
-    // can, so the receiver reads GRO batches.
     const SEGMENT: usize = 100;
     const SEGMENTS: usize = 40;
     const TRAINS: usize = 5;
@@ -131,14 +128,11 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
     std::thread::sleep(Duration::from_millis(50));
 
     transport.poll(now()).expect("poll");
-    // A batch here holds at most one train.
     let first = transport.socket().received;
     assert!(
         (MAX_DATAGRAMS_PER_POLL..MAX_DATAGRAMS_PER_POLL + SEGMENTS).contains(&first),
         "the bound is reached and overshot by less than one batch: {first}"
     );
-    // The rest is still queued, and no readiness edge is needed to get it:
-    // the driver is told to poll again at once.
     let mut polls = 1;
     while transport.next_deadline() == Some(Deadline::IMMEDIATE) {
         assert!(polls < 10, "the burst never drained");
@@ -156,7 +150,6 @@ fn one_receive_call_reads_several_queued_datagrams_where_the_platform_batches() 
         return;
     }
     let destination = transport.local_addr();
-    // Junk the endpoint drops, sent one datagram at a time.
     const DATAGRAMS: usize = 16;
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
     for _ in 0..DATAGRAMS {
@@ -207,13 +200,11 @@ fn buffer_growth_halves_refused_requests_and_never_asks_for_less() {
             SOCKET_BUFFER_BYTES / 4
         ]
     );
-    // Halving stops at the current size rather than asking for less.
     assert_eq!(
         requests(SOCKET_BUFFER_BYTES / 2, |_| false),
         [SOCKET_BUFFER_BYTES]
     );
     assert!(requests(SOCKET_BUFFER_BYTES, |_| true).is_empty());
-    // A platform that refuses everything is given up on at the floor.
     assert_eq!(
         requests(0, |_| false).last(),
         Some(&MIN_SOCKET_BUFFER_BYTES)
@@ -242,8 +233,6 @@ fn each_datagram_a_receive_call_read_owns_an_allocation_of_its_own_length() {
         dst_ip: None,
     };
     let buf: Vec<u8> = (0..=255).collect();
-    // Two single datagrams in their own slots, then a GRO batch of three
-    // 10-byte segments whose last is 4 bytes.
     let slots = [slot(0, 7, 7), slot(64, 3, 3), slot(128, 24, 10)];
     let datagrams: Vec<BytesMut> = slots
         .iter()

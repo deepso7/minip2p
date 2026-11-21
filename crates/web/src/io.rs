@@ -209,8 +209,6 @@ impl WebTransportIo for JsIo {
             if value.is_undefined() || value.is_null() {
                 return None;
             }
-            // `JsIo` is ours; an event it cannot shape is skipped rather
-            // than ending the endpoint.
             if let Ok(event) = serde_wasm_bindgen::from_value::<JsEvent>(value) {
                 return Some(event.into());
             }

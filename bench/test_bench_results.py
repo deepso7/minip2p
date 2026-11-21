@@ -35,7 +35,6 @@ def package(name, version, dependencies=(), external=False):
     return "\n".join(lines) + "\n"
 
 
-# A workspace crate depending on one external crate through another.
 LOCK = "version = 4\n" + package("minip2p-core", "0.10.5", ["aead"]) + package("aead", "0.6.1", ["inout"], external=True) + package(
     "inout", "0.2.0", external=True
 )

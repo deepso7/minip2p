@@ -146,8 +146,6 @@ fn pr_bench() {
         let runs = if support::quick::quick() { 1 } else { PR_RUNS };
         let samples = measure(profile, &point, PR_TOTAL, runs);
         let results = [(point, samples)];
-        // The row still goes out, so the pipeline keeps its shape, but a
-        // link that failed calibration is called out next to it.
         let problems = calibration_problems(profile, &results);
         if !problems.is_empty() {
             println!(
@@ -210,8 +208,6 @@ fn run_sweep(sweep: &str) {
         retry(profile, runs);
         return;
     }
-    // 2.5 s or 25 round trips at the link rate, whichever is longer, so a
-    // long RTT's slow start and credit ramp stay a small share of the time.
     let seconds_x10 = 25.max(profile.rtt.as_millis() as u64 / 4);
     let default_total = (profile.rate_bits_per_s / 8 * seconds_x10 / 10).div_ceil(MB);
     let total = env_or("MINIP2P_RTT_TOTAL_MB", default_total.max(32)) * MB;
@@ -261,15 +257,10 @@ fn run_sweep(sweep: &str) {
     };
     let count = results.len();
     for run in 0..runs {
-        // Rotate the order each run, so drift over the sweep does not
-        // always land on the same points.
         for offset in 0..count {
             sample_point(&mut results, (offset + run) % count, run);
         }
     }
-    // The candidates either side of the cutoff decide the pick: give them
-    // as many runs again, interleaved. Extra runs can move the cutoff, so
-    // repeat until both sides of wherever it lands have them.
     while let Some((pick, below)) = pick(&results) {
         let boundary: Vec<usize> = below
             .into_iter()
@@ -331,7 +322,6 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
             TcpConfig::default(),
         )
     };
-    // Candidate windows, in percent of the BDP.
     let candidates = |percents: &[u64]| -> Vec<usize> {
         percents
             .iter()
@@ -433,8 +423,6 @@ fn calibration_problems(profile: Profile, results: &[(Point, Vec<Sample>)]) -> V
     if lost > 0 {
         problems.push(format!("{lost} datagrams lost"));
     }
-    // Per sample, so one point measured on a slower link cannot hide in a
-    // sweep-wide median.
     let expected = profile.rtt.as_secs_f64() * 1000.0;
     for (point, samples) in results {
         for sample in samples {
@@ -497,8 +485,6 @@ fn summarize(sweep: &str, profile: Profile, results: &[(Point, Vec<Sample>)]) {
         return;
     }
     println!("calibration: ok");
-    // `quic-check`: each chosen point against the reference with as many
-    // streams.
     for (point, samples) in results {
         let Some(streams) = point.label.strip_prefix("chosen") else {
             continue;
@@ -529,8 +515,6 @@ fn summarize(sweep: &str, profile: Profile, results: &[(Point, Vec<Sample>)]) {
         return;
     };
     let rates_at = |index: usize| results.get(index).map(|(_, samples)| rates(samples));
-    // Ambiguous when the pick's own runs dip below the cutoff, or the next
-    // smaller candidate's runs reach it.
     let straddles = rates_at(pick).is_some_and(|rates| min(&rates) < cutoff)
         || below
             .and_then(rates_at)
@@ -620,7 +604,6 @@ fn json_line(sweep: &str, profile: Profile, run: usize, point: &Point, sample: &
 fn socket_addr(addr: &PeerAddr) -> SocketAddr {
     let text = addr.transport().to_string();
     let mut parts = text.split('/');
-    // The component after `udp` or `tcp` is the port.
     parts.find(|part| matches!(*part, "udp" | "tcp"));
     let port = parts
         .next()
@@ -747,7 +730,6 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
     } = link(profile, point);
     let client_peer = *client.peer_id();
     let pings = Arc::new(Mutex::new(Vec::new()));
-    // Off while loss is counted, so the target goes quiet.
     let pinging = Arc::new(AtomicBool::new(true));
     let on_event = {
         let (pings, pinging, client_peer) = (Arc::clone(&pings), Arc::clone(&pinging), client_peer);
@@ -757,7 +739,6 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
                 pings.lock().expect("pings").push(*rtt_ms);
             }
             if pinging.load(Ordering::Relaxed) && Instant::now() >= next_ping {
-                // A ping still outstanding is not an error worth stopping for.
                 drop(endpoint.ping(&client_peer));
                 next_ping = Instant::now() + PING_INTERVAL;
             }
@@ -766,7 +747,6 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
     let unit = (point.streams * CHUNK) as u64;
     let total = total.div_ceil(unit) * unit;
     let (_sink, sink) = bulk::spawn_sink(target, &client, PROTOCOL, Instant::now, on_event);
-    // The streams' windows cap what an unlimited connection window admits.
     let stream_windows = point.quic.stream_receive_window as u64 * point.streams as u64;
     let windows = stream_windows
         + (point.quic.connection_receive_window as u64).min(stream_windows)
@@ -792,8 +772,6 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
 
     let mut samples = Vec::new();
     for _ in 0..runs {
-        // Loss is counted between two quiet points, so nothing in flight at
-        // either snapshot is miscounted.
         pinging.store(false, Ordering::Relaxed);
         quiesce(&mut client, profile);
         up.reset();

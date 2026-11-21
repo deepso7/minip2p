@@ -196,28 +196,8 @@ fn relay_event(
     for _ in 0..EVENTS_PER_BATCH {
         black_box(agent.handle_event(&mut swarm, black_box(&event), false, black_box(now)));
     }
-    // Returned so their teardown is not counted.
     (agent, swarm, event)
 }
-
-// --- N active reservations and N active circuits, at N = 100, 1k and 10k -----
-//
-// Reserved peers `r0..rN-1` each hold one connection. `N / 100` source peers
-// each hold one connection carrying 100 circuits, one to each of 100 distinct
-// reserved peers. The first `EXPIRING` reservations are committed at `EARLY`,
-// the rest at `NOW`, so one tick at `EXPIRY` expires exactly that batch.
-// Every limit has headroom above N, and circuits outlive the reservation
-// expiry, so the only due work is the operation under test. Every scenario
-// runs at each size: an instruction count that stays flat across sizes shows
-// the operation does not scan the population.
-//
-// The measured region is the agent alone. A real swarm updates its own state
-// before it delivers an event, so each setup applies the measured event to
-// `BenchSwarm` and the fake's bookkeeping stays out of the count. The agent
-// runs its swarm commands inline, on `BenchSwarm`, so the measured regions
-// include issuing the writes, acknowledgements, and resets an operation
-// needs. Counts from before that change, when commands were queued for the
-// host, are not comparable.
 
 const CIRCUITS_PER_SOURCE: u64 = 100;
 const EXPIRING: u64 = 100;
@@ -244,8 +224,6 @@ impl Scale {
 }
 
 fn scale_config(size: u64) -> RelayServerConfig {
-    // Rate limits stay on so admission walks N+ live buckets, but none can
-    // refill (and so none become due) inside the measured window.
     let limit = Some(RateLimit {
         capacity: 4_096,
         refill_interval_ms: 86_400_000,
@@ -375,7 +353,6 @@ fn reserve(scale: &mut Scale, index: u64, now: Now) {
     open_hop(scale, &peer_id, stream, now);
     let request = stream_data(&peer_id, stream, hop_frame(HopMessageType::Reserve, None));
     assert!(scale.handle(&request, now));
-    // The client closes its HOP stream once it has read the response.
     let closed = SwarmEvent::StreamClosed {
         peer_id,
         conn_id: stream.conn_id,
@@ -402,8 +379,6 @@ fn connect(scale: &mut Scale, source: u64, slot: u64, now: Now) {
         hop_frame(HopMessageType::Connect, Some(&destination)),
     );
     assert!(scale.handle(&request, now));
-    // The STOP stream negotiates and the destination accepts; the HOP
-    // success follows.
     assert!(scale.handle(&stream_ready(&destination, stop_stream, true), now));
     let accepted = stream_data(
         &destination,
@@ -486,8 +461,6 @@ fn with_new_connector(size: u64) -> (Scale, SwarmEvent) {
     };
     establish(&mut scale, &peer_id, stream.conn_id, NOW);
     open_hop(&mut scale, &peer_id, stream, NOW);
-    // Reserved peer 0 already carries a circuit on `STOP_STREAM`; the new
-    // circuit's STOP leg must be a stream of its own, not replace that one.
     scale.swarm.next_open = Some(StreamKey {
         conn_id: reserved_conn(0),
         stream_id: StreamId::new(STOP_STREAM + 1),
@@ -616,7 +589,6 @@ fn assert_connect_admitted((mut scale, _): (Scale, SwarmEvent)) {
 }
 
 fn assert_hop_admitted((mut scale, _): (Scale, SwarmEvent)) {
-    // A refused stream would be reset.
     assert_eq!(
         scale.swarm.take_counts(),
         Counts::default(),
@@ -712,9 +684,6 @@ fn assert_tail_dropped((mut scale, _): (Scale, SwarmEvent)) {
     );
     assert_eq!(scale.agent.circuit_count(), scale.size as usize - 1);
 }
-
-// Each benchmark returns its inputs so their drop and the assertions in
-// `teardown` stay outside the measured region.
 
 #[library_benchmark]
 #[bench::relay_100_next_deadline(args = (100), setup = scale_agent, teardown = assert_unchanged)]

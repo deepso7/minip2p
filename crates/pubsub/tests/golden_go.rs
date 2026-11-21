@@ -32,13 +32,10 @@ fn go_libp2p_signed_message_decodes_and_verifies() {
     assert_eq!(rpc.publish.len(), 1, "one published message");
     let message = &rpc.publish[0];
 
-    // go emits exactly one topic and omits the key field (inline Ed25519).
     assert_eq!(message.topic_ids, vec!["minip2p-golden".to_string()]);
     assert!(message.key.is_none(), "go inlines the key in from");
     assert_eq!(message.data.as_deref(), Some(&b"golden"[..]));
 
-    // StrictSign verification against go's actual signature: this is the
-    // canonical-re-encode rule proving out end to end.
     let (from, _seqno, signed) = message
         .verify(false)
         .expect("go-signed message must pass strict verification");

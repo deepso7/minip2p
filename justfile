@@ -12,6 +12,7 @@ clean:
 # Fast workspace-only loop: format check, lint, and tests at default features.
 dev:
     cargo fmt --all -- --check
+    python3 scripts/check-comments.py
     cargo clippy --workspace --all-targets -- -D warnings
     cargo nextest run --workspace
 
@@ -42,6 +43,10 @@ test tier="ci":
 # One feature-matrix operation alone, e.g. `just matrix clippy smoltcp`.
 matrix operation tier="ci":
     scripts/run-feature-matrix.sh {{operation}} {{tier}}
+
+# Comment ratchet: `check`, `update` (lock in deletions), or `list [paths]`.
+comments operation="check" *paths:
+    python3 scripts/check-comments.py {{ if operation == "check" { "" } else { "--" + operation } }} {{paths}}
 
 check-nostd:
     rustup target add thumbv7em-none-eabi

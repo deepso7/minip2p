@@ -225,7 +225,6 @@ mod tests {
 
     #[test]
     fn tag_byte_rejects_field_numbers_that_need_multi_byte_tags() {
-        // field 16 ⇒ tag value 128, which is a multi-byte varint — not a u8 push.
         assert_eq!(tag_byte(16, WIRE_VARINT), None);
         assert_eq!(tag_byte(15, WIRE_VARINT), Some(0x78));
         assert_eq!(tag_byte(1, 8), None);
@@ -241,8 +240,6 @@ mod tests {
 
     #[test]
     fn encode_round_trips_field_numbers_that_need_multi_byte_tags() {
-        // Regression for silent corruption: pushing tag_byte(16) as one byte
-        // yields 0x80, so read_tag would swallow the value as a tag continuation.
         let mut out = Vec::new();
         encode_varint_field(&mut out, 16, 7);
         assert_eq!(out, vec![0x80, 0x01, 0x07]);
@@ -298,7 +295,7 @@ mod tests {
 
     #[test]
     fn read_tag_rejects_field_number_zero() {
-        let input = [0x02, 0x00]; // field 0, LEN, empty
+        let input = [0x02, 0x00];
         let mut idx = 0;
         assert_eq!(
             read_tag(&input, &mut idx),
@@ -348,7 +345,6 @@ mod tests {
             })
         );
 
-        // The largest tag that still decodes as a u64 varint.
         let mut buf = Vec::new();
         write_uvarint(u64::MAX, &mut buf);
         let mut idx = 0;
@@ -420,7 +416,7 @@ mod tests {
 
     #[test]
     fn read_len_delimited_reports_field_overflow() {
-        let input = [0x05, b'a', b'b']; // length 5, only 2 bytes remain
+        let input = [0x05, b'a', b'b'];
         let mut idx = 0;
         let err = read_len_delimited(&input, &mut idx).unwrap_err();
         assert_eq!(
@@ -505,7 +501,7 @@ mod tests {
 
     #[test]
     fn truncated_varint_reports_varint_error() {
-        let input = [0x80]; // incomplete varint
+        let input = [0x80];
         let mut idx = 0;
         assert!(matches!(
             read_varint_value(&input, &mut idx),

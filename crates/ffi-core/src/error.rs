@@ -187,7 +187,6 @@ pub fn driver_failure_kind(error: &minip2p::DriverError) -> crate::DriverFailure
             DriverFailureKind::Transport
         }
         minip2p::DriverError::Swarm(_) => DriverFailureKind::Swarm,
-        // Includes failures this binding predates.
         _ => DriverFailureKind::Invariant,
     }
 }

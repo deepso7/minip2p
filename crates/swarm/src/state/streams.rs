@@ -21,15 +21,9 @@ use super::{
 };
 
 impl SwarmState {
-    // -----------------------------------------------------------------------
-    // Write backpressure (ADR 0012)
-    // -----------------------------------------------------------------------
-
     /// Queues a write or close behind the stream's held bytes. Returns the
     /// action back when it may be dispatched now.
     pub(super) fn hold_action(&mut self, action: Action) -> Option<Action> {
-        // Demoting a stream before its held negotiation bytes are accepted
-        // would take the control reserve away from them.
         if let Action::SetControlStream {
             conn_id,
             stream_id,
@@ -53,7 +47,6 @@ impl SwarmState {
                 self.bound_held(conn_id, stream_id);
             }
             _ => {
-                // Writes are over, so a pending Writable never fires.
                 self.held.close_after(conn_id, stream_id);
                 self.user_writable_wanted.remove(&(conn_id, stream_id));
             }
@@ -70,8 +63,6 @@ impl SwarmState {
         self.held.forget_stream(conn_id, stream_id);
         self.user_writable_wanted.remove(&(conn_id, stream_id));
         self.pending_demotions.remove(&(conn_id, stream_id));
-        // Writes still queued for the stream would otherwise go out ahead of
-        // the reset now that nothing holds them back.
         let is_write = |action: &Action| stream_write_key(action) == Some((conn_id, stream_id));
         self.actions.retain(|action| !is_write(action));
         if self.reset_pending.insert((conn_id, stream_id)) {
@@ -112,7 +103,6 @@ impl SwarmState {
                     data,
                 });
             }
-            // Behind the tails, and held again if one comes back Full.
             if self.pending_demotions.remove(&key) {
                 self.mark_control(conn_id, stream_id, false);
             }
@@ -143,10 +133,6 @@ impl SwarmState {
         self.user_writable_wanted.remove(&(conn_id, stream_id));
         self.pending_demotions.remove(&(conn_id, stream_id));
     }
-
-    // -----------------------------------------------------------------------
-    // Application-facing intents
-    // -----------------------------------------------------------------------
 
     /// Validates an application open of `protocol_id` to `peer_id` and
     /// returns the connection to open it on.
@@ -304,7 +290,6 @@ impl SwarmState {
             .take(conn_id, stream_id)
             .map(|held| held.tails)
             .unwrap_or_default();
-        // Writes still queued here come after the held ones.
         self.actions.retain(|action| {
             if !stream_action_matches(action, conn_id, stream_id) {
                 return true;
@@ -316,8 +301,6 @@ impl SwarmState {
             }
             false
         });
-        // The new owner sends the owed bytes as application writes, so a
-        // demotion the cleanup dropped still goes out, after it.
         if demote {
             self.mark_control(conn_id, stream_id, false);
         }
@@ -351,9 +334,6 @@ impl SwarmState {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        // Ownership is relinquished even if the transport has already closed
-        // and forgotten the stream. In that case there is nothing left to
-        // reset, but a terminal event may still be queued for the consumer.
         let mut dropped_data = 0usize;
         let mut dropped_terminal = false;
         self.events.retain(|event| {
@@ -370,30 +350,18 @@ impl SwarmState {
         let key = (conn_id, stream_id);
         let peer_conn = self.conn_to_peer.get(&conn_id) == Some(peer_id);
         let abandoned = peer_conn && self.abandoned_streams.contains(&key);
-        // A stream still negotiating outbound can be abandoned too: its id
-        // was handed out by `open_stream` before `StreamReady`.
         if !abandoned
             && !(peer_conn && self.outbound_negotiators.contains_key(&key))
             && let Err(unknown) = self.require_user_stream(peer_id, conn_id, stream_id)
         {
-            // The connection ended: whatever its terminal events said, the
-            // transport may still hold the stream's delivered bytes, and only
-            // it can settle them (ADR 0012).
             if !self.conn_to_peer.contains_key(&conn_id) {
                 self.actions
                     .push_back(Action::SettleStream { conn_id, stream_id });
                 return Ok(());
             }
-            // A queued terminal proves the stream was ours and that the
-            // transport has already closed and forgotten it; without one it is
-            // genuinely unknown.
             if !dropped_terminal {
                 return Err(unknown);
             }
-            // No reset is coming to settle the data just dropped, and the
-            // consumer will never acknowledge it either, so the state owes the
-            // acknowledgement. Left undone, the muxer holds the stream's slot
-            // against its stream limit for good.
             if dropped_data > 0 {
                 self.actions.push_back(Action::AckStream {
                     conn_id,
@@ -446,10 +414,6 @@ impl SwarmState {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Ingress
-    // -----------------------------------------------------------------------
-
     /// Starts multistream-select negotiation of `protocol` on an outbound
     /// stream the core just opened on `conn_id`. Its deadline is armed by the
     /// transport's `StreamOpened`.
@@ -500,10 +464,6 @@ impl SwarmState {
             ),
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
 
     /// Checks that `conn_id` is `peer_id`'s connection and holds the
     /// negotiated user stream `stream_id`. Streams of a replaced or closed
@@ -632,10 +592,6 @@ impl SwarmState {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: stream event handling
-    // -----------------------------------------------------------------------
-
     /// Queues the mark that lets a stream write into the transport's control
     /// reserve, or takes it away ([`Action::SetControlStream`]).
     pub(super) fn mark_control(
@@ -732,9 +688,7 @@ impl SwarmState {
                 self.identify.on_stream_data(peer_id, stream_id, &data);
                 self.drain_identify_outputs();
             }
-            ProtocolKind::IdentifyResponder => {
-                // Responder doesn't expect data; ignore.
-            }
+            ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
                 let len = data.len();
                 self.events.push_back(SwarmEvent::StreamData {
@@ -755,8 +709,6 @@ impl SwarmState {
         stream_id: StreamId,
     ) {
         let Some(protocol) = self.stream_protocol(conn_id, stream_id).cloned() else {
-            // A peer done writing mid-negotiation can never send its Identify
-            // or agree to ping.
             let key = (conn_id, stream_id);
             if let Some(target) = self
                 .outbound_negotiators
@@ -764,7 +716,6 @@ impl SwarmState {
                 .map(|p| p.target.clone())
                 && (self.fail_identify_stream(&target, conn_id, IdentifyFailure::ClosedEarly)
                     || self.fail_ping_stream(&target, conn_id, PingFailure::StreamClosed))
-                // A failed ping already reset its stream.
                 && self.outbound_negotiators.remove(&key).is_some()
             {
                 self.actions
@@ -811,8 +762,6 @@ impl SwarmState {
         error_code: u64,
     ) {
         let key = (conn_id, stream_id);
-        // A write the transport answered Full is still unsent: a proposal in
-        // it never reached the peer, so no reply will come.
         let proposal_held = self.held.is_held(conn_id, stream_id);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.contains(&key) {
@@ -884,7 +833,6 @@ impl SwarmState {
         }
 
         self.inbound_negotiators.remove(&key);
-        // An open that never negotiated still gets its one terminal event.
         if let Some(pending) = self.outbound_negotiators.remove(&key) {
             if self.fail_identify_stream(&pending.target, conn_id, IdentifyFailure::ClosedEarly)
                 || self.fail_ping_stream(&pending.target, conn_id, PingFailure::StreamClosed)

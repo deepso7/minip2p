@@ -1,0 +1,7 @@
+# Gossipsub message verification and identity binding
+
+`RawMessage::verify` in `minip2p-pubsub` decides which published messages are accepted:
+
+- **The signing key must belong to `from`.** Whether the public key arrives in the `key` field or is recovered from an identity-multihash `from`, it must hash to the `from` peer id. An embedded key that verifies the signature but hashes to another peer id is rejected; otherwise anyone could sign with their own key and impersonate `from`. A recovered key satisfies the check only when `from` really inlines it.
+- **Verification is over the canonical re-encoding of known fields.** Like the upstream implementations, StrictSign verifies the canonical encoding of the fields we know, so a sender's unknown fields (added after signing) do not break verification, while `raw` keeps the original bytes verbatim and forwarding re-emits them unchanged. go-libp2p's signed messages (one topic, no `key` field, Ed25519 key inlined in `from`) verify against this rule; `tests/golden_go.rs` pins that interop. This is why field 0 must be rejected rather than skipped (ADR 0016).
+- **`from` and `seqno` are mandatory even for unsigned messages.** They form the dedup id, so `verify(true)` still requires `from` and a seqno of 1..=`MAX_SEQNO_LEN` (64) bytes. The seqno length is implementation-defined (rust-libp2p floodsub emits 20 random bytes), hence the range rather than a fixed 8 bytes.

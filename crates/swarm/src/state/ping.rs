@@ -13,10 +13,6 @@ use crate::events::{PingFailure, SwarmError, SwarmErrorKind, SwarmEvent};
 use super::{Action, PingAttempt, ProtocolKind, SwarmState};
 
 impl SwarmState {
-    // -----------------------------------------------------------------------
-    // Application-facing intents
-    // -----------------------------------------------------------------------
-
     /// Queues a ping to `peer_id` with the supplied random payload at
     /// `now_ms`.
     ///
@@ -42,7 +38,6 @@ impl SwarmState {
             return Err(SwarmError::NotConnected { peer_id: *peer_id });
         }
 
-        // Case 1: a ping stream is already negotiated -- fire now.
         if self.find_negotiated_ping_stream(peer_id).is_some() {
             self.ping
                 .send_ping(peer_id, &payload, now_ms)
@@ -54,21 +49,15 @@ impl SwarmState {
             return Ok(());
         }
 
-        // Case 2: a ping stream is negotiating -- update the queued payload.
         if self.has_pending_ping_stream(peer_id) {
             self.start_ping_attempt(peer_id, Some(payload), now_ms);
             return Ok(());
         }
 
-        // Case 3: no stream yet -- open one and queue the payload.
         self.queue_open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)?;
         self.start_ping_attempt(peer_id, Some(payload), now_ms);
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: state helpers
-    // -----------------------------------------------------------------------
 
     pub(super) fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
         self.ping.outbound_stream(peer_id)
@@ -122,7 +111,6 @@ impl SwarmState {
         if self.ping.in_flight_payload(peer_id).is_some()
             && let Some(stream_id) = self.ping.outbound_stream(peer_id)
         {
-            // Forgets the stream and its echo; the next ping opens a new one.
             self.ping.on_stream_closed(peer_id, stream_id);
             streams.push(stream_id);
         }
@@ -167,8 +155,6 @@ impl SwarmState {
         if negotiating {
             return true;
         }
-        // Also check for a Ping open still queued (common shortly after
-        // calling ping()).
         self.actions.iter().any(|action| {
             matches!(
                 action,
@@ -176,10 +162,6 @@ impl SwarmState {
             )
         })
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: execute protocol-handler actions
-    // -----------------------------------------------------------------------
 
     pub(super) fn execute_ping_action(&mut self, action: PingAction) {
         match action {
@@ -260,8 +242,6 @@ impl SwarmState {
                     });
                 }
             }
-            // The attempt's own deadline always comes first; this is the
-            // protocol's backstop.
             PingEvent::Timeout { peer_id, .. } => {
                 self.fail_ping(&peer_id, PingFailure::TimedOut);
             }

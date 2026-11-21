@@ -244,7 +244,6 @@ describe("Node adapter", () => {
       expect(snapshot).toMatchObject({ publicKey: expect.any(ArrayBuffer) });
     }
     expect(received).toHaveLength(1);
-    // The native connection ID maps to a public, JS-safe one.
     expect(connIds).toEqual([1]);
     endpoint.close();
   });
@@ -376,8 +375,6 @@ describe("Node adapter", () => {
     const fake = fakeEndpoint();
     const ids: number[] = [];
     endpoint.on("connectionEstablished", ({ connId }) => ids.push(connId));
-    // Dispatched before it closes: an unseen connection that ends without
-    // data would leave the queue whole.
     fake.enqueue(
       [
         {
@@ -552,7 +549,6 @@ describe("Node adapter", () => {
     fake.ring();
     await settle();
 
-    // Never surfaced, so there is nothing to abandon, and later events flow.
     expect(fake.abandonedStreams).toEqual([]);
     expect(peers).toEqual(["after"]);
     endpoint.close();

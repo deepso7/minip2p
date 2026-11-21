@@ -1,4 +1,3 @@
-// See Cargo.toml: musl's allocator is the relay's bottleneck.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -67,7 +66,6 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|mesh| load_keypair(Some(&mesh.key_path), "mesh"))
         .transpose()?;
-    // Watch before the first load, so a renewal in between is noticed.
     let mut watched = options
         .webtransport_certificate
         .clone()
@@ -85,8 +83,6 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         endpoint.peer_id(),
         options.accepting
     );
-    // What the other mesh nodes list for this one in [mesh] members (or
-    // --mesh-member), with a wildcard IP replaced by this node's public one.
     for address in endpoint.relay_mesh_addresses() {
         println!("[relay] mesh listening={address}");
     }
@@ -94,12 +90,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     for address in &listening {
         println!("[relay] listening={address}");
         if address.transport().is_webtransport() && certificate.is_none() {
-            // What a browser dials: the certhash pins this node's certificate.
             println!("[relay] webtransport={address}");
         }
     }
-    // Wildcard listeners are never advertised. With nothing announced the
-    // relay still grants reservations, with an empty address list.
     if options.announce_addrs.is_empty()
         && listening
             .iter()
@@ -109,8 +102,6 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             "[relay] no public address to advertise; clients will use the address they dialed (set --announce to advertise one)"
         );
     }
-    // A CA-signed certificate names a domain, so browsers dial the announced
-    // `/dns` address, not a listener's IP.
     let announced = options
         .announce_addrs
         .iter()
@@ -291,7 +282,6 @@ fn try_bind(
     for address in quic {
         builder = builder.listen_on(&address)?;
         if options.webtransport {
-            // The same socket serves both.
             builder = builder.listen_on(format!("{address}/webtransport"))?;
         }
     }
@@ -358,8 +348,6 @@ fn listen_multiaddr(address: SocketAddr, protocol: &str, suffix: &str) -> String
 }
 
 fn stdin_commands() -> mpsc::Receiver<String> {
-    // Bound piped input so a producer cannot outrun the operator loop and grow
-    // the process without limit.
     let (sender, receiver) = stdin_command_channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {

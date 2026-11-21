@@ -139,8 +139,6 @@ impl File {
                 format!("/dns/{hostname}/tcp/{DEFAULT_PORT}"),
                 format!("/dns/{hostname}/udp/{DEFAULT_PORT}/quic-v1"),
             ];
-            // Derived certificates need a /certhash, which the relay logs
-            // as `webtransport=`; only a CA certificate is dialed by name.
             if options.webtransport_certificate.is_some() {
                 derived.push(format!(
                     "/dns/{hostname}/udp/{DEFAULT_PORT}/quic-v1/webtransport"
@@ -353,7 +351,6 @@ mod tests {
                 ),
             ),
         ];
-        // `[limits]` names each flag without its dashes.
         for (flag, value) in [
             ("--max-reservations", "7"),
             ("--max-reservations-per-ip", "7"),
@@ -440,7 +437,6 @@ mod tests {
             "/dns/relay.example.com/udp/19876/quic-v1",
         ];
         assert_eq!(announced("hostname = \"relay.example.com\""), base);
-        // Derived certificates are dialed by /certhash, never by name.
         assert_eq!(
             announced("hostname = \"relay.example.com\"\n[webtransport]"),
             base

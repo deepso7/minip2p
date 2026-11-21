@@ -87,7 +87,6 @@ pub fn webtransport_certificate(
     let out_of_range = || gen_err("certificate period is out of range");
     let not_before = period
         .checked_mul(PERIOD_SECS)
-        // Period 0 starts at the epoch, so its margin is clamped there.
         .map(|start| start.saturating_sub(CLOCK_SKEW_MARGIN_SECS))
         .ok_or_else(out_of_range)?;
     let not_after = not_before
@@ -101,11 +100,6 @@ pub fn webtransport_certificate(
     let validity = Validity::new(time(not_before)?, time(not_after)?);
 
     let spki = SubjectPublicKeyInfoOwned::from_key(signing_key.verifying_key()).map_err(gen_err)?;
-    // Every certificate has the same self-issued name, so the serial tells
-    // them apart: NSS (Firefox) refuses a certificate whose issuer and serial
-    // match one it already holds. A positive 16-byte serial, 0x01 followed
-    // by 15 bytes of SHA-256 over the period's public key, differs per node
-    // and per period yet stays deterministic.
     let mut serial = [0x01; 16];
     let digest = Sha256::digest(spki.subject_public_key.raw_bytes());
     for (byte, hashed) in serial.iter_mut().skip(1).zip(digest) {
@@ -115,7 +109,6 @@ pub fn webtransport_certificate(
 
     let builder =
         CertificateBuilder::new(WebTransportProfile, serial, validity, spki).map_err(gen_err)?;
-    // ECDSA signing in `p256` is RFC 6979 deterministic.
     let cert = builder
         .build::<_, ecdsa::der::Signature<p256::NistP256>>(&signing_key)
         .map_err(gen_err)?;
@@ -255,7 +248,6 @@ mod tests {
 
     #[test]
     fn validity_is_fourteen_days_from_an_hour_before_the_period() {
-        // Period 2000 starts at 2000 · 13 days = 2_246_400_000.
         let (not_before, not_after) = validity_secs(2_000);
         assert_eq!(not_before, 2_246_400_000 - 3_600);
         assert_eq!(not_after - not_before, 14 * DAY);
@@ -268,20 +260,14 @@ mod tests {
         let tbs = cert.tbs_certificate();
 
         let spki = tbs.subject_public_key_info();
-        assert_eq!(spki.algorithm.oid.to_string(), "1.2.840.10045.2.1"); // id-ecPublicKey
+        use const_oid::db::rfc5912::{ECDSA_WITH_SHA_256, ID_EC_PUBLIC_KEY, SECP_256_R_1};
+        assert_eq!(spki.algorithm.oid, ID_EC_PUBLIC_KEY);
         let curve = spki.algorithm.parameters.as_ref().unwrap();
         assert_eq!(
-            curve
-                .decode_as::<const_oid::ObjectIdentifier>()
-                .unwrap()
-                .to_string(),
-            "1.2.840.10045.3.1.7" // prime256v1
+            curve.decode_as::<const_oid::ObjectIdentifier>().unwrap(),
+            SECP_256_R_1
         );
-        // ecdsa-with-SHA256, so no RSA signature either.
-        assert_eq!(
-            cert.signature_algorithm().oid.to_string(),
-            "1.2.840.10045.4.3.2"
-        );
+        assert_eq!(cert.signature_algorithm().oid, ECDSA_WITH_SHA_256);
         assert!(
             tbs.extensions()
                 .into_iter()
@@ -289,7 +275,6 @@ mod tests {
                 .all(|ext| ext.extn_id != crate::LIBP2P_EXTENSION_OID)
         );
 
-        // The returned PKCS#8 key is the certificate's P-256 key.
         use p256::pkcs8::DecodePrivateKey;
         use spki::EncodePublicKey;
         let key = p256::ecdsa::SigningKey::from_pkcs8_der(&key_der).unwrap();
@@ -342,8 +327,6 @@ mod tests {
 
     #[test]
     fn current_and_next_certificates_overlap_across_the_boundary() {
-        // Certificate k+1 is already valid an hour before period k+1 starts,
-        // and certificate k is still valid 23 h after period k ends.
         let boundary = next_boundary(2_000 * 13 * DAY);
         assert_eq!(validity_secs(2_001).0, boundary - 3_600);
         assert_eq!(validity_secs(2_000).1, boundary + 23 * 3_600);
@@ -351,8 +334,6 @@ mod tests {
 
     #[test]
     fn periods_past_the_x509_range_are_errors() {
-        // Year 10000 cannot be encoded, and the last period's validity end
-        // overflows `u64`; both are generation errors, not panics.
         for period in [period_at(253_402_300_800), period_at(u64::MAX)] {
             assert!(matches!(
                 webtransport_certificate(&host(1), period),

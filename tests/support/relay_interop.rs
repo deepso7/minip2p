@@ -109,7 +109,6 @@ pub fn run_client(relays: &mut [Endpoint], mut client: Command) -> Observed {
         }
         assert!(Instant::now() < deadline, "foreign relay client timed out");
     }
-    // Drive closure/accounting after the foreign process exits.
     for _ in 0..50 {
         drive(relays);
     }
@@ -126,8 +125,6 @@ pub fn mesh(limits: Limits) -> ([Endpoint; 2], [String; 2], [PeerId; 2]) {
     use minip2p::{Ed25519Keypair, PeerAddr, RelayMeshConfig};
 
     let public = Ed25519Keypair::generate();
-    // Each node's backbone key and a port no socket holds now, so each node
-    // can list the other before either binds.
     let nodes = [(), ()].map(|()| {
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .and_then(|socket| socket.local_addr())

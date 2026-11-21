@@ -199,7 +199,6 @@ fn the_client_receive_window_gates_the_server() {
     let mut unacked = 0;
     let mut received = 0;
     let mut stalled_rounds = 0;
-    // Nothing acknowledged: delivery stops at the window.
     while stalled_rounds < 200 {
         let (server, client) = pair.pump("the window to fill");
         if tail.is_some()
@@ -225,7 +224,6 @@ fn the_client_receive_window_gates_the_server() {
     }
     assert_eq!(received, WINDOW);
 
-    // Acknowledging as it arrives lets the rest through.
     let inbound = inbound.expect("incoming");
     while received < TOTAL {
         pair.client.ack_stream(conn, inbound, unacked).expect("ack");

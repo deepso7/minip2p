@@ -1,9 +1,3 @@
-// Serves the browser e2e page from `localhost` (a secure context, so
-// WebTransport works and Chrome's Local Network Access never prompts),
-// with the built `@minip2p/core` and `@minip2p/web` behind an import map.
-//
-// Usage: node e2e/server.mjs <port>
-
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";

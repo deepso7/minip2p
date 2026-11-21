@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
-# Run one pass of the benchmarks listed in bench/targets and collect its
-# result document under target/bench-results/.
 set -eu
 
 git_sha=${BENCH_GIT_SHA:-$(git rev-parse HEAD)}
 
-# Runs every bench/targets line of one pass, in file order. The list is read
-# on fd 3 so a benchmark can never consume it from stdin.
 run_pass() {
   local pass package features bench args
   while read -r -u 3 pass package features bench _; do
