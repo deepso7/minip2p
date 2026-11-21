@@ -52,7 +52,7 @@ A layer that keeps a slice of a payload shorter than half the payload's original
 Where delivery stops without acknowledgement:
 
 - A reader that never acknowledges sees delivery stop at about one stream window, but the exact point differs by transport (`tests/bulk_backpressure.rs` depends on it). On Yamux (TCP), part of the initial window was spent on the multistream negotiation the endpoint consumed itself, and Yamux returns credit in half windows, so delivery stops just short of the window. On QUIC the gate is the delivery budget, which the endpoint restores for the bytes it consumed itself, so delivery reaches the full window.
-- Payloads meant to exercise backpressure must exceed QUIC's default connection queue (1 MiB) plus its send and connection windows (2 and 3 MiB), and Yamux's 256 KiB stream cap plus the kernel socket buffer.
+- Payloads meant to exercise backpressure must exceed QUIC's default connection queue (1 MiB) plus its send and connection windows (2 and 3 MiB), and Yamux's 256 KiB stream cap plus the kernel socket buffer. A reader that never acknowledges is measured against the window its endpoint actually advertises: `TcpConfig::std_default()`'s 2,432 KiB on the std endpoint (ADR 0120), not `YamuxConfig::default()`'s 256 KiB.
 
 Circuits (`minip2p-nat`):
 

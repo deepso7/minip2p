@@ -34,7 +34,7 @@ pub(crate) fn resolve_limits(
     let options = options.unwrap_or_default();
     let mut limits = Limits {
         quic: QuicLimits::default(),
-        tcp: TcpConfig::default(),
+        tcp: TcpConfig::std_default(),
         circuit: CircuitLimits::default(),
         max_circuits: NatConfig::default().max_circuits,
     };
@@ -237,7 +237,7 @@ mod tests {
             format!("{:?}", limits.quic),
             format!("{:?}", QuicLimits::default())
         );
-        assert_eq!(limits.tcp, TcpConfig::default());
+        assert_eq!(limits.tcp, TcpConfig::std_default());
         assert_eq!(limits.circuit, CircuitLimits::default());
         assert_eq!(limits.max_circuits, 64);
     }
@@ -280,7 +280,7 @@ mod tests {
             ..QuicLimits::default()
         };
         assert_eq!(format!("{:?}", limits.quic), format!("{expected:?}"));
-        assert_eq!(limits.tcp, TcpConfig::default());
+        assert_eq!(limits.tcp, TcpConfig::std_default());
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         .expect("limits");
         assert_eq!(circuit_only.circuit.yamux.receive_window, 2 << 20);
         assert_eq!(circuit_only.max_circuits, 8);
-        assert_eq!(circuit_only.tcp, TcpConfig::default());
+        assert_eq!(circuit_only.tcp, TcpConfig::std_default());
     }
 
     #[test]
