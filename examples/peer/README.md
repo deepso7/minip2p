@@ -63,7 +63,7 @@ $ cargo run -p minip2p-peer -- id /ip4/127.0.0.1/udp/58472/quic-v1/p2p/12D3KooWQ
 
 Exactly one `identify` line is printed, and the command exits `0`. A connection that never forms, or a peer that never completes Identify, exits non-zero with the reason on stderr — so `id` works as a reachability check in a script or a CI gate.
 
-`observed=` is the address the *remote* saw us on, which is the quickest way to see what a NAT is doing to your source port.
+`observed=` is the address the _remote_ saw us on, which is the quickest way to see what a NAT is doing to your source port.
 
 ## The real payoff: two peers behind NATs
 
