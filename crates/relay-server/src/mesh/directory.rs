@@ -275,7 +275,7 @@ mod tests {
         directory
             .claims(&peer(destination), 0)
             .into_iter()
-            .map(|claim| claim.member.clone())
+            .map(|claim| *claim.member)
             .collect()
     }
 
@@ -405,7 +405,7 @@ mod tests {
         let live: Vec<_> = directory
             .claims(&peer(1), 50)
             .into_iter()
-            .map(|claim| claim.member.clone())
+            .map(|claim| *claim.member)
             .collect();
         assert_eq!(live, [peer(high)]);
     }

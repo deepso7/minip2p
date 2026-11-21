@@ -4,7 +4,7 @@ The minip2p entry in libp2p's transport interop matrices: dial, handshake, and p
 
 One binary serves both harnesses, which agree on the mechanics and differ in three things:
 
-| | [test-plans](https://github.com/libp2p/test-plans) `transport-interop` | [unified-testing](https://github.com/libp2p/unified-testing) `transport` |
+|  | [test-plans](https://github.com/libp2p/test-plans) `transport-interop` | [unified-testing](https://github.com/libp2p/unified-testing) `transport` |
 | --- | --- | --- |
 | Spec | [`transport-interop/README.md`](https://github.com/libp2p/test-plans/blob/master/transport-interop/README.md) | [`docs/write-a-transport-test-app.md`](https://github.com/libp2p/unified-testing/blob/master/docs/write-a-transport-test-app.md) |
 | Settings | `is_dialer`, `transport`, `security`, `muxer`, `redis_addr`, `ip`, `test_timeout_seconds` | `IS_DIALER`, `TRANSPORT`, `SECURE_CHANNEL`, `MUXER`, `REDIS_ADDR`, `TEST_KEY`, `LISTENER_IP` |

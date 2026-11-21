@@ -69,8 +69,8 @@ use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, Path, PeerId};
-use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+use minip2p_swarm::{DriverError, SwarmCore, SwarmError, SwarmEvent};
+use minip2p_transport::{ConnectionId, StreamKey, Transport, TransportError};
 
 use crate::connect::{
     ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, LegProvider, Legs, circuit_relay,
@@ -81,10 +81,12 @@ use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
 use crate::names::Expander;
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
+use crate::protocols::ProtocolTable;
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
 #[cfg(feature = "relay-server")]
 use crate::relay_server::{RelayServerDriver, concrete_relay_listener_addrs};
+use crate::writes::{SendError, SendOutcome, WriteQueue};
 use crate::{ConnectionInfo, EndpointEvent, StreamAcks};
 
 /// What an engine needs from its mDNS carrier: an `MdnsIo` when mDNS is
@@ -92,12 +94,12 @@ use crate::{ConnectionInfo, EndpointEvent, StreamAcks};
 /// a type-erased, non-`Send` carrier never enters it; portable uses
 /// `Box<dyn MdnsIo>`.
 #[cfg(feature = "mdns")]
-pub(crate) trait Carrier: minip2p_mdns::MdnsIo {}
+pub trait Carrier: minip2p_mdns::MdnsIo {}
 #[cfg(feature = "mdns")]
 impl<I: minip2p_mdns::MdnsIo> Carrier for I {}
 /// What an engine needs from its mDNS carrier: nothing, without mDNS.
 #[cfg(not(feature = "mdns"))]
-pub(crate) trait Carrier {}
+pub trait Carrier {}
 #[cfg(not(feature = "mdns"))]
 impl<I> Carrier for I {}
 
@@ -117,6 +119,10 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     pub(crate) core: SwarmCore<T, E>,
     pub(crate) connect: ConnectEngine,
     acks: StreamAcks,
+    /// Bytes `send_stream` queued that their streams have not accepted yet.
+    pub(crate) writes: WriteQueue,
+    /// The application protocols' handles (ADR 0031).
+    pub(crate) protocols: ProtocolTable,
     /// The Endpoint event stream: queued output the application has not
     /// pulled yet.
     pub(crate) events: VecDeque<EndpointEvent>,
@@ -154,6 +160,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             core,
             connect: ConnectEngine::new(connect_deadline_ms),
             acks,
+            writes: WriteQueue::default(),
+            protocols: ProtocolTable::default(),
             events: VecDeque::new(),
             caller_external_addresses: Vec::new(),
             nat: LegProvider::default(),
@@ -203,7 +211,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         names: &mut dyn Expander,
         now: Now,
     ) -> ConnectId {
-        let peer = target.peer_id().clone();
+        let peer = *target.peer_id();
         #[cfg(feature = "_peer-book")]
         let book = self.discovery.as_ref().map(|discovery| &discovery.book);
         #[cfg(feature = "_peer-book")]
@@ -244,24 +252,23 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.core.disconnect(peer_id, now.monotonic_ms)
     }
 
-    /// The peer a stream operation on `stream_id` of `conn_id` addresses:
-    /// the connection's peer while it is established, otherwise the peer a
-    /// stream event still queued for it names (how `abandon_stream` reaches
-    /// a stream whose `StreamClosed` is undelivered). The swarm then checks
-    /// the exact connection, so a stale id never reaches a replacement's
-    /// stream. A connection with neither is
-    /// [`TransportError::ConnectionNotFound`].
-    fn stream_peer(
-        &self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<PeerId, DriverError> {
+    /// The peer a stream operation on `stream` addresses: the connection's
+    /// peer while it is established, otherwise the peer a stream event still
+    /// queued for it names (how `abandon_stream` reaches a stream whose
+    /// `StreamClosed` is undelivered). The swarm then checks the exact
+    /// connection, so a stale id never reaches a replacement's stream. A
+    /// connection with neither is [`TransportError::ConnectionNotFound`].
+    fn stream_peer(&self, stream: StreamKey) -> Result<PeerId, DriverError> {
+        let (conn_id, stream_id) = (stream.conn_id(), stream.stream_id());
         self.core
             .connection_peer(conn_id)
             .or_else(|| {
-                self.events
-                    .iter()
-                    .find_map(|event| event.stream_peer(conn_id, stream_id))
+                self.events.iter().find_map(|event| {
+                    event
+                        .stream()
+                        .filter(|(_, key)| *key == stream)
+                        .map(|(peer, _)| peer)
+                })
             })
             .or_else(|| {
                 self.core.buffered_events().find_map(|event| {
@@ -270,50 +277,116 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                         .filter(|peer| event.matches_stream(peer, conn_id, stream_id))
                 })
             })
-            .cloned()
+            .copied()
             .ok_or(DriverError::Transport(TransportError::ConnectionNotFound {
                 id: conn_id,
             }))
     }
 
-    /// Sends on an application stream; see `Endpoint::send_stream`.
-    pub(crate) fn send_stream(
+    /// Sends what the stream accepts now; see `Endpoint::try_send_stream`.
+    /// Behind bytes the write queue holds it accepts nothing, so bytes stay
+    /// in order; behind a deferred FIN it fails, since no Writable follows.
+    pub(crate) fn try_send_stream(
         &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         data: Bytes,
         now: Now,
-    ) -> Result<(), DriverError> {
-        let peer_id = self.stream_peer(conn_id, stream_id)?;
-        self.core
-            .send_stream(&peer_id, conn_id, stream_id, data, now.monotonic_ms)
+    ) -> Result<SendOutcome, DriverError> {
+        let peer_id = self.stream_peer(stream)?;
+        if self.writes.is_closing(stream) {
+            return Err(SwarmError::WriteClosed {
+                conn_id: stream.conn_id(),
+                stream_id: stream.stream_id(),
+            }
+            .into());
+        }
+        if self.writes.is_pending(stream) {
+            self.writes.want_writable(stream);
+            return Ok(SendOutcome::Full { unsent: data });
+        }
+        let outcome = SendOutcome::from_send(self.core.send_stream(
+            &peer_id,
+            stream.conn_id(),
+            stream.stream_id(),
+            data,
+            now.monotonic_ms,
+        ))?;
+        if !outcome.is_accepted() {
+            self.writes.want_writable(stream);
+        }
+        Ok(outcome)
     }
 
-    /// Half-closes an application stream's write side.
+    /// Sends a whole payload, queueing what the stream does not accept yet;
+    /// see `Endpoint::send_stream`.
+    pub(crate) fn send_stream(
+        &mut self,
+        stream: StreamKey,
+        data: Bytes,
+        now: Now,
+    ) -> Result<(), SendError> {
+        let peer_id = self.stream_peer(stream)?;
+        let core = &mut self.core;
+        self.writes.send(stream, peer_id, data, |data| {
+            core.send_stream(
+                &peer_id,
+                stream.conn_id(),
+                stream.stream_id(),
+                data,
+                now.monotonic_ms,
+            )
+        })
+    }
+
+    /// Half-closes an application stream's write side, or defers the FIN
+    /// behind the bytes the write queue holds for it.
     pub(crate) fn close_stream_write(
         &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         now: Now,
     ) -> Result<(), DriverError> {
-        let peer_id = self.stream_peer(conn_id, stream_id)?;
-        self.core
-            .close_stream_write(&peer_id, conn_id, stream_id, now.monotonic_ms)
+        let peer_id = self.stream_peer(stream)?;
+        if self.writes.defer_close(stream) {
+            return Ok(());
+        }
+        self.core.close_stream_write(
+            &peer_id,
+            stream.conn_id(),
+            stream.stream_id(),
+            now.monotonic_ms,
+        )?;
+        // No Writable follows a FIN, so none can clear a waiting bare writer,
+        // and one still queued here is stale.
+        self.writes.unwant_writable(stream);
+        self.drop_queued_writable(&peer_id, stream);
+        Ok(())
     }
 
-    /// Resets an application stream.
-    pub(crate) fn reset_stream(
-        &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now: Now,
-    ) -> Result<(), DriverError> {
-        let peer_id = self.stream_peer(conn_id, stream_id)?;
-        self.core
-            .reset_stream(&peer_id, conn_id, stream_id, now.monotonic_ms)
+    /// Drops a `StreamWritable` still queued for `stream`, whose write side
+    /// just ended: it would tell the application to resend after the FIN.
+    fn drop_queued_writable(&mut self, peer_id: &PeerId, stream: StreamKey) {
+        self.events.retain(|event| {
+            !(matches!(event, EndpointEvent::StreamWritable { .. })
+                && event.matches_stream(peer_id, stream))
+        });
     }
 
-    /// Resets and forgets a stream, dropping its events still queued here.
+    /// Resets an application stream, aborting what the write queue held.
+    pub(crate) fn reset_stream(&mut self, stream: StreamKey, now: Now) -> Result<(), DriverError> {
+        let peer_id = self.stream_peer(stream)?;
+        self.core.reset_stream(
+            &peer_id,
+            stream.conn_id(),
+            stream.stream_id(),
+            now.monotonic_ms,
+        )?;
+        self.drop_queued_writable(&peer_id, stream);
+        self.events.extend(self.writes.forget(stream));
+        Ok(())
+    }
+
+    /// Resets and forgets a stream, dropping its events still queued here
+    /// and its queued writes, without an abort event.
     ///
     /// A queued `StreamClosed` proves the stream existed even though the
     /// swarm, having already delivered that close, no longer knows it; its
@@ -326,19 +399,19 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// nothing left naming it, the transport settles it outright.
     pub(crate) fn abandon_stream(
         &mut self,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
+        stream: StreamKey,
         now: Now,
     ) -> Result<(), DriverError> {
-        let Ok(peer_id) = &self.stream_peer(conn_id, stream_id) else {
-            self.acks.forget(conn_id, stream_id);
+        let (conn_id, stream_id) = (stream.conn_id(), stream.stream_id());
+        let Ok(peer_id) = &self.stream_peer(stream) else {
+            self.acks.forget(stream);
             return self
                 .core
                 .abandon_ended_stream(conn_id, stream_id, now.monotonic_ms);
         };
         let queued_close = self.events.iter().any(|event| {
             matches!(event, EndpointEvent::StreamClosed { .. })
-                && event.matches_stream(peer_id, conn_id, stream_id)
+                && event.matches_stream(peer_id, stream)
         });
         match self
             .core
@@ -350,7 +423,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         }
         let mut dropped_data = 0usize;
         self.events.retain(|event| {
-            if !event.matches_stream(peer_id, conn_id, stream_id) {
+            if !event.matches_stream(peer_id, stream) {
                 return true;
             }
             if let EndpointEvent::StreamData { data, .. } = event {
@@ -363,7 +436,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 Ok(()) | Err(_) => {}
             }
         }
-        self.acks.forget(conn_id, stream_id);
+        self.acks.forget(stream);
+        drop(self.writes.forget(stream));
         Ok(())
     }
 
@@ -373,15 +447,16 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     pub(crate) fn add_manual_ack_protocol(
         &mut self,
         protocol_id: String,
-    ) -> Result<(), DriverError> {
+    ) -> Result<crate::ProtocolId, DriverError> {
+        self.protocols.check_room(&protocol_id)?;
         self.core.add_protocol(protocol_id.clone())?;
+        let id = self.protocols.intern(&protocol_id)?;
         let queued = self.events.iter().filter_map(|event| match event {
             EndpointEvent::StreamReady {
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id: ready,
                 ..
-            } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
+            } => (*ready == protocol_id).then_some(*stream),
             _ => None,
         });
         let buffered = self.core.buffered_events().filter_map(|event| match event {
@@ -390,12 +465,12 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 stream_id,
                 protocol_id: ready,
                 ..
-            } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
+            } => (*ready == protocol_id).then_some(StreamKey::new(*conn_id, *stream_id)),
             _ => None,
         });
         let already_ready: Vec<_> = queued.chain(buffered).collect();
         self.acks.set_manual(protocol_id, already_ready);
-        Ok(())
+        Ok(id)
     }
 
     /// Takes the next queued event, acknowledging its stream data (ADR
@@ -420,8 +495,11 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// unless its protocol takes manual acknowledgement. It only fails for
     /// data the application also acknowledged by hand.
     fn ack_pulled(&mut self, event: &EndpointEvent) {
-        if let Some((conn_id, stream_id, bytes)) = self.acks.pulled(event) {
-            match self.core.ack_stream(conn_id, stream_id, bytes) {
+        if let Some((stream, bytes)) = self.acks.pulled(event) {
+            match self
+                .core
+                .ack_stream(stream.conn_id(), stream.stream_id(), bytes)
+            {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -509,7 +587,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// See `Endpoint::connection_info`.
     pub(crate) fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
-        let peer_id = self.core.connection_peer(conn_id)?.clone();
+        let peer_id = *self.core.connection_peer(conn_id)?;
         let ready_protocols = self
             .core
             .peer_readiness(&peer_id)
@@ -731,14 +809,30 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Feeds one swarm event to the Connection engine and the drivers, and
     /// queues it unless one of them claimed it. Its capability and
     /// Connection-attempt output follows at the end of the batch.
-    pub(crate) fn ingest(&mut self, event: SwarmEvent, now: Now) {
+    pub(crate) fn ingest(&mut self, mut event: SwarmEvent, now: Now) {
+        // The swarm reports a replaced connection's punch as Direct: refine
+        // `old` before NAT forgets its punch on this event...
+        if let SwarmEvent::ConnectionReplaced { old, old_path, .. } = &mut event {
+            *old_path = refine_punched(*old_path, is_punched(&self.nat, *old));
+        }
         let consumed = self
             .connect
             .observe(&event, &mut self.core, now.monotonic_ms)
             || self.ingest_into_drivers(&event, now);
-        if !consumed {
-            self.events.push_back(event.into());
+        // ...and `new` after NAT has recorded it.
+        if let SwarmEvent::ConnectionReplaced { new, new_path, .. } = &mut event {
+            *new_path = refine_punched(*new_path, is_punched(&self.nat, *new));
         }
+        // The write queue follows every swarm event, claimed or not: a
+        // connection a driver claims can still end streams it queued for.
+        let (writable_claimed, follow) =
+            self.writes
+                .observe(&mut self.core, &event, now.monotonic_ms);
+        if !consumed && !writable_claimed {
+            self.events
+                .push_back(EndpointEvent::from_swarm(event, &mut self.protocols));
+        }
+        self.events.extend(follow);
         // NAT output reaches the Connection engine in step with the swarm
         // events that caused it.
         self.route_nat(now);
@@ -859,6 +953,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// terminals are claimed (and update the book) before the book's events
     /// are drained, so the updates surface in the same batch.
     pub(crate) fn settle(&mut self, now: Now) {
+        self.events.extend(self.writes.take_failed());
         let settled = self.collect_terminals(now);
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_mut() {
@@ -1056,6 +1151,14 @@ fn path_of<T: Transport, E: EntropySource>(
         return circuit_relay(core, conn_id).map(|relay| Path::Relayed { relay });
     }
     Some(if punched { Path::Punched } else { Path::Direct })
+}
+
+/// A swarm-reported Direct path is Punched when NAT's hole punch made it.
+fn refine_punched(path: Path, punched: bool) -> Path {
+    match path {
+        Path::Direct if punched => Path::Punched,
+        path => path,
+    }
 }
 
 /// Appends the contributions `addresses` does not already hold, keeping

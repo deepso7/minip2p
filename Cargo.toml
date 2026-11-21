@@ -2,10 +2,8 @@
 resolver = "3"
 exclude = ["fuzz", "bindings"]
 members = [
-  "crates/autonat",
   "crates/circuit",
   "crates/core",
-  "crates/dcutr",
   "crates/discovery",
   "crates/ffi",
   "crates/ffi-core",
@@ -37,7 +35,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.11"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"

@@ -2,6 +2,7 @@
 
 import {
   CloseOutcome,
+  ConfigCapability,
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
@@ -116,11 +117,7 @@ class ReactNativeBackend implements Minip2pBackend {
         if (event.tag === P2pEvent_Tags.EndpointClosed) {
           this.#events?.stop();
           this.#close.settle({
-            outcome: sdkName(
-              CloseOutcome,
-              NativeCloseOutcome,
-              event.inner.outcome
-            ),
+            outcome: sdkName(ENUMS.CloseOutcome, event.inner.outcome),
             unfinished: unfinishedPeers(event.inner.unfinished),
           });
           return;
@@ -251,8 +248,7 @@ class ReactNativeBackend implements Minip2pBackend {
 
   reachability(): Reachability {
     return sdkName(
-      Reachability,
-      NativeReachability,
+      ENUMS.Reachability,
       translateErrors(() => this.#endpoint.reachability())
     );
   }
@@ -436,14 +432,63 @@ type NativeEnum = Readonly<Record<number, string>>;
 /** An SDK enum: each variant name maps to itself. */
 type SdkEnum<Name extends string> = Readonly<Record<Name, Name>>;
 
+/** An SDK enum beside its generated counterpart. */
+type EnumPair = readonly [SdkEnum<string>, NativeEnum];
+
+/**
+ * Whether an SDK enum names exactly its generated counterpart's variants,
+ * each mapped to its own name.
+ */
+type SameVariants<Sdk, Native> = [keyof Sdk] extends [keyof Native]
+  ? [keyof Native] extends [keyof Sdk]
+    ? Sdk extends { readonly [Name in keyof Sdk]: Name }
+      ? true
+      : false
+    : false
+  : false;
+
+/**
+ * Returns `pairs` as given. A pair whose SDK enum (in `@minip2p/core`) and
+ * generated enum name different variants fails typecheck here, so a Rust
+ * variant added or renamed shows up at `pnpm rn:generate` time instead of
+ * as an unknown-enum error at runtime.
+ */
+function checkedEnumPairs<
+  const Pairs extends Readonly<Record<string, EnumPair>>,
+>(
+  pairs: Pairs & {
+    readonly [Name in keyof Pairs]: SameVariants<
+      Pairs[Name][0],
+      Pairs[Name][1]
+    > extends true
+      ? Pairs[Name]
+      : never;
+  }
+): Pairs {
+  return pairs;
+}
+
+/** Every flat enum the native endpoint hands the SDK. */
+const ENUMS = checkedEnumPairs({
+  CloseOutcome: [CloseOutcome, NativeCloseOutcome],
+  ConfigCapability: [ConfigCapability, NativeConfigCapability],
+  DiscoverySource: [DiscoverySource, NativeDiscoverySource],
+  DriverFailureKind: [DriverFailureKind, NativeDriverFailureKind],
+  EndpointErrorKind: [EndpointErrorKind, NativeEndpointErrorKind],
+  IdentifyFailure: [IdentifyFailure, NativeIdentifyFailure],
+  MdnsFailureKind: [MdnsFailureKind, NativeMdnsFailureKind],
+  NatErrorKind: [NatErrorKind, NativeNatErrorKind],
+  PingFailure: [PingFailure, NativePingFailure],
+  Reachability: [Reachability, NativeReachability],
+});
+
 /**
  * The SDK name of a generated enum value. UniFFI numbers flat enums while
  * the SDK uses the Rust variant names, so this goes through the generated
  * reverse mapping rather than a parallel numeric table.
  */
 function sdkName<Name extends string>(
-  names: SdkEnum<Name>,
-  native: NativeEnum,
+  [names, native]: readonly [SdkEnum<Name>, NativeEnum],
   value: number
 ): Name {
   const name = native[value];
@@ -457,29 +502,73 @@ function sdkName<Name extends string>(
   return names[name];
 }
 
+/**
+ * Whether a field holds a generated flat enum: numeric literal members,
+ * unlike a plain `number` (a UniFFI `u32`). `number` itself is assignable
+ * to a numeric enum, so the check goes through the literals' text.
+ */
+type IsFlatEnum<Value> = Value extends number
+  ? `${number}` extends `${Value}`
+    ? false
+    : true
+  : false;
+
+/**
+ * The fields of a native event payload that carry a flat enum, optional or
+ * not, each with the pair from `ENUMS` whose generated enum is that field's.
+ */
+type FlatEnumFields<Inner> = {
+  readonly [
+    Field in keyof Inner as IsFlatEnum<NonNullable<Inner[Field]>> extends true
+      ? Field
+      : never
+  ]-?: (typeof ENUMS)[keyof typeof ENUMS] &
+    readonly [
+      SdkEnum<string>,
+      NativeEnum & Readonly<Record<string, NonNullable<Inner[Field]> | string>>,
+    ];
+};
+
+/**
+ * Every native event with flat enum fields, keyed by tag, except
+ * `EndpointClosed`, which `start` converts itself. `ENUM_FIELDS` must name
+ * exactly these, so an enum field added in Rust fails typecheck until it is
+ * mapped.
+ */
+type EnumFieldTable = {
+  readonly [
+    Event in NativeP2pEvent as Event extends {
+      readonly inner: infer Inner;
+    }
+      ? keyof FlatEnumFields<Inner> extends never
+        ? never
+        : `${Event["tag"]}` extends "EndpointClosed"
+          ? never
+          : `${Event["tag"]}`
+      : never
+  ]: Event extends { readonly inner: infer Inner }
+    ? FlatEnumFields<Inner>
+    : never;
+};
+
 /** Event fields carrying a generated enum, with its SDK counterpart. */
 const ENUM_FIELDS: Readonly<
-  Record<
-    string,
-    Readonly<Record<string, readonly [SdkEnum<string>, NativeEnum]>>
-  >
+  Record<string, Readonly<Record<string, EnumPair>>>
 > = {
-  ConnectFailed: { kind: [NatErrorKind, NativeNatErrorKind] },
-  DiscoveryProtocolViolation: {
-    source: [DiscoverySource, NativeDiscoverySource],
-  },
-  DriverFailed: { kind: [DriverFailureKind, NativeDriverFailureKind] },
-  EndpointError: { kind: [EndpointErrorKind, NativeEndpointErrorKind] },
-  IdentifyFailed: { cause: [IdentifyFailure, NativeIdentifyFailure] },
-  MdnsFailed: { kind: [MdnsFailureKind, NativeMdnsFailureKind] },
-  PeerDiscovered: { source: [DiscoverySource, NativeDiscoverySource] },
-  PeerUpdated: { source: [DiscoverySource, NativeDiscoverySource] },
-  PingFailed: { cause: [PingFailure, NativePingFailure] },
+  ConnectFailed: { kind: ENUMS.NatErrorKind },
+  DiscoveryProtocolViolation: { source: ENUMS.DiscoverySource },
+  DriverFailed: { kind: ENUMS.DriverFailureKind },
+  EndpointError: { kind: ENUMS.EndpointErrorKind },
+  IdentifyFailed: { cause: ENUMS.IdentifyFailure },
+  MdnsFailed: { kind: ENUMS.MdnsFailureKind },
+  PeerDiscovered: { source: ENUMS.DiscoverySource },
+  PeerUpdated: { source: ENUMS.DiscoverySource },
+  PingFailed: { cause: ENUMS.PingFailure },
   ReachabilityChanged: {
-    current: [Reachability, NativeReachability],
-    previous: [Reachability, NativeReachability],
+    current: ENUMS.Reachability,
+    previous: ENUMS.Reachability,
   },
-};
+} satisfies EnumFieldTable;
 
 /**
  * Converts one native event to its SDK form. Per-chunk and per-write
@@ -563,12 +652,12 @@ function normalizeGenericEvent(
     throw new TypeError("The native endpoint returned an invalid event");
   }
   const enumFields = Object.entries(ENUM_FIELDS[event.tag] ?? {}).map(
-    ([field, [names, native]]) => {
+    ([field, pair]) => {
       const value: unknown = Reflect.get(inner, field);
       if (typeof value !== "number") {
         throw new TypeError(`The native ${event.tag} has an invalid ${field}`);
       }
-      return [field, sdkName(names, native, value)] as const;
+      return [field, sdkName(pair, value)] as const;
     }
   );
   // The generated event and the SDK event share one shape (see the

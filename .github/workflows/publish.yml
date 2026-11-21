@@ -179,13 +179,10 @@ jobs:
       - name: Test release commit
         run: |
           cargo nextest run --workspace --locked
-          scripts/run-feature-matrix.sh test-full
+          scripts/run-feature-matrix.sh test full
           cargo test --workspace --doc --locked
           cargo test -p minip2p-tcp --features smoltcp --doc --locked
-          cargo doc --workspace --no-deps --locked
-          cargo doc -p minip2p-tcp --features smoltcp --no-deps --locked
-          cargo doc -p minip2p-mdns --features smoltcp --no-deps --locked
-          cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps --locked
+          scripts/check-targets.sh docs
 
   node-native:
     name: Build Node addon (${{ matrix.target }})
@@ -765,31 +762,10 @@ jobs:
               "https://crates.io/api/v1/crates/$1/$CRATE_VERSION"
           }
 
-          crates=(
-            minip2p-identity
-            minip2p-core
-            minip2p-transport
-            minip2p-tls
-            minip2p-multistream-select
-            minip2p-secure-mux
-            minip2p-identify
-            minip2p-ping
-            minip2p-relay
-            minip2p-autonat
-            minip2p-dcutr
-            minip2p-discovery
-            minip2p-smoltcp
-            minip2p-mdns
-            minip2p-swarm
-            minip2p-circuit
-            minip2p-nat
-            minip2p-relay-server
-            minip2p-pubsub
-            minip2p-webtransport
-            minip2p-quic
-            minip2p-tcp
-            minip2p-rs
-          )
+          # Dependency order, derived from the workspace manifests. Captured
+          # first so a failure stops the job instead of publishing nothing.
+          order="$(scripts/publish-order.py)"
+          mapfile -t crates <<<"$order"
 
           for crate in "${crates[@]}"; do
             status="$(crate_http_code "$crate")"

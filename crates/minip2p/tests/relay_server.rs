@@ -81,7 +81,7 @@ fn relayed_pair(
             .nat_config(config),
     );
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -105,8 +105,8 @@ fn relayed_pair(
             }),
     );
     initiator.listen().expect("initiator listens");
-    let initiator_peer = initiator.peer_id().clone();
-    let connect_id = initiator.connect(&responder_peer).expect("connect starts");
+    let initiator_peer = *initiator.peer_id();
+    let connect_id = initiator.connect(responder_peer).expect("connect starts");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut connected = false;
@@ -157,8 +157,8 @@ fn exercise_relay(
     bind_client: impl Fn(EndpointBuilder) -> Endpoint,
 ) {
     let mut pair = relayed_pair(relay, relay_addr, bind_client);
-    let initiator_peer = pair.initiator_peer.clone();
-    let responder_peer = pair.responder_peer.clone();
+    let initiator_peer = pair.initiator_peer;
+    let responder_peer = pair.responder_peer;
     let relay_addr = pair.relay_addr.clone();
     let initiator = &mut pair.initiator;
     let responder = &mut pair.responder;
@@ -181,7 +181,7 @@ fn exercise_relay(
         "NAT-only client must not advertise HOP"
     );
 
-    let (conn, stream) = initiator
+    let stream = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream");
     let payload = b"bidirectional payload through Endpoint relay server".to_vec();
@@ -194,20 +194,17 @@ fn exercise_relay(
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    stream_id,
+                    stream: ready,
                     initiated_locally: true,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => {
-                    initiator
-                        .send_stream(conn, stream, payload.clone())
-                        .unwrap();
+                } if peer_id == responder_peer && ready == stream => {
+                    initiator.send_stream(stream, payload.clone()).unwrap();
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    stream_id,
+                    stream: from,
                     data,
-                    ..
-                } if peer_id == responder_peer && stream_id == stream => {
+                } if peer_id == responder_peer && from == stream => {
                     echoed = Some(data);
                 }
                 _ => {}
@@ -217,22 +214,19 @@ fn exercise_relay(
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some((conn_id, stream_id));
+                    responder_stream = Some(stream);
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     data,
-                } if peer_id == initiator_peer
-                    && Some((conn_id, stream_id)) == responder_stream =>
-                {
-                    responder.send_stream(conn_id, stream_id, data).unwrap();
+                } if peer_id == initiator_peer && Some(stream) == responder_stream => {
+                    responder.send_stream(stream, data).unwrap();
                 }
                 _ => {}
             }
@@ -257,7 +251,7 @@ fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
         .bind()
         .expect("bind relay");
     let bound = relay.bound_addresses().pop().expect("bound address");
-    let relay_addr = PeerAddr::new(bound, relay.peer_id().clone()).unwrap();
+    let relay_addr = PeerAddr::new(bound, *relay.peer_id()).unwrap();
     exercise_relay(relay, relay_addr, |builder| {
         builder
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -290,7 +284,7 @@ fn a_wildcard_only_relay_grants_reservations_and_relays_circuits() {
     let dialed = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
         .parse()
         .unwrap();
-    let relay_addr = PeerAddr::new(dialed, relay.peer_id().clone()).unwrap();
+    let relay_addr = PeerAddr::new(dialed, *relay.peer_id()).unwrap();
     exercise_relay(relay, relay_addr, |builder| {
         builder
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -330,7 +324,7 @@ fn tcp_clients_exchange_payload_through_tcp_relay_endpoint() {
 mod bulk {
     use std::collections::BTreeMap;
 
-    use minip2p::{Bytes, CircuitCloseReason, Error, RelayServerConfig, StreamId};
+    use minip2p::{Bytes, CircuitCloseReason, RelayServerConfig, SendOutcome, StreamKey};
 
     use super::endpoint_support::is_stranger_handshake_failure;
     use super::*;
@@ -346,7 +340,7 @@ mod bulk {
 
     /// One inner stream's sender, holding its unsent tail across a Full.
     struct BulkSender {
-        stream: StreamId,
+        stream: StreamKey,
         offset: usize,
         tail: Option<Bytes>,
         writable: bool,
@@ -374,7 +368,7 @@ mod bulk {
         });
         let writer = &mut pair.initiator;
         let reader = &mut pair.responder;
-        let reader_peer = pair.responder_peer.clone();
+        let reader_peer = pair.responder_peer;
 
         let payload = Bytes::from(
             (0..BULK_PER_STREAM)
@@ -382,12 +376,10 @@ mod bulk {
                 .collect::<Vec<u8>>(),
         );
         let mut senders = Vec::new();
-        let mut conn_id = None;
         for _ in 0..BULK_STREAMS {
-            let (conn, stream) = writer
+            let stream = writer
                 .open_stream(&reader_peer, ECHO_PROTOCOL)
                 .expect("open bulk stream");
-            conn_id = Some(conn);
             senders.push(BulkSender {
                 stream,
                 offset: 0,
@@ -396,9 +388,8 @@ mod bulk {
                 closed: false,
             });
         }
-        let conn_id = conn_id.unwrap();
 
-        let mut received: BTreeMap<StreamId, Vec<u8>> = BTreeMap::new();
+        let mut received: BTreeMap<StreamKey, Vec<u8>> = BTreeMap::new();
         let mut finished = 0;
         let deadline = Instant::now() + Duration::from_secs(60);
         for turn in 0.. {
@@ -416,17 +407,19 @@ mod bulk {
                     })
                 });
                 match data {
-                    Some(data) => match writer.send_stream(conn_id, sender.stream, data) {
-                        Ok(()) => {}
-                        Err(Error::Full { unsent, .. }) => {
+                    Some(data) => match writer
+                        .try_send_stream(sender.stream, data)
+                        .expect("send failed")
+                    {
+                        SendOutcome::Accepted => {}
+                        SendOutcome::Full { unsent } => {
                             sender.tail = Some(unsent);
                             sender.writable = false;
                         }
-                        other => other.expect("send failed"),
                     },
                     None if !sender.closed => {
                         writer
-                            .close_stream_write(conn_id, sender.stream)
+                            .close_stream_write(sender.stream)
                             .expect("close write");
                         sender.closed = true;
                     }
@@ -435,9 +428,9 @@ mod bulk {
             }
             while let Some(event) = writer.next_event(Duration::from_millis(1)).unwrap() {
                 match event {
-                    EndpointEvent::StreamReady { stream_id, .. }
-                    | EndpointEvent::StreamWritable { stream_id, .. } => {
-                        if let Some(sender) = senders.iter_mut().find(|s| s.stream == stream_id) {
+                    EndpointEvent::StreamReady { stream, .. }
+                    | EndpointEvent::StreamWritable { stream, .. } => {
+                        if let Some(sender) = senders.iter_mut().find(|s| s.stream == stream) {
                             sender.writable = true;
                         }
                     }
@@ -451,14 +444,11 @@ mod bulk {
             if turn % READER_EVERY == 0 {
                 while let Some(event) = reader.next_event(Duration::ZERO).unwrap() {
                     match event {
-                        EndpointEvent::StreamData {
-                            stream_id, data, ..
-                        } => received
-                            .entry(stream_id)
-                            .or_default()
-                            .extend_from_slice(&data),
-                        EndpointEvent::StreamRemoteWriteClosed { stream_id, .. } => {
-                            let bytes = received.get(&stream_id).map_or(0, Vec::len);
+                        EndpointEvent::StreamData { stream, data, .. } => {
+                            received.entry(stream).or_default().extend_from_slice(&data)
+                        }
+                        EndpointEvent::StreamRemoteWriteClosed { stream, .. } => {
+                            let bytes = received.get(&stream).map_or(0, Vec::len);
                             assert_eq!(bytes, BULK_PER_STREAM, "the FIN follows the last byte");
                             finished += 1;
                         }

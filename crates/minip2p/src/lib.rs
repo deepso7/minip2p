@@ -1,17 +1,20 @@
 //! Portable and std application-facing APIs for minip2p.
 //!
-//! There are two endpoint types over one private engine:
+//! There is one endpoint type, [`Endpoint<P>`](Endpoint), over one private
+//! engine, generic over the [`Platform`] that supplies what differs between
+//! hosts (ADR 0029):
 //!
-//! - [`PortableEndpoint`] is the `no_std + alloc`, caller-driven endpoint
-//!   over any [`Transport`]. It owns no clock, executor, sockets, or
-//!   operating-system entropy source; the host passes one [`Now`] sample to
-//!   each [`PortableEndpoint::poll`] call.
+//! - [`Portable`] (named [`PortableEndpoint`]) is the `no_std + alloc`,
+//!   caller-driven platform over any [`Transport`]. It owns no clock,
+//!   executor, sockets, or operating-system entropy source; the host
+//!   supplies a [`Clock`] that every call samples.
 //! - With the default `std` and `quic` features, the batteries-included
-//!   `Endpoint` and `EndpointBuilder` add a clock, transport binding, Name
-//!   resolution, and a blocking `wait` for OS programs.
+//!   `StdPlatform` (the default `P`) and `EndpointBuilder` add an OS clock,
+//!   transport binding, Name resolution, and a blocking `wait` for OS
+//!   programs.
 //!
-//! Both drive the same batches and emit the same ordered [`EndpointEvent`]
-//! stream.
+//! Every shared method is implemented once, on `Endpoint<P>`; both drive
+//! the same batches and emit the same ordered [`EndpointEvent`] stream.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -21,14 +24,18 @@ extern crate alloc;
 #[cfg(test)]
 extern crate self as minip2p;
 
+mod builder;
 mod connect;
 #[cfg(feature = "_peer-book")]
 mod discovery;
+mod endpoint;
 mod engine;
 mod names;
 #[cfg(feature = "autonat")]
 mod nat;
+mod platform;
 mod portable;
+mod protocols;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 #[cfg(all(feature = "relay-server", feature = "quic"))]
@@ -40,9 +47,11 @@ mod setup;
 mod std;
 #[cfg(feature = "pubsub")]
 mod stream_conns;
-mod writer;
+mod writes;
 
+pub use builder::EndpointBuilder;
 pub use portable::*;
+pub use protocols::{ProtocolId, ProtocolRef};
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
 #[cfg(all(feature = "relay-server", feature = "quic"))]
@@ -53,4 +62,4 @@ pub use relay_server::RelayServerControlError;
 pub use setup::NatConfigError;
 #[cfg(feature = "std")]
 pub use std::*;
-pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
+pub use writes::{DEFAULT_WRITE_BUDGET, SendError, SendOutcome};

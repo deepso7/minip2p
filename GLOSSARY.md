@@ -32,6 +32,10 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Connection replacement**: A newer connection to a peer taking the single per-peer connection slot from an older one. The peer never counts as disconnected. Everything that belonged to the old connection ends with it, including its streams, its readiness, and any writes it had accepted but not yet sent: acceptance is local, never delivery. The newest connection wins, except in a connection race: when two direct connections to one peer register within the simultaneous-dial window (`SIMULTANEOUS_DIAL_WINDOW_MS`, 5 s by default) of each other, both peers keep the same one whatever order each sees them in. In opposite directions (a simultaneous dial) that is the one dialed by the lower peer ID; in the same direction (two of one peer's candidate dials) it is the one with the lower Connection token, falling back to the newest when either has none. A winner arriving second replaces the other as usual (`ConnectionReplaced`); a loser arriving second is closed unannounced, and if that dial was our own it completes as a dial failure. Both peers agree only once each has seen both connections, so a Connection attempt keeps its other direct dials open for the window instead of aborting them. The side that sees both first closes the loser at once, so when the loser was the other side's only connection so far, that side sees it close before the winner establishes there: a disconnect, not a Connection replacement. _Avoid_: supersede, reconnect
 
+**Protocol handle**: An endpoint-issued `ProtocolId` naming one of its registered application protocols, numbered in registration order. `StreamReady` carries it beside the protocol's string id, and `open_stream` takes either. It means nothing to another endpoint; the string id is the protocol's identity on the wire and in the bindings (ADR 0031). _Avoid_: protocol index, protocol number
+
+**Stream key**: The name of one stream: its connection and its per-connection stream id, together (`StreamKey`). Stream ids repeat across connections, so the Endpoint's stream operations take a stream key and its stream events carry one; the bindings flatten it into `conn_id` and `stream_id`. _Avoid_: stream id (alone), stream handle
+
 **Connection token**: A value both ends of one connection compute identically from its handshake (QUIC: a TLS exporter value; TCP and WebTransport: the Noise handshake hash), carried on the transport's `Connected` endpoint. It lets both peers make the same choice in a same-direction connection race without exchanging anything. It is not a secret and identifies nothing outside that comparison.
 
 **Connection close reason**: Why one connection ended, carried on its close event: we closed it, the peer closed it (with its code), the peer went silent (timed out), the peer stopped reading (stalled), or an error. A Connection replacement is not a close. _Avoid_: close reason (unqualified), disconnect reason
@@ -50,7 +54,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Connection target**: What an application supplies to start a Connection attempt: a peer ID, one complete peer address, or a non-empty set of complete peer addresses that all name the same peer. Each address retains its transport shape and peer ID so it can be copied as advertised.
 
-**Name resolution**: The Endpoint step that turns a `/dns*` candidate of a Connection attempt into concrete `/ip4`/`/ip6` candidates. It runs beside the attempt, never on the driver: other candidates and the relay leg race while it is pending, and a failed lookup is one failed candidate. Transports never resolve names. _Avoid_: expansion
+**Name resolution**: The Endpoint step that turns a `/dns*` candidate of a Connection attempt into concrete `/ip4`/`/ip6` candidates. It runs beside the attempt, never on the driver: other candidates and the relay leg race while it is pending, and a failed lookup is one failed candidate. Transports never resolve names; a portable Endpoint has no Name resolution and hands a named address to its transport as it is. _Avoid_: expansion
 
 **Endpoint event stream**: The endpoint's single public, ordered source of connection, protocol, discovery, and diagnostic events. Applications correlate events with operation IDs and build selective waits above this stream; the endpoint does not expose competing focused queues or waits.
 
@@ -60,7 +64,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Capability**: An optional protocol agent an endpoint can run beside Identify and ping: AutoNAT, relay, relay server, pubsub, discovery, or mDNS. A capability is _built_ when its Cargo feature is on and _configured_ when the endpoint's builder turns it on; it runs only when both hold. _Avoid_: feature (that is the Cargo flag)
 
-**Endpoint setup**: The one place that turns an endpoint's configuration into running capabilities over the shared engine: it validates capability config, registers their protocols, and installs their agents, the same way for the std `Endpoint` and `PortableEndpoint`. The std endpoint adds only OS resources around it (clock, readiness poll, sockets, the name resolver, certificates); the engine routes the resolver's answers to Connection attempts and parked NAT dials. _Avoid_: assembly, wiring
+**Endpoint platform**: The host-specific part of an endpoint: where its time comes from, which transports and entropy it runs over, whether names are resolved, and whether it can block waiting. The std platform owns all of these through the operating system; the portable one takes them from the caller. Everything else an endpoint does is the same on every platform. _Avoid_: backend, runtime, std/portable endpoint (as two types)
+
+**Endpoint setup**: The one place that turns an endpoint's configuration into running capabilities over the shared engine: it validates capability config, registers their protocols, and installs their agents, the same way on every Endpoint platform. The std platform adds only operating-system resources around it; the engine routes the resolver's answers to Connection attempts and parked NAT dials. _Avoid_: assembly, wiring
 
 **Circuit**: The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path. _Avoid_: connection (until that upgrade finishes)
 
@@ -122,7 +128,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Writable**: The one-shot notice that a stream which reported Full can again accept at least half of its smallest send limit. A Full arms it; it fires once, and never if the stream's write side ends first. _Avoid_: ready, drain event
 
-**Stream writer**: The opt-in holder of an application's unsent tails: one pending write per stream, retried on Writable, with a write-side close that waits for it. Its completion means the whole payload was accepted, never delivered. The Rust Endpoint and the FFI core share one. _Avoid_: buffered stream, write queue
+**Write queue**: The Endpoint's bounded holder of the unsent tails of `send_stream` writes, in call order per stream, within a byte budget shared by every stream (`write_budget`; `0` opts out). It resends them on Writable, sends a deferred write-side close behind them, and reports `StreamWriteAccepted` once they are all accepted (never delivered) or `StreamWriteAborted` when their stream or connection ends first. `try_send_stream` bypasses it. The FFI core and the web host use the same one (ADR 0030). _Avoid_: stream writer, buffered stream
+
+**Flush**: Getting what an endpoint accepted for writing out of the endpoint and onto the network before it moves on, so a closing application does not cut off its own last bytes. Distinct from delivery to the peer's application. _Avoid_: drain (that is close's teardown wait)
 
 **Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 

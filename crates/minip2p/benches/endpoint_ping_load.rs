@@ -150,7 +150,7 @@ fn relay_load() -> (Endpoint, Load) {
         }
     });
 
-    let (conn, stream) = client
+    let stream = client
         .open_stream(&target_peer, PROTOCOL)
         .expect("open stream");
     let deadline = Instant::now() + SETUP_TIMEOUT;
@@ -158,12 +158,11 @@ fn relay_load() -> (Endpoint, Load) {
         assert!(Instant::now() < deadline, "stream negotiation timed out");
         next_event(&mut m, Duration::from_millis(1));
         if let Some(EndpointEvent::StreamReady {
-            conn_id,
-            stream_id,
+            stream: ready,
             initiated_locally: true,
             ..
         }) = next_event(&mut client, Duration::from_millis(1))
-            && (conn_id, stream_id) == (conn, stream)
+            && ready == stream
         {
             break;
         }
@@ -175,7 +174,7 @@ fn relay_load() -> (Endpoint, Load) {
     let mut sent = 0;
     let sender = Driven::run(client, move |client| {
         while sent - acked.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64 {
-            let (accepted, full) = send_chunk(client, (conn, stream), &chunk, &mut held);
+            let (accepted, full) = send_chunk(client, stream, &chunk, &mut held);
             sent += accepted;
             if full {
                 break;
@@ -310,7 +309,7 @@ fn case(kind: LoadKind, listen: &str, samples: usize) -> Vec<String> {
 
     let mut probe = bind_on(Endpoint::builder(), listen);
     let probe_addr = probe.listen().expect("probe listens");
-    let probe_peer = probe_addr.peer_id().clone();
+    let probe_peer = *probe_addr.peer_id();
     let _probe = Driven::spawn(probe, |_, _| {});
     m.connect(&probe_addr).expect("connect probe");
     let deadline = Instant::now() + SETUP_TIMEOUT;

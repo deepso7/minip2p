@@ -37,7 +37,7 @@ pub type PeerMultihash = Multihash<PEER_ID_MULTIHASH_SIZE>;
 ///
 /// Supports parsing and formatting in both legacy base58btc and CIDv1
 /// (base32 multibase) forms.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PeerId {
     multihash: PeerMultihash,
 }

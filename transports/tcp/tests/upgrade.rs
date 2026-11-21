@@ -122,7 +122,7 @@ fn upgraded_pair_with(dialer_config: TcpConfig, listener_config: TcpConfig) -> P
     let mut listener = node_with(&net, listener_key, 20, listener_config);
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
-    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("dial target");
+    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
     let connection = dialer.dial(&target).expect("dial starts");
     let (dialer_events, listener_events) = drive(&net, &mut dialer, &mut listener);
 
@@ -555,6 +555,151 @@ fn closing_a_socket_that_cannot_flush_aborts_instead_of_truncating() {
         "the socket must be discarded instead"
     );
     assert!(pair.dialer.connection_ids().is_empty());
+}
+
+#[test]
+fn closing_a_flushed_socket_too_full_for_the_go_away_still_half_closes() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The last bytes and FIN reach the socket, which then has no room left:
+    // the `GoAway` cannot follow, but aborting would discard what it took.
+    pair.dialer
+        .send_stream(id, stream, Bytes::from_static(b"last"))
+        .expect("send");
+    pair.dialer.close_stream_write(id, stream).expect("fin");
+    let _ = pair.dialer.poll(Now::from_millis(0)).expect("flush");
+    assert!(!pair.dialer.has_pending_writes(), "the socket took it all");
+    let full = pair.dialer.provider().bytes_in_flight_to_peer();
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(full));
+    let (close_writes, aborts) = (
+        pair.dialer.provider().close_write_calls(),
+        pair.dialer.provider().abort_calls(),
+    );
+
+    pair.dialer.close(id).expect("close");
+    assert_eq!(pair.dialer.provider().close_write_calls(), close_writes + 1);
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts);
+
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let received: Vec<u8> = listener_events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(received, b"last");
+    assert!(
+        listener_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { .. })),
+        "the FIN arrives: {listener_events:?}"
+    );
+}
+
+/// Dropping a half-closed socket while the peer still sends makes the kernel
+/// reset it, discarding what the peer had not read; so a graceful close
+/// counts as pending until the peer closes too, or the linger runs out.
+#[test]
+fn a_gracefully_closed_socket_is_pending_until_the_peer_closes() {
+    let mut pair = upgraded_pair();
+    pair.dialer.close(pair.connection).expect("close");
+    assert!(pair.dialer.has_pending_writes(), "waits for the peer");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    assert!(
+        !pair.dialer.has_pending_writes(),
+        "the peer closed its side"
+    );
+
+    // A peer that never closes is aborted once the linger runs out.
+    let mut pair = upgraded_pair();
+    pair.dialer.close(pair.connection).expect("close");
+    let aborts = pair.dialer.provider().abort_calls();
+    let _ = pair.dialer.poll(Now::from_millis(1_000)).expect("closed");
+    let _ = pair.dialer.poll(Now::from_millis(1_000)).expect("stamps");
+    let _ = pair.dialer.poll(Now::from_millis(10_999)).expect("lingers");
+    assert!(pair.dialer.has_pending_writes());
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(11_000))
+    );
+    let _ = pair.dialer.poll(Now::from_millis(11_000)).expect("expires");
+    assert!(!pair.dialer.has_pending_writes());
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
+}
+
+#[test]
+fn closing_with_window_blocked_bytes_aborts_when_the_go_away_does_not_fit() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // More than the peer's initial window, never acknowledged: the socket
+    // takes every frame it may, and the rest waits behind the window.
+    for _ in 0..64 {
+        if pair
+            .dialer
+            .send_stream(id, stream, Bytes::from(vec![7u8; 16 * 1024]))
+            .is_err()
+        {
+            break;
+        }
+        drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    }
+    assert!(pair.dialer.has_pending_writes(), "bytes wait on the window");
+    let full = pair.dialer.provider().bytes_in_flight_to_peer();
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(full));
+    let (close_writes, aborts) = (
+        pair.dialer.provider().close_write_calls(),
+        pair.dialer.provider().abort_calls(),
+    );
+
+    // `go_away` discards the held bytes, so a FIN would pass the truncated
+    // stream off as complete.
+    pair.dialer.close(id).expect("close");
+    assert_eq!(pair.dialer.provider().close_write_calls(), close_writes);
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
+}
+
+#[test]
+fn closing_with_window_blocked_bytes_aborts_when_the_go_away_fits() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // More than the peer's initial window, never acknowledged: the socket
+    // takes every frame it may, and the rest waits behind the window.
+    for _ in 0..64 {
+        if pair
+            .dialer
+            .send_stream(id, stream, Bytes::from(vec![7u8; 16 * 1024]))
+            .is_err()
+        {
+            break;
+        }
+        drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    }
+    assert!(pair.dialer.has_pending_writes(), "bytes wait on the window");
+    let (close_writes, aborts) = (
+        pair.dialer.provider().close_write_calls(),
+        pair.dialer.provider().abort_calls(),
+    );
+
+    // `go_away` discards the held bytes, so a FIN would pass the truncated
+    // stream off as complete.
+    pair.dialer.close(id).expect("close");
+    assert_eq!(pair.dialer.provider().close_write_calls(), close_writes);
+    assert_eq!(pair.dialer.provider().abort_calls(), aborts + 1);
 }
 
 #[test]
@@ -1213,7 +1358,7 @@ fn a_dial_past_the_ceiling_is_refused_and_costs_nothing() {
     );
     let listener_peer = identity(2).peer_id();
     dialer
-        .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+        .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("target"))
         .expect("the first dial fits");
 
     let error = dialer
@@ -1254,7 +1399,7 @@ fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
     let mut second = node(&net, identity(3), 30);
     for dialer in [&mut first, &mut second] {
         dialer
-            .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+            .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("target"))
             .expect("dial starts");
     }
 

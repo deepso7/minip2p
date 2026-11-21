@@ -115,24 +115,25 @@ fn negotiated_bridge() -> BridgePair {
     }
     let inner_conn = inner_conn.expect("local connection id");
     let relay_conn = relay_conn.expect("relay connection id");
-    let (_, stream) = local
+    let stream = local
         .open_stream(relay_addr.peer_id(), HOP_PROTOCOL_ID)
-        .expect("open bridge stream");
+        .expect("open bridge stream")
+        .stream_id();
     let mut local_stream_ready = false;
     let mut relay_stream_ready = false;
     while !local_stream_ready || !relay_stream_ready {
         assert!(Instant::now() < deadline, "bridge stream did not negotiate");
-        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = local
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) = local
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive local stream")
-            && stream_id == stream
+            && ready.stream_id() == stream
         {
             local_stream_ready = true;
         }
-        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = relay
+        if let Some(EndpointEvent::StreamReady { stream: ready, .. }) = relay
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive relay stream")
-            && stream_id == stream
+            && ready.stream_id() == stream
         {
             relay_stream_ready = true;
         }
@@ -354,8 +355,8 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
         .expect("quic listen address")
         .bind()
         .expect("bind client");
-    let wake = client.poll.wake_handle();
-    client.resolver = super::dial::Resolver::with_lookup(move || wake.wake(), lookup);
+    let wake = client.platform.poll.wake_handle();
+    client.platform.resolver = super::dial::Resolver::with_lookup(move || wake.wake(), lookup);
 
     // One long wait on an idle endpoint: without an early start, the
     // lookup would begin only once the sleep ended at this deadline.
@@ -392,11 +393,9 @@ fn a_relay_configured_by_name_is_resolved_off_the_driver_and_reserved() {
     let relay_addr = relay.listen().expect("relay listens");
     let mut protocols = relay_addr.transport().protocols().to_vec();
     *protocols.first_mut().expect("a host") = minip2p_core::Protocol::Dns4("localhost".to_string());
-    let named = minip2p_core::PeerAddr::new(
-        Multiaddr::from_protocols(protocols),
-        relay_addr.peer_id().clone(),
-    )
-    .expect("named relay addr");
+    let named =
+        minip2p_core::PeerAddr::new(Multiaddr::from_protocols(protocols), *relay_addr.peer_id())
+            .expect("named relay addr");
     let mut client = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([85; 32]))
         .nat_config(NatConfig {
@@ -462,18 +461,18 @@ fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
 /// A driver over a fresh agent configured with the pair's relay, and the
 /// handoff that agent makes once the relay bridges the pair's stream.
 fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver, BridgeHandoff) {
-    let relay_peer = pair.relay_addr.peer_id().clone();
+    let relay_peer = *pair.relay_addr.peer_id();
     let config = NatConfig {
         relays: vec![pair.relay_addr.clone()],
         force_relay: true,
         reservation_policy: ReservationPolicy::Never,
         ..NatConfig::default()
     };
-    let agent = NatAgent::new(pair.local.peer_id().clone(), config);
+    let agent = NatAgent::new(*pair.local.peer_id(), config);
     let handoff = BridgeHandoff {
         inner_conn: pair.inner_conn,
         stream_id: pair.stream,
-        relay: relay_peer.clone(),
+        relay: relay_peer,
         remote_peer: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
         role: BridgeRole::Initiator,
         pending_data: Vec::new(),
@@ -609,7 +608,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
     header.extend_from_slice(b"/multistream/1.0.0\n");
     assert!(driver.ingest(
         &SwarmEvent::StreamData {
-            peer_id: pair.relay_addr.peer_id().clone(),
+            peer_id: *pair.relay_addr.peer_id(),
             conn_id: pair.inner_conn,
             stream_id: pair.stream,
             data: Bytes::from(header),
@@ -620,7 +619,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
     assert!(driver.promoted().contains_key(&key));
     assert!(!driver.ingest(
         &SwarmEvent::StreamData {
-            peer_id: pair.relay_addr.peer_id().clone(),
+            peer_id: *pair.relay_addr.peer_id(),
             conn_id: ConnectionId::new(pair.inner_conn.as_u64() + 100),
             stream_id: pair.stream,
             data: Bytes::from(vec![1]),
@@ -651,7 +650,7 @@ fn promotion_uses_handoff_connection_after_same_batch_relay_replacement() {
     let mut pair = negotiated_bridge();
     let old_conn = pair.inner_conn;
     let stream = pair.stream;
-    let relay_peer = pair.relay_addr.peer_id().clone();
+    let relay_peer = *pair.relay_addr.peer_id();
     let (mut driver, promotion) = promotion_driver(&pair, false);
 
     // Replace the relay connection, but stop as soon as both public
@@ -667,7 +666,9 @@ fn promotion_uses_handoff_connection_after_same_batch_relay_replacement() {
     while replacement.is_none() || !relay_established {
         assert!(Instant::now() < deadline, "replacement did not establish");
         if replacement.is_none()
-            && let Some(EndpointEvent::ConnectionReplaced { peer_id, old, new }) = pair
+            && let Some(EndpointEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            }) = pair
                 .local
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive local replacement")
@@ -747,7 +748,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     promote(&mut fin, handoff, &mut fin_pair.local).expect("adopted");
     assert!(fin.ingest(
         &SwarmEvent::StreamRemoteWriteClosed {
-            peer_id: fin_pair.relay_addr.peer_id().clone(),
+            peer_id: *fin_pair.relay_addr.peer_id(),
             conn_id: fin_pair.inner_conn,
             stream_id: fin_pair.stream,
         },
@@ -762,7 +763,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     promote(&mut closed, handoff, &mut closed_pair.local).expect("adopted");
     assert!(closed.ingest(
         &SwarmEvent::StreamClosed {
-            peer_id: closed_pair.relay_addr.peer_id().clone(),
+            peer_id: *closed_pair.relay_addr.peer_id(),
             conn_id: closed_pair.inner_conn,
             stream_id: closed_pair.stream,
         },
@@ -779,12 +780,14 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         let (mut inner, handoff) = promotion_driver(&inner_pair, false);
         promote(&mut inner, handoff, &mut inner_pair.local).expect("adopted");
         let promoted = circuit_id(&inner, inner_key);
-        let peer_id = inner_pair.relay_addr.peer_id().clone();
+        let peer_id = *inner_pair.relay_addr.peer_id();
         let carrier_gone = if replaced {
             SwarmEvent::ConnectionReplaced {
                 peer_id,
                 old: inner_pair.inner_conn,
                 new: ConnectionId::new(9_998),
+                old_path: minip2p_core::Path::Direct,
+                new_path: minip2p_core::Path::Direct,
             }
         } else {
             SwarmEvent::ConnectionClosed {
@@ -930,7 +933,7 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
 
     let reservation_deadline = Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -961,7 +964,7 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
     let id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relay-only connect");
     initiator.cancel_connect(id);
 
@@ -1011,7 +1014,7 @@ fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
     let reservation_deadline = Instant::now() + std::time::Duration::from_secs(10);
     loop {
         assert!(
@@ -1044,7 +1047,7 @@ fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
     let id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relay connect");
 
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -1167,7 +1170,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         .bind()
         .expect("bind responder");
     let b_addr = b.listen().expect("responder listens");
-    let b_peer = b.peer_id().clone();
+    let b_peer = *b.peer_id();
     b.subscribe(TOPIC).expect("responder subscribes");
 
     let reserve_deadline = Instant::now() + Duration::from_secs(10);
@@ -1197,7 +1200,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         .expect("bind initiator");
     a.listen().expect("initiator listens");
     a.subscribe(TOPIC).expect("initiator subscribes");
-    a.connect(&b_peer).expect("relay-only connect");
+    a.connect(b_peer).expect("relay-only connect");
 
     drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
@@ -1247,7 +1250,22 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
                 EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
                     a_sequence.push(("established", conn_id, conn_id));
                 }
-                EndpointEvent::ConnectionReplaced { peer_id, old, new } if peer_id == b_peer => {
+                EndpointEvent::ConnectionReplaced {
+                    peer_id,
+                    old,
+                    new,
+                    old_path,
+                    new_path,
+                } if peer_id == b_peer => {
+                    // The event itself tells the upgrade off the relay
+                    // apart from a lost link.
+                    assert_eq!(
+                        old_path,
+                        Path::Relayed {
+                            relay: *relay.addr().peer_id()
+                        }
+                    );
+                    assert_eq!(new_path, Path::Direct);
                     a_sequence.push(("replaced", old, new));
                 }
                 EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
@@ -1291,7 +1309,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 #[test]
 fn a_single_autonat_server_cannot_confirm_addresses() {
-    use minip2p_autonat::{AUTONAT_PROTOCOL_ID, AutoNatServer, AutoNatServerOutput};
+    use minip2p_nat::autonat::{AUTONAT_PROTOCOL_ID, AutoNatServer, AutoNatServerOutput};
 
     let mut server = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([91; 32]))
@@ -1338,24 +1356,18 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
         {
             Some(EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 ..
             }) if protocol_id == AUTONAT_PROTOCOL_ID => {
                 let observed = server
-                    .connection_remote_addr(conn_id)
+                    .connection_remote_addr(stream.conn_id())
                     .expect("the stream's connection is open");
                 let machine = AutoNatServer::new(peer_id, observed);
-                machines.insert((conn_id, stream_id), machine);
+                machines.insert(stream, machine);
             }
-            Some(EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            }) => {
-                let Some(machine) = machines.get_mut(&(conn_id, stream_id)) else {
+            Some(EndpointEvent::StreamData { stream, data, .. }) => {
+                let Some(machine) = machines.get_mut(&stream) else {
                     continue;
                 };
                 machine.on_data(&data).expect("well-formed request");
@@ -1366,9 +1378,7 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
                             vouched += 1;
                         }
                         AutoNatServerOutput::Outbound(bytes) => {
-                            server
-                                .send_stream(conn_id, stream_id, bytes)
-                                .expect("send response");
+                            server.send_stream(stream, bytes).expect("send response");
                         }
                     }
                 }
@@ -1436,7 +1446,7 @@ fn relay_close_reports_the_reservations_it_ends() {
         .is_some()
     {}
 
-    let client_peer = client.peer_id().clone();
+    let client_peer = *client.peer_id();
     let report = relay.close();
     assert!(
         report.events.iter().any(|event| matches!(

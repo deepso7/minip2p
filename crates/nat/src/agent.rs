@@ -7,8 +7,8 @@ use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, sele
 use minip2p_swarm::{HeldWrites, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use minip2p_autonat::AUTONAT_PROTOCOL_ID;
-use minip2p_dcutr::DCUTR_PROTOCOL_ID;
+use crate::autonat::AUTONAT_PROTOCOL_ID;
+use crate::dcutr::DCUTR_PROTOCOL_ID;
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 
 use crate::attempt::ConnectAttempt;
@@ -187,7 +187,7 @@ impl Shared {
         let (token, _) = self.start_dial(swarm, purpose, &addr)?;
         let expires = now.monotonic_ms + deadline_ms;
         self.pending_session_dials
-            .insert(token, (addr.peer_id().clone(), expires));
+            .insert(token, (*addr.peer_id(), expires));
         Ok(())
     }
 
@@ -239,7 +239,7 @@ impl Shared {
         stream: StreamId,
         role: StreamRole,
     ) {
-        self.streams.insert((conn_id, stream), (peer.clone(), role));
+        self.streams.insert((conn_id, stream), (*peer, role));
     }
 
     /// Resets and releases a stream the agent still owns. A stream already
@@ -768,7 +768,9 @@ impl NatAgent {
                     now,
                 );
             }
-            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+            SwarmEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } => {
                 touched_state = true;
                 self.connection_replaced(peer_id, *old, *new, is_circuit, swarm, now);
             }
@@ -891,7 +893,7 @@ impl NatAgent {
                             InboundCircuit::new(
                                 id,
                                 *conn_id,
-                                peer_id.clone(),
+                                *peer_id,
                                 *stream_id,
                                 &self.shared,
                                 now,
@@ -1331,14 +1333,14 @@ impl NatAgent {
         self.shared.push_event(match upgrade.owner {
             Owner::Attempt(connect_id) => NatEvent::PathUpgraded {
                 connect_id,
-                peer: peer.clone(),
+                peer: *peer,
                 from: upgrade.from,
                 to: upgrade.to,
                 old_conn_id: old,
                 new_conn_id: new,
             },
             Owner::Inbound => NatEvent::InboundDirectUpgrade {
-                peer: peer.clone(),
+                peer: *peer,
                 old_conn_id: old,
                 new_conn_id: new,
             },

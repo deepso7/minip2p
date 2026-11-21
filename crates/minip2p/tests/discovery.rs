@@ -87,8 +87,8 @@ fn beacons_do_not_leak_to_the_application() {
     let mut b = discovery_endpoint();
     let a_addr = a.listen().expect("a listens");
     let b_addr = b.listen().expect("b listens");
-    let a_peer = a.peer_id().clone();
-    let b_peer = b.peer_id().clone();
+    let a_peer = *a.peer_id();
+    let b_peer = *b.peer_id();
     a.connect(&b_addr).expect("a connects to b");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -124,9 +124,9 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
     let hub_addr = hub.listen().expect("hub listens");
     a.listen().expect("a listens");
     b.listen().expect("b listens");
-    let hub_peer = hub.peer_id().clone();
-    let a_peer = a.peer_id().clone();
-    let b_peer = b.peer_id().clone();
+    let hub_peer = *hub.peer_id();
+    let a_peer = *a.peer_id();
+    let b_peer = *b.peer_id();
     a.connect(&hub_addr).expect("a connects to hub");
     b.connect(&hub_addr).expect("b connects to hub");
 
@@ -146,7 +146,7 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
         assert_no_discovery_gossipsub(b.next_event(Duration::from_millis(20)).expect("b drives"));
     }
 
-    assert_eq!(a.connected_peers(), vec![hub_peer.clone()]);
+    assert_eq!(a.connected_peers(), vec![hub_peer]);
     assert_eq!(b.connected_peers(), vec![hub_peer]);
     assert_queue_has_no_discovery_gossipsub(&mut hub);
     assert_queue_has_no_discovery_gossipsub(&mut a);
@@ -161,8 +161,8 @@ fn connect_uses_known_discovery_book_addresses() {
     let hub_addr = hub.listen().expect("hub listens");
     a.listen().expect("a listens");
     b.listen().expect("b listens");
-    let a_peer = a.peer_id().clone();
-    let b_peer = b.peer_id().clone();
+    let a_peer = *a.peer_id();
+    let b_peer = *b.peer_id();
     a.connect(&hub_addr).expect("a connects to hub");
     b.connect(&hub_addr).expect("b connects to hub");
 
@@ -185,7 +185,7 @@ fn connect_uses_known_discovery_book_addresses() {
         !a.connected_peers().contains(&b_peer),
         "a must not already have a direct connection to b"
     );
-    let id = a.connect(&b_peer).expect("connect by peer id");
+    let id = a.connect(b_peer).expect("connect by peer id");
     let connect_deadline = Instant::now() + Duration::from_secs(15);
     let mut settled = None;
     while settled.is_none() {

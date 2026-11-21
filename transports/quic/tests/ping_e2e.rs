@@ -212,7 +212,7 @@ impl PingHarness {
                                         &mut client_ping,
                                         |ping| {
                                             ping.register_outbound_stream(
-                                                peer_addr.peer_id().clone(),
+                                                *peer_addr.peer_id(),
                                                 client_stream,
                                             )
                                             .expect("ping input")
@@ -356,7 +356,7 @@ impl PingHarness {
                                         server_ping,
                                         |ping| {
                                             ping.register_inbound_stream(
-                                                peer_addr.peer_id().clone(),
+                                                *peer_addr.peer_id(),
                                                 *stream_id,
                                             )
                                         },
@@ -502,7 +502,7 @@ impl PingHarness {
 #[test]
 fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
     let mut h = PingHarness::new(400);
-    let peer_id = h.peer_id().clone();
+    let peer_id = *h.peer_id();
 
     let payload: [u8; PING_PAYLOAD_LEN] = core::array::from_fn(|i| i as u8);
     let mut ping_sent = false;
@@ -607,7 +607,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
 #[test]
 fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
     let mut h = PingHarness::new(401);
-    let peer_id = h.peer_id().clone();
+    let peer_id = *h.peer_id();
 
     let payloads = [
         core::array::from_fn::<_, PING_PAYLOAD_LEN, _>(|i| i as u8),

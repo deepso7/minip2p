@@ -7,8 +7,9 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Deadline, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, Multiaddr,
-    Now, PeerAddr, PeerId, PortableEndpoint, StreamId,
+    ConnectOutcome, Deadline, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent,
+    ManualClock, Multiaddr, Now, PeerAddr, PeerId, PortableEndpoint, PortableEndpointBuilder,
+    StreamId,
 };
 use minip2p_core::platform::{Clock, StdClock, StdEntropy};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
@@ -76,7 +77,7 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
     let mut b = bind(listen, Ed25519Keypair::generate());
     let a_addr = a.listen().expect("a listens");
     let b_addr = b.listen().expect("b listens");
-    let (a_peer, b_peer) = (a.peer_id().clone(), b.peer_id().clone());
+    let (a_peer, b_peer) = (*a.peer_id(), *b.peer_id());
 
     a.connect(&b_addr).expect("a connects");
     b.connect(&a_addr).expect("b connects");
@@ -328,28 +329,29 @@ fn duplicate_candidates_run<T: Transport>(
     reverse: bool,
 ) {
     let (a_key, b_key) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
-    let mut a = Endpoint::portable(&a_key, StdEntropy)
+    let mut a = PortableEndpointBuilder::new(&a_key, StdEntropy, ManualClock::default())
         .build(transport(&a_key))
         .expect("a builds");
     let b_transport = ReverseFirstTwo::new(transport(&b_key), reverse);
     let b_listen = listen(&b_transport.inner);
     let swapped = std::rc::Rc::clone(&b_transport.swapped);
-    let mut b = Endpoint::portable(&b_key, StdEntropy)
+    let mut b = PortableEndpointBuilder::new(&b_key, StdEntropy, ManualClock::default())
         .build(b_transport)
         .expect("b builds");
-    let b_addr =
-        PeerAddr::new(b.listen(&b_listen).expect("b listens"), b_key.peer_id()).expect("b address");
+    let b_addr = PeerAddr::new(b.listen_on(&b_listen).expect("b listens"), b_key.peer_id())
+        .expect("b address");
     let (a_peer, b_peer) = (a_key.peer_id(), b_key.peer_id());
 
     let mut clock = StdClock::new();
     let connect_id = a
-        .connect(vec![b_addr.clone(), b_addr], clock.now())
+        .at(clock.now())
+        .connect(vec![b_addr.clone(), b_addr])
         .expect("a connects");
     // Polls both once and returns the sample with what each surfaced.
     let mut drive = |a: &mut Portable<T>, b: &mut Portable<ReverseFirstTwo<T>>| {
         let now = clock.now();
-        let a_new = a.poll(now).expect("a polls");
-        let b_new = b.poll(now).expect("b polls");
+        let a_new = a.at(now).poll().expect("a polls");
+        let b_new = b.at(now).poll().expect("b polls");
         std::thread::sleep(Duration::from_millis(1));
         (now, a_new, b_new)
     };
@@ -369,8 +371,8 @@ fn duplicate_candidates_run<T: Transport>(
     let (now, a_new, b_new) = drive(&mut a, &mut b);
     a_events.extend(a_new);
     b_events.extend(b_new);
-    a.ping(&b_peer, now).expect("a pings");
-    b.ping(&a_peer, now).expect("b pings");
+    a.at(now).ping(&b_peer).expect("a pings");
+    b.at(now).ping(&a_peer).expect("b pings");
     while !pinged(&a_events, &b_peer) || !pinged(&b_events, &a_peer) {
         assert!(
             Instant::now() < deadline,
@@ -392,8 +394,8 @@ fn duplicate_candidates_run<T: Transport>(
     }
     let (now, a_new, b_new) = drive(&mut a, &mut b);
     let (mut a_later, mut b_later) = (a_new, b_new);
-    a.ping(&b_peer, now).expect("a pings again");
-    b.ping(&a_peer, now).expect("b pings again");
+    a.at(now).ping(&b_peer).expect("a pings again");
+    b.at(now).ping(&a_peer).expect("b pings again");
     while !pinged(&a_later, &b_peer) || !pinged(&b_later, &a_peer) {
         assert!(
             Instant::now() < deadline,
@@ -445,7 +447,7 @@ fn duplicate_candidates_run<T: Transport>(
     }
 }
 
-type Portable<T> = PortableEndpoint<T, StdEntropy>;
+type Portable<T> = PortableEndpoint<T, StdEntropy, ManualClock>;
 
 #[test]
 fn duplicate_quic_candidates_keep_one_shared_connection() {
@@ -486,7 +488,7 @@ fn reconnect_after_silent_death(a_is_lower: bool) {
     let a_addr = a.listen().expect("a listens");
     let mut b = bind_short_window(b_key.clone());
     let b_addr = b.listen().expect("b listens");
-    let (a_peer, b_peer) = (a.peer_id().clone(), b.peer_id().clone());
+    let (a_peer, b_peer) = (*a.peer_id(), *b.peer_id());
 
     a.connect(&b_addr).expect("a connects");
     let mut ignored = Vec::new();

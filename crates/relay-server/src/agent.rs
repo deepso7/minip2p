@@ -130,7 +130,7 @@ impl AdmissionLimiters {
     /// request never costs a token.
     fn consume(&mut self, peer_id: &PeerId, ip: Option<IpKey>, now_ms: u64) {
         if let Some(limiter) = &mut self.peer {
-            limiter.consume(peer_id.clone(), now_ms);
+            limiter.consume(*peer_id, now_ms);
         }
         if let (Some(limiter), Some(ip)) = (&mut self.ip, ip) {
             limiter.consume(ip, now_ms);
@@ -994,9 +994,9 @@ impl RelayServerAgent {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 if self.is_backbone(*conn_id) {
-                    self.on_backbone_established(io, peer_id.clone(), *conn_id);
+                    self.on_backbone_established(io, *peer_id, *conn_id);
                 } else {
-                    self.on_connection_established(io, peer_id.clone(), *conn_id, is_circuit);
+                    self.on_connection_established(io, *peer_id, *conn_id, is_circuit);
                 }
                 false
             }
@@ -1006,7 +1006,9 @@ impl RelayServerAgent {
                 self.on_connection_closed(io, peer_id, *conn_id);
                 false
             }
-            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+            SwarmEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } => {
                 if self.is_backbone(*new) {
                     self.on_backbone_replaced(io, peer_id, *old, *new);
                 } else {
@@ -1033,7 +1035,7 @@ impl RelayServerAgent {
                         self.on_stop_ready(io, key)
                     }
                 } else if protocol_id == HOP_PROTOCOL_ID {
-                    self.on_hop_ready(io, peer_id.clone(), key, is_circuit);
+                    self.on_hop_ready(io, *peer_id, key, is_circuit);
                     true
                 } else if self.mesh.is_some() {
                     self.on_mesh_stream_ready(io, peer_id, key, protocol_id)
@@ -1280,7 +1282,7 @@ impl RelayServerAgent {
                 continue;
             }
             if let Some(worker) = self.remove_hop_worker(key) {
-                self.reset(io, worker.peer_id.clone(), key);
+                self.reset(io, worker.peer_id, key);
                 if worker.request_known {
                     self.runtime_error(
                         RelayServerRuntimeErrorKind::ResetStream,
@@ -1329,7 +1331,7 @@ impl RelayServerAgent {
     ) -> bool {
         let owned = self.claims_stream(key);
         if owned {
-            self.reset(io, peer_id.clone(), key);
+            self.reset(io, *peer_id, key);
         }
         owned
     }
@@ -1375,7 +1377,7 @@ impl RelayServerAgent {
         if let Some(retired) = self.retired_stops.get_mut(&key) {
             if !retired.ready {
                 retired.ready = true;
-                let peer_id = retired.peer_id.clone();
+                let peer_id = retired.peer_id;
                 self.reset(io, peer_id, key);
             }
             return true;
@@ -1390,20 +1392,17 @@ impl RelayServerAgent {
         match &mut circuit.destination {
             PendingDestination::Stop(stop @ None) => {
                 // The initiator's first output is the STOP CONNECT request.
-                *stop = Some(StopInitiator::new(
-                    circuit.source_peer_id.clone(),
-                    Some(limit),
-                ));
+                *stop = Some(StopInitiator::new(circuit.source_peer_id, Some(limit)));
                 self.drain_stop(io, source_stream);
             }
             PendingDestination::Forward(forward) if forward.reply.is_none() => {
                 forward.reply = Some(Vec::new());
                 let request = ForwardMessage::Forward {
-                    source: circuit.source_peer_id.clone(),
-                    destination: circuit.destination_peer_id.clone(),
+                    source: circuit.source_peer_id,
+                    destination: circuit.destination_peer_id,
                     limit,
                 };
-                let member = forward.member.clone();
+                let member = forward.member;
                 if let Err(error) =
                     io.swarm
                         .send_stream(&member, key, request.encode_frame().into(), io.now_ms())
@@ -1439,7 +1438,7 @@ impl RelayServerAgent {
             // The stream is gone: nothing to reset or claim.
             circuit.destination_stream = None;
             self.stop_to_source.remove(&key);
-            let peer_id = circuit.destination_leg_peer().clone();
+            let peer_id = *circuit.destination_leg_peer();
             let forward = matches!(circuit.destination, PendingDestination::Forward(_));
             self.runtime_error(
                 RelayServerRuntimeErrorKind::OpenStream,
@@ -1557,7 +1556,7 @@ impl RelayServerAgent {
         new: ConnectionId,
         is_circuit: bool,
     ) {
-        self.on_connection_established(io, peer_id.clone(), new, is_circuit);
+        self.on_connection_established(io, *peer_id, new, is_circuit);
         let mut moved = false;
         if !is_circuit
             && let Some(reservation) = self.reservations.get_mut(peer_id)
@@ -1567,7 +1566,7 @@ impl RelayServerAgent {
             let expires_unix = reservation.expires_unix;
             moved = true;
             self.publish(io, || DirectoryMessage::Present {
-                peer: peer_id.clone(),
+                peer: *peer_id,
                 expires_unix,
             });
         }
@@ -1630,7 +1629,7 @@ impl RelayServerAgent {
                 {
                     self.stop_to_source.remove(&stop_stream);
                     if !circuit.destination_ready() {
-                        let peer_id = circuit.destination_peer_id.clone();
+                        let peer_id = circuit.destination_peer_id;
                         self.runtime_error(
                             RelayServerRuntimeErrorKind::OpenStream,
                             Some(peer_id),
@@ -1651,7 +1650,7 @@ impl RelayServerAgent {
         {
             self.remove_reservation(io, peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 reason: ReservationCloseReason::ConnectionClosed,
             });
         }
@@ -1687,12 +1686,12 @@ impl RelayServerAgent {
 
     fn on_hop_ready(&mut self, io: &mut Io<'_>, peer_id: PeerId, key: StreamKey, is_circuit: bool) {
         let Some(connection) = self.connections.get(&key.conn_id) else {
-            self.rejected_hop_streams.insert(key, peer_id.clone());
+            self.rejected_hop_streams.insert(key, peer_id);
             self.reset(io, peer_id, key);
             return;
         };
         if connection.peer_id != peer_id {
-            self.rejected_hop_streams.insert(key, peer_id.clone());
+            self.rejected_hop_streams.insert(key, peer_id);
             self.reset(io, peer_id, key);
             return;
         }
@@ -1713,12 +1712,12 @@ impl RelayServerAgent {
             })
             .count();
         if count >= self.config.max_pending_hop_requests_per_connection {
-            self.rejected_hop_streams.insert(key, peer_id.clone());
+            self.rejected_hop_streams.insert(key, peer_id);
             self.reset(io, peer_id, key);
             return;
         }
         let worker = HopWorker {
-            peer_id: peer_id.clone(),
+            peer_id,
             responder: Responder::Hop(HopResponder::new()),
             request_known: false,
             is_circuit,
@@ -1750,7 +1749,7 @@ impl RelayServerAgent {
         else {
             return false;
         };
-        let peer_id = peer_id.clone();
+        let peer_id = *peer_id;
         let result = input(responder);
         if let Err(error) = result {
             self.runtime_error(
@@ -1795,7 +1794,7 @@ impl RelayServerAgent {
             let Some(output) = responder.poll_output() else {
                 break;
             };
-            let peer_id = worker.peer_id.clone();
+            let peer_id = worker.peer_id;
             match output {
                 HopResponderOutput::Request(HopRequest::Reserve) => {
                     worker.request_known = true;
@@ -1851,7 +1850,7 @@ impl RelayServerAgent {
             let Some(output) = stop.poll_output() else {
                 break;
             };
-            let peer_id = circuit.destination_peer_id.clone();
+            let peer_id = circuit.destination_peer_id;
             let stream = circuit.destination_stream;
             match output {
                 StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted) => accepted = true,
@@ -1916,7 +1915,7 @@ impl RelayServerAgent {
             self.fail_pending_connect(io, source_stream, Status::ConnectionFailed);
             return;
         };
-        let peer_id = worker.peer_id.clone();
+        let peer_id = worker.peer_id;
         // The success reply, and payload a HOP responder held behind CONNECT.
         let accepted = match &mut worker.responder {
             Responder::Forward { .. } => Ok((
@@ -2004,14 +2003,10 @@ impl RelayServerAgent {
         };
         // Only a circuit across the backbone keeps its own leg peer and
         // limit; any other's are its endpoints and the config's.
-        let backbone = if let Some(via) = pending
-            .mesh
-            .as_ref()
-            .and_then(|mesh| mesh.forwarded_by.clone())
-        {
+        let backbone = if let Some(via) = pending.mesh.as_ref().and_then(|mesh| mesh.forwarded_by) {
             Some((via, CircuitLeg::Source))
         } else if let PendingDestination::Forward(forward) = &pending.destination {
-            Some((forward.member.clone(), CircuitLeg::Destination))
+            Some((forward.member, CircuitLeg::Destination))
         } else {
             None
         };
@@ -2030,8 +2025,8 @@ impl RelayServerAgent {
             pending.destination_ip.as_ref(),
         );
         let mut circuit = Circuit {
-            source_peer_id: pending.source_peer_id.clone(),
-            destination_peer_id: pending.destination_peer_id.clone(),
+            source_peer_id: pending.source_peer_id,
+            destination_peer_id: pending.destination_peer_id,
             backbone: backbone.map(|(via, leg)| Box::new(Backbone { via, leg, limit })),
             source_ip: pending.source_ip,
             destination_ip: pending.destination_ip,
@@ -2053,7 +2048,7 @@ impl RelayServerAgent {
         let via = circuit
             .backbone
             .as_ref()
-            .map(|backbone| Box::new(backbone.via.clone()));
+            .map(|backbone| Box::new(backbone.via));
         self.circuits.insert(source_stream, circuit);
         self.events.push_back(RelayServerEvent::CircuitOpened {
             source_peer_id: pending.source_peer_id,
@@ -2117,8 +2112,8 @@ impl RelayServerAgent {
             return true;
         }
         let peer_id = match direction {
-            CircuitDirection::SourceToDestination => circuit.source_peer_id.clone(),
-            CircuitDirection::DestinationToSource => circuit.destination_peer_id.clone(),
+            CircuitDirection::SourceToDestination => circuit.source_peer_id,
+            CircuitDirection::DestinationToSource => circuit.destination_peer_id,
         };
         self.abort_pending_connect_both(io, source_stream);
         self.runtime_error(
@@ -2171,7 +2166,7 @@ impl RelayServerAgent {
                     match io.swarm.close_stream_write(peer_id, stream, io.now_ms()) {
                         Ok(()) => self.circuit_close_accepted(io, source_stream, leg),
                         Err(error) => {
-                            let peer_id = peer_id.clone();
+                            let peer_id = *peer_id;
                             self.close_circuit(
                                 io,
                                 source_stream,
@@ -2196,7 +2191,7 @@ impl RelayServerAgent {
                     Some(unsent)
                 }
                 Err(error) => {
-                    let peer_id = peer_id.clone();
+                    let peer_id = *peer_id;
                     self.close_circuit(
                         io,
                         source_stream,
@@ -2300,11 +2295,11 @@ impl RelayServerAgent {
             _ => (true, true),
         };
         if reset_source {
-            let peer = circuit.leg_peer(CircuitLeg::Source).clone();
+            let peer = *circuit.leg_peer(CircuitLeg::Source);
             self.reset(io, peer, circuit.source_stream);
         }
         if reset_destination {
-            let peer = circuit.leg_peer(CircuitLeg::Destination).clone();
+            let peer = *circuit.leg_peer(CircuitLeg::Destination);
             self.reset(io, peer, circuit.destination_stream);
         }
         // Bytes still queued were never forwarded; release the origins'
@@ -2384,11 +2379,7 @@ impl RelayServerAgent {
     /// Decides a RESERVE and, once the transport takes its success reply,
     /// commits the reservation.
     fn decide_reservation(&mut self, io: &mut Io<'_>, key: StreamKey) {
-        let Some(peer_id) = self
-            .hop_workers
-            .get(&key)
-            .map(|worker| worker.peer_id.clone())
-        else {
+        let Some(peer_id) = self.hop_workers.get(&key).map(|worker| worker.peer_id) else {
             return;
         };
         let now = io.now;
@@ -2463,7 +2454,7 @@ impl RelayServerAgent {
                 .saturating_add(self.config.reservation_duration_secs);
             self.insert_reservation(
                 io,
-                peer_id.clone(),
+                peer_id,
                 ReservationRecord {
                     conn_id: key.conn_id,
                     ip,
@@ -2474,8 +2465,8 @@ impl RelayServerAgent {
             // A CONNECT to this peer waiting on a member's snapshot can use
             // the new local reservation now, rather than time out on the
             // wait. A peer with no circuit (the usual renewal) has none.
-            let waiting_for = (self.mesh.is_some() && self.peer_circuit_count(&peer_id) > 0)
-                .then(|| peer_id.clone());
+            let waiting_for =
+                (self.mesh.is_some() && self.peer_circuit_count(&peer_id) > 0).then_some(peer_id);
             self.events
                 .push_back(RelayServerEvent::ReservationAccepted {
                     peer_id,
@@ -2515,7 +2506,7 @@ impl RelayServerAgent {
         let mut addrs = Vec::new();
         for address in self.selected_addrs() {
             let mut advertised = address.clone();
-            advertised.push(Protocol::P2p(self.local_peer_id.clone()));
+            advertised.push(Protocol::P2p(self.local_peer_id));
             addrs.push(advertised.to_bytes());
         }
         let limit = circuit_limit(&self.config);
@@ -2569,11 +2560,7 @@ impl RelayServerAgent {
     /// `StreamReady`. A mesh node with no local reservation resolves the
     /// CONNECT across the mesh instead.
     fn decide_connect(&mut self, io: &mut Io<'_>, key: StreamKey, destination_peer_id: PeerId) {
-        let Some(source_peer_id) = self
-            .hop_workers
-            .get(&key)
-            .map(|worker| worker.peer_id.clone())
-        else {
+        let Some(source_peer_id) = self.hop_workers.get(&key).map(|worker| worker.peer_id) else {
             return;
         };
         let now_ms = io.now_ms();
@@ -2710,13 +2697,13 @@ impl RelayServerAgent {
             // Opens are peer-scoped: this one landed on a connection that
             // replaced the reservation's.
             Ok(stream) => {
-                self.retire_stop(io, destination.clone(), stream, false);
+                self.retire_stop(io, *destination, stream, false);
                 Err(Status::NoReservation)
             }
             Err(detail) => {
                 self.runtime_error(
                     RelayServerRuntimeErrorKind::OpenStream,
-                    Some(destination.clone()),
+                    Some(*destination),
                     detail,
                 );
                 Err(Status::ConnectionFailed)
@@ -2748,7 +2735,7 @@ impl RelayServerAgent {
         let Some(worker) = self.hop_workers.get(&key) else {
             return;
         };
-        let leg_peer = worker.peer_id.clone();
+        let leg_peer = worker.peer_id;
         let Responder::Forward { source, .. } = &worker.responder else {
             self.events.push_back(RelayServerEvent::CircuitDenied {
                 source_peer_id: leg_peer,
@@ -2759,7 +2746,7 @@ impl RelayServerAgent {
             return;
         };
         self.events.push_back(RelayServerEvent::CircuitDenied {
-            source_peer_id: source.clone().unwrap_or_else(|| leg_peer.clone()),
+            source_peer_id: (*source).unwrap_or(leg_peer),
             destination_peer_id,
             status,
         });
@@ -2802,7 +2789,7 @@ impl RelayServerAgent {
             self.stop_to_source.remove(&stream);
             self.retire_stop(
                 io,
-                circuit.destination_leg_peer().clone(),
+                *circuit.destination_leg_peer(),
                 stream,
                 circuit.destination_ready(),
             );
@@ -2823,7 +2810,7 @@ impl RelayServerAgent {
     /// closes.
     fn retire_stop(&mut self, io: &mut Io<'_>, peer_id: PeerId, stream: StreamKey, ready: bool) {
         if ready {
-            self.reset(io, peer_id.clone(), stream);
+            self.reset(io, peer_id, stream);
         }
         self.retired_stops
             .insert(stream, RetiredStop { peer_id, ready });
@@ -2845,8 +2832,8 @@ impl RelayServerAgent {
         error: RelaySwarmError,
     ) {
         self.remove_hop_worker(stream);
-        self.rejected_hop_streams.insert(stream, peer_id.clone());
-        self.reset(io, peer_id.clone(), stream);
+        self.rejected_hop_streams.insert(stream, peer_id);
+        self.reset(io, peer_id, stream);
         self.runtime_error(
             RelayServerRuntimeErrorKind::SendStream,
             Some(peer_id),
@@ -2888,12 +2875,12 @@ impl RelayServerAgent {
     ) {
         self.ip_tally.add(record.ip.as_ref(), Held::Reservations);
         let expires_unix = record.expires_unix;
-        if let Some(replaced) = self.reservations.insert(peer_id.clone(), record) {
+        if let Some(replaced) = self.reservations.insert(peer_id, record) {
             self.ip_tally
                 .remove(replaced.ip.as_ref(), Held::Reservations);
         }
         self.publish(io, || DirectoryMessage::Present {
-            peer: peer_id.clone(),
+            peer: peer_id,
             expires_unix,
         });
         self.reservation_deadlines.set(peer_id, deadline_ms);
@@ -2907,9 +2894,7 @@ impl RelayServerAgent {
         if let Some(removed) = self.reservations.remove(peer_id) {
             self.ip_tally
                 .remove(removed.ip.as_ref(), Held::Reservations);
-            self.publish(io, || DirectoryMessage::Gone {
-                peer: peer_id.clone(),
-            });
+            self.publish(io, || DirectoryMessage::Gone { peer: *peer_id });
         }
     }
 
@@ -2978,7 +2963,7 @@ impl RelayServerAgent {
         destination_ip: Option<&IpKey>,
     ) {
         for peer in circuit_endpoints(source, destination) {
-            *self.peer_circuits.entry(peer.clone()).or_default() += 1;
+            *self.peer_circuits.entry(*peer).or_default() += 1;
         }
         self.hold_circuit_ips(source_ip, destination_ip);
     }
@@ -3094,7 +3079,7 @@ impl RelayServerAgent {
             );
         for (source, destination) in endpoints {
             for peer in circuit_endpoints(source, destination) {
-                *peer_circuits.entry(peer.clone()).or_insert(0) += 1;
+                *peer_circuits.entry(*peer).or_insert(0) += 1;
             }
         }
         assert_eq!(peer_circuits, self.peer_circuits);

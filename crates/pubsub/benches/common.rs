@@ -102,14 +102,14 @@ fn join_peer(agent: &mut GossipsubAgent, index: u16, topics: &[String]) {
 
     agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id,
         },
         0,
     );
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id,
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.into()],
         },
@@ -134,7 +134,7 @@ fn join_peer(agent: &mut GossipsubAgent, index: u16, topics: &[String]) {
     agent.stream_open_result(&remote, token, Ok(outbound), 0);
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id,
             stream_id: outbound,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.into(),
@@ -146,7 +146,7 @@ fn join_peer(agent: &mut GossipsubAgent, index: u16, topics: &[String]) {
 
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id,
             stream_id: inbound,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.into(),
@@ -429,7 +429,7 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
             gossip
                 .entry(topic)
                 .or_default()
-                .entry(peer.clone())
+                .entry(peer)
                 .or_default()
                 .extend(ihave.message_ids);
         }

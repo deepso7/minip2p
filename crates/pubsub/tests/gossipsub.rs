@@ -73,7 +73,7 @@ fn inbound_bytes_are_acknowledged_once_their_frame_is_decoded() {
         .encode(),
     );
     let data = |bytes: &[u8]| SwarmEvent::StreamData {
-        peer_id: remote.clone(),
+        peer_id: remote,
         conn_id: ConnectionId::new(1),
         stream_id: stream,
         data: Bytes::copy_from_slice(bytes),
@@ -90,7 +90,7 @@ fn inbound_bytes_are_acknowledged_once_their_frame_is_decoded() {
     assert!(agent.handle_event(&data(head), 0));
     assert!(agent.handle_event(
         &SwarmEvent::StreamClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: stream,
         },
@@ -110,14 +110,14 @@ fn drain_events(agent: &mut GossipsubAgent) -> Vec<GossipsubEvent> {
 fn connect(agent: &mut GossipsubAgent, peer: &PeerId, protocols: &[&str], now_ms: u64) {
     agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id: ConnectionId::new(1),
         },
         now_ms,
     );
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id: ConnectionId::new(1),
             protocols: protocols.iter().map(|id| (*id).to_string()).collect(),
         },
@@ -146,7 +146,7 @@ fn make_ready(
     agent.stream_open_result(peer, token, Ok(stream_id), now_ms);
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id: ConnectionId::new(1),
             stream_id,
             protocol_id: negotiated.to_string(),
@@ -171,7 +171,7 @@ fn inbound_open_on(
 ) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id,
             stream_id,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.to_string(),
@@ -201,7 +201,7 @@ fn inbound_rpc_on(
 ) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamData {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             conn_id,
             stream_id,
             data: Bytes::from(encode_frame(&rpc.encode())),
@@ -354,7 +354,7 @@ fn prefers_v11_but_encodes_for_the_actually_negotiated_version() {
     agent.stream_open_result(&remote, token, Ok(stream), 1);
     agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: stream,
             protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
@@ -401,7 +401,7 @@ fn join_promotes_known_peer_and_sender_stays_long_lived() {
     drain_events(&mut agent);
 
     agent.subscribe("room", 1).unwrap();
-    assert_eq!(agent.mesh_peers("room"), vec![remote.clone()]);
+    assert_eq!(agent.mesh_peers("room"), vec![remote]);
     let subscription = drain_actions(&mut agent);
     let rpc = decode_rpc(&sent(&subscription).unwrap().0);
     assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
@@ -449,7 +449,7 @@ fn a_full_send_holds_its_tail_until_writable_and_blocks_later_frames() {
     let remote = peer(2);
     let stream = StreamId::new(4);
     let writable = SwarmEvent::StreamWritable {
-        peer_id: remote.clone(),
+        peer_id: remote,
         conn_id: ConnectionId::new(1),
         stream_id: stream,
     };
@@ -570,7 +570,7 @@ fn unannounced_or_excess_graft_is_pruned_immediately() {
         },
         2,
     );
-    assert_eq!(agent.mesh_peers("room"), vec![first.clone()]);
+    assert_eq!(agent.mesh_peers("room"), vec![first]);
 
     let excess = peer(3);
     connect(&mut agent, &excess, &[MESHSUB_PROTOCOL_ID_V11], 3);
@@ -779,7 +779,7 @@ fn heartbeat_repairs_mesh_and_received_prune_blocks_regraft() {
     drain_events(&mut agent);
 
     agent.handle_tick(1_010);
-    assert_eq!(agent.mesh_peers("room"), vec![remote.clone()]);
+    assert_eq!(agent.mesh_peers("room"), vec![remote]);
     let graft = drain_actions(&mut agent);
     ack(&mut agent, &remote, &graft, 1_010);
     drain_actions(&mut agent);
@@ -1027,7 +1027,7 @@ fn stale_close_of_a_failed_stream_keeps_the_ready_replacement_sending() {
     // The old stream's close arrives late, after stream 8 is ready.
     assert!(agent.handle_event(
         &SwarmEvent::StreamClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(4),
         },
@@ -1066,7 +1066,7 @@ fn stream_reopen_resyncs_an_acked_unsubscribe() {
     drain_actions(&mut agent);
     agent.handle_event(
         &SwarmEvent::StreamClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(4),
         },
@@ -1101,7 +1101,7 @@ fn write_stop_resets_the_outbound_stream_and_is_claimed_on_inbound() {
     drain_actions(&mut agent);
 
     let stopped = |stream_id| SwarmEvent::StreamWriteStopped {
-        peer_id: remote.clone(),
+        peer_id: remote,
         conn_id: ConnectionId::new(1),
         stream_id,
         error_code: 0,
@@ -1160,7 +1160,7 @@ fn disconnect_preserves_backoff_and_replacement_reannounces_subscriptions() {
 
     agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             reason: ConnectionCloseReason::Local,
         },
@@ -1194,15 +1194,17 @@ fn disconnect_preserves_backoff_and_replacement_reannounces_subscriptions() {
 
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: remote.clone(),
+            peer_id: remote,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         6,
     );
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(2),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
@@ -1276,7 +1278,7 @@ fn queued_prune_reencodes_for_v10_after_stream_reopen() {
 
     agent.handle_event(
         &SwarmEvent::StreamClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(4),
         },
@@ -1284,7 +1286,7 @@ fn queued_prune_reencodes_for_v10_after_stream_reopen() {
     );
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
         },
@@ -1304,7 +1306,7 @@ fn queued_prune_reencodes_for_v10_after_stream_reopen() {
     agent.stream_open_result(&remote, token, Ok(stream), 4);
     agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id: stream,
             protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
@@ -1543,7 +1545,7 @@ fn v11_leave_prune_carries_backoff() {
         },
         2,
     );
-    assert_eq!(agent.mesh_peers("room"), vec![remote.clone()]);
+    assert_eq!(agent.mesh_peers("room"), vec![remote]);
 
     agent.unsubscribe("room", 3);
     let unsubscribe = drain_actions(&mut agent);
@@ -1608,7 +1610,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     )));
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
@@ -1636,7 +1638,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     )));
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
@@ -1671,7 +1673,7 @@ fn disconnect_and_replace_aggregate_queued_failures() {
 
     agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            peer_id: first.clone(),
+            peer_id: first,
             conn_id: ConnectionId::new(1),
             reason: ConnectionCloseReason::Local,
         },
@@ -1679,9 +1681,11 @@ fn disconnect_and_replace_aggregate_queued_failures() {
     );
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: second.clone(),
+            peer_id: second,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         2,
     );
@@ -1719,9 +1723,11 @@ fn replaced_connection_waits_for_new_peer_ready_before_reannouncing() {
 
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: remote.clone(),
+            peer_id: remote,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         1,
     );
@@ -1734,7 +1740,7 @@ fn replaced_connection_waits_for_new_peer_ready_before_reannouncing() {
 
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(2),
             protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
         },
@@ -1753,7 +1759,7 @@ fn replaced_connection_waits_for_new_peer_ready_before_reannouncing() {
     agent.stream_open_result(&remote, token, Ok(stream_id), 2_000);
     agent.handle_event(
         &SwarmEvent::StreamReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(2),
             stream_id,
             protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
@@ -1898,7 +1904,7 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
     let selected = sent_first
         .iter()
         .find_map(|action| match action {
-            GossipsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            GossipsubAction::SendStream { peer, .. } => Some(*peer),
             _ => None,
         })
         .unwrap();
@@ -1910,7 +1916,7 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
     let reselected = sent_second
         .iter()
         .find_map(|action| match action {
-            GossipsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            GossipsubAction::SendStream { peer, .. } => Some(*peer),
             _ => None,
         })
         .unwrap();
@@ -1932,9 +1938,11 @@ fn replacement_drops_undrained_actions_for_the_old_connection() {
     // Both peers' opens are still queued when `remote` is handed over.
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: remote.clone(),
+            peer_id: remote,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         1,
     );
@@ -1970,9 +1978,11 @@ fn subscription_events(events: &[GossipsubEvent], of: &PeerId) -> Vec<String> {
 fn replace(agent: &mut GossipsubAgent, peer: &PeerId, now_ms: u64) {
     agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: peer.clone(),
+            peer_id: *peer,
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         now_ms,
     );
@@ -1989,7 +1999,7 @@ fn subscription_events_stay_balanced_across_a_replacement() {
     replace(&mut agent, &remote, 2);
     agent.handle_event(
         &SwarmEvent::PeerReady {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(2),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
@@ -2017,7 +2027,7 @@ fn connection_close_unsubscribes_every_announced_topic() {
 
     agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            peer_id: remote.clone(),
+            peer_id: remote,
             conn_id: ConnectionId::new(1),
             reason: ConnectionCloseReason::Local,
         },

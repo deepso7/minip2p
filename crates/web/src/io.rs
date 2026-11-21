@@ -92,6 +92,9 @@ enum JsEvent {
         stream: u32,
         bytes: u32,
     },
+    WriteClosed {
+        stream: u32,
+    },
 }
 
 impl From<JsEvent> for IoEvent {
@@ -143,6 +146,7 @@ impl From<JsEvent> for IoEvent {
                 stream: stream(id),
                 bytes: bytes as usize,
             },
+            JsEvent::WriteClosed { stream: id } => Self::WriteClosed { stream: stream(id) },
         }
     }
 }

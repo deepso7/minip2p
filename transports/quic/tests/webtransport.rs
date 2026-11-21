@@ -113,7 +113,7 @@ fn drive(
 
 fn connected(events: &[TransportEvent]) -> Option<(ConnectionId, ConnectionEndpoint)> {
     events.iter().find_map(|event| match event {
-        TransportEvent::Connected { id, endpoint } => Some((*id, endpoint.clone())),
+        TransportEvent::Connected { id, endpoint } => Some((*id, (**endpoint).clone())),
         _ => None,
     })
 }

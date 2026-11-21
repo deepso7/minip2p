@@ -1,6 +1,6 @@
 {
   "name": "@minip2p/web",
-  "version": "0.11.11",
+  "version": "0.13.0",
   "description": "Browser SDK for minip2p over libp2p WebTransport",
   "keywords": [
     "browser",
@@ -48,6 +48,7 @@
       "types": "./dist/manual.d.ts",
       "default": "./dist/manual.js"
     },
+    "./wasm": "./wasm/minip2p_web_bg.wasm",
     "./package.json": "./package.json"
   },
   "publishConfig": {

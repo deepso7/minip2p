@@ -11,17 +11,19 @@
 //! and is tested natively.
 
 use minip2p::{
-    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
-    EndpointEvent, GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
-    PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
+    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair, ManualClock,
+    NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint, PortableEndpointBuilder,
+    ReservationPolicy, Transport,
 };
+#[cfg(feature = "pubsub")]
+use minip2p_ffi_core::map_gossipsub_error;
 use minip2p_ffi_core::{
-    CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, EndpointConfig, EventCarry,
-    FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent, PUMP_DRAIN_LIMIT, PathKind,
-    Reachability, RelayReservationInfo, UnfinishedConnection, convert_endpoint_event,
-    convert_identify, convert_path, convert_reachability, driver_failure_kind, keypair_from_bytes,
-    map_driver_error, map_gossipsub_error, map_write_error, parse_connect_target,
-    parse_direct_peer_addr, parse_peer_id, stream_writer, write_accepted_event,
+    BINDING_WRITE_BUDGET, CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo,
+    EndpointConfig, EventCarry, FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent,
+    PUMP_DRAIN_LIMIT, PathKind, Reachability, RelayReservationInfo, UnfinishedConnection,
+    convert_endpoint_event, convert_identify, convert_path, convert_reachability,
+    driver_failure_kind, keypair_from_bytes, map_driver_error, parse_connect_target,
+    parse_direct_peer_addr, parse_peer_id, send_whole, stream_key,
 };
 
 use crate::WebEntropy;
@@ -37,25 +39,19 @@ pub struct Pumped {
 }
 
 /// The endpoint a [`Host`] drives: `T` behind a circuit transport.
-type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy>;
-
-/// The endpoint with its pending stream writes, released together.
-struct Live<T: Transport> {
-    endpoint: HostEndpoint<T>,
-    writes: minip2p::StreamWriter,
-}
+type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy, ManualClock>;
 
 enum Lifecycle<T: Transport> {
     /// Commands work; [`Host::pump`] does nothing yet.
-    Created(Live<T>),
-    Running(Live<T>),
+    Created(HostEndpoint<T>),
+    Running(HostEndpoint<T>),
     /// Closed or failed: the endpoint is released.
     Stopped,
 }
 
 impl<T: Transport> Lifecycle<T> {
     /// The endpoint while it accepts commands: created or running.
-    fn live(&mut self) -> Result<&mut Live<T>, FfiError> {
+    fn live(&mut self) -> Result<&mut HostEndpoint<T>, FfiError> {
         match self {
             Self::Created(live) | Self::Running(live) => Ok(live),
             Self::Stopped => Err(FfiError::Stopped),
@@ -63,8 +59,8 @@ impl<T: Transport> Lifecycle<T> {
     }
 }
 
-/// A browser endpoint: the portable endpoint, its pending stream writes, and
-/// the carry its events wait in until the binding drains them.
+/// A browser endpoint: the portable endpoint and the carry its events wait
+/// in until the binding drains them.
 pub struct Host<T: Transport> {
     peer_id: String,
     lifecycle: Lifecycle<T>,
@@ -92,17 +88,22 @@ impl<T: Transport> Host<T> {
             .iter()
             .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut builder = PortableEndpointBuilder::new(&keypair, WebEntropy)
-            .agent_version(
-                config
-                    .agent_version
-                    .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
-            )
-            .gossipsub_config(GossipsubConfig {
+        let mut builder =
+            PortableEndpointBuilder::new(&keypair, WebEntropy, ManualClock::default())
+                .agent_version(
+                    config
+                        .agent_version
+                        .unwrap_or_else(|| format!("minip2p-web/{}", env!("CARGO_PKG_VERSION"))),
+                )
+                .timeouts(config.timeouts.map(Into::into).unwrap_or_default())
+                .write_budget(BINDING_WRITE_BUDGET);
+        #[cfg(feature = "pubsub")]
+        {
+            builder = builder.gossipsub_config(minip2p::GossipsubConfig {
                 allow_unsigned: config.allow_unsigned,
-                ..GossipsubConfig::default()
-            })
-            .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
+                ..minip2p::GossipsubConfig::default()
+            });
+        }
         // `force_relay` without a relay still submits the config, so the
         // endpoint's validation refuses it rather than dropping the flag.
         if !relays.is_empty() || config.force_relay {
@@ -118,26 +119,18 @@ impl<T: Transport> Host<T> {
         for relay in relays {
             builder = builder.relay(relay);
         }
-        let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
-        let mut endpoint = builder
-            .build_with_circuits(circuits)
-            .map_err(map_build_error)?;
         // The binding acknowledges stream data as its reader consumes it
         // (`stream_consumed`), not as the pump pulls the event.
         for protocol in config.protocols {
-            endpoint
-                .add_manual_ack_protocol(protocol)
-                .map_err(|error| FfiError::InvalidConfig {
-                    capability: ConfigCapability::Options,
-                    detail: error.to_string(),
-                })?;
+            builder = builder.manual_ack_protocol(protocol);
         }
+        let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
+        let endpoint = builder
+            .build_with_circuits(circuits)
+            .map_err(map_build_error)?;
         Ok(Self {
             peer_id: keypair.peer_id().to_base58(),
-            lifecycle: Lifecycle::Created(Live {
-                endpoint,
-                writes: stream_writer(),
-            }),
+            lifecycle: Lifecycle::Created(endpoint),
             carry: EventCarry::default(),
             listen_addrs: Vec::new(),
         })
@@ -164,24 +157,24 @@ impl<T: Transport> Host<T> {
     /// `EndpointClosed` are carried, and every later command is
     /// [`FfiError::Stopped`].
     pub fn pump(&mut self, now: Now) -> Pumped {
-        let Lifecycle::Running(Live { endpoint, .. }) = &mut self.lifecycle else {
+        let Lifecycle::Running(endpoint) = &mut self.lifecycle else {
             return Pumped {
                 ring: false,
                 next_deadline: None,
             };
         };
-        match endpoint.poll(now) {
+        match endpoint.at(now).poll() {
             Ok(events) => {
                 let mut ring = false;
                 let mut events = events.into_iter().peekable();
                 // Each ingest takes a bounded batch, as the carry expects.
                 while events.peek().is_some() {
                     let batch: Vec<_> = events.by_ref().take(PUMP_DRAIN_LIMIT).collect();
-                    let converted = self.convert(batch, now);
-                    ring |= self.ingest(converted);
+                    let converted = batch.into_iter().filter_map(convert_endpoint_event);
+                    ring |= self.ingest(converted.collect());
                 }
-                let next_deadline = match &self.lifecycle {
-                    Lifecycle::Running(live) => live.endpoint.next_deadline(now),
+                let next_deadline = match &mut self.lifecycle {
+                    Lifecycle::Running(endpoint) => endpoint.at(now).next_deadline(),
                     Lifecycle::Created(_) | Lifecycle::Stopped => None,
                 };
                 Pumped {
@@ -261,33 +254,64 @@ impl<T: Transport> Host<T> {
     }
 
     /// Subscribes to a pubsub topic.
+    #[cfg(feature = "pubsub")]
     pub fn subscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
-            .subscribe(&topic, now)
+            .at(now)
+            .subscribe(&topic)
             .map_err(map_gossipsub_error)
     }
 
     /// Withdraws a pubsub subscription.
+    #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: String, now: Now) -> Result<bool, FfiError> {
         self.endpoint()?
-            .unsubscribe(&topic, now)
+            .at(now)
+            .unsubscribe(&topic)
             .map_err(map_gossipsub_error)
     }
 
     /// Publishes one pubsub payload.
+    #[cfg(feature = "pubsub")]
     pub fn publish(&mut self, topic: String, data: Vec<u8>, now: Now) -> Result<(), FfiError> {
         if data.len() > minip2p_pubsub::MAX_RPC_SIZE {
             return Err(FfiError::MessageTooLarge);
         }
         self.endpoint()?
-            .publish(&topic, data, now)
+            .at(now)
+            .publish(&topic, data)
             .map_err(map_gossipsub_error)
+    }
+
+    /// Refuses: this build has no pubsub. The pubsub commands stay so the
+    /// JavaScript surface is the same with or without the feature.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn subscribe(&mut self, _topic: String, _now: Now) -> Result<bool, FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
+    }
+
+    /// Refuses: this build has no pubsub.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn unsubscribe(&mut self, _topic: String, _now: Now) -> Result<bool, FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
+    }
+
+    /// Refuses: this build has no pubsub.
+    #[cfg(not(feature = "pubsub"))]
+    pub fn publish(&mut self, _topic: String, _data: Vec<u8>, _now: Now) -> Result<(), FfiError> {
+        self.endpoint()?;
+        Err(pubsub_not_built())
     }
 
     /// Sends an explicit ping; its result arrives as an event.
     pub fn ping(&mut self, peer_id: String, now: Now) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.endpoint()?.ping(&peer, now).map_err(map_driver_error)
+        self.endpoint()?
+            .at(now)
+            .ping(&peer)
+            .map_err(map_driver_error)
     }
 
     /// Registers an application protocol, acknowledged by the binding with
@@ -295,6 +319,7 @@ impl<T: Transport> Host<T> {
     pub fn add_protocol(&mut self, protocol_id: String) -> Result<(), FfiError> {
         self.endpoint()?
             .add_manual_ack_protocol(protocol_id)
+            .map(drop)
             .map_err(map_driver_error)
     }
 
@@ -309,7 +334,7 @@ impl<T: Transport> Host<T> {
     ) -> Result<(), FfiError> {
         let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
         self.endpoint()?
-            .stream_consumed(ConnectionId::new(conn_id), StreamId::new(stream_id), bytes)
+            .stream_consumed(stream_key(conn_id, stream_id), bytes)
             .map_err(map_driver_error)
     }
 
@@ -321,17 +346,15 @@ impl<T: Transport> Host<T> {
         now: Now,
     ) -> Result<OpenStreamResult, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        let (conn_id, stream_id) = self
+        let stream = self
             .endpoint()?
-            .open_stream(&peer, &protocol_id, now)
+            .at(now)
+            .open_stream(&peer, &protocol_id)
             .map_err(map_driver_error)?;
         // The binding knows this connection now, so the carry must not
         // elide its events, its end above all.
-        self.carry.mark_connection_seen(conn_id.as_u64());
-        Ok(OpenStreamResult {
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-        })
+        self.carry.mark_connection_seen(stream.conn_id().as_u64());
+        Ok(stream.into())
     }
 
     /// Sends one payload (see `P2pEndpoint::send_stream`): `true` once every
@@ -343,17 +366,11 @@ impl<T: Transport> Host<T> {
         data: Vec<u8>,
         now: Now,
     ) -> Result<bool, FfiError> {
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        writes
-            .write_at(
-                endpoint,
-                ConnectionId::new(conn_id),
-                StreamId::new(stream_id),
-                data,
-                now,
-            )
-            .map(|progress| progress == WriteProgress::Accepted)
-            .map_err(map_write_error)
+        send_whole(
+            self.endpoint()?.at(now),
+            stream_key(conn_id, stream_id),
+            data,
+        )
     }
 
     /// Half-closes a stream's write side, after any held tail.
@@ -363,26 +380,18 @@ impl<T: Transport> Host<T> {
         stream_id: u64,
         now: Now,
     ) -> Result<(), FfiError> {
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        writes
-            .close_write_at(
-                endpoint,
-                ConnectionId::new(conn_id),
-                StreamId::new(stream_id),
-                now,
-            )
-            .map_err(map_write_error)
+        self.endpoint()?
+            .at(now)
+            .close_stream_write(stream_key(conn_id, stream_id))
+            .map_err(map_driver_error)
     }
 
-    /// Resets a stream, forgetting its held tail once accepted.
+    /// Resets a stream, dropping its held tail once the reset is accepted.
     pub fn reset_stream(&mut self, conn_id: u64, stream_id: u64, now: Now) -> Result<(), FfiError> {
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        endpoint
-            .reset_stream(conn_id, stream_id, now)
-            .map_err(map_driver_error)?;
-        writes.forget(conn_id, stream_id);
-        Ok(())
+        self.endpoint()?
+            .at(now)
+            .reset_stream(stream_key(conn_id, stream_id))
+            .map_err(map_driver_error)
     }
 
     /// Resets and forgets a stream, dropping its events still carried (see
@@ -394,21 +403,22 @@ impl<T: Transport> Host<T> {
         now: Now,
     ) -> Result<(), FfiError> {
         let (raw_conn, raw_stream) = (conn_id, stream_id);
-        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        let Live { endpoint, writes } = self.lifecycle.live()?;
-        let abandoned = endpoint.abandon_stream(conn_id, stream_id, now);
-        if abandoned.is_err() && !self.carry.holds_stream_close(raw_conn, raw_stream) {
+        let stream = stream_key(conn_id, stream_id);
+        let endpoint = self.lifecycle.live()?;
+        let abandoned = endpoint.at(now).abandon_stream(stream);
+        let Some(dropped_data) = self
+            .carry
+            .abandon_stream(raw_conn, raw_stream, abandoned.is_ok())
+        else {
             return abandoned.map_err(map_driver_error);
-        }
-        let dropped_data = self.carry.remove_stream(raw_conn, raw_stream);
-        // Never drained, so never acknowledged: after a reset this is moot,
-        // and a stream closed on a live connection is released by it.
+        };
+        // After a reset this is moot, and a stream closed on a live
+        // connection is released by it.
         if dropped_data > 0 {
-            match endpoint.stream_consumed(conn_id, stream_id, dropped_data) {
+            match endpoint.stream_consumed(stream, dropped_data) {
                 Ok(()) | Err(_) => {}
             }
         }
-        writes.forget(conn_id, stream_id);
         Ok(())
     }
 
@@ -416,7 +426,8 @@ impl<T: Transport> Host<T> {
     pub fn connect(&mut self, target: ConnectTarget, now: Now) -> Result<u64, FfiError> {
         let target = parse_connect_target(target)?;
         self.endpoint()?
-            .connect(target, now)
+            .at(now)
+            .connect(target)
             .map(|id| id.as_u64())
             .map_err(|error| FfiError::InvalidAddress {
                 detail: error.to_string(),
@@ -426,7 +437,8 @@ impl<T: Transport> Host<T> {
     /// Cancels a Connection attempt; idempotent.
     pub fn cancel_connect(&mut self, id: u64, now: Now) -> Result<(), FfiError> {
         self.endpoint()?
-            .cancel_connect(ConnectId::from_u64(id), now);
+            .at(now)
+            .cancel_connect(ConnectId::from_u64(id));
         Ok(())
     }
 
@@ -434,7 +446,8 @@ impl<T: Transport> Host<T> {
     pub fn disconnect(&mut self, peer_id: String, now: Now) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.endpoint()?
-            .disconnect(&peer, now)
+            .at(now)
+            .disconnect(&peer)
             .map_err(map_driver_error)
     }
 
@@ -487,24 +500,7 @@ impl<T: Transport> Host<T> {
     }
 
     fn endpoint(&mut self) -> Result<&mut HostEndpoint<T>, FfiError> {
-        Ok(&mut self.lifecycle.live()?.endpoint)
-    }
-
-    /// Converts one batch: each event's held write is followed first, so a
-    /// Writable that settles a write reports it right after the event.
-    fn convert(&mut self, batch: Vec<EndpointEvent>, now: Now) -> Vec<P2pEvent> {
-        let Ok(Live { endpoint, writes }) = self.lifecycle.live() else {
-            return Vec::new();
-        };
-        let mut converted = Vec::with_capacity(batch.len());
-        for event in batch {
-            let settled = writes
-                .observe_at(endpoint, &event, now)
-                .map(write_accepted_event);
-            converted.extend(convert_endpoint_event(event));
-            converted.extend(settled);
-        }
-        converted
+        self.lifecycle.live()
     }
 
     /// Ingests one batch, following the listen set, and returns whether to
@@ -523,11 +519,14 @@ impl<T: Transport> Host<T> {
     /// `EndpointClosed`.
     fn shut_down(&mut self, now: Now, failure: Option<P2pEvent>) -> bool {
         let endpoint = match core::mem::replace(&mut self.lifecycle, Lifecycle::Stopped) {
-            Lifecycle::Created(live) | Lifecycle::Running(live) => Some(live.endpoint),
+            Lifecycle::Created(endpoint) | Lifecycle::Running(endpoint) => Some(endpoint),
             Lifecycle::Stopped => None,
         };
         let failed = failure.is_some();
-        let report = endpoint.map(|endpoint| endpoint.shutdown(now));
+        let report = endpoint.map(|mut endpoint| {
+            endpoint.at(now);
+            endpoint.close()
+        });
         let mut events: Vec<P2pEvent> = failure.into_iter().collect();
         let closed = match report {
             Some(report) => {
@@ -572,6 +571,15 @@ fn closed_event(
     }
 }
 
+/// The refusal pubsub commands get from a build without the `pubsub` feature.
+#[cfg(not(feature = "pubsub"))]
+fn pubsub_not_built() -> FfiError {
+    FfiError::NotPermitted {
+        detail: "this build of minip2p-web has no pubsub; build it with the `pubsub` feature"
+            .into(),
+    }
+}
+
 /// Rejects configuration a browser cannot run, each with the reason.
 fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
     let reject = |capability, detail: &str| {
@@ -584,6 +592,13 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
         return reject(
             ConfigCapability::Options,
             "browsers cannot listen; omit listen and configure relays (a browser is reached at its /p2p-circuit address through a relay reservation)",
+        );
+    }
+    #[cfg(not(feature = "pubsub"))]
+    if config.allow_unsigned {
+        return reject(
+            ConfigCapability::Gossipsub,
+            "this build of minip2p-web has no pubsub; omit allowUnsigned, or build it with the `pubsub` feature",
         );
     }
     if config.mdns.is_some() {
@@ -622,6 +637,7 @@ fn map_build_error(error: PortableBuildError) -> FfiError {
                 detail,
             }
         }
+        #[cfg(feature = "pubsub")]
         PortableBuildError::Gossipsub(_) | PortableBuildError::Topic(_) => {
             FfiError::InvalidConfig {
                 capability: ConfigCapability::Gossipsub,

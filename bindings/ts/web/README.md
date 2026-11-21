@@ -22,7 +22,7 @@ A native node serves browsers by listening on a `/…/quic-v1/webtransport` addr
 ## Loading the wasm
 
 - **`@minip2p/web`** loads its `.wasm` (resolved from `import.meta.url`, so bundlers emit it as an asset) with top-level `await`. Once the import resolves, `Minip2p.create` is synchronous, as in Node. Bundlers need an `es2022` target for the top-level `await`; Vite also needs `optimizeDeps.exclude: ["@minip2p/web"]` so pre-bundling keeps the package next to its `.wasm`.
-- **`@minip2p/web/manual`** exports the same API plus `initMinip2p({ wasm })` and fetches nothing at import: serve the `.wasm` yourself (a CDN, a strict CSP) and pass a URL, a `Response`, its bytes or a compiled `WebAssembly.Module`. `Minip2p.create` throws until `initMinip2p` has resolved.
+- **`@minip2p/web/manual`** exports the same API plus `initMinip2p({ wasm })` and fetches nothing at import: serve the `.wasm` yourself (a CDN, a strict CSP) and pass a URL, a `Response`, its bytes or a compiled `WebAssembly.Module`. `Minip2p.create` throws until `initMinip2p` has resolved. The package exports the `.wasm` as `@minip2p/web/wasm`, so a bundler can hand you its URL (Vite: `import wasm from "@minip2p/web/wasm?url"`).
 
 ## What works in a browser
 
@@ -41,7 +41,7 @@ Other limits:
 
 - Only WebTransport addresses dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. An address with certhashes pins the node's self-signed certificates. One without, such as `/dns/relay.example.com/udp/443/quic-v1/webtransport/p2p/12D3KooW…`, expects a CA-signed certificate for that domain, which the browser verifies as it would for any HTTPS page.
 - `listenAddrs()` is always empty (a reservation is `circuitAddress`), `knownPeers()` is empty and `reachability()` stays `unknown`.
-- `close()` closes every session at once with WebTransport's close capsule; its timeout is ignored. `setActive()` is ignored as well: the page's own timers drive the endpoint.
+- `close()` closes every session at once with WebTransport's close capsule, without flushing accepted writes first; its timeout is ignored. `setActive()` is ignored as well: the page's own timers drive the endpoint.
 - A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt.
 - A trapped wasm module (a Rust panic) fails the endpoint with `DriverFailedError`; its WebTransport sessions are closed from TypeScript, `close()` still resolves (`Failed`), and later calls throw `ClosedError`. Create a new endpoint to carry on.
 
@@ -59,7 +59,7 @@ pnpm test          # unit tests (runs wasm:build first)
 pnpm test:e2e      # Playwright: Chromium and Firefox against native nodes
 ```
 
-`wasm:build` regenerates `wasm/minip2p_web.js` and its `.d.ts`, the checked-in wasm-bindgen glue; commit them, CI fails when they are stale. The `.wasm` is a build output. The e2e suite needs `pnpm build:bindings`, the Node addon (`pnpm --filter @minip2p/node native:build`), the relay-server example (`cargo build -p minip2p-relay-server-example`) and `npx playwright install chromium firefox`.
+`wasm:build` regenerates `wasm/minip2p_web.js` and its `.d.ts`, the checked-in wasm-bindgen glue; commit them, CI fails when they are stale. The `.wasm` is a build output: about 1.4 MB raw, 310 KB with brotli. It ships without its `name` section; set `MINIP2P_WASM_NAMES=1` to keep the Rust function names in stack traces. Sizes, and a smaller build without pubsub, are covered in [`crates/web`](https://github.com/deepso7/minip2p/tree/main/crates/web#building). The e2e suite needs `pnpm build:bindings`, the Node addon (`pnpm --filter @minip2p/node native:build`), the relay-server example (`cargo build -p minip2p-relay-server-example`) and `npx playwright install chromium firefox`.
 
 `src/io.ts` is `JsIo`, the `WebTransportIo` seam the Rust client drives over the browser's `WebTransport`; [`crates/web`](https://github.com/deepso7/minip2p/tree/main/crates/web) is the Rust side.
 

@@ -27,4 +27,16 @@ cargo install wasm-bindgen-cli --version 0.2.128   # matches the pinned crate
 pnpm --filter @minip2p/web wasm:build                # cargo build + wasm-bindgen
 ```
 
-The build uses the workspace's `wasm-release` profile (`opt-level = "z"`, LTO, one codegen unit). `just check-wasm` lints the crate for wasm32.
+The build uses the workspace's `wasm-release` profile (`opt-level = "z"`, LTO, one codegen unit, `panic = "abort"`) and drops the module's `name` section. That section holds Rust function names and takes 62% of the raw bytes. `MINIP2P_WASM_NAMES=1` keeps it, for readable stack traces or `twiggy` profiling. `just check-wasm` lints the crate for wasm32.
+
+Sizes of `minip2p_web_bg.wasm` (gzip `-9`, brotli `11`):
+
+| Build                           | Raw       | gzip    | brotli  |
+| ------------------------------- | --------- | ------- | ------- |
+| default (`pubsub`)              | 1,438,574 | 409,111 | 308,935 |
+| `--no-default-features`         | 1,242,962 | 361,525 | 274,749 |
+| default, `MINIP2P_WASM_NAMES=1` | 3,813,658 | 585,219 | 404,338 |
+
+The default `pubsub` feature compiles in Gossipsub. Without it (`cargo build -p minip2p-web --no-default-features …`, then `wasm-bindgen` as `bindings/ts/web/scripts/build-wasm.mjs` runs it), the generated JavaScript glue is the same, `subscribe`, `unsubscribe` and `publish` refuse with `NotPermitted`, and `allowUnsigned` is rejected as `InvalidConfig`. That build suits apps that use only streams and relays. The published `@minip2p/web` package keeps `pubsub`.
+
+Most of the remaining code is generic collection code specialised for each key and value type (`BTreeMap`/`BTreeSet`, about 600 KB raw). Running `wasm-opt -Oz` (binaryen 132) cuts the raw size by 12% but grows the brotli size by 12%, so the build does not run it.

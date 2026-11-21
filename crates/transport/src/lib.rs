@@ -22,6 +22,7 @@ mod poll;
 mod send_caps;
 mod set;
 mod stream_id;
+mod stream_key;
 mod transport;
 mod unsettled;
 
@@ -39,6 +40,7 @@ pub use minip2p_core::Bytes;
 pub use send_caps::SendCaps;
 pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
+pub use stream_key::StreamKey;
 pub use transport::Transport;
 pub use unsettled::UnsettledConnections;
 

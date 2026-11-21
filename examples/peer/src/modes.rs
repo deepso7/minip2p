@@ -8,14 +8,13 @@
 //! `relayed → direct` hole-punch upgrade shows up as an RTT drop with an
 //! unbroken seq sequence.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BindError, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent,
-    EndpointWaitOutcome, NatEvent, Path, PeerAddr, PeerId, StreamId, StreamWriteError,
-    StreamWriter,
+    BindError, ConnectId, ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, NatEvent,
+    Path, PeerAddr, PeerId, SendError, StreamKey,
 };
 
 use minip2p_example_common::{
@@ -24,48 +23,15 @@ use minip2p_example_common::{
 
 use crate::cli::{DialTarget, RunOptions, print_event, print_identify};
 
-/// An echo stream: its connection and its id.
-type EchoStream = (ConnectionId, StreamId);
-
-/// What an echo stream still owes its peer beyond the writer's pending
-/// write: bytes that arrived while that write was pending, and whether the
-/// peer's FIN should be mirrored once they are sent.
-#[derive(Default)]
-struct Echo {
-    backlog: Vec<u8>,
-    close: bool,
-}
-
-/// The listener's echo streams and the writer that finishes their writes.
-struct Echoes {
-    streams: HashMap<EchoStream, Echo>,
-    writer: StreamWriter,
-}
-
-impl Default for Echoes {
-    fn default() -> Self {
-        Self {
-            streams: HashMap::new(),
-            writer: StreamWriter::new(ECHO_WRITE_BUDGET),
-        }
-    }
-}
+/// The listener's echo streams. The endpoint's write queue holds what a
+/// stream cannot take yet, in order, with the mirrored FIN behind it.
+type Echoes = HashSet<StreamKey>;
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Echo protocol: the listener returns every byte unchanged.
 const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 /// One ping frame: 8-byte seq (BE) ++ 8-byte send-timestamp millis (BE).
 const FRAME_LEN: usize = 16;
-/// The most bytes one echo stream may queue behind its pending write; a peer
-/// that sends more without reading is reset. Bytes arriving while nothing is
-/// pending go straight to the writer, within `ECHO_WRITE_BUDGET`.
-const ECHO_STREAM_LIMIT: usize = 64 * 1024;
-/// The most echo bytes the writer holds across every stream; a stream it
-/// cannot admit is reset like an overflowing one.
-const ECHO_WRITE_BUDGET: usize = 16 * 1024 * 1024;
-/// The most ping bytes a channel holds while its stream is full: room for
-/// every outstanding frame of a long run.
-const PING_WRITE_BUDGET: usize = 1024 * 1024;
 /// Cadence of the dialer's pings.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// Outlives the engine's 30 s connect deadline so the path wait can still
@@ -263,119 +229,61 @@ fn dispatch_listen_event(
 }
 
 fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &mut Echoes) {
-    // The writer follows every event first: it finishes held echoes on
-    // Writable and forgets the ones whose stream or connection ended.
-    if let Some(done) = echoes.writer.observe(endpoint, event) {
-        flush_echo(endpoint, (done.conn_id, done.stream_id), echoes);
-    }
     match event {
         EndpointEvent::StreamReady {
-            conn_id,
-            stream_id,
+            stream,
             protocol_id,
             initiated_locally: false,
             ..
         } if protocol_id == ECHO_PROTOCOL => {
-            echoes
-                .streams
-                .insert((*conn_id, *stream_id), Echo::default());
+            echoes.insert(*stream);
         }
-        EndpointEvent::StreamData {
-            conn_id,
-            stream_id,
-            data,
-            ..
-        } => {
-            let key = (*conn_id, *stream_id);
-            if let Some(echo) = echoes.streams.get_mut(&key) {
-                if echoes.writer.is_pending(*conn_id, *stream_id)
-                    && echo.backlog.len() + data.len() > ECHO_STREAM_LIMIT
-                {
-                    drop_echo(endpoint, key, echoes, "the peer is not reading its echo");
-                } else {
-                    echo.backlog.extend_from_slice(data);
-                    flush_echo(endpoint, key, echoes);
-                }
+        // The write queue keeps echoes in order behind what a slow reader
+        // has not taken yet; a peer that sends more than the endpoint's
+        // write budget holds without reading is reset.
+        EndpointEvent::StreamData { stream, data, .. } if echoes.contains(stream) => {
+            if let Err(e) = endpoint.send_stream(*stream, data.clone()) {
+                drop_echo(endpoint, *stream, echoes, &e.to_string());
             }
         }
-        EndpointEvent::StreamRemoteWriteClosed {
-            conn_id, stream_id, ..
-        } => {
-            let key = (*conn_id, *stream_id);
-            if let Some(echo) = echoes.streams.get_mut(&key) {
-                echo.close = true;
-                flush_echo(endpoint, key, echoes);
+        // Mirror the peer's FIN, behind every echo still queued.
+        EndpointEvent::StreamRemoteWriteClosed { stream, .. } if echoes.remove(stream) => {
+            if let Err(e) = endpoint.close_stream_write(*stream) {
+                drop_echo(endpoint, *stream, echoes, &e.to_string());
             }
         }
-        // A stopped write side can never carry the echo, so drop its backlog.
-        EndpointEvent::StreamWriteStopped {
-            conn_id, stream_id, ..
-        }
-        | EndpointEvent::StreamClosed {
-            conn_id, stream_id, ..
-        } => {
-            echoes.streams.remove(&(*conn_id, *stream_id));
+        EndpointEvent::StreamWriteStopped { stream, .. }
+        | EndpointEvent::StreamClosed { stream, .. } => {
+            echoes.remove(stream);
         }
         // A closed or replaced connection ends its streams without
         // per-stream `StreamClosed` events, so untrack them all here.
         EndpointEvent::ConnectionClosed { conn_id, .. }
         | EndpointEvent::ConnectionReplaced { old: conn_id, .. } => {
-            echoes.streams.retain(|(conn, _), _| conn != conn_id);
+            echoes.retain(|stream| stream.conn_id() != *conn_id);
         }
         _ => {}
     }
 }
 
-/// Sends an echo stream's backlog once its previous write is accepted, then
-/// mirrors the peer's FIN behind it. A full stream is not a dead one: the
-/// writer holds the unsent tail and this runs again on its acceptance.
-fn flush_echo(endpoint: &mut Endpoint, key: EchoStream, echoes: &mut Echoes) {
-    let (conn, stream) = key;
-    if echoes.writer.is_pending(conn, stream) {
-        return;
-    }
-    let Some(echo) = echoes.streams.get_mut(&key) else {
-        return;
-    };
-    let mut result = Ok(());
-    if !echo.backlog.is_empty() {
-        result = echoes
-            .writer
-            .write(endpoint, conn, stream, std::mem::take(&mut echo.backlog))
-            .map(drop);
-    }
-    if result.is_ok() && echo.close {
-        result = echoes.writer.close_write(endpoint, conn, stream);
-        echoes.streams.remove(&key);
-    }
-    if let Err(e) = result {
-        drop_echo(endpoint, key, echoes, &e.to_string());
-    }
-}
-
 /// Gives up on an echo stream: resets it, so the peer learns the echo
-/// stopped, and forgets what it still owed.
-fn drop_echo(endpoint: &mut Endpoint, key: EchoStream, echoes: &mut Echoes, why: &str) {
-    let (conn, stream) = key;
-    eprintln!("[listen] echo failed conn={conn} stream={stream}: {why}");
-    echoes.streams.remove(&key);
-    echoes.writer.forget(conn, stream);
+/// stopped, and drops what the endpoint still held for it.
+fn drop_echo(endpoint: &mut Endpoint, stream: StreamKey, echoes: &mut Echoes, why: &str) {
+    eprintln!("[listen] echo failed stream={stream}: {why}");
+    echoes.remove(&stream);
     // A stream that is already gone has nothing left to reset.
-    match endpoint.reset_stream(conn, stream) {
+    match endpoint.reset_stream(stream) {
         Ok(()) | Err(_) => {}
     }
 }
 
 // --- dial ------------------------------------------------------------------
 
-/// Where the dialer's ping frames currently travel.
+/// Where the dialer's ping frames currently travel. A frame the stream
+/// cannot take at once waits in the endpoint's write queue.
 struct Channel {
-    conn: ConnectionId,
-    stream: StreamId,
+    stream: StreamKey,
     direct: bool,
-    /// Holds a frame the stream could not take at once; dropped with the
-    /// channel when it is replaced.
-    writer: StreamWriter,
 }
 
 impl Channel {
@@ -383,22 +291,15 @@ impl Channel {
         if self.direct { "direct" } else { "relayed" }
     }
 
-    /// Whether a stream event names this channel's stream.
-    fn carries(&self, conn: ConnectionId, stream: StreamId) -> bool {
-        conn == self.conn && stream == self.stream
+    /// Sends `data`, leaving any unsent tail in the write queue. A full
+    /// stream is backpressure, not a dead channel.
+    fn send(&self, endpoint: &mut Endpoint, data: Vec<u8>) -> Result<(), SendError> {
+        endpoint.send_stream(self.stream, data)
     }
 
-    /// Sends `data`, leaving any unsent tail with the writer. A full stream
-    /// is backpressure, not a dead channel.
-    fn send(&mut self, endpoint: &mut Endpoint, data: Vec<u8>) -> Result<(), StreamWriteError> {
-        self.writer
-            .write(endpoint, self.conn, self.stream, data)
-            .map(drop)
-    }
-
-    /// Half-closes the channel, after any frame the writer still holds.
-    fn close_write(&mut self, endpoint: &mut Endpoint) -> Result<(), StreamWriteError> {
-        self.writer.close_write(endpoint, self.conn, self.stream)
+    /// Half-closes the channel, after any frame the queue still holds.
+    fn close_write(&self, endpoint: &mut Endpoint) -> Result<(), minip2p::Error> {
+        endpoint.close_stream_write(self.stream)
     }
 }
 
@@ -471,14 +372,14 @@ pub fn run_dial(
             let id = endpoint
                 .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
-            (peer.clone(), id)
+            (*peer, id)
         }
         DialTarget::Direct(addr) => {
             println!("[dial] target={addr}");
             let id = endpoint
                 .connect(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
-            (addr.peer_id().clone(), id)
+            (*addr.peer_id(), id)
         }
     };
 
@@ -656,7 +557,7 @@ fn open_echo_stream(
     endpoint: &mut Endpoint,
     peer: &PeerId,
     deadline: Instant,
-) -> Result<(ConnectionId, StreamId), Box<dyn Error>> {
+) -> Result<StreamKey, Box<dyn Error>> {
     while !endpoint.is_peer_ready(peer) {
         match endpoint
             .wait(deadline)
@@ -669,7 +570,7 @@ fn open_echo_stream(
             _ => {}
         }
     }
-    let (conn, stream) = endpoint
+    let stream = endpoint
         .open_stream(peer, ECHO_PROTOCOL)
         .map_err(|e| format!("open echo stream: {e}"))?;
     loop {
@@ -684,14 +585,13 @@ fn open_echo_stream(
         match &event {
             EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream: ready,
                 ..
-            } if peer_id == peer && *conn_id == conn && *stream_id == stream => {
-                return Ok((conn, stream));
+            } if peer_id == peer && *ready == stream => {
+                return Ok(stream);
             }
             EndpointEvent::ConnectionReplaced { peer_id, old, .. }
-                if peer_id == peer && *old == conn =>
+                if peer_id == peer && *old == stream.conn_id() =>
             {
                 print_event("dial", &event);
                 // A second punch connection just replaced the one this
@@ -743,14 +643,10 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    let (conn, stream) = open_echo_stream(endpoint, peer, deadline)?;
-    let mut channel = Channel {
-        conn,
-        stream,
+    let channel = Channel {
+        stream: open_echo_stream(endpoint, peer, deadline)?,
         direct: true,
-        writer: StreamWriter::new(PING_WRITE_BUDGET),
     };
-    // One write, so the stream's single pending write can hold it all.
     let resend: Vec<u8> = outstanding
         .iter()
         .flat_map(|&missing| encode_frame(missing, millis_since(start)))
@@ -809,7 +705,7 @@ fn ping_loop(
                 }
                 continue;
             }
-            if channel.writer.is_pending(channel.conn, channel.stream) {
+            if endpoint.is_write_pending(channel.stream) {
                 // The previous frame is still being accepted; skip a beat
                 // rather than queue behind it.
                 next_ping = next_ping_deadline(Instant::now());
@@ -866,15 +762,8 @@ fn ping_loop(
             continue;
         };
 
-        // A Writable finishes a held frame (and a deferred close behind it).
-        let _ = channel.writer.observe(endpoint, &event);
         match &event {
-            EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            } if channel.carries(*conn_id, *stream_id) => {
+            EndpointEvent::StreamData { stream, data, .. } if *stream == channel.stream => {
                 frames.push(data);
                 while let Some(frame) = frames.pop() {
                     let (pong_seq, sent_at_ms) = decode_frame(&frame);
@@ -899,12 +788,10 @@ fn ping_loop(
                     return Ok(());
                 }
             }
-            EndpointEvent::StreamRemoteWriteClosed {
-                conn_id, stream_id, ..
-            }
-            | EndpointEvent::StreamClosed {
-                conn_id, stream_id, ..
-            } if channel.carries(*conn_id, *stream_id) => {
+            EndpointEvent::StreamRemoteWriteClosed { stream, .. }
+            | EndpointEvent::StreamClosed { stream, .. }
+                if *stream == channel.stream =>
+            {
                 print_event("dial", &event);
                 if drain_deadline.is_some() {
                     stats.print_summary();

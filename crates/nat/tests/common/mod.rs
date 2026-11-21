@@ -8,9 +8,9 @@
     reason = "each integration test imports only the shared helpers it needs"
 )]
 
-use minip2p_autonat::{AutoNatServer, AutoNatServerOutput, ResponseStatus};
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
-use minip2p_dcutr::{
+use minip2p_nat::autonat::{AutoNatServer, AutoNatServerOutput, ResponseStatus};
+use minip2p_nat::dcutr::{
     FrameDecode, HolePunch, HolePunchType, decode_frame as dcutr_decode_frame,
     encode_frame as dcutr_encode_frame,
 };
@@ -232,7 +232,7 @@ pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, n
             let conn_id = ConnectionId::new(1);
             node.handle_event(
                 &SwarmEvent::ConnectionEstablished {
-                    peer_id: reporter.clone(),
+                    peer_id: *reporter,
                     conn_id,
                 },
                 false,
@@ -259,7 +259,7 @@ pub fn identify_observed_on(
         .or_insert_with(|| addr.clone());
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
-            peer_id: reporter.clone(),
+            peer_id: *reporter,
             conn_id,
             info: IdentifyMessage {
                 observed_addr: Some(addr.to_bytes()),
@@ -443,7 +443,7 @@ pub fn complete_promotion(
     let conn_id = promoted_circuit(actions);
     node.handle_event(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: target.clone(),
+            peer_id: *target,
             conn_id,
         },
         true,
@@ -474,10 +474,10 @@ impl Harness {
         let target = peer(b"target-peer");
         let relay = peer(b"relay-peer");
         let relay_addr =
-            PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).expect("valid relay addr");
+            PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay).expect("valid relay addr");
         config.relays = vec![relay_addr.clone()];
         config.reservation_policy = ReservationPolicy::Never;
-        let mut agent = Node::new(local.clone(), config);
+        let mut agent = Node::new(local, config);
         agent.set_listen_addrs(&[maddr(LISTEN_ADDR)]);
         Self {
             agent,
@@ -495,8 +495,8 @@ impl Harness {
         let target = peer(b"target-peer");
         let relay = peer(b"relay-peer");
         let relay_addr =
-            PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).expect("valid relay addr");
-        let mut agent = Node::new(local.clone(), config);
+            PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay).expect("valid relay addr");
+        let mut agent = Node::new(local, config);
         agent.set_listen_addrs(&[maddr(LISTEN_ADDR)]);
         Self {
             agent,
@@ -509,7 +509,7 @@ impl Harness {
     }
 
     pub fn start(&mut self, legs: ConnectLegs, now: Now) -> ConnectId {
-        self.start_peer(self.target.clone(), legs, now)
+        self.start_peer(self.target, legs, now)
     }
 
     pub fn start_peer(&mut self, peer: PeerId, legs: ConnectLegs, now: Now) -> ConnectId {
@@ -525,14 +525,14 @@ impl Harness {
         self.agent.handle_event(
             &SwarmEvent::ConnectionEstablished {
                 conn_id: minip2p_transport::ConnectionId::new(1),
-                peer_id: self.relay.clone(),
+                peer_id: self.relay,
             },
             false,
             now,
         );
         self.agent.handle_event(
             &SwarmEvent::PeerReady {
-                peer_id: self.relay.clone(),
+                peer_id: self.relay,
                 conn_id: ConnectionId::new(1),
                 protocols: vec![HOP_PROTOCOL_ID.to_string()],
             },
@@ -545,7 +545,7 @@ impl Harness {
         self.agent.handle_event(
             &SwarmEvent::StreamReady {
                 conn_id: minip2p_transport::ConnectionId::new(1),
-                peer_id: self.relay.clone(),
+                peer_id: self.relay,
                 stream_id: stream,
                 protocol_id: HOP_PROTOCOL_ID.to_string(),
                 initiated_locally: true,
@@ -559,7 +559,7 @@ impl Harness {
         self.agent.handle_event(
             &SwarmEvent::StreamData {
                 conn_id: minip2p_transport::ConnectionId::new(1),
-                peer_id: self.relay.clone(),
+                peer_id: self.relay,
                 stream_id: stream,
                 data: Bytes::from(data),
             },
@@ -572,7 +572,7 @@ impl Harness {
         self.agent.handle_event(
             &SwarmEvent::ConnectionEstablished {
                 conn_id: minip2p_transport::ConnectionId::new(1),
-                peer_id: self.target.clone(),
+                peer_id: self.target,
             },
             false,
             now,
@@ -719,14 +719,14 @@ impl FakeSwarm {
 
     /// Makes `conn` `peer`'s current, not yet ready, connection.
     pub fn connect(&mut self, peer: &PeerId, conn: ConnectionId) {
-        self.connections.insert(peer.clone(), conn);
+        self.connections.insert(*peer, conn);
         self.ready.remove(peer);
     }
 
     /// Marks `conn` as `peer`'s ready connection advertising `protocols`.
     pub fn make_ready(&mut self, peer: &PeerId, conn: ConnectionId, protocols: &[String]) {
-        self.connections.insert(peer.clone(), conn);
-        self.ready.insert(peer.clone(), (conn, protocols.to_vec()));
+        self.connections.insert(*peer, conn);
+        self.ready.insert(*peer, (conn, protocols.to_vec()));
     }
 
     /// Drops `peer`'s connection without an event.
@@ -803,13 +803,13 @@ impl NatSwarm for FakeSwarm {
             _ => None,
         };
         self.calls.push(Out::OpenStream {
-            peer: peer.clone(),
+            peer: *peer,
             protocol_id: protocol_id.into(),
             opened,
         });
         opened.ok_or_else(|| {
             NatSwarmError::Swarm(DriverError::Swarm(SwarmError::NotConnected {
-                peer_id: peer.clone(),
+                peer_id: *peer,
             }))
         })
     }
@@ -826,7 +826,7 @@ impl NatSwarm for FakeSwarm {
             && limit < data.len()
         {
             self.calls.push(Out::SendStream {
-                peer: peer.clone(),
+                peer: *peer,
                 conn: conn_id,
                 stream_id,
                 data: data.slice(..limit).to_vec(),
@@ -838,7 +838,7 @@ impl NatSwarm for FakeSwarm {
             }));
         }
         self.calls.push(Out::SendStream {
-            peer: peer.clone(),
+            peer: *peer,
             conn: conn_id,
             stream_id,
             data: data.to_vec(),
@@ -864,7 +864,7 @@ impl NatSwarm for FakeSwarm {
         _now_ms: u64,
     ) -> Result<(), NatSwarmError> {
         self.calls.push(Out::CloseStreamWrite {
-            peer: peer.clone(),
+            peer: *peer,
             conn: conn_id,
             stream_id,
         });
@@ -879,7 +879,7 @@ impl NatSwarm for FakeSwarm {
         _now_ms: u64,
     ) -> Result<(), NatSwarmError> {
         self.calls.push(Out::ResetStream {
-            peer: peer.clone(),
+            peer: *peer,
             conn: conn_id,
             stream_id,
         });
@@ -887,7 +887,7 @@ impl NatSwarm for FakeSwarm {
     }
 
     fn ping(&mut self, peer: &PeerId, _now_ms: u64) -> Result<(), NatSwarmError> {
-        self.calls.push(Out::Ping { peer: peer.clone() });
+        self.calls.push(Out::Ping { peer: *peer });
         Ok(())
     }
 

@@ -407,7 +407,7 @@ mod tests {
                     identity: initiator_identity,
                     static_secret: [3; 32],
                     ephemeral_secret: [4; 32],
-                    expected_peer: Some(responder_peer.clone()),
+                    expected_peer: Some(responder_peer),
                     local_extensions: None,
                 }),
                 responder: NoiseSession::new(NoiseConfig {
@@ -415,7 +415,7 @@ mod tests {
                     identity: responder_identity,
                     static_secret: [5; 32],
                     ephemeral_secret: [6; 32],
-                    expected_peer: Some(initiator_peer.clone()),
+                    expected_peer: Some(initiator_peer),
                     local_extensions: None,
                 }),
                 initiator_peer,
@@ -472,7 +472,7 @@ mod tests {
             identity: Ed25519Keypair::from_secret_key_bytes([1; 32]),
             static_secret: [3; 32],
             ephemeral_secret: [4; 32],
-            expected_peer: Some(pair.responder_peer.clone()),
+            expected_peer: Some(pair.responder_peer),
             local_extensions: initiator,
         });
         pair.responder = NoiseSession::new(NoiseConfig {
@@ -480,7 +480,7 @@ mod tests {
             identity: Ed25519Keypair::from_secret_key_bytes([2; 32]),
             static_secret: [5; 32],
             ephemeral_secret: [6; 32],
-            expected_peer: Some(pair.initiator_peer.clone()),
+            expected_peer: Some(pair.initiator_peer),
             local_extensions: responder,
         });
         pair.initiator.start().unwrap();

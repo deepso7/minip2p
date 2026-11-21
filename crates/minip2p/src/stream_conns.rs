@@ -21,7 +21,7 @@ pub(crate) struct StreamConns(BTreeMap<(PeerId, StreamId), ConnectionId>);
 impl StreamConns {
     /// Records the connection a synchronous `open_stream` returned.
     pub(crate) fn opened(&mut self, peer_id: &PeerId, conn_id: ConnectionId, stream_id: StreamId) {
-        self.0.insert((peer_id.clone(), stream_id), conn_id);
+        self.0.insert((*peer_id, stream_id), conn_id);
     }
 
     /// Tracks stream and connection lifecycle. Call before the agent sees
@@ -39,7 +39,7 @@ impl StreamConns {
                 conn_id,
                 stream_id,
             } => {
-                let key = (peer_id.clone(), *stream_id);
+                let key = (*peer_id, *stream_id);
                 if self.0.get(&key) == Some(conn_id) {
                     self.0.remove(&key);
                 }
@@ -78,7 +78,7 @@ impl StreamConns {
             ..
         } = event
         {
-            let key = (peer_id.clone(), *stream_id);
+            let key = (*peer_id, *stream_id);
             if self.0.get(&key) == Some(conn_id) {
                 self.0.remove(&key);
             }
@@ -88,7 +88,7 @@ impl StreamConns {
     /// The connection `peer_id`'s stream `stream_id` was observed on, if it
     /// is still live.
     pub(crate) fn get(&self, peer_id: &PeerId, stream_id: StreamId) -> Option<ConnectionId> {
-        self.0.get(&(peer_id.clone(), stream_id)).copied()
+        self.0.get(&(*peer_id, stream_id)).copied()
     }
 }
 
@@ -104,16 +104,18 @@ mod tests {
         conns.opened(&peer_id, old, stream_id);
 
         conns.observe(&SwarmEvent::ConnectionReplaced {
-            peer_id: peer_id.clone(),
+            peer_id,
             old,
             new,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         });
         assert_eq!(conns.get(&peer_id, stream_id), None);
 
         conns.opened(&peer_id, new, stream_id);
         // A late close for the old connection's stream 3 leaves the new one.
         conns.observe(&SwarmEvent::StreamClosed {
-            peer_id: peer_id.clone(),
+            peer_id,
             conn_id: old,
             stream_id,
         });
@@ -148,7 +150,7 @@ mod tests {
     fn a_stream_the_agent_did_not_claim_is_forgotten() {
         let peer_id = PeerId::from_public_key_protobuf(b"stream-conns-app");
         let ready = SwarmEvent::StreamReady {
-            peer_id: peer_id.clone(),
+            peer_id,
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(3),
             protocol_id: "/app/1".into(),

@@ -32,7 +32,7 @@ fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: stream,
             protocol_id: STOP_PROTOCOL_ID.to_string(),
             initiated_locally: false,
@@ -50,7 +50,7 @@ fn force_relay_promotes_immediately_after_stop_acceptance() {
     });
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stream, stop_connect(&target), at(10));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
@@ -75,7 +75,7 @@ fn default_inbound_promotes_immediately_after_stop_acceptance() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
 
     h.stream_data(stream, stop_connect(&target), at(10));
 
@@ -109,7 +109,7 @@ fn dcutr_off_holder_settles_on_the_inbound_circuit() {
     let mut h = inbound_harness(config);
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stream, stop_connect(&target), at(10));
     let promotion = drain_actions(&mut h.agent);
     complete_promotion(&mut h.agent, &target, &promotion, at(11));
@@ -143,7 +143,7 @@ fn a_stop_status_refused_as_full_rides_the_promotion() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
 
     h.agent.swarm.full_sends = true;
     h.stream_data(stream, stop_connect(&target), at(10));
@@ -161,7 +161,7 @@ fn inbound_relay_path_opens_dcutr_after_the_circuit_is_connected() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stream, stop_connect(&target), at(10));
     let promotion = drain_actions(&mut h.agent);
 
@@ -210,7 +210,7 @@ fn stalled_inbound_circuit_handshake_is_closed_at_its_deadline() {
     });
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stream, stop_connect(&target), at(10));
     let conn_id = promoted_circuit(&drain_actions(&mut h.agent));
 
@@ -232,7 +232,7 @@ fn established_inbound_circuit_disarms_its_handshake_deadline() {
     });
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stream, stop_connect(&target), at(10));
     let actions = drain_actions(&mut h.agent);
     let conn_id = complete_promotion(&mut h.agent, &target, &actions, at(11));
@@ -295,7 +295,7 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         ..NatConfig::default()
     });
     h.agent.swarm.circuit_slots = 1;
-    let target = h.target.clone();
+    let target = h.target;
     let accepted = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, accepted, 0);
     h.stream_data(accepted, stop_connect(&target), at(10));
@@ -326,7 +326,7 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: conn,
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: refused,
         },
         false,
@@ -366,7 +366,7 @@ fn inbound_application_streams_are_never_claimed() {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: stream,
             protocol_id: "/my-app/1.0.0".to_string(),
             initiated_locally: false,
@@ -399,15 +399,15 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
         // Even the configured relay may open only STOP. Use an untrusted
         // peer for STOP to cover its additional trust gate.
         let remote = if protocol_id == STOP_PROTOCOL_ID {
-            h.target.clone()
+            h.target
         } else {
-            h.relay.clone()
+            h.relay
         };
         let conn_id = minip2p_transport::ConnectionId::new(10 + offset as u64);
         assert!(h.agent.handle_event(
             &SwarmEvent::StreamReady {
                 conn_id,
-                peer_id: remote.clone(),
+                peer_id: remote,
                 stream_id: stream,
                 protocol_id: protocol_id.to_string(),
                 initiated_locally: false,
@@ -425,7 +425,7 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
         assert!(h.agent.handle_event(
             &SwarmEvent::StreamData {
                 conn_id,
-                peer_id: remote.clone(),
+                peer_id: remote,
                 stream_id: stream,
                 data: Bytes::from_static(b"rejected control data"),
             },
@@ -436,7 +436,7 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
         assert!(h.agent.handle_event(
             &SwarmEvent::StreamClosed {
                 conn_id,
-                peer_id: remote.clone(),
+                peer_id: remote,
                 stream_id: stream,
             },
             false,

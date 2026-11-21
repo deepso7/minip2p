@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::StreamKey;
 
 use super::EndpointEvent;
 
@@ -19,10 +19,10 @@ use super::EndpointEvent;
 pub(crate) struct StreamAcks {
     manual_protocols: BTreeSet<String>,
     /// Pulled streams of a manual protocol that have not ended yet.
-    manual_streams: BTreeSet<(ConnectionId, StreamId)>,
+    manual_streams: BTreeSet<StreamKey>,
     /// Streams of a manual protocol that became ready before it was made
     /// manual, whose `StreamReady` is not pulled yet: they stay automatic.
-    pinned_auto: BTreeSet<(ConnectionId, StreamId)>,
+    pinned_auto: BTreeSet<StreamKey>,
 }
 
 impl StreamAcks {
@@ -34,7 +34,7 @@ impl StreamAcks {
     pub(crate) fn set_manual(
         &mut self,
         protocol_id: String,
-        already_ready: impl IntoIterator<Item = (ConnectionId, StreamId)>,
+        already_ready: impl IntoIterator<Item = StreamKey>,
     ) {
         if self.manual_protocols.insert(protocol_id) {
             self.pinned_auto.extend(already_ready);
@@ -43,36 +43,27 @@ impl StreamAcks {
 
     /// Observes an event the application is pulling, and returns the
     /// acknowledgement the Endpoint owes for it, if any.
-    pub(crate) fn pulled(
-        &mut self,
-        event: &EndpointEvent,
-    ) -> Option<(ConnectionId, StreamId, usize)> {
+    pub(crate) fn pulled(&mut self, event: &EndpointEvent) -> Option<(StreamKey, usize)> {
         match event {
             EndpointEvent::StreamReady {
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 ..
             } => {
-                let key = (*conn_id, *stream_id);
-                if !self.pinned_auto.remove(&key) && self.manual_protocols.contains(protocol_id) {
-                    self.manual_streams.insert(key);
+                if !self.pinned_auto.remove(stream) && self.manual_protocols.contains(protocol_id) {
+                    self.manual_streams.insert(*stream);
                 }
             }
-            EndpointEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            } if !data.is_empty() && !self.manual_streams.contains(&(*conn_id, *stream_id)) => {
-                return Some((*conn_id, *stream_id, data.len()));
+            EndpointEvent::StreamData { stream, data, .. }
+                if !data.is_empty() && !self.manual_streams.contains(stream) =>
+            {
+                return Some((*stream, data.len()));
             }
-            EndpointEvent::StreamClosed {
-                conn_id, stream_id, ..
-            } => self.forget(*conn_id, *stream_id),
+            EndpointEvent::StreamClosed { stream, .. } => self.forget(*stream),
             EndpointEvent::ConnectionClosed { conn_id, .. }
             | EndpointEvent::ConnectionReplaced { old: conn_id, .. } => {
-                self.manual_streams.retain(|(conn, _)| conn != conn_id);
+                self.manual_streams
+                    .retain(|stream| stream.conn_id() != *conn_id);
             }
             _ => {}
         }
@@ -81,27 +72,31 @@ impl StreamAcks {
 
     /// Forgets a stream the application gave up (`abandon_stream`), whose
     /// later events it never pulls.
-    pub(crate) fn forget(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        self.manual_streams.remove(&(conn_id, stream_id));
-        self.pinned_auto.remove(&(conn_id, stream_id));
+    pub(crate) fn forget(&mut self, stream: StreamKey) {
+        self.manual_streams.remove(&stream);
+        self.pinned_auto.remove(&stream);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConnectionCloseReason;
+    use crate::{ConnectionCloseReason, ConnectionId, StreamId};
     use minip2p_core::{Bytes, PeerId};
 
     fn peer() -> PeerId {
         PeerId::from_public_key_protobuf(b"stream-acks")
     }
 
+    fn key(stream: u64) -> StreamKey {
+        StreamKey::new(ConnectionId::new(1), StreamId::new(stream))
+    }
+
     fn ready(protocol_id: &str, stream: u64) -> EndpointEvent {
         EndpointEvent::StreamReady {
             peer_id: peer(),
-            conn_id: ConnectionId::new(1),
-            stream_id: StreamId::new(stream),
+            stream: key(stream),
+            protocol: crate::protocols::ProtocolTable::default().for_event(protocol_id),
             protocol_id: protocol_id.into(),
             initiated_locally: false,
         }
@@ -110,8 +105,7 @@ mod tests {
     fn data(stream: u64, len: usize) -> EndpointEvent {
         EndpointEvent::StreamData {
             peer_id: peer(),
-            conn_id: ConnectionId::new(1),
-            stream_id: StreamId::new(stream),
+            stream: key(stream),
             data: Bytes::from(alloc::vec![0; len]),
         }
     }
@@ -120,23 +114,14 @@ mod tests {
     fn streams_already_ready_keep_auto_acknowledgement() {
         let mut acks = StreamAcks::default();
         // Stream 1 became ready before the registration, but is pulled after.
-        acks.set_manual(
-            "/later/1".into(),
-            [(ConnectionId::new(1), StreamId::new(1))],
-        );
+        acks.set_manual("/later/1".into(), [key(1)]);
         assert_eq!(acks.pulled(&ready("/later/1", 1)), None);
-        assert_eq!(
-            acks.pulled(&data(1, 3)),
-            Some((ConnectionId::new(1), StreamId::new(1), 3))
-        );
+        assert_eq!(acks.pulled(&data(1, 3)), Some((key(1), 3)));
         acks.pulled(&ready("/later/1", 2));
         assert_eq!(acks.pulled(&data(2, 3)), None);
 
         // Registering it again changes nothing: stream 3 was manual already.
-        acks.set_manual(
-            "/later/1".into(),
-            [(ConnectionId::new(1), StreamId::new(3))],
-        );
+        acks.set_manual("/later/1".into(), [key(3)]);
         acks.pulled(&ready("/later/1", 3));
         assert_eq!(acks.pulled(&data(3, 3)), None);
     }
@@ -148,10 +133,7 @@ mod tests {
         assert_eq!(acks.pulled(&ready("/auto/1", 1)), None);
         assert_eq!(acks.pulled(&ready("/manual/1", 2)), None);
 
-        assert_eq!(
-            acks.pulled(&data(1, 5)),
-            Some((ConnectionId::new(1), StreamId::new(1), 5))
-        );
+        assert_eq!(acks.pulled(&data(1, 5)), Some((key(1), 5)));
         assert_eq!(acks.pulled(&data(2, 5)), None);
         assert_eq!(acks.pulled(&data(1, 0)), None, "nothing to acknowledge");
 

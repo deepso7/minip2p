@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder, EndpointEvent,
-    EndpointWaitOutcome, PeerAddr, StreamId,
+    Bytes, ConnectOutcome, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome, PeerAddr,
+    StreamKey,
 };
 
 const PROTOCOL: &str = "/minip2p/unsettled-churn/1";
@@ -58,17 +58,17 @@ fn deliver_then_close(
     reader: &mut Endpoint,
     reader_addr: &PeerAddr,
     writer: EndpointBuilder,
-) -> (ConnectionId, StreamId) {
+) -> StreamKey {
     let (mut writer, connected) = dial(reader, reader_addr, writer);
     assert!(connected, "a free slot admits the peer");
-    let reader_peer = reader.peer_id().clone();
+    let reader_peer = *reader.peer_id();
     let deadline = Instant::now() + BACKSTOP;
     while !writer.is_peer_ready(&reader_peer) {
         assert!(Instant::now() < deadline, "never ready");
         let _ = next(reader);
         let _ = next(&mut writer);
     }
-    let (conn_id, stream_id) = writer
+    let stream = writer
         .open_stream(&reader_peer, PROTOCOL)
         .expect("open stream");
     let mut sent = false;
@@ -76,31 +76,28 @@ fn deliver_then_close(
     while held.is_none() {
         assert!(Instant::now() < deadline, "the bytes never arrived");
         match next(&mut writer) {
-            Some(EndpointEvent::StreamReady { stream_id: id, .. }) if id == stream_id => {
+            Some(EndpointEvent::StreamReady { stream: ready, .. }) if ready == stream => {
                 writer
-                    .send_stream(conn_id, stream_id, Bytes::from_static(b"held"))
+                    .send_stream(stream, Bytes::from_static(b"held"))
                     .expect("send");
                 sent = true;
             }
             _ => {}
         }
-        if let Some(EndpointEvent::StreamData {
-            conn_id, stream_id, ..
-        }) = next(reader)
-        {
+        if let Some(EndpointEvent::StreamData { stream, .. }) = next(reader) {
             assert!(sent);
-            held = Some((conn_id, stream_id));
+            held = Some(stream);
         }
     }
-    let (held_conn, held_stream) = held.expect("delivered");
+    let held = held.expect("delivered");
     writer.disconnect(&reader_peer).expect("disconnect");
     loop {
         assert!(Instant::now() < deadline, "the reader never saw the close");
         let _ = next(&mut writer);
         if let Some(EndpointEvent::ConnectionClosed { conn_id, .. }) = next(reader)
-            && conn_id == held_conn
+            && conn_id == held.conn_id()
         {
-            return (held_conn, held_stream);
+            return held;
         }
     }
 }
@@ -116,7 +113,7 @@ fn churn(listen: &str, reader: EndpointBuilder, writer: impl Fn() -> EndpointBui
 
     // The reader never acknowledges, so the closed connection keeps its
     // only slot and every later peer is refused rather than delivered to.
-    let (conn_id, stream_id) = deliver_then_close(&mut reader, &reader_addr, writer());
+    let stream = deliver_then_close(&mut reader, &reader_addr, writer());
     for _ in 0..2 {
         assert!(!dial(&mut reader, &reader_addr, writer()).1, "refused");
     }
@@ -124,19 +121,17 @@ fn churn(listen: &str, reader: EndpointBuilder, writer: impl Fn() -> EndpointBui
     // A partial acknowledgement after the close keeps the slot; the last
     // byte frees it.
     reader
-        .stream_consumed(conn_id, stream_id, 2)
+        .stream_consumed(stream, 2)
         .expect("partial ack after close");
     assert!(!dial(&mut reader, &reader_addr, writer()).1, "still held");
     reader
-        .stream_consumed(conn_id, stream_id, 2)
+        .stream_consumed(stream, 2)
         .expect("final ack after close");
 
     // Abandoning after the close frees it too.
-    let (conn_id, stream_id) = deliver_then_close(&mut reader, &reader_addr, writer());
+    let stream = deliver_then_close(&mut reader, &reader_addr, writer());
     assert!(!dial(&mut reader, &reader_addr, writer()).1, "held again");
-    reader
-        .abandon_stream(conn_id, stream_id)
-        .expect("abandon after close");
+    reader.abandon_stream(stream).expect("abandon after close");
     let _ = deliver_then_close(&mut reader, &reader_addr, writer());
 }
 

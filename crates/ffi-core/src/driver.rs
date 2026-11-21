@@ -8,7 +8,7 @@ use std::time::Duration;
 use minip2p::{EndpointWaitOutcome, Error, PeerId, WaitDeadline};
 
 use crate::carry::PUMP_DRAIN_LIMIT;
-use crate::endpoint::{Lifecycle, Live, Shared};
+use crate::endpoint::{Lifecycle, Shared};
 use crate::events::{CloseOutcome, UnfinishedConnection, convert_endpoint_event};
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent, driver_failure_kind};
 
@@ -71,7 +71,7 @@ pub(crate) fn run_with(
                 live,
                 close_timeout,
             } if !panicked => (
-                live.take().map(|live| live.endpoint),
+                live.take(),
                 if failed {
                     Duration::ZERO
                 } else {
@@ -121,7 +121,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
     loop {
         let mut state = guard.shared.lock_state();
         let crate::endpoint::EndpointState {
-            lifecycle: Lifecycle::Running(Live { endpoint, writes }),
+            lifecycle: Lifecycle::Running(endpoint),
             published_peers,
             ..
         } = &mut *state
@@ -166,17 +166,10 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             guard.shared.wait_for_commands();
             continue;
         }
-        // Pending writes follow each event first: a Writable resends a held
-        // tail and, once it is all accepted, settles the binding's write
-        // right after the event that caused it.
-        let mut converted = Vec::with_capacity(batch.len());
-        for event in batch {
-            let settled = writes
-                .observe(endpoint, &event)
-                .map(crate::write_accepted_event);
-            converted.extend(convert_endpoint_event(event));
-            converted.extend(settled);
-        }
+        let converted: Vec<_> = batch
+            .into_iter()
+            .filter_map(convert_endpoint_event)
+            .collect();
         // Published and ingested before `state` is released, so no command
         // runs between the endpoint emitting these events and the carry
         // holding them, and the doorbell never rings ahead of the peers.

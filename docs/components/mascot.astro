@@ -94,12 +94,14 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
   const cell = (index: number) => `${(index % 3) * 50}% ${Math.floor(index / 3) * 50}%`;
   const wrap = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
 
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-mascot]")) {
+  // Wires one mascot. Every listener hangs off `signal`, so the next page
+  // load can drop them all, including the window-level pointer tracking.
+  const setup = (button: HTMLButtonElement, signal: AbortSignal) => {
     const squash = button.querySelector<HTMLElement>(".mascot-squash");
     const head = button.querySelector<HTMLElement>('[data-layer="directions"]');
     const face = button.querySelector<HTMLElement>('[data-layer="reactions"]');
     if (!(squash && head && face)) {
-      continue;
+      return;
     }
 
     const look = (direction: Direction) => {
@@ -144,8 +146,8 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
       addEventListener("pointermove", (event) => {
         pointer = { x: event.clientX, y: event.clientY };
         aim();
-      }, { passive: true });
-      addEventListener("scroll", aim, { passive: true });
+      }, { passive: true, signal });
+      addEventListener("scroll", aim, { passive: true, signal });
     }
 
     let timers: number[] = [];
@@ -178,6 +180,17 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
       // Per-keyframe easing with the effect itself linear: an easing on the effect
       // would reinterpret every offset and front-load the whole bounce.
       squash.animate(HOP, { duration: 620, easing: "linear" });
-    });
-  }
+    }, { signal });
+  };
+
+  // Blume's client router swaps pages without rerunning this module, so wire
+  // mascots on every page load, dropping the previous page's listeners first.
+  let live: AbortController | null = null;
+  document.addEventListener("astro:page-load", () => {
+    live?.abort();
+    live = new AbortController();
+    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-mascot]")) {
+      setup(button, live.signal);
+    }
+  });
 </script>

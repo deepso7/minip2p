@@ -1,6 +1,6 @@
 # minip2p-nat
 
-Sans-I/O NAT-traversal orchestrator for minip2p. The protocol machines (Circuit Relay v2, DCUtR, AutoNAT) live in their own crates; `NatAgent` is the relay-leg provider for a Connection attempt: it dials the relay, runs HOP CONNECT, promotes the circuit through Noise and Yamux, then runs DCUtR on that Relayed path. Direct candidate racing and the attempt's terminal outcome belong to the Connection-attempt engine.
+Sans-I/O NAT traversal for minip2p. The `autonat` module holds the AutoNAT v1 client and server machines, and `dcutr` the DCUtR initiator and responder (both formerly the `minip2p-autonat` and `minip2p-dcutr` crates); Circuit Relay v2 lives in `minip2p-relay`. `NatAgent` is the relay-leg provider for a Connection attempt: it dials the relay, runs HOP CONNECT, promotes the circuit through Noise and Yamux, then runs DCUtR on that Relayed path. Direct candidate racing and the attempt's terminal outcome belong to the Connection-attempt engine.
 
 `no_std + alloc`, no I/O, no clocks, no async.
 

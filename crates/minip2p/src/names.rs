@@ -19,22 +19,14 @@ use core::net::IpAddr;
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 
 /// What admission's `expand` step made of one candidate address.
-pub(crate) enum Expansion {
+pub enum Expansion {
     /// Concrete addresses to dial now.
     Ready(Vec<PeerAddr>),
     /// Name resolution started; the answer arrives later through
     /// [`Expander::take_answers`].
-    #[cfg_attr(
-        not(any(feature = "std", test)),
-        expect(dead_code, reason = "only the std Endpoint resolves names")
-    )]
     Resolving,
     /// The candidate cannot be used; the reason becomes its
     /// `CandidateFailure`.
-    #[cfg_attr(
-        not(any(feature = "std", test)),
-        expect(dead_code, reason = "portable expansion never refuses")
-    )]
     Refused(String),
 }
 
@@ -51,7 +43,7 @@ pub(crate) type NameAnswer = Result<Vec<PeerAddr>, String>;
 /// How an engine turns candidate addresses into dial targets. The engine
 /// calls [`Self::take_answers`] once per drive batch and routes what it
 /// returns to every Connection attempt and parked NAT dial waiting on it.
-pub(crate) trait Expander {
+pub trait Expander {
     /// Expands one candidate: concrete addresses, a lookup under way, or a
     /// refusal with its reason.
     fn expand(&mut self, addr: &PeerAddr) -> Expansion;
@@ -181,7 +173,7 @@ fn rebuild(
             IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
         }];
         expanded.extend_from_slice(rest);
-        let target = PeerAddr::new(Multiaddr::from_protocols(expanded), addr.peer_id().clone())
+        let target = PeerAddr::new(Multiaddr::from_protocols(expanded), *addr.peer_id())
             .map_err(|error| invalid(format!("resolved address was not a peer addr: {error}")))?;
         targets.push(target);
     }

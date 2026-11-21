@@ -27,9 +27,9 @@
 
 use alloc::vec::Vec;
 
+use crate::dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
-use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -328,8 +328,8 @@ impl InboundCircuit {
         let handoff = BridgeHandoff {
             inner_conn: self.inner_conn,
             stream_id: self.stream,
-            relay: self.relay.clone(),
-            remote_peer: source.clone(),
+            relay: self.relay,
+            remote_peer: source,
             role: BridgeRole::Responder,
             pending_data,
             unsent_data: Vec::new(),
@@ -418,8 +418,8 @@ impl InboundCircuit {
     /// What this machine claims about the establishing circuit `conn_id`:
     /// that it is the one it promoted, Relayed through its relay.
     pub(crate) fn circuit_claim(&self, conn_id: ConnectionId) -> Option<Claim> {
-        (!self.is_done() && self.promoted() == Some(conn_id)).then(|| Claim::Circuit {
-            relay: self.relay.clone(),
+        (!self.is_done() && self.promoted() == Some(conn_id)).then_some(Claim::Circuit {
+            relay: self.relay,
             owner: Owner::Inbound,
         })
     }
@@ -454,13 +454,13 @@ impl InboundCircuit {
                 return false;
             }
             if let Phase::Handshaking { source, .. } = &self.phase {
-                let source = source.clone();
+                let source = *source;
                 self.announce_path(source, circuit, swarm, shared, now);
             }
             return true;
         }
         shared.push_event(NatEvent::InboundDirectUpgrade {
-            peer: peer.clone(),
+            peer: *peer,
             old_conn_id: circuit,
             new_conn_id: conn_id,
         });
@@ -480,10 +480,8 @@ impl InboundCircuit {
         now: Now,
     ) {
         shared.push_event(NatEvent::InboundPathEstablished {
-            peer: source.clone(),
-            path: crate::Path::Relayed {
-                relay: self.relay.clone(),
-            },
+            peer: source,
+            path: crate::Path::Relayed { relay: self.relay },
             conn_id: circuit,
         });
         if !shared.config.upgrades() {
@@ -688,9 +686,7 @@ impl InboundCircuit {
                     }
                     if dcutr.send_sync().is_ok() {
                         // The source punches once it reads SYNC.
-                        shared
-                            .ledger
-                            .expect_punches(source.clone(), budget.deadline());
+                        shared.ledger.expect_punches(*source, budget.deadline());
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             send(swarm, source, conn, stream, data, now);
                         }
@@ -755,7 +751,7 @@ fn open_round(
     let opened =
         if swarm.connection(source) == Some(circuit) && budget.begin_round(now.monotonic_ms) {
             swarm
-                .open_stream(source, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
+                .open_stream(source, crate::dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
                 .ok()
         } else {
             None

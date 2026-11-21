@@ -89,42 +89,25 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-      - run: cargo check -p minip2p-rs --features relay-server
-      - run: cargo check -p minip2p-rs --features relay,relay-server
-      - run: cargo check -p minip2p-rs --features relay,relay-server,tcp
-      - run: cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
+      # Library-only checks, as a consumer builds the crate: the clippy rows
+      # below use `--all-targets`, which unifies dev-dependency features in.
+      - run: |
+          for row in relay-server relay-relay-server relay-relay-server-tcp bare-tcp-relay-server; do
+            scripts/run-feature-matrix.sh check "$row"
+          done
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: scripts/run-feature-matrix.sh clippy
+      # Every row, not just `ci`: release-tier feature combinations are only
+      # linted here (publish.yml tests them but does not run clippy).
+      - run: scripts/run-feature-matrix.sh clippy full
       # --locked: fuzz/ has its own lockfile, which a PR cut before a version
       # bump can leave stale; fail here rather than let it land on main.
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
-      - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-webtransport -p minip2p-rs
-      - run: cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
-      - run: cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features autonat --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features relay --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features relay-server --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features mdns,discovery,relay --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features smoltcp,relay,discovery,relay-server --target thumbv7em-none-eabi -p minip2p-rs
-      # Mirrors `just check-wasm`.
-      - run: cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
-      - run: cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
-      - run: cargo check --target wasm32-unknown-unknown -p minip2p-webtransport --no-default-features
-      - run: cargo clippy --target wasm32-unknown-unknown -p minip2p-web -- -D warnings
-      - run: cargo doc --workspace --no-deps
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features relay,discovery,mdns,tcp,relay-server --no-deps
-      - run: cargo doc -p minip2p-tcp --features smoltcp --no-deps
-      - run: cargo doc -p minip2p-mdns --features smoltcp --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features autonat --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features relay --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,relay,discovery,relay-server --no-deps
-      - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
-      - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done
-      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["dep:minip2p-relay-server"]'
+      # The same lists `just check-nostd`, `check-wasm`, `docs` and
+      # `package-check` run.
+      - run: scripts/check-targets.sh nostd
+      - run: scripts/check-targets.sh wasm
+      - run: scripts/check-targets.sh docs
+      - run: scripts/check-targets.sh package-check
 
   # Builds exactly the benchmarks the bench image builds (bench/targets) and
   # checks the IR bench ids against scripts/bench_results.py, so a renamed
@@ -161,7 +144,7 @@ jobs:
         run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
       - run: cargo nextest run --workspace
       # Only the matrix's `ci` rows; publish.yml's test-rust runs every row.
-      - run: scripts/run-feature-matrix.sh test
+      - run: scripts/run-feature-matrix.sh test ci
       # nextest does not run doctests, and `--workspace --doc` only builds
       # default features, so a doctest behind a feature gate needs its own line
       # here. Today that is just SmoltcpTcpProvider; add a line when there are

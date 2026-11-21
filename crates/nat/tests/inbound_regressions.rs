@@ -28,7 +28,7 @@ fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             stream_id: stream,
             protocol_id: STOP_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -41,7 +41,7 @@ fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
 fn drive_to_relayed(h: &mut Harness) -> (ConnectionId, Vec<Out>) {
     let stop = StreamId::new(STOP_STREAM);
     inbound_stop_stream(h, stop, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(10));
     let promotion = drain_actions(&mut h.agent);
     let conn = complete_promotion(&mut h.agent, &target, &promotion, at(11));
@@ -61,7 +61,7 @@ fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[Out]) -> StreamId 
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             protocol_id: DCUTR_PROTOCOL_ID.into(),
             initiated_locally: true,
@@ -119,7 +119,7 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream_and_starts_the_next_rou
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
         },
         false,
@@ -141,7 +141,7 @@ fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs:
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&reply_addrs)),
         },
@@ -155,7 +155,7 @@ fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
     let mut h = inbound_harness(NatConfig::default());
     let stop = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stop, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(10));
     let conn = promoted_circuit(&drain_actions(&mut h.agent));
 
@@ -226,7 +226,7 @@ fn rtt_is_timed_from_when_a_held_connect_is_fully_written() {
     // so the first blast is due at t=1_024.
     h.agent.handle_event(
         &SwarmEvent::StreamWritable {
-            peer_id: h.target.clone(),
+            peer_id: h.target,
             conn_id: conn,
             stream_id: stream,
         },
@@ -264,7 +264,7 @@ fn the_holder_runs_three_rounds_each_with_a_fresh_rtt() {
         h.agent.handle_event(
             &SwarmEvent::StreamReady {
                 conn_id: conn,
-                peer_id: h.target.clone(),
+                peer_id: h.target,
                 stream_id: stream,
                 protocol_id: DCUTR_PROTOCOL_ID.into(),
                 initiated_locally: true,
@@ -444,7 +444,7 @@ fn dcutr_connect_advertises_trusted_observation_but_not_tcp_listener() {
     let mut h = inbound_harness(NatConfig::default());
     h.agent
         .set_listen_addrs(&[maddr("/ip4/192.0.2.1/tcp/4001"), maddr(LISTEN_ADDR)]);
-    let relay = h.relay.clone();
+    let relay = h.relay;
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
@@ -464,7 +464,7 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
-            peer_id: h.relay.clone(),
+            peer_id: h.relay,
             reason: ConnectionCloseReason::Local,
         },
         false,
@@ -498,12 +498,14 @@ fn inbound_direct_replacement_after_the_circuit_finished_reports_the_upgrade() {
     let (circuit, _) = drive_to_relayed(&mut h);
     assert!(h.agent.is_idle(), "inbound handling finished at Relayed");
 
-    let target = h.target.clone();
+    let target = h.target;
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: target.clone(),
+            peer_id: target,
             old: circuit,
             new: ConnectionId::new(50),
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         false,
         at(20),
@@ -522,19 +524,19 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
         ..NatConfig::default()
     };
     config.relays.push(
-        PeerAddr::new(maddr("/ip4/203.0.113.2/udp/4001/quic-v1"), relay_b.clone())
+        PeerAddr::new(maddr("/ip4/203.0.113.2/udp/4001/quic-v1"), relay_b)
             .expect("valid second relay"),
     );
     let mut h = inbound_harness(config);
     let (circuit_a, _) = drive_to_relayed(&mut h);
-    let target = h.target.clone();
+    let target = h.target;
 
     // The same peer reaches us again through relay B.
     let stop = StreamId::new(STOP_STREAM + 10);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: ConnectionId::new(3),
-            peer_id: relay_b.clone(),
+            peer_id: relay_b,
             stream_id: stop,
             protocol_id: STOP_PROTOCOL_ID.into(),
             initiated_locally: false,
@@ -545,7 +547,7 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: ConnectionId::new(3),
-            peer_id: relay_b.clone(),
+            peer_id: relay_b,
             stream_id: stop,
             data: Bytes::from(stop_connect(&target)),
         },
@@ -555,9 +557,11 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
     let circuit_b = promoted_circuit(&drain_actions(&mut h.agent));
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: target.clone(),
+            peer_id: target,
             old: circuit_a,
             new: circuit_b,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         true,
         at(23),
@@ -574,12 +578,12 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
 #[test]
 fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
     let mut h = inbound_harness(NatConfig::default());
-    let target = h.target.clone();
+    let target = h.target;
     let direct = ConnectionId::new(9);
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: direct,
-            peer_id: target.clone(),
+            peer_id: target,
         },
         false,
         at(0),
@@ -591,9 +595,11 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
-            peer_id: target.clone(),
+            peer_id: target,
             old: direct,
             new: circuit,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         true,
         at(12),
@@ -615,7 +621,7 @@ fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
     let mut h = inbound_harness(NatConfig::default());
     let stop = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stop, 0);
-    let target = h.target.clone();
+    let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(10));
     let circuit = promoted_circuit(&drain_actions(&mut h.agent));
     // The swarm is ahead: a direct connection already replaced the circuit
@@ -623,7 +629,7 @@ fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
     h.agent.swarm.connect(&target, ConnectionId::new(7));
     h.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
-            peer_id: target.clone(),
+            peer_id: target,
             conn_id: circuit,
         },
         true,
@@ -741,7 +747,7 @@ fn observed_mappings_survive_the_punch_candidate_cap() {
         })
         .collect();
     h.agent.set_listen_addrs(&listen);
-    let relay = h.relay.clone();
+    let relay = h.relay;
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
@@ -861,12 +867,14 @@ fn complete_a_round(h: &mut Harness) -> ConnectionId {
 }
 
 fn replace(h: &mut Harness, old: ConnectionId, new: ConnectionId, is_circuit: bool, t: u64) {
-    let target = h.target.clone();
+    let target = h.target;
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: target,
             old,
             new,
+            old_path: minip2p_core::Path::Direct,
+            new_path: minip2p_core::Path::Direct,
         },
         is_circuit,
         at(t),
@@ -922,14 +930,16 @@ fn a_buffered_second_inbound_punch_is_punched() {
     let mut h = inbound_harness(passive_budget());
     let circuit = complete_a_round(&mut h);
     let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
-    let target = h.target.clone();
+    let target = h.target;
     h.agent.swarm.connect(&target, b);
     for (old, new) in [(circuit, a), (a, b)] {
         h.agent.deliver_late(
             &SwarmEvent::ConnectionReplaced {
-                peer_id: target.clone(),
+                peer_id: target,
                 old,
                 new,
+                old_path: minip2p_core::Path::Direct,
+                new_path: minip2p_core::Path::Direct,
             },
             false,
             at(30),

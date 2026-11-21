@@ -20,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder, EndpointEvent,
-    EndpointWaitOutcome, Error, NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy,
-    StreamId, WaitDeadline,
+    Bytes, ConnectOutcome, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome,
+    NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy, SendOutcome, StreamKey,
+    WaitDeadline,
 };
 
 /// Upper bound for every setup step.
@@ -60,22 +60,19 @@ pub fn bind_on(builder: EndpointBuilder, listen: &str) -> Endpoint {
 /// panics.
 pub fn send_chunk(
     endpoint: &mut Endpoint,
-    stream: (ConnectionId, StreamId),
+    stream: StreamKey,
     chunk: &Bytes,
     held: &mut Option<Bytes>,
 ) -> (u64, bool) {
     let data = held.take().unwrap_or_else(|| chunk.clone());
     let len = data.len();
-    match endpoint.send_stream(stream.0, stream.1, data) {
-        Err(Error::Full { unsent, .. }) => {
+    match endpoint.try_send_stream(stream, data).expect("send failed") {
+        SendOutcome::Full { unsent } => {
             let accepted = len - unsent.len();
             *held = Some(unsent);
             (accepted as u64, true)
         }
-        other => {
-            other.expect("send failed");
-            (len as u64, false)
-        }
+        SendOutcome::Accepted => (len as u64, false),
     }
 }
 
@@ -185,7 +182,7 @@ impl Relayed {
         let tick = Duration::from_millis(1);
 
         let mut target = peer(ReservationPolicy::Always);
-        let target_peer = target.peer_id().clone();
+        let target_peer = *target.peer_id();
         let deadline = Instant::now() + SETUP_TIMEOUT;
         loop {
             assert!(Instant::now() < deadline, "target reservation timed out");
@@ -199,8 +196,8 @@ impl Relayed {
         }
 
         let mut client = peer(ReservationPolicy::Never);
-        let client_peer = client.peer_id().clone();
-        let connect_id = client.connect(&target_peer).expect("relayed connect");
+        let client_peer = *client.peer_id();
+        let connect_id = client.connect(target_peer).expect("relayed connect");
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let (mut circuit, mut client_ready, mut target_ready) = (false, false, false);
         while !(circuit && client_ready && target_ready) {

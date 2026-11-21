@@ -160,6 +160,39 @@ fn browser_config_accepts_relays() {
     }
 }
 
+#[cfg(not(feature = "pubsub"))]
+#[test]
+fn without_pubsub_the_pubsub_surface_refuses() {
+    let mut unsigned = config();
+    unsigned.allow_unsigned = true;
+    assert!(matches!(
+        Host::new(vec![1; 32], unsigned, |_| InMemoryTransport::pair(
+            peer(1),
+            peer(2)
+        )
+        .0),
+        Err(FfiError::InvalidConfig {
+            capability: ConfigCapability::Gossipsub,
+            ..
+        })
+    ));
+
+    let (mut a, _b) = pair();
+    let now = Now::from_millis(0);
+    assert!(matches!(
+        a.subscribe("room".into(), now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+    assert!(matches!(
+        a.unsubscribe("room".into(), now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+    assert!(matches!(
+        a.publish("room".into(), vec![1], now),
+        Err(FfiError::NotPermitted { .. })
+    ));
+}
+
 #[test]
 fn a_pumped_host_connects_rings_once_and_reports_its_deadline() {
     let (mut a, mut b) = pair();
@@ -183,8 +216,10 @@ fn a_pumped_host_connects_rings_once_and_reports_its_deadline() {
         vec![peer(2).to_base58()]
     );
     assert!(a.is_peer_ready(peer(2).to_base58()).expect("ready"));
-    // Ping and Identify keep timers, so an idle host still has a deadline.
-    assert!(a.pump(Now::from_millis(40)).next_deadline.is_some());
+    // Gossipsub's heartbeat keeps a timer, so an idle host still has a
+    // deadline; without pubsub nothing is due until I/O arrives.
+    let idle = a.pump(Now::from_millis(40)).next_deadline;
+    assert_eq!(idle.is_some(), cfg!(feature = "pubsub"), "{idle:?}");
 }
 
 #[test]
@@ -375,11 +410,11 @@ impl Transport for Breakable {
 }
 
 /// Host `a` over a [`Breakable`] transport, connected to `b` and settled,
-/// with the switch for its mode. `b`'s host is pumped alongside, then dropped.
+/// with the switch for its mode, and `b`'s host, pumped alongside.
 fn connected_breakable(
     a: InMemoryTransport,
     b: InMemoryTransport,
-) -> (Host<Breakable>, Rc<Cell<Mode>>) {
+) -> (Host<Breakable>, Host<InMemoryTransport>, Rc<Cell<Mode>>) {
     let mode = Rc::new(Cell::new(Mode::Up));
     let mut a = Host::new(vec![1; 32], config(), |_| Breakable(a, mode.clone())).expect("a");
     let mut b = Host::new(vec![2; 32], config(), |_| b).expect("b");
@@ -391,7 +426,9 @@ fn connected_breakable(
         a.drain_events(LIMIT);
         b.drain_events(LIMIT);
     }
-    (a, mode)
+    // `b` is returned, not dropped: dropping an endpoint disconnects it,
+    // and these tests need a peer that stays connected but silent.
+    (a, b, mode)
 }
 
 /// A clean shutdown that leaves a connection still tracked ends
@@ -401,7 +438,7 @@ fn connected_breakable(
 fn a_close_that_abandons_a_connection_ends_deadline_expired() {
     let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
     let conn_id = a.connection_id();
-    let (mut a, mode) = connected_breakable(a, b);
+    let (mut a, _b, mode) = connected_breakable(a, b);
     mode.set(Mode::Deaf);
     a.close(Now::from_millis(32));
     let events = a.drain_events(LIMIT);
@@ -424,7 +461,7 @@ fn a_close_that_abandons_a_connection_ends_deadline_expired() {
 fn a_failed_close_carries_its_events_and_unfinished_connections() {
     let (a, b) = InMemoryTransport::pair(peer(1), peer(2));
     let conn_id = a.connection_id();
-    let (mut a, mode) = connected_breakable(a, b);
+    let (mut a, _b, mode) = connected_breakable(a, b);
     mode.set(Mode::Gone);
     a.close(Now::from_millis(32));
     let events = a.drain_events(LIMIT);

@@ -152,14 +152,6 @@ impl<T: Transport> NatDriver<T> {
         self
     }
 
-    /// Parks relay and AutoNAT dials to `/dns*` hosts instead of rejecting
-    /// them, for an engine whose [`Expander`] resolves names (the std
-    /// Endpoint); see [`Self::expand_parked`].
-    #[cfg(any(feature = "std", test))]
-    pub(crate) fn park_named_dials(&mut self) {
-        self.io.parked = Some(Vec::new());
-    }
-
     /// Expands the dials parked since the last call that the agent still
     /// waits on: a dial whose lookup started waits for [`Self::resolved`], and one expansion settles at
     /// once (refused, say at the resolver's lookup cap) is finished now.
@@ -172,12 +164,7 @@ impl<T: Transport> NatDriver<T> {
         now: Now,
     ) {
         loop {
-            let parked = self
-                .io
-                .parked
-                .as_mut()
-                .map(core::mem::take)
-                .unwrap_or_default();
+            let parked = core::mem::take(&mut self.io.parked);
             if parked.is_empty() {
                 return;
             }
@@ -303,10 +290,11 @@ impl<T: Transport> NatDriver<T> {
         self.pump(swarm);
     }
 
-    /// When [`NatDriver::tick`] next has work: immediately while events are
-    /// queued, else the agent's next timer, `None` when nothing is armed.
+    /// When [`NatDriver::tick`] next has work: immediately while events or
+    /// parked dials are queued, else the agent's next timer, `None` when
+    /// nothing is armed.
     pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
-        if !self.unrouted.is_empty() || !self.staged.is_empty() {
+        if !self.unrouted.is_empty() || !self.staged.is_empty() || !self.io.parked.is_empty() {
             Some(Deadline::IMMEDIATE)
         } else {
             self.agent.next_deadline(now)
@@ -668,9 +656,9 @@ impl<T: Transport> NatDriver<T> {
                     return;
                 };
                 let mut circuit = transport.clone();
-                circuit.push(Protocol::P2p(relay.clone()));
+                circuit.push(Protocol::P2p(*relay));
                 circuit.push(Protocol::P2pCircuit);
-                self.reserved_relays.push((relay.clone(), circuit));
+                self.reserved_relays.push((*relay, circuit));
                 self.addresses_changed = true;
             }
             NatEvent::RelayReservationLost { relay } => {
@@ -695,9 +683,12 @@ impl<T: Transport> NatDriver<T> {
 
 /// What the NAT driver keeps around the swarm for the agent's commands.
 struct HostIo<T> {
-    /// Dials to `/dns*` hosts parked for the composition to resolve, when it
-    /// owns Name resolution (the std Endpoint); `None` rejects them.
-    parked: Option<Vec<(NatToken, PeerAddr)>>,
+    /// Relay and AutoNAT dials to `/dns*` hosts, parked for the engine's
+    /// [`Expander`]: the std Endpoint resolves them off the driver, and a
+    /// portable one hands them to its transport as they are, as it does a
+    /// named Connection-attempt candidate (a browser's WebTransport dials a
+    /// host name itself).
+    parked: Vec<(NatToken, PeerAddr)>,
     /// The transport's circuit operations; `None` refuses promotions.
     #[cfg(feature = "relay")]
     circuits: Option<CircuitOps<T>>,
@@ -713,7 +704,7 @@ struct HostIo<T> {
 impl<T> HostIo<T> {
     fn new() -> Self {
         Self {
-            parked: None,
+            parked: Vec::new(),
             #[cfg(feature = "relay")]
             circuits: None,
             #[cfg(feature = "relay")]
@@ -756,10 +747,8 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
     /// Parks a dial to a named host for the composition's resolver, so the
     /// agent's token is already registered when the answer comes back.
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {
-        if let Some(parked) = self.io.parked.as_mut()
-            && minip2p_nat::is_named(addr)
-        {
-            parked.push((token, addr.clone()));
+        if minip2p_nat::is_named(addr) {
+            self.io.parked.push((token, addr.clone()));
             return Ok(DialStart::Deferred);
         }
         NatSwarm::dial(&mut *self.swarm, addr, token)

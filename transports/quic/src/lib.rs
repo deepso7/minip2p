@@ -6,6 +6,13 @@
 //! packet info where the platform has them. The engine owns no I/O: the
 //! adapter feeds it datagrams and a time sample, and sends what it produces.
 //! No async runtime required.
+//!
+//! `has_pending_writes` (what `Endpoint::flush` waits on) counts stream
+//! bytes and FINs until the engine takes them, and a FIN until the peer
+//! acknowledged it (`Finished`, which covers every byte before it). Bytes on
+//! a stream left open are best effort past that: quinn-proto exposes no
+//! count of the stream data it still holds for congestion control, pacing or
+//! peer credit. To deliver everything, close the write side before flushing.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -786,7 +793,7 @@ impl QuicTransport {
         self.local_addresses()
             .into_iter()
             .map(|addr| {
-                PeerAddr::new(addr.clone(), peer_id.clone())
+                PeerAddr::new(addr.clone(), peer_id)
                     .map_err(|error| TransportError::LocalPeerAddr { addr, error })
             })
             .collect()
@@ -847,7 +854,7 @@ impl QuicTransport {
         };
         let tls = self
             .tls
-            .client_config(Some(expected.clone()))
+            .client_config(Some(*expected))
             .map_err(|_no_tls13| unsupported())?;
         let crypto = QuicClientConfig::try_from(tls).map_err(|_no_quic_suite| unsupported())?;
         let mut config = ClientConfig::new(Arc::new(crypto));
@@ -1042,7 +1049,10 @@ impl QuicTransport {
                 self.handles.insert(handle, id);
                 self.received.push(id);
                 self.pending_events
-                    .push(TransportEvent::IncomingConnection { id, endpoint });
+                    .push(TransportEvent::IncomingConnection {
+                        id,
+                        endpoint: Box::new(endpoint),
+                    });
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -1497,6 +1507,21 @@ impl Transport for QuicTransport {
         self.service_due(instant);
         received?;
         Ok(std::mem::take(&mut self.pending_events))
+    }
+
+    /// Datagrams waiting on socket writability, or, on a connection that
+    /// is not closing, stream bytes or FINs not yet handed to the engine,
+    /// output a service left unfinished, or a FIN its peer has not
+    /// acknowledged yet (see [`Transport::has_pending_writes`]). Bytes on a
+    /// stream left open count only until the engine takes them; the engine
+    /// may still hold them for congestion control, so close the write side
+    /// to wait for delivery.
+    fn has_pending_writes(&self) -> bool {
+        self.sockets.iter().any(Socket::has_pending)
+            || self
+                .connections
+                .values()
+                .any(QuicConnection::has_pending_writes)
     }
 
     fn next_deadline(&self) -> Option<Deadline> {

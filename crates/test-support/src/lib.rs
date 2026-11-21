@@ -134,15 +134,18 @@ impl InMemoryTransport {
         let [first_queue, second_queue] = &mut queues;
         first_queue.push_back(TransportEvent::Connected {
             id: connection,
-            endpoint: ConnectionEndpoint::with_peer_id(b_addr.clone(), remote_peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(
+                b_addr.clone(),
+                remote_peer,
+            )),
         });
         second_queue.push_back(TransportEvent::IncomingConnection {
             id: connection,
-            endpoint: ConnectionEndpoint::new(a_addr.clone()),
+            endpoint: Box::new(ConnectionEndpoint::new(a_addr.clone())),
         });
         second_queue.push_back(TransportEvent::Connected {
             id: connection,
-            endpoint: ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer),
+            endpoint: Box::new(ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer)),
         });
         let shared = Rc::new(RefCell::new(InMemoryLink {
             queues,
@@ -538,7 +541,7 @@ impl RelayEmulator {
             return Err(RelayEmulatorError::Unexpected("expected RESERVE"));
         }
 
-        let channels = self.reservations.entry(reserver.clone()).or_default();
+        let channels = self.reservations.entry(*reserver).or_default();
         let response = HopMessage {
             kind: HopMessageType::Status,
             peer: None,
@@ -551,9 +554,8 @@ impl RelayEmulator {
             status: Some(Status::Ok),
         };
         channels.hop_inbox.extend(encode_frame(&response.encode()));
-        self.events.push(RelayEvent::ReservationStored {
-            peer: reserver.clone(),
-        });
+        self.events
+            .push(RelayEvent::ReservationStored { peer: *reserver });
         trailing_bytes(bytes, consumed)
     }
 
@@ -624,8 +626,8 @@ impl RelayEmulator {
         self.pending_connects.insert(
             pending_id,
             PendingConnect {
-                initiator: initiator.clone(),
-                target: target.clone(),
+                initiator: *initiator,
+                target,
             },
         );
         Ok(ConnectRequestOutcome::Bridging {

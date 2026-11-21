@@ -47,7 +47,7 @@ impl Relay {
     fn spawn(mut endpoint: Endpoint) -> Self {
         let public = PeerAddr::new(
             endpoint.bound_addresses().pop().unwrap(),
-            endpoint.peer_id().clone(),
+            *endpoint.peer_id(),
         )
         .unwrap();
         let backbone = endpoint.relay_mesh_addresses().pop().unwrap();
@@ -214,8 +214,8 @@ fn relayed(
     target: &mut Endpoint,
     relays: &[&Relay],
 ) -> minip2p::ConnectionId {
-    let target_peer = target.peer_id().clone();
-    let connect_id: ConnectId = dialer.connect(&target_peer).unwrap();
+    let target_peer = *target.peer_id();
+    let connect_id: ConnectId = dialer.connect(target_peer).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut trace = Vec::new();
     loop {
@@ -278,13 +278,13 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
     let mut alice = client(&a.public, no_punch(ReservationPolicy::Always));
     await_reservation(&mut alice, &a.public);
     let mut bob = client(&b.public, no_punch(ReservationPolicy::Never));
-    let alice_peer = alice.peer_id().clone();
-    let bob_peer = bob.peer_id().clone();
+    let alice_peer = *alice.peer_id();
+    let bob_peer = *bob.peer_id();
     let conn = relayed(&mut bob, &mut alice, &[&a, &b]);
 
     // Bob speaks first; Alice answers with bytes of her own on the stream.
-    let (bob_conn, stream) = bob.open_stream(&alice_peer, ECHO_PROTOCOL).unwrap();
-    assert_eq!(bob_conn, conn);
+    let stream = bob.open_stream(&alice_peer, ECHO_PROTOCOL).unwrap();
+    assert_eq!(stream.conn_id(), conn);
     let (hello, reply) = (
         b"hello from bob".to_vec(),
         b"hello back from alice".to_vec(),
@@ -298,20 +298,19 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
         if let Some(event) = bob.next_event(Duration::from_millis(20)).unwrap() {
             match event {
                 EndpointEvent::StreamReady {
-                    stream_id,
+                    stream: ready,
                     initiated_locally: true,
                     ..
-                } if stream_id == stream => bob.send_stream(conn, stream, hello.clone()).unwrap(),
+                } if ready == stream => bob.send_stream(stream, hello.clone()).unwrap(),
                 EndpointEvent::StreamData {
-                    stream_id, data, ..
-                } if stream_id == stream => received.extend_from_slice(&data),
+                    stream: from, data, ..
+                } if from == stream => received.extend_from_slice(&data),
                 _ => {}
             }
         }
         if let Some(EndpointEvent::StreamData {
             peer_id,
-            conn_id,
-            stream_id,
+            stream,
             data,
         }) = alice.next_event(Duration::from_millis(20)).unwrap()
             && peer_id == bob_peer
@@ -320,9 +319,7 @@ fn a_circuit_forwarded_across_the_mesh_carries_data_both_ways() {
             assert!(at_alice.len() <= hello.len(), "Bob sent only hello");
             if at_alice.len() == hello.len() {
                 assert_eq!(at_alice, hello);
-                alice
-                    .send_stream(conn_id, stream_id, reply.clone())
-                    .unwrap();
+                alice.send_stream(stream, reply.clone()).unwrap();
             }
         }
     }
@@ -371,10 +368,10 @@ fn dcutr_punches_a_direct_path_over_a_forwarded_circuit() {
     let mut alice = client(&a.public, punch(ReservationPolicy::Always));
     await_reservation(&mut alice, &a.public);
     let mut bob = client(&b.public, punch(ReservationPolicy::Never));
-    let alice_peer = alice.peer_id().clone();
+    let alice_peer = *alice.peer_id();
     // No candidates: the forwarded circuit is the only way in, so a direct
     // connection can only come from the punch.
-    let connect_id = bob.connect(&alice_peer).unwrap();
+    let connect_id = bob.connect(alice_peer).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut trace = Vec::new();

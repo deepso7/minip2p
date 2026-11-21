@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Bytes, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
@@ -54,10 +54,18 @@ pub enum SwarmEvent {
     /// replaces it only if the lower peer id dialed it. Otherwise it is
     /// closed unannounced (our own losing dial completes as
     /// [`SwarmEvent::DialFailed`]), so both peers keep the same connection.
+    ///
+    /// `old_path` and `new_path` say how each connection was made, as far as
+    /// the swarm can tell: [`Path::Relayed`] for a circuit, otherwise
+    /// [`Path::Direct`] (a host that tracks hole punches refines that to
+    /// [`Path::Punched`]). A relayed `old` with a direct `new` is a planned
+    /// upgrade off the relay, not a lost link.
     ConnectionReplaced {
         peer_id: PeerId,
         old: ConnectionId,
         new: ConnectionId,
+        old_path: Path,
+        new_path: Path,
     },
     /// Identify information received from a remote peer on `conn_id`.
     ///

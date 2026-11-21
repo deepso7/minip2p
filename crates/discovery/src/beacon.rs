@@ -88,7 +88,7 @@ impl BeaconAgent {
         }
 
         self.events.push_back(BeaconEvent::Observation(Observation {
-            peer: from.clone(),
+            peer: *from,
             addrs: normalize_addrs(from, beacon.addrs, self.config.max_announced_addrs),
         }));
     }
@@ -131,7 +131,7 @@ impl BeaconAgent {
                 continue;
             }
             let mut advertised = addr.clone();
-            advertised.push(Protocol::P2p(self.local_peer_id.clone()));
+            advertised.push(Protocol::P2p(self.local_peer_id));
             let bytes = advertised.to_bytes();
             if bytes.len() <= crate::MAX_ADDR_LEN && !beacon.addrs.contains(&bytes) {
                 beacon.addrs.push(bytes);
@@ -149,7 +149,7 @@ impl BeaconAgent {
 
     fn violation(&mut self, peer: &PeerId, reason: &str) {
         self.events.push_back(BeaconEvent::ProtocolViolation {
-            peer: peer.clone(),
+            peer: *peer,
             reason: reason.to_string(),
         });
     }
@@ -217,7 +217,7 @@ mod tests {
             .iter()
             .map(|addr| {
                 let mut addr = Multiaddr::from_str(addr).expect("valid test multiaddr");
-                addr.push(Protocol::P2p(peer.clone()));
+                addr.push(Protocol::P2p(peer));
                 addr.to_bytes()
             })
             .collect();

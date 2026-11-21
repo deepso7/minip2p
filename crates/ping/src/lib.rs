@@ -213,7 +213,7 @@ impl PingProtocol {
         peer_id: PeerId,
         stream_id: StreamId,
     ) -> Result<(), PingError> {
-        let peer = self.peers.entry(peer_id.clone()).or_default();
+        let peer = self.peers.entry(peer_id).or_default();
 
         if let Some(existing) = peer.outbound.stream_id() {
             if existing != stream_id {
@@ -256,7 +256,7 @@ impl PingProtocol {
 
     /// Registers a negotiated inbound stream from a peer.
     pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
-        let peer = self.peers.entry(peer_id.clone()).or_default();
+        let peer = self.peers.entry(peer_id).or_default();
         if peer.inbound_streams.contains(&stream_id) {
             return;
         }
@@ -264,7 +264,7 @@ impl PingProtocol {
         if peer.inbound_streams.len() >= MAX_INBOUND_STREAMS {
             self.pending_events
                 .push_back(PingEvent::StreamLimitExceeded {
-                    peer_id: peer_id.clone(),
+                    peer_id,
                     stream_id,
                     limit: MAX_INBOUND_STREAMS,
                 });
@@ -295,9 +295,7 @@ impl PingProtocol {
         let peer = self
             .peers
             .get_mut(peer_id)
-            .ok_or_else(|| PingError::OutboundStreamMissing {
-                peer_id: peer_id.clone(),
-            })?;
+            .ok_or(PingError::OutboundStreamMissing { peer_id: *peer_id })?;
         let stream_id = Self::writable_outbound(peer_id, &peer.outbound)?;
 
         let mut frame = [0u8; PING_PAYLOAD_LEN];
@@ -311,7 +309,7 @@ impl PingProtocol {
         );
 
         self.pending_actions.push_back(PingAction::Send {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             stream_id,
             data: frame,
         });
@@ -326,15 +324,13 @@ impl PingProtocol {
         let peer = self
             .peers
             .get_mut(peer_id)
-            .ok_or_else(|| PingError::OutboundStreamMissing {
-                peer_id: peer_id.clone(),
-            })?;
+            .ok_or(PingError::OutboundStreamMissing { peer_id: *peer_id })?;
         let stream_id = Self::writable_outbound(peer_id, &peer.outbound)?;
         peer.outbound = Outbound::WriteClosed(stream_id);
 
         self.pending_actions
             .push_back(PingAction::CloseStreamWrite {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 stream_id,
             });
         Ok(())
@@ -344,15 +340,13 @@ impl PingProtocol {
     fn writable_outbound(peer_id: &PeerId, outbound: &Outbound) -> Result<StreamId, PingError> {
         match *outbound {
             Outbound::Open(stream_id) => Ok(stream_id),
-            Outbound::None => Err(PingError::OutboundStreamMissing {
-                peer_id: peer_id.clone(),
-            }),
+            Outbound::None => Err(PingError::OutboundStreamMissing { peer_id: *peer_id }),
             Outbound::InFlight(stream_id, _) => Err(PingError::PingAlreadyInFlight {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 stream_id,
             }),
             Outbound::WriteClosed(stream_id) => Err(PingError::OutboundWriteClosed {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 stream_id,
             }),
         }
@@ -476,7 +470,7 @@ impl PingProtocol {
 
             let rtt_ms = now_ms.saturating_sub(pending.sent_at_ms);
             self.pending_events.push_back(PingEvent::RttMeasured {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 stream_id,
                 rtt_ms,
             });
@@ -485,7 +479,7 @@ impl PingProtocol {
 
         if peer.inbound_streams.contains(&stream_id) {
             self.pending_actions.push_back(PingAction::Send {
-                peer_id: peer_id.clone(),
+                peer_id: *peer_id,
                 stream_id,
                 data: payload,
             });
@@ -516,7 +510,7 @@ impl PingProtocol {
             peer.recv_bufs.remove(&stream_id);
             self.pending_events
                 .push_back(PingEvent::OutboundStreamClosed {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     stream_id,
                 });
         }
@@ -557,7 +551,7 @@ impl PingProtocol {
         }
 
         if let Some(state) = self.peers.remove(old_peer_id) {
-            self.peers.insert(new_peer_id.clone(), state);
+            self.peers.insert(*new_peer_id, state);
         }
 
         for event in &mut self.pending_events {
@@ -570,7 +564,7 @@ impl PingProtocol {
                 | PingEvent::StreamLimitExceeded { peer_id, .. }
                 | PingEvent::ProtocolViolation { peer_id, .. } => {
                     if peer_id == old_peer_id {
-                        *peer_id = new_peer_id.clone();
+                        *peer_id = *new_peer_id;
                     }
                 }
             }
@@ -590,17 +584,17 @@ impl PingProtocol {
                 peer.outbound = Outbound::None;
                 peer.recv_bufs.remove(&stream_id);
                 self.pending_events.push_back(PingEvent::Timeout {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     stream_id,
                     timeout_ms: self.config.request_timeout_ms,
                 });
                 self.pending_events
                     .push_back(PingEvent::OutboundStreamClosed {
-                        peer_id: peer_id.clone(),
+                        peer_id: *peer_id,
                         stream_id,
                     });
                 self.pending_actions.push_back(PingAction::ResetStream {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     stream_id,
                 });
             }
@@ -618,13 +612,13 @@ impl PingProtocol {
             peer.recv_bufs.remove(&stream_id);
         }
         self.pending_events.push_back(PingEvent::ProtocolViolation {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             stream_id,
             reason,
         });
 
         self.pending_actions.push_back(PingAction::ResetStream {
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             stream_id,
         });
     }
@@ -677,7 +671,7 @@ mod tests {
         let peer = test_peer();
         let stream_id = StreamId::new(1);
 
-        ping.register_inbound_stream(peer.clone(), stream_id);
+        ping.register_inbound_stream(peer, stream_id);
         let mut payload = [0u8; PING_PAYLOAD_LEN];
         payload[0] = 7;
         ping.on_stream_data(&peer, stream_id, &payload, 10);
@@ -706,7 +700,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
 
         let payload = [42u8; PING_PAYLOAD_LEN];
@@ -743,7 +737,7 @@ mod tests {
         let mut ping = PingProtocol::default();
         let peer = test_peer();
         let stream = StreamId::new(0);
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
         ping.send_ping(&peer, &[1u8; PING_PAYLOAD_LEN], 0)
             .expect("send ping");
@@ -751,7 +745,7 @@ mod tests {
 
         ping.on_stream_data(&peer, stream, &[2u8; PING_PAYLOAD_LEN], 5);
         assert!(ping.poll_actions().contains(&PingAction::ResetStream {
-            peer_id: peer.clone(),
+            peer_id: peer,
             stream_id: stream,
         }));
         assert_eq!(ping.outbound_stream(&peer), None, "the stream was reset");
@@ -766,11 +760,11 @@ mod tests {
         let mut ping = PingProtocol::default();
         let peer = test_peer();
 
-        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        ping.register_inbound_stream(peer, StreamId::new(1));
         let a = ping.poll_actions();
-        ping.register_inbound_stream(peer.clone(), StreamId::new(5));
+        ping.register_inbound_stream(peer, StreamId::new(5));
         let b = ping.poll_actions();
-        ping.register_inbound_stream(peer.clone(), StreamId::new(9));
+        ping.register_inbound_stream(peer, StreamId::new(9));
         let c = ping.poll_actions();
 
         assert!(a.is_empty());
@@ -778,7 +772,7 @@ mod tests {
         assert_eq!(
             c,
             vec![PingAction::ResetStream {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 stream_id: StreamId::new(9),
             }]
         );
@@ -797,7 +791,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer, stream);
         let _ = ping.poll_actions();
 
         let payload = [7u8; PING_PAYLOAD_LEN];
@@ -821,7 +815,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
         let payload = [1u8; PING_PAYLOAD_LEN];
         ping.send_ping(&peer, &payload, 100).expect("send ping");
@@ -832,7 +826,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![PingAction::ResetStream {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 stream_id: stream,
             }]
         );
@@ -865,7 +859,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer, stream);
         let _ = ping.poll_actions();
 
         let payload = [7u8; PING_PAYLOAD_LEN];
@@ -894,7 +888,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
 
         let payload = [42u8; PING_PAYLOAD_LEN];
@@ -934,7 +928,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer, stream);
         let _ = ping.poll_actions();
 
         // Send more than 32 bytes in one shot.
@@ -944,7 +938,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![PingAction::ResetStream {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 stream_id: stream,
             }]
         );
@@ -963,7 +957,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
 
         let payload = [1u8; PING_PAYLOAD_LEN];
@@ -980,7 +974,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
         ping.close_outbound_stream_write(&peer)
             .expect("close write");
@@ -990,7 +984,7 @@ mod tests {
         assert_eq!(
             ping.send_ping(&peer, &payload, 100),
             Err(PingError::OutboundWriteClosed {
-                peer_id: peer.clone(),
+                peer_id: peer,
                 stream_id: stream,
             })
         );
@@ -999,7 +993,7 @@ mod tests {
 
         // The remote's close retires the stream; a new one can be registered.
         ping.on_stream_remote_write_closed(&peer, stream);
-        ping.register_outbound_stream(peer.clone(), StreamId::new(4))
+        ping.register_outbound_stream(peer, StreamId::new(4))
             .expect("register replacement");
     }
 
@@ -1009,9 +1003,9 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
-        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        ping.register_inbound_stream(peer, StreamId::new(1));
         let _ = ping.poll_actions();
 
         let payload = [1u8; PING_PAYLOAD_LEN];
@@ -1021,9 +1015,9 @@ mod tests {
         ping.remove_peer(&peer);
 
         // After removal, we can re-register everything fresh.
-        ping.register_outbound_stream(peer.clone(), StreamId::new(10))
+        ping.register_outbound_stream(peer, StreamId::new(10))
             .expect("re-register outbound stream after remove_peer");
-        ping.register_inbound_stream(peer.clone(), StreamId::new(11));
+        ping.register_inbound_stream(peer, StreamId::new(11));
         let actions = ping.poll_actions();
         assert!(actions.is_empty());
     }
@@ -1033,10 +1027,10 @@ mod tests {
         let mut ping = PingProtocol::default();
         let peer = test_peer();
 
-        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        ping.register_inbound_stream(peer, StreamId::new(1));
         assert_eq!(ping.outbound_stream(&peer), None);
 
-        ping.register_outbound_stream(peer.clone(), StreamId::new(2))
+        ping.register_outbound_stream(peer, StreamId::new(2))
             .expect("register outbound stream");
         assert_eq!(ping.outbound_stream(&peer), Some(StreamId::new(2)));
     }
@@ -1047,7 +1041,7 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(0);
 
-        ping.register_outbound_stream(peer.clone(), stream)
+        ping.register_outbound_stream(peer, stream)
             .expect("register stream");
 
         // No ping in flight -- remote closes write side.

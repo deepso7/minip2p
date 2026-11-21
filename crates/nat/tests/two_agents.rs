@@ -88,10 +88,10 @@ impl World {
         let b_id = peer(b"agent-b");
         let relay_id = peer(b"relay-peer");
         let relay_addr =
-            PeerAddr::new(maddr(RELAY_ADDR), relay_id.clone()).expect("valid relay peer address");
+            PeerAddr::new(maddr(RELAY_ADDR), relay_id).expect("valid relay peer address");
 
         let mut a = Node::new(
-            a_id.clone(),
+            a_id,
             NatConfig {
                 relays: vec![relay_addr.clone()],
                 reservation_policy: ReservationPolicy::Never,
@@ -102,7 +102,7 @@ impl World {
         a.set_listen_addrs(&[maddr(A_LISTEN)]);
 
         let mut b = Node::new(
-            b_id.clone(),
+            b_id,
             NatConfig {
                 relays: vec![relay_addr],
                 reservation_policy: ReservationPolicy::Always,
@@ -155,8 +155,8 @@ impl World {
 
     fn peer_of(&self, side: Side) -> PeerId {
         match side {
-            Side::A => self.a_id.clone(),
-            Side::B => self.b_id.clone(),
+            Side::A => self.a_id,
+            Side::B => self.b_id,
         }
     }
 
@@ -233,19 +233,19 @@ impl World {
                             .get_mut(Self::side_index(side))
                             .expect("every side index selects one relay connection slot") =
                             Some(conn);
-                        let relay = self.relay_id.clone();
+                        let relay = self.relay_id;
                         let agent = self.agent(side);
                         agent.handle_event(
                             &SwarmEvent::ConnectionEstablished {
                                 conn_id: conn,
-                                peer_id: relay.clone(),
+                                peer_id: relay,
                             },
                             false,
                             now,
                         );
                         agent.handle_event(
                             &SwarmEvent::PeerReady {
-                                peer_id: relay.clone(),
+                                peer_id: relay,
                                 conn_id: conn,
                                 protocols: vec![
                                     HOP_PROTOCOL_ID.to_string(),
@@ -468,7 +468,7 @@ impl World {
                     self.streams.push((Side::B, stop_stream, EmuStream::Stop));
                     self.bridge = Some((stream, stop_stream, pending_id));
 
-                    let relay = self.relay_id.clone();
+                    let relay = self.relay_id;
                     let conn_id = self.relay_conn(Side::B);
                     self.b.handle_event(
                         &SwarmEvent::StreamReady {
@@ -526,7 +526,7 @@ impl World {
     }
 
     fn deliver(&mut self, side: Side, stream: StreamId, data: Vec<u8>) {
-        let relay = self.relay_id.clone();
+        let relay = self.relay_id;
         let now = at(self.now);
         let conn_id = self.relay_conn(side);
         self.agent(side).handle_event(
@@ -543,7 +543,7 @@ impl World {
 
     /// The punch "lands": both sides observe the direct connection.
     fn establish_direct(&mut self) {
-        let (a_id, b_id) = (self.a_id.clone(), self.b_id.clone());
+        let (a_id, b_id) = (self.a_id, self.b_id);
         let now = at(self.now);
         let a_conn = self.punch_conn_a.unwrap_or(ConnectionId::new(1));
         let b_conn = self.punch_conn_b.unwrap_or(ConnectionId::new(1));
@@ -577,7 +577,7 @@ impl World {
 
     /// A starts connecting to B (relay leg only — no direct candidates).
     fn start_connect(&mut self) -> ConnectId {
-        let id = start(&mut self.a, 1, self.b_id.clone(), RELAY_NOW, at(self.now));
+        let id = start(&mut self.a, 1, self.b_id, RELAY_NOW, at(self.now));
         self.pump();
         id
     }

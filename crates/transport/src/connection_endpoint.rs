@@ -33,7 +33,7 @@ impl ConnectionEndpoint {
 
     /// Creates an endpoint from a [`PeerAddr`].
     pub fn from_peer_addr(addr: &PeerAddr) -> Self {
-        Self::with_peer_id(addr.transport().clone(), addr.peer_id().clone())
+        Self::with_peer_id(addr.transport().clone(), *addr.peer_id())
     }
 
     /// Returns the transport address.
@@ -67,7 +67,7 @@ impl ConnectionEndpoint {
     /// Converts to a [`PeerAddr`], returning `None` if no peer id is set.
     #[cfg(test)]
     pub fn to_peer_addr(&self) -> Option<PeerAddr> {
-        let peer_id = self.peer_id.as_ref()?.clone();
+        let peer_id = *self.peer_id.as_ref()?;
         PeerAddr::new(self.transport.clone(), peer_id).ok()
     }
 }

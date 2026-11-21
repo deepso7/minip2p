@@ -111,7 +111,7 @@ fn connect_without_candidates_or_relay_fails_fast() {
     a.listen().expect("a listens");
 
     let stranger = minip2p::Ed25519Keypair::generate().peer_id();
-    let id = a.connect(&stranger).expect("connect starts");
+    let id = a.connect(stranger).expect("connect starts");
 
     let event = a
         .next_event(Duration::from_secs(1))
@@ -209,7 +209,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
 
     await_reservation(&mut responder, &relay);
 
@@ -226,9 +226,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
-    let initiator_peer = initiator.peer_id().clone();
+    let initiator_peer = *initiator.peer_id();
     let connect_id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -285,7 +285,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     assert_eq!(
         path,
         Some(Path::Relayed {
-            relay: relay.addr().peer_id().clone()
+            relay: *relay.addr().peer_id()
         })
     );
     match settled {
@@ -322,7 +322,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         relay.assert_healthy();
     }
 
-    let (conn, stream) = initiator
+    let stream = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream over circuit");
     let payload = b"echo across the promoted circuit".to_vec();
@@ -339,21 +339,21 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    stream_id,
+                    stream: id,
                     initiated_locally: true,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => {
+                } if peer_id == responder_peer && id == stream => {
                     initiator_stream_ready = true;
                     initiator
-                        .send_stream(conn, stream, payload.clone())
+                        .send_stream(stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    stream_id,
+                    stream: id,
                     data,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => echoed = Some(data),
+                } if peer_id == responder_peer && id == stream => echoed = Some(data),
                 _ => {}
             }
         }
@@ -364,24 +364,19 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some((conn_id, stream_id));
+                    responder_stream = Some(stream);
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     data,
-                } if peer_id == initiator_peer
-                    && Some((conn_id, stream_id)) == responder_stream =>
-                {
-                    responder
-                        .send_stream(conn_id, stream_id, data)
-                        .expect("echo payload");
+                } if peer_id == initiator_peer && Some(stream) == responder_stream => {
+                    responder.send_stream(stream, data).expect("echo payload");
                 }
                 _ => {}
             }
@@ -452,7 +447,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
 
     await_reservation(&mut responder, &relay);
 
@@ -469,9 +464,9 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
-    let initiator_peer = initiator.peer_id().clone();
+    let initiator_peer = *initiator.peer_id();
     let connect_id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -526,7 +521,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     assert_eq!(
         path,
         Some(Path::Relayed {
-            relay: relay.addr().peer_id().clone()
+            relay: *relay.addr().peer_id()
         })
     );
     assert!(
@@ -584,7 +579,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
 
     // And it carries application traffic, which is the only thing that
     // proves the whole stack negotiated over it rather than merely opened.
-    let (conn, stream) = initiator
+    let stream = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream over circuit");
     let payload = b"echo across a circuit on a TCP relay".to_vec();
@@ -600,20 +595,20 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    stream_id,
+                    stream: id,
                     initiated_locally: true,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => {
+                } if peer_id == responder_peer && id == stream => {
                     initiator
-                        .send_stream(conn, stream, payload.clone())
+                        .send_stream(stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    stream_id,
+                    stream: id,
                     data,
                     ..
-                } if peer_id == responder_peer && stream_id == stream => echoed = Some(data),
+                } if peer_id == responder_peer && id == stream => echoed = Some(data),
                 _ => {}
             }
         }
@@ -624,24 +619,19 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     initiated_locally: false,
                     protocol_id,
+                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some((conn_id, stream_id));
+                    responder_stream = Some(stream);
                 }
                 EndpointEvent::StreamData {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     data,
-                } if peer_id == initiator_peer
-                    && Some((conn_id, stream_id)) == responder_stream =>
-                {
-                    responder
-                        .send_stream(conn_id, stream_id, data)
-                        .expect("echo payload");
+                } if peer_id == initiator_peer && Some(stream) == responder_stream => {
+                    responder.send_stream(stream, data).expect("echo payload");
                 }
                 _ => {}
             }
@@ -708,7 +698,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
     await_reservation(&mut responder, &relay);
 
     let start_timeout_ms = 1_500;
@@ -726,7 +716,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     initiator.listen().expect("initiator listens");
     let started = Instant::now();
     let connect_id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relayed connect");
 
     // The 30 s connect deadline is far off; the start timeout settles it.
@@ -772,7 +762,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     assert_eq!(
         initiator.path(&responder_peer),
         Some(Path::Relayed {
-            relay: relay.addr().peer_id().clone()
+            relay: *relay.addr().peer_id()
         })
     );
 }
@@ -796,7 +786,7 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
         .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
+    let responder_peer = *responder.peer_id();
     await_reservation(&mut responder, &relay);
 
     let mut initiator = Endpoint::builder()
@@ -810,12 +800,13 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
     // No candidates: the circuit is the only way in, so a direct connection
     // can only come from the punch.
     let connect_id = initiator
-        .connect(&responder_peer)
+        .connect(responder_peer)
         .expect("start relayed connect");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut trace = Vec::new();
     let mut punched = None;
+    let mut replaced = None;
     let outcome = loop {
         assert!(
             Instant::now() < deadline,
@@ -833,6 +824,13 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
                     new_conn_id,
                     ..
                 }) if id == connect_id => punched = Some(new_conn_id),
+                EndpointEvent::ConnectionReplaced {
+                    peer_id,
+                    new,
+                    old_path,
+                    new_path,
+                    ..
+                } if peer_id == responder_peer => replaced = Some((new, old_path, new_path)),
                 EndpointEvent::ConnectSettled {
                     connect_id: id,
                     outcome,
@@ -856,6 +854,15 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
     assert_eq!(path, Path::Punched, "{trace:#?}");
     assert_eq!(Some(conn_id), punched, "settled on the punched connection");
     assert_eq!(initiator.path(&responder_peer), Some(Path::Punched));
+    // The replacement itself says the relay was left for the punch.
+    let relayed = Path::Relayed {
+        relay: *relay.addr().peer_id(),
+    };
+    assert_eq!(
+        replaced,
+        Some((conn_id, relayed, Path::Punched)),
+        "{trace:#?}"
+    );
 }
 
 /// Drives `responder` until it holds a reservation on `relay`.
@@ -896,7 +903,7 @@ fn observe_path_event(
         && peer == remote
         && path.is_none()
     {
-        *path = Some(found.clone());
+        *path = Some(*found);
     }
 }
 

@@ -3,7 +3,7 @@
 //! same way for the std `Endpoint` and [`crate::PortableEndpoint`].
 //!
 //! A builder only records intent in [`Capabilities`]. [`validate`] applies
-//! every default against the [`Platform`] (the NAT base, the merged relay and
+//! every default against the [`PlatformCaps`] (the NAT base, the merged relay and
 //! AutoNAT lists, NAT for discovered peers) and checks the result before any
 //! socket opens; [`install`] then registers each capability's protocols
 //! on the swarm and installs its agent. A capability's protocols are
@@ -105,7 +105,7 @@ pub(crate) struct RelayServerSetup {
 
 /// What the endpoint's platform offers its capabilities.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Platform {
+pub(crate) struct PlatformCaps {
     /// Whether the endpoint runs DCUtR hole punching: only the std endpoint
     /// with QUIC does.
     #[cfg_attr(
@@ -133,7 +133,7 @@ pub(crate) struct Platform {
 /// [`install`].
 pub(crate) struct Validated {
     capabilities: Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
     /// The relay server's agent, built (and its announce addresses checked)
     /// while validating.
     #[cfg(feature = "relay-server")]
@@ -274,7 +274,7 @@ impl From<RelayServerConfigError> for SetupError {
 )]
 pub(crate) fn validate(
     mut capabilities: Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
     local_peer: &PeerId,
 ) -> Result<Validated, SetupError> {
     #[cfg(feature = "pubsub")]
@@ -294,8 +294,7 @@ pub(crate) fn validate(
     #[cfg(feature = "relay-server")]
     let relay_server = match capabilities.relay_server.take() {
         Some(setup) => {
-            let mut agent =
-                minip2p_relay_server::RelayServerAgent::new(local_peer.clone(), setup.config)?;
+            let mut agent = minip2p_relay_server::RelayServerAgent::new(*local_peer, setup.config)?;
             agent
                 .replace_announce_addrs(setup.announce_addrs)
                 .map_err(|error| SetupError::RelayServerAnnounce(alloc::boxed::Box::new(error)))?;
@@ -330,7 +329,7 @@ pub(crate) fn validate(
 #[cfg(feature = "autonat")]
 fn resolve_nat(
     capabilities: &mut Capabilities,
-    platform: Platform,
+    platform: PlatformCaps,
 ) -> Result<Option<NatConfig>, NatConfigError> {
     let relays = core::mem::take(&mut capabilities.relays);
     let autonat_servers = core::mem::take(&mut capabilities.autonat_servers);
@@ -368,7 +367,7 @@ fn merge_unique(base: Vec<PeerAddr>, added: Vec<PeerAddr>) -> Vec<PeerAddr> {
 
 /// Rejects NAT configuration that cannot run on `platform`.
 #[cfg(feature = "autonat")]
-fn validate_nat(config: &NatConfig, platform: Platform) -> Result<(), NatConfigError> {
+fn validate_nat(config: &NatConfig, platform: PlatformCaps) -> Result<(), NatConfigError> {
     let relays = !config.relays.is_empty();
     if !relays && config.force_relay {
         Err(NatConfigError::ForceRelayWithoutRelay)
@@ -446,11 +445,11 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
         let relay_addrs = config
             .relays
             .iter()
-            .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
+            .map(|relay| (*relay.peer_id(), relay.transport().clone()))
             .collect();
         let jitter_seed = core.entropy_mut().next_u64()?;
         // The driver seeds the agent's listen addresses on its first turn.
-        let agent = minip2p_nat::NatAgent::new(core.local_peer_id().clone(), config);
+        let agent = minip2p_nat::NatAgent::new(*core.local_peer_id(), config);
         let driver = NatDriver::new(agent, relay_addrs, jitter_seed);
         #[cfg(feature = "relay")]
         let driver = match circuits {
@@ -503,11 +502,8 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
     if let (Some(config), Some(io)) = (capabilities.mdns, mdns_carrier) {
         let mut seed = [0; 32];
         engine.core.entropy_mut().fill_bytes(&mut seed)?;
-        let agent = minip2p_mdns::MdnsAgent::new(
-            engine.core.local_peer_id().clone(),
-            config.clone(),
-            seed,
-        )?;
+        let agent =
+            minip2p_mdns::MdnsAgent::new(*engine.core.local_peer_id(), config.clone(), seed)?;
         engine.set_mdns(
             minip2p_mdns::MdnsDriver::new(agent, io, &config),
             platform.mdns_shares_transport,
@@ -526,7 +522,7 @@ pub(crate) fn install<T: Transport, E: EntropySource, M: Carrier>(
         let mdns_enabled = false;
         if beacon_enabled || mdns_enabled {
             let book = minip2p_discovery::PeerDiscoveryAgent::new(
-                engine.core.local_peer_id().clone(),
+                *engine.core.local_peer_id(),
                 capabilities.peer_discovery,
             )?;
             engine.discovery = Some(DiscoveryDriver::new(

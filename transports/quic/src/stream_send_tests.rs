@@ -557,3 +557,79 @@ fn a_local_close_retracts_queued_writables() {
     );
     assert_eq!(server.connections[&id].writable_armed_count(), 0);
 }
+
+#[test]
+fn a_fin_behind_bytes_the_engine_holds_stays_pending_until_acknowledged() {
+    let mut server = server_with_queue(1 << 20);
+    let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+    let raw = open_streams(&mut server, &mut peer, &[b"hi"])[0];
+    let _ = peer.read(raw);
+    let stream = StreamId::new(raw);
+
+    // Far past the initial congestion window, then the FIN: the engine
+    // takes it all, but without the peer's acknowledgements most of it
+    // stays in the engine. Only the FIN's acknowledgement says it left.
+    const LEN: usize = 256 * 1024;
+    server
+        .send_stream(id, stream, Bytes::from(vec![7; LEN]))
+        .expect("send");
+    server.close_stream_write(id, stream).expect("fin");
+    for _ in 0..3 {
+        server.poll(now()).expect("poll");
+    }
+    assert_eq!(
+        pending_write_bytes(&server, id),
+        0,
+        "the engine took it all"
+    );
+    assert!(server.has_pending_writes(), "the FIN is not acknowledged");
+
+    let (mut received, mut fin) = (0, false);
+    let start = Instant::now();
+    while server.has_pending_writes() {
+        assert!(start.elapsed() < Duration::from_secs(20), "never drained");
+        std::thread::sleep(Duration::from_millis(1));
+        peer.pump();
+        server.poll(now()).expect("poll");
+        let (data, done) = peer.read(raw);
+        received += data.len();
+        fin |= done;
+    }
+    // Drained means acknowledged: the peer has every byte and the FIN.
+    for _ in 0..3 {
+        peer.pump();
+        let (data, done) = peer.read(raw);
+        received += data.len();
+        fin |= done;
+    }
+    assert_eq!(received, LEN);
+    assert!(fin);
+}
+
+#[test]
+fn a_peer_reset_ends_the_wait_for_an_unacknowledged_fin() {
+    let mut server = server_with_idle_timeout(10_000);
+    let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+    let raw = open_streams(&mut server, &mut peer, &[b"hi"])[0];
+    let stream = StreamId::new(raw);
+
+    // The FIN goes out, and the peer resets the stream before reading it:
+    // the engine never reports the FIN acknowledged.
+    server
+        .send_stream(id, stream, Bytes::from_static(b"bye"))
+        .expect("send");
+    server.close_stream_write(id, stream).expect("fin");
+    server.poll(now()).expect("poll");
+    assert!(server.has_pending_writes(), "the FIN waits on its ack");
+    peer.reset(raw, 5);
+    peer.service();
+    // Only the server runs, so the peer acknowledges nothing it sent.
+    let mut events = Vec::new();
+    drive_until(&mut server, &mut [], &mut events, "reset", |events| {
+        events.contains(&TransportEvent::StreamClosed {
+            id,
+            stream_id: stream,
+        })
+    });
+    assert!(!server.has_pending_writes());
+}

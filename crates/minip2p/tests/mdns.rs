@@ -30,8 +30,8 @@ fn two_endpoints_discover_and_connect_without_bootstrap() {
     let mut b = endpoint();
     a.listen().expect("a listens");
     b.listen().expect("b listens");
-    let a_peer = a.peer_id().clone();
-    let b_peer = b.peer_id().clone();
+    let a_peer = *a.peer_id();
+    let b_peer = *b.peer_id();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while !a.connected_peers().contains(&b_peer) || !b.connected_peers().contains(&a_peer) {
@@ -46,6 +46,6 @@ fn two_endpoints_discover_and_connect_without_bootstrap() {
 
     assert!(a.known_peers().iter().any(|known| known.peer == b_peer));
     assert!(b.known_peers().iter().any(|known| known.peer == a_peer));
-    a.shutdown().expect("a sends goodbyes");
-    b.shutdown().expect("b sends goodbyes");
+    a.shutdown_mdns().expect("a sends goodbyes");
+    b.shutdown_mdns().expect("b sends goodbyes");
 }

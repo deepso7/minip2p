@@ -5,92 +5,65 @@ minip2p is a minimal libp2p implementation in Rust: small, portable, understanda
 ## Goals
 
 - Awesome DX: clear APIs, sensible defaults, and actionable errors.
-- Sans-I/O: keep core logic deterministic; I/O belongs in adapters.
+- Sans-I/O: keep core logic deterministic. Adapters and drivers own I/O, clocks, and timers.
 - `no_std + alloc` core crates.
 - No `async`/`.await`; remain caller-driven and executor-independent.
 - QUIC and TCP side by side: QUIC is `std`-only; TCP is portable down to `no_std`.
-
-Additional constraints: `unsafe` is forbidden workspace-wide, except one scoped call in `minip2p-quic` (ADR 0019) and napi-rs's generated code in `crates/nodejs`, whose own source still denies it; sockets, clocks, and timers live only in adapters/drivers; pre-1.0, breaking API changes are fine.
+- `unsafe` is forbidden, except one scoped call in `minip2p-quic` (ADR 0019) and napi-rs's generated code in `crates/nodejs`.
+- Pre-1.0: breaking API changes are fine.
 
 ## Commands
 
-`just` mirrors CI (`.github/workflows/ci.yml`):
+`just` mirrors CI; `just --list` shows every recipe.
 
 ```bash
-just test          # nextest + doctests, workspace + the feature matrix's `ci` rows; needs cargo-nextest
-just test test-full # every matrix row, as the release workflow runs it
-just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
+just dev           # fast loop: fmt check, workspace clippy, workspace nextest
+just test          # nextest + doctests + the feature matrix's `ci` rows; needs cargo-nextest
+just clippy full   # every feature-matrix row, as CI lints them; run before pushing feature-gated code
 just fmt           # also formats fuzz/
-just clean         # Cargo targets, node_modules, Turbo caches, docs output
-just check-nostd   # all no_std crates on thumbv7em-none-eabi
-just check-wasm    # the browser build's crates on wasm32-unknown-unknown
-just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine for one test; the matrix runs use nextest because it runs every binary's tests at once instead of one binary at a time). Endpoint features: `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`, `discovery,mdns,tcp`; see `scripts/run-feature-matrix.sh` for the full matrix). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
-
-Publish a release end to end with:
-
-```bash
-just release <version>
-```
-
-The command bumps every public package and local dependency, regenerates lockfiles, waits for push CI, publishes the GitHub release, waits for the native build and registry workflow, and verifies crates.io and npm. PRs and push CI test only the matrix's `ci` rows; the full matrix runs in the release workflow's `test-rust` job, which gates every publish job. The default path leaves that to GitHub to avoid running it twice; use `just release <version> --full-local` to run the full matrix locally before pushing as well.
+- Single test: `cargo test -p minip2p-ping test_name`. Endpoint features: `cargo test -p minip2p-rs --features tcp`; `scripts/run-feature-matrix.sh list` prints every matrix row.
+- `fuzz/` is outside the workspace: use `--manifest-path fuzz/Cargo.toml`.
+- Release: `just release <version>` bumps versions, pushes, and publishes. The release workflow runs the full matrix; add `--full-local` to run it locally first.
 
 ## Architecture
 
-Four layers, strictly separated:
+Four layers, strictly separated; layers 1, 2, and 4 live in `crates/`. Each published crate's README covers its API.
 
-1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns` (agent plus the portable `MdnsDriver` over an `MdnsIo` seam, with `MdnsSockets` behind `std` and `SmoltcpMdnsIo` behind `smoltcp`); plus `identity`, `core` (addresses, stream length-prefix framing, the shared protobuf field wire vocabulary, and the `platform` module's `Clock`/`Now`/`Deadline`/`EntropySource` contracts), `tls`, `secure-mux` (the `noise` (Noise XX) and `yamux` modules, and the multistream-select + Noise + Yamux session over an ordered byte stream, shared by circuit and TCP), and `transport` (the `Transport`/`BlockingTransport` contracts, plus `TransportSet`, which routes several transports behind one of them).
-2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`, the `no_std` swarm that drives a transport with caller-supplied time and entropy, and a `std`-gated `Swarm<T>` that adds a clock and a blocking wait), `crates/nat` (`NatAgent`: relay-leg provider; Connection engine owns the race), `crates/relay-server` (`RelayServerAgent`: reservation admission and relay forwarding), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
-3. **Transport adapters**: `transports/quic` (`std`-only, quinn-proto-based, owns UDP, exposes deadlines; transports take `/ip4`/`/ip6` only) and `transports/tcp` (`no_std + alloc`; `TcpTransport` over a pluggable `TcpProvider` byte-stream seam, with `StdTcpProvider` on `mio` behind `std` and `SmoltcpTcpProvider` behind `smoltcp`), plus `transports/webtransport` (`no_std + alloc`; the sans-I/O HTTP/3 + static-table QPACK codec that WebTransport needs).
-4. **`std` adapters**: `crates/minip2p` — the application-facing `Endpoint` API, which composes the transports it is asked to bind into a `TransportSet`, routes by address, and resolves `/dns*` candidates off the driver thread, and whose features layer on without changing the base API — `crates/ffi-core`, the binding-agnostic detached driver, event carry, and endpoint lifecycle — `crates/ffi`, the thin UniFFI binding shell, and `crates/web`, the wasm shell behind `@minip2p/web`.
+1. **Sans-I/O protocol crates** (`no_std + alloc`): `multistream-select`, `ping`, `identify`, `relay`, `pubsub`, `mdns`, plus `identity`, `core` (incl. `platform` time/entropy contracts), `tls`, `secure-mux` (Noise + Yamux session, shared by circuit and TCP), `transport`, `circuit`, and `smoltcp`.
+2. **Sans-I/O orchestrators**: `swarm` (`SwarmCore`; `std` adds `Swarm<T>`), `nat` (AutoNAT v1, DCUtR, `NatAgent`), `relay-server`, `discovery`.
+3. **Transport adapters**: `transports/quic` (`std`, quinn-proto), `transports/tcp` (`no_std`, pluggable `TcpProvider`), `transports/webtransport` (`no_std`, HTTP/3 codec and browser client). QUIC and the bundled TCP providers take `/ip4`/`/ip6` only; the `std` `Endpoint` resolves `/dns*`.
+4. **Application and binding adapters**: `minip2p` (package `minip2p-rs`: the application-facing `Endpoint`, portable without `std`), `ffi-core`, `ffi` (UniFFI), `nodejs` (napi-rs), `web` (wasm, `@minip2p/web`).
 
-The default swarm composes only identify + ping + protocols registered via `SwarmBuilder::protocol`/`EndpointBuilder::protocol`; relay/AutoNAT/DCUtR policy belongs to the host. `code-ref/` is read-only reference checkouts, not part of the build.
+The default swarm composes only identify + ping + protocols registered via `SwarmBuilder::protocol`/`EndpointBuilder::protocol`; relay/AutoNAT/DCUtR policy belongs to the host. `code-ref/` holds read-only reference checkouts outside the build.
+
+Before adding an Endpoint capability or Cargo feature, an `EndpointEvent` variant, or a binding method or config field, read `docs/agents/change-recipes.md`: each touches several layers in a fixed set of places.
 
 ## Conventions
 
-- Every crate has a README and rustdoc on all public APIs; keep both current.
+- Keep rustdoc current on all public APIs, and a README current for every published crate.
 - Wire-facing decoders get fuzz coverage via the `wire_inputs` target in `fuzz/`.
-- If a PR touches a perf-sensitive path, add the `bench` label on the PR to bench it and review the results comment for regressions.
+- Add the `bench` label to PRs touching a perf-sensitive path, and review the results comment for regressions.
 
-## Coding Preferences
+## Coding preferences
 
-- Prefer concise, simple solutions over clever or heavy abstractions. Channel "YAGNI" principles and avoid over-engineering.
-- Typesafety is useful, take advantage of it.
-- If a substantially simpler approach exists, use it or surface it clearly.
-- Comments are a great way to clarify functionality and how code is used. Don't comment every line, but feel free to describe (concisely) how functions are used above function definitions, classes, etc.
-- Keep comments up to date! When making changes, it's important to keep things in sync.
-- Look for ways to reduce complexity when solving problems.
-- Tests are good! Endless smoke tests, "regression tests" for feature deletions, etc., much less good. Tests should be focused, not slop.
+- YAGNI: concise, simple solutions over clever or heavy abstractions. If a substantially simpler approach exists, use it or surface it.
+- Lean on the type system.
+- Comment sparingly: a concise note above a definition on how it is used, not line-by-line narration. Keep comments in sync with the code.
+- Tests are focused: no endless smoke tests or "regression tests" for deleted features.
+- TypeScript: inferred types, never `any`; no one-line casting wrappers; idiomatic TS that Matt Pocock and Theo would be proud of. Prefer Effect for application services, concurrency, resource management, and typed errors; keep it out of trivial pure code.
 
-## Coding preferences (Typescript focused)
+## Killing processes
 
-- `any` is the enemy. Inferred types are our friend. Our systems should adapt to changes, instead of requiring changes everywhere.
-- If your TS code looks like a Python dev wrote it, it is bad TS code.
-- Avoid one-line functions that are just casting wrappers.
-- Write TypeScript in ways that Matt Pocock and Theo would be proud of.
-- Prefer Effect for application services, concurrency, resource management, and typed errors; don’t introduce it into trivial pure code.
-
-## Don'ts
-
-- Killing processes: Never use `pkill -f`, `pgrep | kill`, or kill a PID found by matching a name, path, or worktree string. Kill only a PID you captured when starting the process, or the listener returned by `lsof -nP -iTCP:<port> -sTCP:LISTEN -t`. Before killing a port owner, confirm its working directory with `lsof -a -p <pid> -d cwd -Fn`. Use `kill <pid>` first; use `kill -9 <pid>` only if termination fails.
+Kill only a PID you captured when starting the process, or the listener from `lsof -nP -iTCP:<port> -sTCP:LISTEN -t` after confirming its cwd with `lsof -a -p <pid> -d cwd -Fn`. Never match by name, path, or worktree string (`pkill -f`, `pgrep | kill`). Use `kill <pid>`, then `kill -9` only if that fails.
 
 ## Questions are read-only
 
-- A question is a request for an answer, not for changes. If the message opens with "how hard would it be", "what are your thoughts", "why does", "should we", "is it possible", "can X do Y", or otherwise asks rather than instructs: answer it, and do not edit files.
-- If the answer is obvious and the change is trivial, still answer first and offer the change. Ask before making it.
+A message that asks rather than instructs ("how hard would it be", "should we", "why does", "is it possible", "can X do Y") gets an answer, not edits. If the change is obvious and trivial, offer it and ask first.
 
 ## Agent skills
 
-### Issue tracker
-
-Issues and specs are tracked in GitHub Issues for this repository. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Use the five default canonical triage labels. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Use a single-context layout with `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+- Issues and specs live in GitHub Issues: `docs/agents/issue-tracker.md`.
+- Triage uses the five default canonical labels: `docs/agents/triage-labels.md`.
+- Domain docs use a single-context layout with `GLOSSARY.md` and `docs/adr/` at the root: `docs/agents/domain.md`.
