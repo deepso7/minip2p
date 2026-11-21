@@ -7,15 +7,15 @@ use minip2p_core::platform::Deadline;
 use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, PeerAddr, PeerId};
 use minip2p_nat::{ConnectLegs, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
-use minip2p_relay_server::mesh::{DIRECTORY_PROTOCOL_ID, DirectoryMessage, FORWARD_PROTOCOL_ID};
+use minip2p_relay_server::mesh::{DIRECTORY_PROTOCOL_ID, FORWARD_PROTOCOL_ID};
 use minip2p_relay_server::{
     CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit, RelayServerConfig,
     RelayServerEvent, Status, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
+use minip2p_transport::ConnectionId;
 
-use common::mesh::{Mesh, link, member, verify_by_hand};
+use common::mesh::{Mesh, link, member};
 use common::nat_client::{
     CLIENT_RELAY_CONN, ClientSwarm, establish_relay_session, ready_client_hop,
 };
@@ -245,7 +245,7 @@ fn forwarded_circuit_carries_bytes_both_ways_with_backpressure_and_half_close() 
     let mut mesh = mesh(defaults());
     mesh.reserve(A, &alice(), key(ALICE_CONN, 1), at(0));
     let stop = open_forwarded(&mut mesh, B, A, &bob(), bob_stream());
-    let forward_at_a = Mesh::remote(B, mesh.opened(B, A, FORWARD_PROTOCOL_ID)[0]);
+    let forward_at_a = mesh.remote(B, mesh.opened(B, A, FORWARD_PROTOCOL_ID)[0]);
 
     mesh.nodes[A].swarm.credit.insert(stop, 2);
     mesh.nodes[B].data(&bob(), bob_stream(), b"abcdef", at(1));
@@ -438,13 +438,20 @@ fn a_local_stop_that_fails_to_open_falls_through_to_a_remote_claim() {
 #[test]
 fn a_replaced_link_keeps_connects_waiting_for_the_new_snapshot() {
     let mut mesh = Mesh::with_held(defaults().into(), &[(B, C)]);
+    mesh.reserve(B, &alice(), key(ALICE_CONN, 1), at(0));
     mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
 
-    let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
-    mesh.nodes[C].replace(&member(B), link(B), new_link, false, 2);
-    let calls = mesh.nodes[C].calls();
-    assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
+    let new_link = mesh.replace(C, B, 2);
+    assert_eq!(mesh.hop_status(C, bob_stream()).0, None);
     assert_eq!(mesh.nodes[C].circuit_count(), 1);
+    assert_eq!(forward_opens(&mesh, C, B), 0);
+
+    mesh.release_directory(B, C, at(3));
+    let forward = mesh.opened(C, B, FORWARD_PROTOCOL_ID);
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].conn_id, new_link);
+    mesh.answer_stop(B, &alice(), Status::Ok, at(3));
+    assert_eq!(mesh.hop_status(C, bob_stream()).0, Some(Status::Ok));
 }
 
 #[test]
@@ -454,41 +461,14 @@ fn a_forward_lost_to_a_replaced_link_retries_the_member_on_the_new_link() {
     mesh.connect(C, &bob(), bob_stream(), &alice(), at(1));
     assert_eq!(forward_opens(&mesh, C, B), 1);
 
-    let new_link = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, 99).expect("in range");
-    let node = &mut mesh.nodes[C];
-    node.replace(&member(B), link(B), new_link, false, 2);
-    let calls = node.calls();
-    verify_by_hand(node, B, new_link, &calls, at(2));
-    let directory = StreamKey {
-        conn_id: new_link,
-        stream_id: StreamId::new(7),
-    };
-    node.handle_event(
-        &SwarmEvent::StreamReady {
-            peer_id: member(B),
-            conn_id: directory.conn_id,
-            stream_id: directory.stream_id,
-            protocol_id: DIRECTORY_PROTOCOL_ID.into(),
-            initiated_locally: false,
-        },
-        false,
-        at(2),
-    );
-    let mut snapshot = DirectoryMessage::Present {
-        peer: alice(),
-        expires_unix: u64::MAX,
-    }
-    .encode_frame();
-    snapshot.extend(DirectoryMessage::Synced.encode_frame());
-    node.data(&member(B), directory, &snapshot, at(2));
+    mesh.calls(B);
 
-    let calls = node.calls();
-    let retried = calls.iter().any(|call| {
-        matches!(call, Call::Open { protocol_id, opened: Some(stream), .. }
-            if protocol_id == FORWARD_PROTOCOL_ID && stream.conn_id == new_link)
-    });
-    assert!(retried, "{calls:?}");
-    assert_eq!(common::mesh::hop_status(&calls, bob_stream()).0, None);
+    let new_link = mesh.replace(C, B, 2);
+    let forwards = mesh.opened(C, B, FORWARD_PROTOCOL_ID);
+    assert_eq!(forwards.len(), 2);
+    assert_eq!(forwards[1].conn_id, new_link);
+    mesh.answer_stop(B, &alice(), Status::Ok, at(2));
+    assert_eq!(mesh.hop_status(C, bob_stream()).0, Some(Status::Ok));
 }
 
 #[test]
@@ -803,6 +783,6 @@ fn a_forward_that_times_out_fails_and_leaves_no_state() {
         assert_eq!(mesh.nodes[node].circuit_count(), 0);
     }
     assert!(!mesh.nodes[A].owns_stream(stop));
-    assert!(!mesh.nodes[A].owns_stream(Mesh::remote(B, forward)));
+    assert!(!mesh.nodes[A].owns_stream(mesh.remote(B, forward)));
     assert!(!mesh.nodes[B].owns_stream(forward));
 }
