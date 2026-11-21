@@ -103,7 +103,6 @@ class AffectedPlanTest(unittest.TestCase):
         self.assertTrue(plan["bindings_web_e2e"])
         self.assertTrue(plan["bindings_node_native"])
         self.assertFalse(plan["bindings_rn_gen"])
-        self.assertFalse(plan["bindings_rn_built"])
         self.assertFalse(plan["relay_container"])
         self.assertFalse(plan["fuzz_smoke"])
 
@@ -119,9 +118,8 @@ class AffectedPlanTest(unittest.TestCase):
     def test_react_native_ts_skips_playwright(self) -> None:
         plan = affected.compute_plan(["bindings/ts/react-native/src/index.ts"])
         self.assertTrue(plan["bindings_ts"])
-        self.assertEqual(plan["bindings_ts_packages"], "@minip2p/core @minip2p/react-native")
+        self.assertEqual(plan["bindings_ts_packages"], "")
         self.assertTrue(plan["bindings_rn_gen"])
-        self.assertTrue(plan["bindings_rn_built"])
         self.assertFalse(plan["bindings_web"])
         self.assertFalse(plan["bindings_web_e2e"])
         self.assertFalse(plan["bindings_node_native"])
@@ -129,12 +127,11 @@ class AffectedPlanTest(unittest.TestCase):
 
     def test_ts_scripts_enable_full_binding_prerequisites(self) -> None:
         plan = affected.compute_plan(["bindings/ts/scripts/module-exports.mjs"])
-        self.assertEqual(plan["bindings_ts_packages"], "all")
+        self.assertEqual(plan["bindings_ts_packages"], "@minip2p/core @minip2p/node @minip2p/web")
         self.assertTrue(plan["bindings_node_native"])
         self.assertTrue(plan["bindings_web"])
         self.assertTrue(plan["bindings_web_e2e"])
         self.assertTrue(plan["bindings_rn_gen"])
-        self.assertTrue(plan["bindings_rn_built"])
 
     def test_node_platform_manifest_triggers_workflow_tests(self) -> None:
         plan = affected.compute_plan(["bindings/ts/node-platforms/x86_64-unknown-linux-gnu/package.json"])

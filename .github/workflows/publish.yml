@@ -420,6 +420,8 @@ jobs:
     needs: [verify-release, android-native, ios-native, node-native, node-musl]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         working-directory: bindings/ts

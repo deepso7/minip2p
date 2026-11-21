@@ -51,7 +51,6 @@ jobs:
       bindings_ts_packages: ${{ steps.affected.outputs.bindings_ts_packages }}
       bindings_node_native: ${{ steps.affected.outputs.bindings_node_native }}
       bindings_rn_gen: ${{ steps.affected.outputs.bindings_rn_gen }}
-      bindings_rn_built: ${{ steps.affected.outputs.bindings_rn_built }}
       bindings_web: ${{ steps.affected.outputs.bindings_web }}
       bindings_web_e2e: ${{ steps.affected.outputs.bindings_web_e2e }}
       summary: ${{ steps.affected.outputs.summary }}
@@ -301,56 +300,38 @@ jobs:
 
   ts-bindings:
     needs: plan
-    if: needs.plan.outputs.bindings_ts == 'true'
+    if: needs.plan.outputs.bindings_web_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-node
-      - id: rust
-        uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-          targets: ${{ needs.plan.outputs.bindings_web_e2e == 'true' && 'wasm32-unknown-unknown' || '' }}
+          targets: wasm32-unknown-unknown
           shared-key: generated-and-typescript
-          wasm-bindgen: ${{ needs.plan.outputs.bindings_web_e2e }}
+          wasm-bindgen: "true"
       - run: pnpm typecheck
-      - if: needs.plan.outputs.bindings_node_native == 'true'
-        run: pnpm --filter @minip2p/node native:build
-      - name: Run TypeScript tests
+      - run: pnpm --filter @minip2p/node native:build
+      - name: Run Node and Web tests
         env:
           TS_PACKAGES: ${{ needs.plan.outputs.bindings_ts_packages }}
         run: |
-          if [ "$TS_PACKAGES" = all ]; then
-            pnpm test
-          else
-            filters=()
-            for pkg in $TS_PACKAGES; do
-              filters+=(--filter "$pkg")
-            done
-            pnpm "${filters[@]}" test
-          fi
-      - name: Build bindings
+          filters=()
+          for pkg in $TS_PACKAGES; do
+            filters+=(--filter "$pkg")
+          done
+          pnpm "${filters[@]}" test
+      - name: Build Node and Web bindings
         env:
           TS_PACKAGES: ${{ needs.plan.outputs.bindings_ts_packages }}
         run: |
-          if [ "$TS_PACKAGES" = all ]; then
-            pnpm build:bindings
-          else
-            filters=()
-            for pkg in $TS_PACKAGES; do
-              filters+=(--filter "${pkg}...")
-            done
-            pnpm "${filters[@]}" build
-          fi
-      - if: needs.plan.outputs.bindings_rn_built == 'true'
-        run: pnpm --filter @minip2p/react-native test:built
-      - if: needs.plan.outputs.bindings_rn_gen == 'true'
-        uses: ./.github/actions/run-ubrn
-        with:
-          rust-cachekey: ${{ steps.rust.outputs.cachekey }}
-          command: pnpm rn:generate
+          filters=()
+          for pkg in $TS_PACKAGES; do
+            filters+=(--filter "${pkg}...")
+          done
+          pnpm "${filters[@]}" build
       - name: Prepare browser e2e fixtures
-        if: needs.plan.outputs.bindings_web_e2e == 'true'
         env:
           BINDINGS_WEB: ${{ needs.plan.outputs.bindings_web }}
         run: |
@@ -359,18 +340,15 @@ jobs:
             pnpm --filter @minip2p/web... build
           fi
           cargo build --locked -p minip2p-relay-server-example
-      - name: Generated files are current
-        if: needs.plan.outputs.bindings_rn_gen == 'true' || needs.plan.outputs.bindings_web_e2e == 'true'
+      - name: Generated web glue is current
         run: test -z "$(git status --porcelain)"
       - name: Restore Playwright browsers
-        if: needs.plan.outputs.bindings_web_e2e == 'true'
         id: playwright
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bindings/ts/web/package.json') }}
       - name: Install Playwright browsers
-        if: needs.plan.outputs.bindings_web_e2e == 'true'
         env:
           CACHE_HIT: ${{ steps.playwright.outputs.cache-hit }}
         run: |
@@ -380,14 +358,36 @@ jobs:
             pnpm --filter @minip2p/web exec playwright install --with-deps chromium firefox
           fi
       - name: Save Playwright browsers
-        if: needs.plan.outputs.bindings_web_e2e == 'true' && github.ref == 'refs/heads/main' && steps.playwright.outputs.cache-hit != 'true'
+        if: github.ref == 'refs/heads/main' && steps.playwright.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: ${{ steps.playwright.outputs.cache-primary-key }}
       - name: Browser e2e
-        if: needs.plan.outputs.bindings_web_e2e == 'true'
         run: pnpm --filter @minip2p/web test:e2e
+
+  rn-bindings:
+    needs: plan
+    if: needs.plan.outputs.bindings_rn_gen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-node
+      - id: rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: rn-bindings
+      - run: pnpm --filter @minip2p/core --filter @minip2p/react-native typecheck
+      - run: pnpm --filter @minip2p/core --filter @minip2p/react-native test
+      - run: pnpm --filter @minip2p/core --filter @minip2p/react-native build
+      - run: pnpm --filter @minip2p/react-native test:built
+      - uses: ./.github/actions/run-ubrn
+        with:
+          rust-cachekey: ${{ steps.rust.outputs.cachekey }}
+          command: pnpm rn:generate
+      - name: Generated React Native files are current
+        run: test -z "$(git status --porcelain)"
 
   ci:
     if: always()
@@ -403,6 +403,7 @@ jobs:
       - relay-container
       - docs-site
       - ts-bindings
+      - rn-bindings
     runs-on: ubuntu-latest
     steps:
       - name: Verify all reachable checks passed

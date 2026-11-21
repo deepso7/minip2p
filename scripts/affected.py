@@ -566,10 +566,9 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
             "workflow_tests": True,
             "script_tests": True,
             "bindings_ts": True,
-            "bindings_ts_packages": "all",
+            "bindings_ts_packages": "@minip2p/core @minip2p/node @minip2p/web",
             "bindings_node_native": True,
             "bindings_rn_gen": True,
-            "bindings_rn_built": True,
             "bindings_web": True,
             "bindings_web_e2e": True,
             "summary": "full suite",
@@ -785,20 +784,16 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
     bindings_web = bindings_web_direct or bool(web_crates & changed_crates)
     bindings_web_e2e = bindings_web or bindings_node_tests
     bindings_node_native = bindings_node_tests or bindings_web_e2e
-    bindings_rn_built = bindings_rn_gen
     bindings_ts = bindings_node_native or bindings_rn_gen or bindings_web
 
-    if bindings_node_tests and bindings_rn_gen and bindings_web:
-        bindings_ts_packages = "all"
-    else:
-        ts_pkgs: list[str] = []
-        if bindings_node_tests:
-            ts_pkgs.append("@minip2p/node")
-        if bindings_rn_gen:
-            ts_pkgs.extend(["@minip2p/core", "@minip2p/react-native"])
-        if bindings_web:
-            ts_pkgs.append("@minip2p/web")
-        bindings_ts_packages = " ".join(dict.fromkeys(ts_pkgs))
+    ts_pkgs: list[str] = []
+    if bindings_node_tests and bindings_web:
+        ts_pkgs.extend(["@minip2p/core", "@minip2p/node", "@minip2p/web"])
+    elif bindings_node_tests:
+        ts_pkgs.append("@minip2p/node")
+    elif bindings_web:
+        ts_pkgs.append("@minip2p/web")
+    bindings_ts_packages = " ".join(ts_pkgs)
 
     matrix_clippy_val = (
         "full" if len(matrix_clippy) == len(all_matrix_rows) else ",".join(matrix_clippy)
@@ -862,7 +857,6 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
         "bindings_ts_packages": bindings_ts_packages,
         "bindings_node_native": bindings_node_native,
         "bindings_rn_gen": bindings_rn_gen,
-        "bindings_rn_built": bindings_rn_built,
         "bindings_web": bindings_web,
         "bindings_web_e2e": bindings_web_e2e,
         "summary": summary,

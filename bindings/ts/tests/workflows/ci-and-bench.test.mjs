@@ -79,3 +79,19 @@ test("Bench workflow keeps self-hosted bench job read-only and comments on ubunt
   assert.equal(bench.jobs.comment.permissions["pull-requests"], "write");
   assert.deepEqual(bench.jobs.comment.needs, ["start-runner", "bench"]);
 });
+
+test("publish package-typescript matches ci ts-bindings rust-cache env", async () => {
+  const [ci, publish] = await Promise.all([
+    readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf-8").then(
+      parse
+    ),
+    readFile(
+      path.join(repoRoot, ".github/workflows/publish.yml"),
+      "utf-8"
+    ).then(parse),
+  ]);
+  assert.equal(
+    publish.jobs["package-typescript"].env.CARGO_PROFILE_DEV_DEBUG,
+    ci.env.CARGO_PROFILE_DEV_DEBUG
+  );
+});
