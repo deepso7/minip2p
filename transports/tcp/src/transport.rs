@@ -358,6 +358,10 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                         endpoint: Box::new(endpoint),
                     }
                 }
+                SessionOutput::StreamOpened { stream } => TransportEvent::StreamOpened {
+                    id,
+                    stream_id: stream,
+                },
                 SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
                     id,
                     stream_id: stream,
@@ -530,11 +534,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     id,
                     stream_id: StreamId::new(u64::from(stream)),
                     unsent,
-                })
-            }
-            Err(SessionError::Yamux(YamuxError::TooManyStreams)) => {
-                Err(TransportError::ResourceExhausted {
-                    resource: "Yamux streams",
                 })
             }
             Err(SessionError::Yamux(YamuxError::AckExceedsDelivered {
@@ -769,10 +768,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        let stream_id = self.operate_session(id, SecureMuxSession::open_stream)?;
-        self.pending
-            .push_back(TransportEvent::StreamOpened { id, stream_id });
-        Ok(stream_id)
+        self.operate_session(id, SecureMuxSession::open_stream)
     }
 
     fn send_stream(

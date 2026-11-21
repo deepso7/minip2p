@@ -114,7 +114,8 @@ pub enum AdoptError {
 /// Limits for one [`CircuitTransport`]: its circuits' Yamux limits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CircuitLimits {
-    /// Limits applied to each circuit's Yamux session.
+    /// Limits applied to each circuit's Yamux session. Local opens beyond
+    /// `max_streams` wait FIFO in an unbounded local-caller-only queue.
     pub yamux: YamuxConfig,
 }
 
@@ -518,6 +519,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                         endpoint: Box::new(circuit.endpoint(Some(peer))),
                     }
                 }
+                SessionOutput::StreamOpened { stream } => TransportEvent::StreamOpened {
+                    id,
+                    stream_id: stream,
+                },
                 SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
                     id,
                     stream_id: stream,
@@ -849,11 +854,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     unsent,
                 })
             }
-            Err(SessionError::Yamux(YamuxError::TooManyStreams)) => {
-                Err(TransportError::ResourceExhausted {
-                    resource: "Yamux streams",
-                })
-            }
             Err(SessionError::Yamux(YamuxError::AckExceedsDelivered {
                 stream,
                 acked,
@@ -905,10 +905,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.open_stream(id);
         }
-        let stream_id = self.operate_session(id, SecureMuxSession::open_stream)?;
-        self.pending
-            .push_back(TransportEvent::StreamOpened { id, stream_id });
-        Ok(stream_id)
+        self.operate_session(id, SecureMuxSession::open_stream)
     }
 
     fn send_stream(

@@ -269,6 +269,9 @@ pub struct YamuxSession {
     config: YamuxConfig,
     decoder: FrameDecoder,
     streams: BTreeMap<u32, StreamState>,
+    pending_opens: BTreeSet<u32>,
+    /// Opens without a reserved stream slot; writes wait for admission.
+    waiting_opens: BTreeSet<u32>,
     /// Closed streams still holding unacknowledged bytes, by stream id. Each
     /// keeps a stream slot until those bytes are acknowledged.
     unsettled: BTreeMap<u32, u32>,
@@ -331,6 +334,8 @@ impl YamuxSession {
             decoder: FrameDecoder::new(config.receive_window),
             config,
             streams: BTreeMap::new(),
+            pending_opens: BTreeSet::new(),
+            waiting_opens: BTreeSet::new(),
             unsettled: BTreeMap::new(),
             next_stream_id,
             events: VecDeque::new(),
@@ -447,19 +452,23 @@ impl YamuxSession {
 
     /// Opens a local stream and returns its role-partitioned identifier.
     ///
-    /// The first data/control frame carries `SYN`; if nothing is sent before
+    /// Opens past the active and unsettled stream cap wait FIFO without a
+    /// queue length limit: only local callers enqueue them. Writes return
+    /// [`YamuxError::Full`] until admission; FIN may queue while waiting.
+    /// The first data/control frame carries `SYN`;
+    /// pulling it emits [`YamuxOutput::StreamOpened`]. If nothing is sent before
     /// the caller pulls frames, [`YamuxSession::poll_frame`] emits a
     /// standalone window-update frame carrying `SYN`.
     pub fn open_stream(&mut self) -> Result<u32, YamuxError> {
         self.ensure_active()?;
-        if self.slots_full() {
-            return Err(YamuxError::TooManyStreams);
-        }
         let stream = self.next_stream_id.ok_or(YamuxError::StreamsExhausted)?;
         self.next_stream_id = stream.checked_add(2);
+        if self.slots_full() || !self.waiting_opens.is_empty() {
+            self.waiting_opens.insert(stream);
+        }
         self.streams
             .insert(stream, StreamState::outbound(&self.config));
-        self.index_work(stream);
+        self.pending_opens.insert(stream);
         Ok(stream)
     }
 
@@ -477,7 +486,11 @@ impl YamuxSession {
             .streams
             .get_mut(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
-        let total_room = total_cap_for(config, state.control).saturating_sub(total_buffered_send);
+        let total_room = if self.waiting_opens.contains(&stream) {
+            0
+        } else {
+            total_cap_for(config, state.control).saturating_sub(total_buffered_send)
+        };
         if state.write != WriteSide::Open {
             return Err(YamuxError::StreamWriteClosed(stream));
         }
@@ -538,6 +551,7 @@ impl YamuxSession {
     }
 
     /// Immediately resets a stream and emits [`YamuxOutput::StreamClosed`].
+    /// A queued open is dropped without sending any frame to the peer.
     ///
     /// The reset abandons the stream's unacknowledged bytes, so it settles
     /// at once. Resetting a stream that is closed but unsettled only settles
@@ -684,6 +698,20 @@ impl YamuxSession {
             return None;
         }
         debug_assert!(self.work_indexed(), "stream work index out of sync");
+        if let Some(stream) = self.next_open() {
+            self.pending_opens.remove(&stream);
+            self.waiting_opens.remove(&stream);
+            self.index_work(stream);
+            self.events.push_back(YamuxOutput::StreamOpened { stream });
+            let frame = if self.control_due.contains(&stream) {
+                self.deferred_control_frame_for(stream)
+                    .map(|frame| room.wrap(frame))
+            } else {
+                self.data_frame_for(stream, room)
+            };
+            self.wake_writable();
+            return frame;
+        }
         if let Some(frame) = self.deferred_control_frame() {
             return Some(room.wrap(frame));
         }
@@ -710,18 +738,26 @@ impl YamuxSession {
         if self.lifecycle != Lifecycle::Active {
             return false;
         }
-        !self.control_due.is_empty() || !self.sendable.is_empty()
+        !self.control_due.is_empty() || !self.sendable.is_empty() || self.next_open().is_some()
     }
 
     /// Whether accepted stream bytes or a `FIN` are still waiting to be
     /// framed: a frame [`has_frames`](Self::has_frames) would hand out now,
-    /// or bytes held back by the peer's window. What a host drains before
-    /// closing the session.
+    /// a `FIN` on an open still waiting for a stream slot, or bytes held back
+    /// by the peer's window. What a host drains before closing the session.
     pub fn has_unsent(&self) -> bool {
-        self.total_buffered_send != 0 || self.has_frames()
+        self.total_buffered_send != 0 || self.has_frames() || self.has_queued_fin()
     }
 
-    /// Returns the number of currently tracked streams.
+    fn has_queued_fin(&self) -> bool {
+        self.pending_opens.iter().any(|stream| {
+            self.streams
+                .get(stream)
+                .is_some_and(|state| state.write == WriteSide::FinPending)
+        })
+    }
+
+    /// Returns the number of tracked streams, including queued opens.
     #[cfg(test)]
     pub fn stream_count(&self) -> usize {
         self.streams.len()
@@ -751,7 +787,15 @@ impl YamuxSession {
 
     /// Whether open and unsettled streams fill every stream slot.
     fn slots_full(&self) -> bool {
-        self.streams.len() + self.unsettled.len() >= self.config.max_streams
+        self.streams.len() - self.waiting_opens.len() + self.unsettled.len()
+            >= self.config.max_streams
+    }
+
+    fn next_open(&self) -> Option<u32> {
+        self.pending_opens
+            .first()
+            .copied()
+            .filter(|stream| !self.waiting_opens.contains(stream) || !self.slots_full())
     }
 
     /// Returns aggregate accepted bytes not yet pulled as frames.
@@ -778,6 +822,20 @@ impl YamuxSession {
     }
 
     fn process_frame(&mut self, frame: Frame) -> Result<(), YamuxError> {
+        if matches!(
+            frame.frame_type(),
+            FrameType::Data | FrameType::WindowUpdate
+        ) && self.pending_opens.contains(&frame.stream_id())
+        {
+            if frame.flags() & FLAG_SYN != 0 {
+                return Err(YamuxError::Protocol("remote used a local-parity stream id"));
+            }
+            return if frame.flags() & FLAG_RST != 0 {
+                Ok(())
+            } else {
+                self.queue_reset_for_unknown(frame.stream_id())
+            };
+        }
         match frame.frame_type() {
             FrameType::Data => self.on_data(frame),
             FrameType::WindowUpdate => self.on_window_update(frame),
@@ -941,6 +999,10 @@ impl YamuxSession {
     /// standalone window update.
     fn deferred_control_frame(&mut self) -> Option<Vec<u8>> {
         let stream = *self.control_due.first()?;
+        self.deferred_control_frame_for(stream)
+    }
+
+    fn deferred_control_frame_for(&mut self, stream: u32) -> Option<Vec<u8>> {
         let state = self.streams.get_mut(&stream)?;
         let flags = state.take_open_flag();
         let credit = state.pending_credit.min(u64::from(u32::MAX)) as u32;
@@ -959,6 +1021,10 @@ impl YamuxSession {
             .range((Bound::Excluded(after), Bound::Unbounded))
             .chain(self.sendable.range(..=after))
             .next()?;
+        self.data_frame_for(stream, room)
+    }
+
+    fn data_frame_for(&mut self, stream: u32, room: FrameRoom) -> Option<Vec<u8>> {
         self.send_cursor = stream;
         let max_frame_len = self.config.max_frame_len as usize;
         let state = self.streams.get_mut(&stream)?;
@@ -1014,13 +1080,15 @@ impl YamuxSession {
         let config = &self.config;
         let total_buffered_send = self.total_buffered_send;
         let streams = &self.streams;
+        let waiting_opens = &self.waiting_opens;
         let events = &mut self.events;
         self.writable_armed.retain(|stream| {
             let Some(state) = streams.get(stream) else {
                 return false;
             };
             let threshold = writable_threshold(config, state.control);
-            if config.max_buffered_send.saturating_sub(state.buffered_send) < threshold
+            if waiting_opens.contains(stream)
+                || config.max_buffered_send.saturating_sub(state.buffered_send) < threshold
                 || total_cap_for(config, state.control).saturating_sub(total_buffered_send)
                     < threshold
             {
@@ -1037,7 +1105,11 @@ impl YamuxSession {
     /// both.
     fn index_work(&mut self, stream: u32) {
         let (control, data) = self.streams.get(&stream).map_or((false, false), |state| {
-            (state.needs_control_frame(), state.has_sendable_data())
+            let active = !self.pending_opens.contains(&stream);
+            (
+                active && state.needs_control_frame(),
+                active && state.has_sendable_data(),
+            )
         });
         for (index, member) in [(&mut self.control_due, control), (&mut self.sendable, data)] {
             if member {
@@ -1054,7 +1126,7 @@ impl YamuxSession {
         let scanned = |test: fn(&StreamState) -> bool| {
             self.streams
                 .iter()
-                .filter(|(_, state)| test(state))
+                .filter(|(id, state)| !self.pending_opens.contains(id) && test(state))
                 .map(|(id, _)| *id)
                 .collect::<BTreeSet<_>>()
         };
@@ -1098,6 +1170,8 @@ impl YamuxSession {
     /// Drops a stream's state. One still holding unacknowledged bytes stays
     /// unsettled, keeping its slot; a local reset settles it afterwards.
     fn remove_stream(&mut self, stream: u32, emit: bool) {
+        self.pending_opens.remove(&stream);
+        self.waiting_opens.remove(&stream);
         self.disarm_writable(stream);
         self.control_due.remove(&stream);
         self.sendable.remove(&stream);
@@ -1142,6 +1216,8 @@ impl YamuxSession {
     /// Moves every open stream's unacknowledged count into `unsettled` and
     /// drops the open streams.
     fn unsettle_all(&mut self) {
+        self.pending_opens.clear();
+        self.waiting_opens.clear();
         for (stream, state) in core::mem::take(&mut self.streams) {
             if state.unacked != 0 {
                 self.unsettled.insert(stream, state.unacked);
