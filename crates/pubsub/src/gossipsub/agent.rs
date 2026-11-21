@@ -445,11 +445,17 @@ pub struct GossipsubAgent {
     events: VecDeque<GossipsubEvent>,
     topics: BTreeSet<String>,
     peers: BTreeMap<PeerId, PeerState>,
+    /// Peers whose `remote_topics` contain each topic; no empty sets.
+    topic_peers: BTreeMap<String, BTreeSet<PeerId>>,
+    /// `(since_ms, peer)` for every peer whose sender is opening or
+    /// negotiating, kept in step with `PeerState::sender` by `set_sender`.
+    establishing: BTreeSet<(u64, PeerId)>,
     roles: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
     mesh: BTreeMap<String, BTreeSet<PeerId>>,
     fanout: BTreeMap<String, BTreeSet<PeerId>>,
     fanout_last_pub: BTreeMap<String, u64>,
-    backoff: BTreeMap<(String, PeerId), u64>,
+    /// Backoff expiry per topic and peer; no empty inner maps.
+    backoff: BTreeMap<String, BTreeMap<PeerId, u64>>,
     mcache: MessageCache,
     seen: SeenCache,
     iwant_requested: BTreeSet<MessageId>,
@@ -482,6 +488,8 @@ impl GossipsubAgent {
             events: VecDeque::new(),
             topics: BTreeSet::new(),
             peers: BTreeMap::new(),
+            topic_peers: BTreeMap::new(),
+            establishing: BTreeSet::new(),
             roles: BTreeMap::new(),
             mesh: BTreeMap::new(),
             fanout: BTreeMap::new(),
@@ -718,9 +726,7 @@ impl GossipsubAgent {
                     peer: *peer,
                     stream_id,
                 });
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.sender = SendState::Idle;
-                }
+                self.set_sender(peer, SendState::Idle);
                 self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: *peer,
                     reason: format!("send failed: {reason}"),
@@ -811,21 +817,20 @@ impl GossipsubAgent {
         };
         match result {
             Ok(stream_id) => {
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.sender = SendState::Negotiating {
+                self.set_sender(
+                    peer,
+                    SendState::Negotiating {
                         stream_id,
                         since_ms,
-                    };
-                }
+                    },
+                );
                 self.roles
                     .entry(*peer)
                     .or_default()
                     .insert(stream_id, StreamRole::Outbound);
             }
             Err(reason) => {
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.sender = SendState::Idle;
-                }
+                self.set_sender(peer, SendState::Idle);
                 self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: *peer,
                     reason: format!("open failed: {reason}"),
@@ -840,21 +845,19 @@ impl GossipsubAgent {
         self.arm_heartbeat(now_ms);
         self.seen.gc(now_ms);
 
-        let timed_out: Vec<(PeerId, Option<StreamId>)> = self
-            .peers
+        let mut timed_out: Vec<PeerId> = self
+            .establishing
             .iter()
-            .filter_map(|(peer, state)| {
-                let since = state.sender.establishment_since()?;
-                (now_ms.saturating_sub(since) >= self.config.send_timeout_ms)
-                    .then(|| (*peer, state.sender.stream_id()))
-            })
+            .take_while(|(since, _)| now_ms.saturating_sub(*since) >= self.config.send_timeout_ms)
+            .map(|(_, peer)| *peer)
             .collect();
-        for (peer, stream) in timed_out {
+        timed_out.sort_unstable();
+        for peer in timed_out {
+            let stream = self
+                .set_sender(&peer, SendState::Idle)
+                .and_then(|closed| closed.stream_id());
             if let Some(stream_id) = stream {
                 self.reject_stream(&peer, stream_id);
-            }
-            if let Some(state) = self.peers.get_mut(&peer) {
-                state.sender = SendState::Idle;
             }
             self.events.push_back(GossipsubEvent::OutboundFailure {
                 peer,
@@ -885,11 +888,9 @@ impl GossipsubAgent {
         if let Some(expiry) = self.seen.next_expiry() {
             due = Some(due.map_or(expiry, |current| current.min(expiry)));
         }
-        for state in self.peers.values() {
-            if let Some(since) = state.sender.establishment_since() {
-                let expiry = since.saturating_add(self.config.send_timeout_ms);
-                due = Some(due.map_or(expiry, |current| current.min(expiry)));
-            }
+        if let Some((since, _)) = self.establishing.first() {
+            let expiry = since.saturating_add(self.config.send_timeout_ms);
+            due = Some(due.map_or(expiry, |current| current.min(expiry)));
         }
         due.map(Deadline::from_millis)
     }
@@ -935,6 +936,12 @@ impl GossipsubAgent {
     /// those subscriptions lapse with the connection that carried them.
     fn remove_peer(&mut self, peer: &PeerId, cause: &str) {
         if let Some(state) = self.peers.remove(peer) {
+            if let Some(since) = state.sender.establishment_since() {
+                self.establishing.remove(&(since, *peer));
+            }
+            for topic in &state.remote_topics {
+                self.unindex_topic_peer(topic, peer);
+            }
             let dropped = state.queued_work();
             if dropped > 0 {
                 self.events.push_back(GossipsubEvent::OutboundFailure {
@@ -976,7 +983,7 @@ impl GossipsubAgent {
             if !ours {
                 return self.owns_stream(peer, stream_id);
             }
-            if let Some(state) = self.peers.get_mut(peer) {
+            if let Some(state) = self.peers.get(peer) {
                 let announce = self.topics.iter().map(|topic| (true, topic));
                 let withdraw = state
                     .unsubscribe_tombstones
@@ -989,12 +996,15 @@ impl GossipsubAgent {
                         topic_id: Some(topic.clone()),
                     })
                     .collect();
-                state.sender = SendState::Ready {
-                    stream_id,
-                    version,
-                    subscriptions,
-                    in_flight: None,
-                };
+                self.set_sender(
+                    peer,
+                    SendState::Ready {
+                        stream_id,
+                        version,
+                        subscriptions,
+                        in_flight: None,
+                    },
+                );
             }
             self.drive_sender(peer, now_ms);
             return true;
@@ -1192,11 +1202,15 @@ impl GossipsubAgent {
         }
         match role {
             StreamRole::Outbound => {
-                let closed = self
+                let bound = self
                     .peers
-                    .get_mut(peer)
-                    .filter(|state| state.sender.stream_id() == Some(stream_id))
-                    .map(|state| core::mem::take(&mut state.sender));
+                    .get(peer)
+                    .is_some_and(|state| state.sender.stream_id() == Some(stream_id));
+                let closed = if bound {
+                    self.set_sender(peer, SendState::Idle)
+                } else {
+                    None
+                };
                 match closed {
                     Some(SendState::Ready {
                         in_flight: Some(frame),
@@ -1289,12 +1303,17 @@ impl GossipsubAgent {
             });
         }
         for topic in &added {
+            self.topic_peers
+                .entry(topic.clone())
+                .or_default()
+                .insert(*peer);
             self.events.push_back(GossipsubEvent::PeerSubscribed {
                 peer: *peer,
                 topic: topic.clone(),
             });
         }
         for topic in removed {
+            self.unindex_topic_peer(&topic, peer);
             if let Some(mesh) = self.mesh.get_mut(&topic) {
                 mesh.remove(peer);
             }
@@ -1516,7 +1535,10 @@ impl GossipsubAgent {
     }
 
     fn heartbeat(&mut self, now_ms: u64) {
-        self.backoff.retain(|_, expiry| *expiry > now_ms);
+        self.backoff.retain(|_, peers| {
+            peers.retain(|_, expiry| *expiry > now_ms);
+            !peers.is_empty()
+        });
         self.ihave_budget.clear();
         self.iwant_served.clear();
         self.iwant_requested.clear();
@@ -1613,31 +1635,17 @@ impl GossipsubAgent {
             self.fanout.insert(topic, current);
         }
 
-        let gossip_topics: Vec<String> = self
-            .peers
-            .values()
-            .flat_map(|state| state.remote_topics.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let gossip_topics: Vec<String> = if self.config.d_lazy == 0 {
+            Vec::new()
+        } else {
+            self.topic_peers.keys().cloned().collect()
+        };
         for topic in gossip_topics {
             let ids = self.mcache.gossip_ids(&topic, self.config.mcache_gossip);
-            if ids.is_empty() || self.config.d_lazy == 0 {
+            if ids.is_empty() {
                 continue;
             }
-            let mesh = self.mesh.get(&topic).cloned().unwrap_or_default();
-            let fanout = self.fanout.get(&topic).cloned().unwrap_or_default();
-            let candidates: Vec<PeerId> = self
-                .peers
-                .iter()
-                .filter(|(peer, state)| {
-                    state.advertised_version.is_some()
-                        && state.remote_topics.contains(&topic)
-                        && !mesh.contains(*peer)
-                        && !fanout.contains(*peer)
-                })
-                .map(|(peer, _)| *peer)
-                .collect();
+            let candidates = self.gossip_candidates(&topic);
             for peer in self.select_peers(candidates, self.config.d_lazy) {
                 for id in ids.iter().take(self.config.max_ihave_length) {
                     self.queue_control(
@@ -1669,12 +1677,13 @@ impl GossipsubAgent {
         match (&state.sender, state.advertised_version) {
             (SendState::Idle, Some(version)) => {
                 let token = self.allocate_token();
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.sender = SendState::Opening {
+                self.set_sender(
+                    peer,
+                    SendState::Opening {
                         token,
                         since_ms: now_ms,
-                    };
-                }
+                    },
+                );
                 self.actions.push_back(GossipsubAction::OpenStream {
                     token,
                     peer: *peer,
@@ -1870,15 +1879,59 @@ impl GossipsubAgent {
         peers.into_iter().collect()
     }
 
-    fn eligible_topic_peers(&self, topic: &str, now_ms: u64) -> Vec<PeerId> {
-        self.peers
-            .iter()
-            .filter(|(peer, state)| {
-                state.advertised_version.is_some()
-                    && state.remote_topics.contains(topic)
-                    && !self.is_backed_off(topic, peer, now_ms)
+    /// Replaces `peer`'s sender, keeping `establishing` in step. Returns
+    /// the previous sender, or `None` for an unknown peer.
+    fn set_sender(&mut self, peer: &PeerId, sender: SendState) -> Option<SendState> {
+        let state = self.peers.get_mut(peer)?;
+        if let Some(since) = state.sender.establishment_since() {
+            self.establishing.remove(&(since, *peer));
+        }
+        if let Some(since) = sender.establishment_since() {
+            self.establishing.insert((since, *peer));
+        }
+        Some(core::mem::replace(&mut state.sender, sender))
+    }
+
+    fn unindex_topic_peer(&mut self, topic: &str, peer: &PeerId) {
+        if let Some(peers) = self.topic_peers.get_mut(topic) {
+            peers.remove(peer);
+            if peers.is_empty() {
+                self.topic_peers.remove(topic);
+            }
+        }
+    }
+
+    /// Known subscribers of `topic` with an advertised version, in peer-id
+    /// order.
+    fn topic_subscribers<'a>(&'a self, topic: &str) -> impl Iterator<Item = &'a PeerId> + 'a {
+        self.topic_peers
+            .get(topic)
+            .into_iter()
+            .flatten()
+            .filter(|peer| {
+                self.peers
+                    .get(*peer)
+                    .is_some_and(|state| state.advertised_version.is_some())
             })
-            .map(|(peer, _)| *peer)
+    }
+
+    fn eligible_topic_peers(&self, topic: &str, now_ms: u64) -> Vec<PeerId> {
+        self.topic_subscribers(topic)
+            .filter(|peer| !self.is_backed_off(topic, peer, now_ms))
+            .copied()
+            .collect()
+    }
+
+    /// IHAVE candidates for `topic`: subscribers outside its mesh and fanout.
+    fn gossip_candidates(&self, topic: &str) -> Vec<PeerId> {
+        let mesh = self.mesh.get(topic);
+        let fanout = self.fanout.get(topic);
+        self.topic_subscribers(topic)
+            .filter(|peer| {
+                !mesh.is_some_and(|mesh| mesh.contains(*peer))
+                    && !fanout.is_some_and(|fanout| fanout.contains(*peer))
+            })
+            .copied()
             .collect()
     }
 
@@ -1901,14 +1954,19 @@ impl GossipsubAgent {
 
     fn is_backed_off(&self, topic: &str, peer: &PeerId, now_ms: u64) -> bool {
         self.backoff
-            .get(&(String::from(topic), *peer))
+            .get(topic)
+            .and_then(|peers| peers.get(peer))
             .is_some_and(|expiry| *expiry > now_ms)
     }
 
     fn record_backoff(&mut self, topic: &str, peer: &PeerId, duration_ms: u64, now_ms: u64) {
         let expiry = now_ms.saturating_add(duration_ms);
-        self.backoff
-            .entry((String::from(topic), *peer))
+        let peers = match self.backoff.get_mut(topic) {
+            Some(peers) => peers,
+            None => self.backoff.entry(String::from(topic)).or_default(),
+        };
+        peers
+            .entry(*peer)
             .and_modify(|current| *current = (*current).max(expiry))
             .or_insert(expiry);
     }
@@ -2008,11 +2066,8 @@ mod tests {
         .expect("default config");
         let first = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
         let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
-        for peer in [&first, &second] {
-            let mut state = PeerState::default();
-            state.remote_topics.insert(String::from("topic"));
-            state.advertised_version = Some(MeshsubVersion::V11);
-            agent.peers.insert(*peer, state);
+        for peer in [first, second] {
+            insert_peer(&mut agent, peer, &["topic"]);
         }
 
         agent
@@ -2130,13 +2185,159 @@ mod tests {
         )
         .expect("default config");
         let peer = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
-        let state = PeerState {
-            advertised_version: Some(MeshsubVersion::V11),
-            remote_topics: topics.iter().map(|topic| String::from(*topic)).collect(),
-            ..PeerState::default()
-        };
-        agent.peers.insert(peer, state);
+        insert_peer(&mut agent, peer, topics);
         (agent, peer)
+    }
+
+    /// Adds a v1.1 peer that announced `topics` through the subscription
+    /// path, so every index sees it.
+    fn insert_peer(agent: &mut GossipsubAgent, peer: PeerId, topics: &[&str]) {
+        agent.peers.insert(
+            peer,
+            PeerState {
+                advertised_version: Some(MeshsubVersion::V11),
+                ..PeerState::default()
+            },
+        );
+        set_remote_topics(agent, &peer, topics, true);
+    }
+
+    fn set_remote_topics(agent: &mut GossipsubAgent, peer: &PeerId, topics: &[&str], on: bool) {
+        let subscriptions: Vec<SubOpts> = topics
+            .iter()
+            .map(|topic| SubOpts {
+                subscribe: Some(on),
+                topic_id: Some(String::from(*topic)),
+            })
+            .collect();
+        agent
+            .apply_subscriptions(peer, StreamId::new(1), &subscriptions)
+            .expect("within the topic bound");
+    }
+
+    /// Recomputes every derived index from `peers` and checks it matches.
+    fn assert_indexes_consistent(agent: &GossipsubAgent) {
+        let mut topic_peers: BTreeMap<String, BTreeSet<PeerId>> = BTreeMap::new();
+        let mut establishing = BTreeSet::new();
+        for (peer, state) in &agent.peers {
+            for topic in &state.remote_topics {
+                topic_peers.entry(topic.clone()).or_default().insert(*peer);
+            }
+            if let Some(since) = state.sender.establishment_since() {
+                establishing.insert((since, *peer));
+            }
+        }
+        assert_eq!(agent.topic_peers, topic_peers);
+        assert_eq!(agent.establishing, establishing);
+        assert!(agent.backoff.values().all(|peers| !peers.is_empty()));
+    }
+
+    fn timeout_deadline(agent: &GossipsubAgent) -> Option<u64> {
+        agent
+            .establishing
+            .first()
+            .map(|(since, _)| since + agent.config.send_timeout_ms)
+    }
+
+    #[test]
+    fn topic_index_tracks_subscriptions_and_peer_lifecycle() {
+        let (mut agent, first) = agent_with_peer(&["a", "b"]);
+        let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        insert_peer(&mut agent, second, &["b"]);
+        assert_indexes_consistent(&agent);
+        assert_eq!(
+            agent.eligible_topic_peers("b", 0),
+            alloc::vec![first, second]
+        );
+
+        set_remote_topics(&mut agent, &first, &["a"], false);
+        assert_indexes_consistent(&agent);
+        assert!(!agent.topic_peers.contains_key("a"));
+
+        agent.on_connection_replaced(&first);
+        assert_indexes_consistent(&agent);
+        assert_eq!(agent.topic_peers["b"], BTreeSet::from([second]));
+
+        set_remote_topics(&mut agent, &first, &["c"], true);
+        agent.remove_peer(&second, "connection closed");
+        agent.remove_peer(&first, "connection closed");
+        assert_indexes_consistent(&agent);
+        assert!(agent.topic_peers.is_empty());
+    }
+
+    #[test]
+    fn backoff_expiry_unblocks_and_drops_empty_topics() {
+        let (mut agent, peer) = agent_with_peer(&["room"]);
+        agent.record_backoff("room", &peer, 1_000, 0);
+        agent.record_backoff("other", &peer, 5_000, 0);
+        assert!(agent.is_backed_off("room", &peer, 999));
+        assert!(!agent.is_backed_off("room", &peer, 1_000));
+
+        agent.heartbeat(1_000);
+        assert!(!agent.backoff.contains_key("room"));
+        assert!(agent.is_backed_off("other", &peer, 1_000));
+        assert_eq!(agent.eligible_topic_peers("room", 1_000), alloc::vec![peer]);
+
+        agent.heartbeat(5_000);
+        assert!(agent.backoff.is_empty());
+    }
+
+    #[test]
+    fn establishing_index_follows_sender_transitions() {
+        let (mut agent, first) = agent_with_peer(&[]);
+        let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        insert_peer(&mut agent, second, &[]);
+        let timeout = agent.config.send_timeout_ms;
+
+        agent.drive_sender(&first, 10);
+        agent.drive_sender(&second, 20);
+        assert_indexes_consistent(&agent);
+        assert_eq!(timeout_deadline(&agent), Some(10 + timeout));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(10 + timeout))
+        );
+
+        let SendState::Opening { token, .. } = agent.peers[&first].sender else {
+            panic!("first is opening");
+        };
+        let stream = StreamId::new(4);
+        agent.stream_open_result(&first, token, Ok(stream), 11);
+        assert_indexes_consistent(&agent);
+        assert_eq!(timeout_deadline(&agent), Some(10 + timeout));
+
+        assert!(agent.on_stream_ready(&first, stream, MESHSUB_PROTOCOL_ID_V11, true, 12));
+        assert_indexes_consistent(&agent);
+        assert_eq!(timeout_deadline(&agent), Some(20 + timeout));
+
+        agent.handle_tick(20 + timeout);
+        assert_indexes_consistent(&agent);
+        assert!(matches!(agent.peers[&second].sender, SendState::Idle));
+        assert_eq!(timeout_deadline(&agent), None);
+
+        agent.drive_sender(&second, 30);
+        let SendState::Opening { token, .. } = agent.peers[&second].sender else {
+            panic!("second is opening");
+        };
+        agent.stream_open_result(&second, token, Err(String::from("refused")), 31);
+        assert_indexes_consistent(&agent);
+
+        agent.drive_sender(&second, 40);
+        let SendState::Opening { token, .. } = agent.peers[&second].sender else {
+            panic!("second is opening");
+        };
+        let stream = StreamId::new(8);
+        agent.stream_open_result(&second, token, Ok(stream), 41);
+        assert!(agent.on_stream_closed(&second, stream));
+        assert_indexes_consistent(&agent);
+
+        agent.drive_sender(&second, 50);
+        agent.on_connection_replaced(&second);
+        assert_indexes_consistent(&agent);
+        agent.drive_sender(&first, 60);
+        agent.remove_peer(&first, "connection closed");
+        assert_indexes_consistent(&agent);
+        assert!(agent.establishing.is_empty());
     }
 
     fn prune(topic: &str, backoff_secs: u64) -> ControlMessage {
