@@ -566,7 +566,7 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
             "workflow_tests": True,
             "script_tests": True,
             "bindings_ts": True,
-            "bindings_ts_packages": "@minip2p/core @minip2p/node @minip2p/web",
+            "bindings_ts_packages": "@minip2p/core @minip2p/node @minip2p/test-fixtures @minip2p/web",
             "bindings_node_native": True,
             "bindings_rn_gen": True,
             "bindings_web": True,
@@ -788,7 +788,7 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
 
     ts_pkgs: list[str] = []
     if bindings_node_tests and bindings_web:
-        ts_pkgs.extend(["@minip2p/core", "@minip2p/node", "@minip2p/web"])
+        ts_pkgs.extend(["@minip2p/core", "@minip2p/node", "@minip2p/test-fixtures", "@minip2p/web"])
     elif bindings_node_tests:
         ts_pkgs.append("@minip2p/node")
     elif bindings_web:
@@ -816,9 +816,8 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
         ("fuzz", fuzz_needed),
         ("relay-container", relay_container),
         ("docs-site", docs_site),
-        ("ts-bindings", bindings_ts),
-        ("web-e2e", bindings_web_e2e),
-        ("rn-gen", bindings_rn_gen),
+        ("ts-bindings", bindings_web_e2e),
+        ("rn-bindings", bindings_rn_gen),
         ("ts-lint", ts_lint),
     ):
         if enabled:

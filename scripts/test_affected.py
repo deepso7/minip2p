@@ -127,7 +127,10 @@ class AffectedPlanTest(unittest.TestCase):
 
     def test_ts_scripts_enable_full_binding_prerequisites(self) -> None:
         plan = affected.compute_plan(["bindings/ts/scripts/module-exports.mjs"])
-        self.assertEqual(plan["bindings_ts_packages"], "@minip2p/core @minip2p/node @minip2p/web")
+        self.assertEqual(
+            plan["bindings_ts_packages"],
+            "@minip2p/core @minip2p/node @minip2p/test-fixtures @minip2p/web",
+        )
         self.assertTrue(plan["bindings_node_native"])
         self.assertTrue(plan["bindings_web"])
         self.assertTrue(plan["bindings_web_e2e"])

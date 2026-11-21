@@ -80,7 +80,7 @@ test("Bench workflow keeps self-hosted bench job read-only and comments on ubunt
   assert.deepEqual(bench.jobs.comment.needs, ["start-runner", "bench"]);
 });
 
-test("publish package-typescript matches ci ts-bindings rust-cache env", async () => {
+test("publish package-typescript matches ci ts-bindings rust-cache env and step order", async () => {
   const [ci, publish] = await Promise.all([
     readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf-8").then(
       parse
@@ -94,4 +94,16 @@ test("publish package-typescript matches ci ts-bindings rust-cache env", async (
     publish.jobs["package-typescript"].env.CARGO_PROFILE_DEV_DEBUG,
     ci.env.CARGO_PROFILE_DEV_DEBUG
   );
+  for (const steps of [
+    ci.jobs["ts-bindings"].steps,
+    publish.jobs["package-typescript"].steps,
+  ]) {
+    const nodeIdx = steps.findIndex(
+      ({ uses }) => uses === "./.github/actions/setup-node"
+    );
+    const rustIdx = steps.findIndex(
+      ({ uses }) => uses === "./.github/actions/setup-rust"
+    );
+    assert.ok(nodeIdx !== -1 && rustIdx !== -1 && nodeIdx < rustIdx);
+  }
 });

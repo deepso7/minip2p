@@ -47,9 +47,7 @@ jobs:
       ts_lint: ${{ steps.affected.outputs.ts_lint }}
       workflow_tests: ${{ steps.affected.outputs.workflow_tests }}
       script_tests: ${{ steps.affected.outputs.script_tests }}
-      bindings_ts: ${{ steps.affected.outputs.bindings_ts }}
       bindings_ts_packages: ${{ steps.affected.outputs.bindings_ts_packages }}
-      bindings_node_native: ${{ steps.affected.outputs.bindings_node_native }}
       bindings_rn_gen: ${{ steps.affected.outputs.bindings_rn_gen }}
       bindings_web: ${{ steps.affected.outputs.bindings_web }}
       bindings_web_e2e: ${{ steps.affected.outputs.bindings_web_e2e }}
@@ -330,7 +328,7 @@ jobs:
           for pkg in $TS_PACKAGES; do
             filters+=(--filter "${pkg}...")
           done
-          pnpm "${filters[@]}" build
+          pnpm --if-present "${filters[@]}" build
       - name: Prepare browser e2e fixtures
         env:
           BINDINGS_WEB: ${{ needs.plan.outputs.bindings_web }}
@@ -378,7 +376,7 @@ jobs:
         with:
           toolchain: stable
           shared-key: rn-bindings
-      - run: pnpm --filter @minip2p/core --filter @minip2p/react-native typecheck
+      - run: pnpm typecheck
       - run: pnpm --filter @minip2p/core --filter @minip2p/react-native test
       - run: pnpm --filter @minip2p/core --filter @minip2p/react-native build
       - run: pnpm --filter @minip2p/react-native test:built
