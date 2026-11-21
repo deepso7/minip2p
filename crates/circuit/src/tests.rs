@@ -1071,7 +1071,7 @@ fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     assert_eq!(
         a.next_deadline(),
         Some(Deadline::IMMEDIATE),
-        "an injected handshake completion must schedule keepalive arming"
+        "an injected handshake completion queues events to deliver"
     );
 
     let events = a
@@ -1089,17 +1089,18 @@ fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     )));
     assert_eq!(
         a.next_deadline(),
-        Some(Deadline::IMMEDIATE),
-        "draining pending events must leave an immediate wakeup"
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "the drain armed the session it established, so the next deadline is real"
     );
     assert!(
         a.poll(Now::from_millis(0))
-            .expect("arm keepalive")
+            .expect("nothing left to do")
             .is_empty()
     );
     assert_eq!(
         a.next_deadline(),
-        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "and no extra wakeup was needed to get there"
     );
 }
 

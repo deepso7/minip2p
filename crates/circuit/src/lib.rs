@@ -1045,12 +1045,20 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         Ok(())
     }
 
+    /// Established sessions get their time sample on every call, including
+    /// the one that only drains buffered events.
+    ///
+    /// Bytes can reach a session outside the wrapped transport's poll — see
+    /// [`inject_bridge_data`](Self::inject_bridge_data) — and complete the
+    /// upgrade while events are already buffered. Skipping the session loop
+    /// then left a newly established Yamux session with no time sample and
+    /// its keepalive unarmed, so [`next_deadline`](Self::next_deadline) had
+    /// nothing real to report for it.
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        if !self.pending.is_empty() {
-            return Ok(self.drain_pending_events());
-        }
-        for event in self.inner.poll(now)? {
-            self.handle_inner_event(event);
+        if self.pending.is_empty() {
+            for event in self.inner.poll(now)? {
+                self.handle_inner_event(event);
+            }
         }
         for id in self.circuits.keys().copied().collect::<Vec<_>>() {
             if !self
@@ -1082,19 +1090,19 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                 .any(|circuit| circuit.bridge_tail.is_some() || circuit.session.has_unsent_writes())
     }
 
+    /// The earliest of the wrapped transport's deadline and the circuits'
+    /// session keepalives, or immediate while events are buffered.
+    ///
+    /// Every established session has been polled by then, so a session with
+    /// no deadline has nothing pending rather than nothing sampled, and this
+    /// reports only real deadlines.
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
             return Some(Deadline::IMMEDIATE);
         }
         let mut deadline = self.inner.next_deadline();
         for circuit in self.circuits.values() {
-            let session_deadline = circuit.session.next_deadline().or_else(|| {
-                circuit
-                    .session
-                    .is_established()
-                    .then_some(Deadline::IMMEDIATE)
-            });
-            deadline = Deadline::earliest_opt(deadline, session_deadline);
+            deadline = Deadline::earliest_opt(deadline, circuit.session.next_deadline());
         }
         deadline
     }
