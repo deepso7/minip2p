@@ -249,6 +249,19 @@ impl fmt::Display for Multiaddr {
 impl FromStr for Multiaddr {
     type Err = MultiaddrError;
 
+    /// Parses the text form. `""` is the text form of the empty multiaddr, so
+    /// it parses to [`Multiaddr::new`]; `"/"` and other malformed text are
+    /// rejected.
+    ///
+    /// Round-trips [`Display`](fmt::Display) for every multiaddr this parser
+    /// or [`Multiaddr::from_bytes`] accepts, the empty one included. A value
+    /// built unchecked with [`Multiaddr::from_protocols`] may print text this
+    /// rejects, such as `/dns/` from an empty DNS name.
+    ///
+    /// Callers that need a non-empty address check it where that requirement
+    /// lives: [`PeerAddr`](crate::PeerAddr) rejects `""` with
+    /// `MissingPeerId`, and endpoint listen validation rejects the empty
+    /// multiaddr.
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         parse_multiaddr(input)
     }
@@ -320,7 +333,7 @@ pub enum TransportKind {
 /// Parses a `/`-delimited multiaddr string into protocol components.
 fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
     if input.is_empty() {
-        return Err(MultiaddrError::EmptyInput);
+        return Ok(Multiaddr::default());
     }
     if !input.starts_with('/') {
         return Err(MultiaddrError::MissingLeadingSlash);
@@ -823,6 +836,23 @@ mod tests {
         let addr = Multiaddr::new();
         assert_eq!(addr.to_bytes(), Vec::<u8>::new());
         assert_eq!(Multiaddr::from_bytes(&[]).unwrap(), addr);
+    }
+
+    #[test]
+    fn text_codec_round_trips_empty_multiaddr() {
+        let addr = Multiaddr::new();
+        assert_eq!(addr.to_string(), "");
+        assert_eq!("".parse::<Multiaddr>().unwrap(), addr);
+        assert_eq!("/".parse::<Multiaddr>(), Err(MultiaddrError::EmptyProtocol));
+    }
+
+    #[test]
+    fn an_address_required_to_name_a_peer_still_rejects_the_empty_one() {
+        let err = crate::PeerAddr::from_str("").unwrap_err();
+        assert!(
+            matches!(err, crate::PeerAddrError::MissingPeerId),
+            "{err:?}"
+        );
     }
 
     #[test]

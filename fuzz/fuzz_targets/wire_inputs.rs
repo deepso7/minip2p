@@ -388,11 +388,9 @@ fn fuzz_multiaddr(data: &[u8]) {
         let decoded = Multiaddr::from_bytes(&reencoded).expect("re-decode own encoding");
         assert_eq!(decoded, addr);
 
-        if !addr.protocols().is_empty() {
-            let text = addr.to_string();
-            let parsed: Multiaddr = text.parse().expect("re-parse own text");
-            assert_eq!(parsed, addr);
-        }
+        let text = addr.to_string();
+        let parsed: Multiaddr = text.parse().expect("re-parse own text");
+        assert_eq!(parsed, addr);
 
         assert_eq!(addr.transport_kind(), expected_transport_kind(&addr));
     }

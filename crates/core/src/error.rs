@@ -6,8 +6,6 @@ use thiserror::Error;
 /// Errors from parsing a multiaddr (string or binary).
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum MultiaddrError {
-    #[error("multiaddr input is empty")]
-    EmptyInput,
     #[error("multiaddr must start with '/' (example: /ip4/127.0.0.1/udp/4001/quic-v1)")]
     MissingLeadingSlash,
     #[error("empty protocol segment in multiaddr")]
