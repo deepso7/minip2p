@@ -342,13 +342,10 @@ export class WebEndpoint {
     }
     /**
      * Tells the endpoint its page is visible again, so a relay
-     * reservation recovers at once.
+     * reservation recovers at once. Does nothing once closed.
      */
     resume() {
-        const ret = wasm.webendpoint_resume(this.__wbg_ptr);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
+        wasm.webendpoint_resume(this.__wbg_ptr);
     }
     /**
      * Sends bytes on a stream: `true` once all are accepted, `false` while

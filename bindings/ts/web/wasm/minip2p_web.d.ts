@@ -125,7 +125,7 @@ export class WebEndpoint {
     resetStream(conn_id: bigint, stream_id: bigint): void;
     /**
      * Tells the endpoint its page is visible again, so a relay
-     * reservation recovers at once.
+     * reservation recovers at once. Does nothing once closed.
      */
     resume(): void;
     /**
@@ -200,7 +200,7 @@ export interface InitOutput {
     readonly webendpoint_pump: (a: number) => [number, number];
     readonly webendpoint_reachability: (a: number) => [number, number, number];
     readonly webendpoint_resetStream: (a: number, b: bigint, c: bigint) => [number, number];
-    readonly webendpoint_resume: (a: number) => [number, number];
+    readonly webendpoint_resume: (a: number) => void;
     readonly webendpoint_sendStream: (a: number, b: bigint, c: bigint, d: number, e: number) => [number, number, number];
     readonly webendpoint_start: (a: number, b: any) => [number, number];
     readonly webendpoint_streamConsumed: (a: number, b: bigint, c: bigint, d: number) => [number, number];

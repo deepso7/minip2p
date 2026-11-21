@@ -257,9 +257,7 @@ class ReactNativeBackend implements Minip2pBackend {
   }
 
   resume(): void {
-    translateErrors(() => {
-      this.#endpoint.resume();
-    });
+    this.#endpoint.resume();
   }
 
   subscribe(topic: string): boolean {

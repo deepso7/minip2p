@@ -48,8 +48,8 @@ impl P2pEndpoint {
         self.0.peer_info(peer_id)
     }
     /// Tells the endpoint its app is back in the foreground, so a relay reservation recovers at once.
-    pub fn resume(&self) -> Result<(), FfiError> {
-        self.0.resume()
+    pub fn resume(&self) {
+        self.0.resume();
     }
     /// Returns whether the driver accepts work.
     pub fn is_running(&self) -> bool {

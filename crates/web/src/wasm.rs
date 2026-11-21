@@ -151,10 +151,10 @@ impl WebEndpoint {
     }
 
     /// Tells the endpoint its page is visible again, so a relay
-    /// reservation recovers at once.
-    pub fn resume(&mut self) -> Result<(), JsValue> {
+    /// reservation recovers at once. Does nothing once closed.
+    pub fn resume(&mut self) {
         let now = self.now();
-        self.host.resume(now).map_err(|error| js_error(&error))
+        self.host.resume(now);
     }
 
     /// Subscribes to a pubsub topic.

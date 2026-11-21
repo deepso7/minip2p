@@ -490,8 +490,8 @@ impl NodeEndpoint {
 
     /// Tells the endpoint its host is back from a pause, so a relay reservation recovers at once.
     #[napi]
-    pub fn resume(&self, env: Env) -> Result<()> {
-        self.0.resume().map_err(|error| native_error(&env, error))
+    pub fn resume(&self) {
+        self.0.resume();
     }
 
     /// Subscribes to a pubsub topic.

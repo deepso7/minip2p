@@ -31,7 +31,7 @@ export const webendpoint_publish: (a: number, b: number, c: number, d: number, e
 export const webendpoint_pump: (a: number) => [number, number];
 export const webendpoint_reachability: (a: number) => [number, number, number];
 export const webendpoint_resetStream: (a: number, b: bigint, c: bigint) => [number, number];
-export const webendpoint_resume: (a: number) => [number, number];
+export const webendpoint_resume: (a: number) => void;
 export const webendpoint_sendStream: (a: number, b: bigint, c: bigint, d: number, e: number) => [number, number, number];
 export const webendpoint_start: (a: number, b: any) => [number, number];
 export const webendpoint_streamConsumed: (a: number, b: bigint, c: bigint, d: number) => [number, number];

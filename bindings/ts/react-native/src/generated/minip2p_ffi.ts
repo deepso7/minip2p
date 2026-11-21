@@ -391,7 +391,7 @@ export interface P2pEndpointLike {
 /**
  * Tells the endpoint its app is back in the foreground, so a relay reservation recovers at once.
  */
-    resume() /*throws*/: void;
+    resume(): void;
 /**
  * Sends bytes on a stream, named by its connection and stream ids.
  *
@@ -877,8 +877,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 /**
  * Tells the endpoint its app is back in the foreground, so a relay reservation recovers at once.
  */
-    resume(): void /*throws*/ {uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
+    resume(): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_resume(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
                 callStatus);
@@ -1199,7 +1198,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 8949) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_resume() !== 37327) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_resume() !== 36646) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_resume");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 31876) {

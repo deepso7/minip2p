@@ -305,9 +305,10 @@ impl<T: Transport> Host<T> {
     }
 
     /// Tells the endpoint its page is visible again; see `Endpoint::resume`.
-    pub fn resume(&mut self, now: Now) -> Result<(), FfiError> {
-        self.endpoint()?.at(now).resume();
-        Ok(())
+    pub fn resume(&mut self, now: Now) {
+        if let Ok(endpoint) = self.endpoint() {
+            endpoint.at(now).resume();
+        }
     }
 
     /// Sends an explicit ping; its result arrives as an event.

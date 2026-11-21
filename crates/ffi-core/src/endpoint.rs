@@ -380,12 +380,15 @@ impl P2pEndpoint {
     }
 
     /// Tells the endpoint its app is back in the foreground; see
-    /// [`Endpoint::resume`].
-    pub fn resume(&self) -> Result<(), FfiError> {
-        self.with_endpoint_mut(|endpoint| {
+    /// [`Endpoint::resume`]. A stopped endpoint has nothing to recover, so
+    /// this never fails: an app-state callback has no error to handle.
+    pub fn resume(&self) {
+        match self.with_endpoint_mut(|endpoint| {
             endpoint.resume();
             Ok(())
-        })
+        }) {
+            Ok(()) | Err(_) => {}
+        }
     }
 
     /// Returns whether the background driver is accepting work.
