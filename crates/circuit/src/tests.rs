@@ -27,6 +27,8 @@ impl EntropySource for FailingEntropy {
 
 struct CloseObservingTransport<T> {
     inner: T,
+    dial_id: Option<ConnectionId>,
+    closed: Vec<ConnectionId>,
     fail_close_write: bool,
     fail_send: bool,
     send_calls: usize,
@@ -139,6 +141,8 @@ impl<T> CloseObservingTransport<T> {
     fn new(inner: T) -> Self {
         Self {
             inner,
+            dial_id: None,
+            closed: Vec::new(),
             fail_close_write: false,
             fail_send: false,
             send_calls: 0,
@@ -159,7 +163,10 @@ impl<T: Transport> Transport for CloseObservingTransport<T> {
     }
 
     fn dial(&mut self, address: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
-        self.inner.dial(address)
+        match self.dial_id {
+            Some(id) => Ok(id),
+            None => self.inner.dial(address),
+        }
     }
 
     fn listen(&mut self, address: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -213,6 +220,7 @@ impl<T: Transport> Transport for CloseObservingTransport<T> {
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        self.closed.push(id);
         self.inner.close(id)
     }
 
@@ -2011,6 +2019,36 @@ fn wrapped_high_bit_ids_are_rejected_without_becoming_circuits() {
                 .to_string(),
         }]
     );
+    assert!(transport.circuit_ids().is_empty());
+}
+
+#[test]
+fn wrapped_dial_returning_a_circuit_id_is_closed_and_rejected() {
+    let local = identity(1);
+    let relay = identity(9).peer_id();
+    let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
+    let collision =
+        ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 77).expect("circuit id in range");
+    let mut observed = CloseObservingTransport::new(inner);
+    observed.dial_id = Some(collision);
+    let mut transport = CircuitTransport::new(observed, local, CounterEntropy(1));
+    let address = minip2p_core::PeerAddr::new(
+        "/ip4/203.0.113.7/udp/7007/quic-v1"
+            .parse()
+            .expect("dial transport address"),
+        relay,
+    )
+    .expect("dial address");
+
+    assert_eq!(
+        transport.dial(&address),
+        Err(TransportError::DialFailed {
+            id: collision,
+            reason: "wrapped transport allocated in the circuit connection-ID namespace"
+                .to_string(),
+        })
+    );
+    assert_eq!(transport.inner().closed, vec![collision]);
     assert!(transport.circuit_ids().is_empty());
 }
 
