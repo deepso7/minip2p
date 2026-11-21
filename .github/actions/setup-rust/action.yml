@@ -1,0 +1,84 @@
+name: Setup Rust toolchain and cache
+description: Install Rust toolchain, optional cargo-cache, and pinned Cargo CLI tools.
+inputs:
+  toolchain:
+    description: Rust toolchain name or version
+    required: false
+    default: stable
+  components:
+    description: Comma-separated rustup components
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated rustup targets
+    required: false
+    default: ""
+  cache:
+    description: Enable Swatinem/rust-cache
+    required: false
+    default: "true"
+  shared-key:
+    description: Explicit rust-cache shared-key prefix
+    required: false
+    default: ""
+  workspaces:
+    description: Extra Cargo workspaces for rust-cache
+    required: false
+    default: ""
+  save-cache:
+    description: "Cache save policy: main, always, or never"
+    required: false
+    default: main
+  nextest:
+    description: Install pinned cargo-nextest
+    required: false
+    default: "false"
+  wasm-bindgen:
+    description: Install pinned wasm-bindgen-cli
+    required: false
+    default: "false"
+  cargo-ndk:
+    description: Install pinned cargo-ndk
+    required: false
+    default: "false"
+  cargo-fuzz:
+    description: Install pinned cargo-fuzz
+    required: false
+    default: "false"
+outputs:
+  cachekey:
+    description: Rust toolchain cache key from dtolnay/rust-toolchain
+    value: ${{ steps.rust.outputs.cachekey }}
+runs:
+  using: composite
+  steps:
+    - id: rust
+      uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}
+        save-if: ${{ inputs.save-cache == 'always' || (inputs.save-cache == 'main' && github.ref == 'refs/heads/main') }}
+    - if: inputs.nextest == 'true'
+      name: Install cargo-nextest
+      shell: bash
+      env:
+        NEXTEST_VERSION: "0.9.143"
+      run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
+    - if: inputs.wasm-bindgen == 'true'
+      name: Install wasm-bindgen-cli
+      shell: bash
+      run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+    - if: inputs.cargo-ndk == 'true'
+      name: Install cargo-ndk
+      shell: bash
+      run: cargo install cargo-ndk --version 4.1.2 --locked
+    - if: inputs.cargo-fuzz == 'true'
+      name: Install cargo-fuzz
+      shell: bash
+      run: cargo install cargo-fuzz --version 0.13.2 --locked

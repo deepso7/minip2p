@@ -2,13 +2,13 @@
 set -eu
 
 usage() {
-  echo "usage: $0 check|clippy|test [ci|full|<row>]" >&2
+  echo "usage: $0 check|clippy|test [ci|full|<row>|--rows <csv>] [--shard <i/n>]" >&2
   echo "       $0 list" >&2
   exit 2
 }
 
 operation=${1:-}
-selection=${2:-ci}
+shift || true
 case "$operation" in
 check | clippy | test | list) ;;
 *) usage ;;
@@ -63,15 +63,82 @@ if [ "$operation" = list ]; then
   exit 0
 fi
 
-case "$selection" in
-ci | full) ;;
-*)
-  if ! cut -d'|' -f1 <<<"$matrix" | grep -qxF -- "$selection"; then
-    echo "unknown matrix row: $selection (see \`$0 list\`)" >&2
+selection="ci"
+rows_csv=""
+shard_requested=false
+shard_index=""
+shard_total=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --rows)
+    [ "$#" -ge 2 ] || usage
+    selection="rows"
+    rows_csv="$2"
+    shift 2
+    ;;
+  --shard)
+    [ "$#" -ge 2 ] || usage
+    shard_requested=true
+    case "$2" in
+    */*)
+      shard_index=${2%%/*}
+      shard_total=${2#*/}
+      ;;
+    *) usage ;;
+    esac
+    shift 2
+    ;;
+  -*)
+    usage
+    ;;
+  *)
+    selection="$1"
+    shift
+    ;;
+  esac
+done
+
+if [ "$shard_requested" = true ]; then
+  if ! [[ "$shard_index" =~ ^[1-9][0-9]*$ && "$shard_total" =~ ^[1-9][0-9]*$ ]] || [ "$shard_index" -gt "$shard_total" ]; then
+    echo "invalid shard specification: $shard_index/$shard_total" >&2
     exit 2
   fi
+fi
+
+validate_row_name() {
+  if ! cut -d'|' -f1 <<<"$matrix" | grep -qxF -- "$1"; then
+    echo "unknown matrix row: $1 (see \`$0 list\`)" >&2
+    exit 2
+  fi
+}
+
+case "$selection" in
+ci | full) ;;
+rows)
+  if [ -z "$rows_csv" ]; then
+    exit 0
+  fi
+  IFS=',' read -r -a requested_rows <<<"$rows_csv"
+  for row_name in "${requested_rows[@]}"; do
+    validate_row_name "$row_name"
+  done
+  ;;
+*)
+  validate_row_name "$selection"
   ;;
 esac
+
+row_selected() {
+  local name="$1"
+  local tier="$2"
+  case "$selection" in
+  ci) [ "$tier" = ci ] ;;
+  full) return 0 ;;
+  rows) [[ ",$rows_csv," == *",$name,"* ]] ;;
+  *) [ "$name" = "$selection" ] ;;
+  esac
+}
 
 run() {
   printf '+'
@@ -80,12 +147,15 @@ run() {
   "$@"
 }
 
+matched_index=0
 while IFS='|' read -r name package defaults features tier; do
-  case "$selection" in
-  ci) [ "$tier" = ci ] || continue ;;
-  full) ;;
-  *) [ "$name" = "$selection" ] || continue ;;
-  esac
+  row_selected "$name" "$tier" || continue
+
+  if [ "$shard_requested" = true ]; then
+    bucket=$(( (matched_index % shard_total) + 1 ))
+    matched_index=$((matched_index + 1))
+    [ "$bucket" -eq "$shard_index" ] || continue
+  fi
 
   set -- -p "$package"
   if [ "$defaults" = "no-default" ]; then

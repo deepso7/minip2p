@@ -1,0 +1,45 @@
+name: Run ubrn with CLI build cache
+description: Restore the cached uniffi-bindgen-react-native CLI build, run a command, and save on main.
+inputs:
+  rust-cachekey:
+    description: Rust toolchain cachekey output from setup-rust
+    required: true
+  command:
+    description: Shell command to invoke ubrn
+    required: true
+  working-directory:
+    description: Directory to run the command in
+    required: false
+    default: .
+  save-cache:
+    description: "Cache save policy: main, always, or never"
+    required: false
+    default: main
+runs:
+  using: composite
+  steps:
+    - name: Restore ubrn CLI build
+      id: ubrn
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          node_modules/uniffi-bindgen-react-native/target
+          node_modules/uniffi-bindgen-react-native/Cargo.lock
+        key: ubrn-${{ runner.os }}-${{ runner.arch }}-${{ inputs.rust-cachekey }}-${{ hashFiles('node_modules/uniffi-bindgen-react-native/package.json', 'bindings/ts/react-native/patches/*.patch') }}
+    - name: Backdate ubrn sources
+      if: steps.ubrn.outputs.cache-hit == 'true'
+      shell: bash
+      working-directory: node_modules/uniffi-bindgen-react-native
+      run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
+    - name: Run ubrn command
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ inputs.command }}
+    - name: Save ubrn CLI build
+      if: steps.ubrn.outputs.cache-hit != 'true' && (inputs.save-cache == 'always' || (inputs.save-cache == 'main' && github.ref == 'refs/heads/main'))
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          node_modules/uniffi-bindgen-react-native/target
+          node_modules/uniffi-bindgen-react-native/Cargo.lock
+        key: ${{ steps.ubrn.outputs.cache-primary-key }}

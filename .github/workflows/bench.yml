@@ -3,10 +3,6 @@ name: Bench
 on:
   release:
     types: [published]
-  # A writer adds the `bench` label to measure a PR's head against its
-  # merge-base, both in the same run, typically once before merging; the run
-  # removes the label, so adding it again re-measures (after a fix, say).
-  # Pushes alone never start a run.
   pull_request_target:
     branches: [main]
     types: [labeled]
@@ -34,23 +30,15 @@ on:
 permissions:
   contents: read
 
-# Re-adding `bench` replaces a PR's earlier run. Any other label's event gets a
-# group of its own, so it cannot cancel a bench in progress.
 concurrency:
   group: bench-${{ github.event.label.name == 'bench' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
   AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'ap-south-1' }}
-  # A PR run, or a dispatch with `base`, measures two trees and compares them.
   AB_RUN: ${{ github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.base != '') }}
 
 jobs:
-  # Wakes the self-hosted bench instance (normally stopped; its watchdog
-  # powers it off when idle). Manual runs need approval through `aws-bench`.
-  # Releases and the weekly keepalive run only trusted code from a tag or
-  # `main`, and a labelled PR was opted in by a writer, so those use the
-  # reviewer-free `aws-bench-unattended`.
   start-runner:
     if: >-
       (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || (github.event.label.name == 'bench' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'schedule'
@@ -61,10 +49,11 @@ jobs:
       contents: read
       id-token: write
       pull-requests: write
+    outputs:
+      authorized: ${{ steps.label.outputs.authorized }}
     steps:
-      # Removes the label so adding it again starts a new run, then admits
-      # only a writer's label: triage access can label too.
       - name: Take bench label
+        id: label
         if: github.event_name == 'pull_request_target'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,6 +66,7 @@ jobs:
             echo "$SENDER has $permission access; only writers can start a bench" >&2
             exit 1
           fi
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
@@ -86,8 +76,6 @@ jobs:
         run: |
           echo "a run with base set compares two trees; it cannot also record a baseline or sweep" >&2
           exit 1
-      # Fails a baseline dispatch before the instance starts unless it names
-      # what a `release` run would have measured.
       - name: Check baseline tag
         if: github.event_name == 'workflow_dispatch' && inputs.baseline
         env:
@@ -128,10 +116,6 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
-      # The scripts and Dockerfile that drive the bench host always come from
-      # the trusted checkout above; a PR head, a dispatched `ref` and an A/B
-      # run's merge-base are only the code measured (image build contexts),
-      # checked out beside it.
       - name: Check out benchmark source
         if: github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -146,8 +130,6 @@ jobs:
         run: |
           echo "dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
           echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # The base side of an A/B run: where the measured code forked from the
-      # base branch, so commits merged there since are not attributed to it.
       - name: Resolve merge-base
         id: merge-base
         if: env.AB_RUN == 'true'
@@ -167,8 +149,6 @@ jobs:
           ref: ${{ steps.merge-base.outputs.sha }}
           path: bench-base
           persist-credentials: false
-      # `exec` makes the helper the step's process, so the runner's
-      # cancellation signals reach its traps.
       - name: Measure
         id: measure
         env:
@@ -178,21 +158,14 @@ jobs:
           BENCH_BASE_CONTEXT: ${{ env.AB_RUN == 'true' && 'bench-base' || '' }}
           BENCH_BASE_GIT_SHA: ${{ steps.merge-base.outputs.sha }}
         run: exec scripts/run-bench-container.sh
-      # A single measurement (release, baseline or plain dispatch) becomes the
-      # result slice the `baseline` job stores; an A/B run is compared below.
       - name: Prepare result slice
         id: result
         if: always()
         env:
           MEASURE_OUTCOME: ${{ steps.measure.outcome }}
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           mkdir -p target/bench-artifacts
-          if [ -n "$PR_NUMBER" ]; then
-            printf '%s\n' "$PR_NUMBER" > target/bench-artifacts/pr-number
-            printf '%s\n' "$BENCH_GIT_SHA" > target/bench-artifacts/head-sha
-          fi
           if [ "$AB_RUN" = true ]; then
             exit 0
           fi
@@ -203,32 +176,24 @@ jobs:
             jq -n --arg sha "$BENCH_GIT_SHA" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/current.json
           fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
-      # The comparator runs from the trusted checkout, so a PR cannot change
-      # how its own result is judged; each side's rows were already checked
-      # by that side's own harness inside its container.
       - name: Compare
         id: compare
         if: env.AB_RUN == 'true'
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref || inputs.base }}
           HEAD_DIR: ${{ steps.source.outputs.dir }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p target/bench-comparison
           python3 scripts/bench_results.py compare --base target/bench-artifacts/base.json --head target/bench-artifacts/head.json \
             --base-source bench-base --head-source "$HEAD_DIR" --base-ref "$BASE_REF" --run-url "$RUN_URL" \
             --output target/bench-comparison/comparison.md
-          if [ -n "$PR_NUMBER" ]; then
-            printf '%s\n' "$PR_NUMBER" > target/bench-comparison/pr-number
-          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: bench-results
           path: target/bench-artifacts/
           if-no-files-found: error
-      # Bench comment posts it on the PR; a dispatch keeps it as an artifact.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.compare.outcome == 'success'
         with:
@@ -236,8 +201,80 @@ jobs:
           path: target/bench-comparison/
           if-no-files-found: error
 
-  # The weekly schedule connects the runner so GitHub does not remove it
-  # after 14 days offline; the watchdog stops the instance afterwards.
+  comment:
+    if: >-
+      always() && github.event_name == 'pull_request_target' && needs.start-runner.outputs.authorized == 'true' && needs.bench.result != 'cancelled'
+    needs: [start-runner, bench]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download comparison
+        if: needs.bench.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-comparison
+          path: ${{ runner.temp }}/bench-comparison
+      - name: Upsert sticky comment
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bench-comparison
+          BENCH_RESULT: ${{ needs.bench.result }}
+          START_RESULT: ${{ needs.start-runner.result }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET: ${{ runner.temp }}/bench-comment.md
+        run: |
+          set -euo pipefail
+          actual_head_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+          if [ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "PR head moved since benchmark started; skipping stale comment" >&2
+            exit 0
+          fi
+
+          existing_json=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+            | jq --slurp '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0] // {}')
+          comment_id=$(jq -r '.id // empty' <<<"$existing_json")
+          existing_body=$(jq -r '.body // empty' <<<"$existing_json")
+
+          if [ "$START_RESULT" = success ] && [ "$BENCH_RESULT" = success ]; then
+            test -s "$ARTIFACT_DIR/comparison.md"
+            cp "$ARTIFACT_DIR/comparison.md" "$TARGET"
+          else
+            conclusion="$BENCH_RESULT"
+            if [ "$START_RESULT" != success ]; then
+              conclusion="$START_RESULT"
+            fi
+            previous_body=$(printf '%s\n' "$existing_body" | sed \
+              -e '/^<!-- bench-comment -->$/d' \
+              -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d')
+            {
+              printf '%s\n' '<!-- bench-comment -->'
+              printf '%s\n' '<!-- bench-status-start -->'
+              printf '> [!WARNING]\n'
+              if [ -n "${previous_body//[[:space:]]/}" ]; then
+                previous=' The comparison below is from the last successful run.'
+              else
+                previous=''
+              fi
+              printf '> Benchmark run [%s](%s).%s To retry, use **Re-run all jobs**: re-running only the failed job does not wake the stopped bench instance.\n' \
+                "$conclusion" "$RUN_URL" "$previous"
+              printf '%s\n\n' '<!-- bench-status-end -->'
+              if [ -n "$previous" ]; then
+                printf '%s\n' "$previous_body"
+              fi
+            } > "$TARGET"
+          fi
+
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F "body=@$TARGET"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$TARGET"
+          fi
+
   keepalive:
     if: github.event_name == 'schedule'
     needs: start-runner
@@ -248,8 +285,6 @@ jobs:
     steps:
       - run: "true"
 
-  # Records a stable release's result on `bench-data`, from its `release` run
-  # or from a dispatch with `baseline` set that (re)measures its tag.
   baseline:
     if: >-
       needs.bench.outputs.complete == 'true' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.baseline))

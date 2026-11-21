@@ -225,7 +225,7 @@ wait_for_push_workflows() {
   local sha="$1"
   local started now elapsed runs summary workflow row run_status conclusion url
   local all_success
-  local workflows=("CI" "TypeScript bindings")
+  local workflows=("CI")
   started="$(date +%s)"
 
   echo "release: waiting for push workflows on ${sha:0:8}"

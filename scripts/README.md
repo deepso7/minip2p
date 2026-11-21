@@ -6,9 +6,12 @@ Each script prints its usage when called without valid arguments; the environmen
 
 | Script | Used by | What it does |
 | --- | --- | --- |
-| `run-feature-matrix.sh` | `just check`, `just clippy`, `just test`, `just matrix`, `ci.yml`, `publish.yml` | Runs `check`, `clippy` or `test` over the named feature-matrix rows (`ci`, `full`, or one row; `list` prints them). |
+| `affected.py` | `ci.yml` (`plan`) | Computes diff-reachable crates, matrix rows, benches, fuzz, docs, and TS binding checks. |
+| `test_affected.py` | `ci.yml` (`checks`) | Unit tests for `affected.py`, including cross-checks against `cargo tree`. |
+| `run-feature-matrix.sh` | `just check`, `just clippy`, `just test`, `just matrix`, `ci.yml`, `publish.yml` | Runs `check`, `clippy` or `test` over named feature-matrix rows (`ci`, `full`, `<row>`, `--rows <csv>`, optional `--shard i/n`; `list` prints them). |
 | `check-targets.sh` | `just check-nostd`, `check-wasm`, `docs`, `package-check`, `ci.yml`, `publish.yml` | The no_std, wasm32, rustdoc and package lists. |
-| `publish-order.py` | `check-targets.sh package-check`, `publish.yml` | Prints the publishable crates in dependency order. |
+| `publish-order.py` | `check-targets.sh package-check`, `publish-crates.sh` | Prints the publishable crates in dependency order. |
+| `prune-caches.sh` | `ci.yml` (`prune-caches` on `main`) | Deletes superseded GitHub Actions caches per key group to stay under the 10 GiB cap. |
 | `clean.sh` | `just clean`, `pnpm clean:all` | Removes build outputs, `node_modules`, Turbo caches and docs output. |
 
 `check-targets.sh` subcommands:
@@ -48,6 +51,10 @@ Each script prints its usage when called without valid arguments; the environmen
 | Script | Used by | What it does |
 | --- | --- | --- |
 | `release.sh` | `just release` | Bumps versions, pushes, publishes the GitHub release and waits for the registries. |
+| `verify-release-versions.sh` | `publish.yml` | Checks lockstep Rust and TypeScript versions and release tag alignment. |
+| `publish-crates.sh` | `publish.yml` | Publishes workspace crates to crates.io in dependency order with idempotent retries. |
+| `publish-npm-packages.sh` | `publish.yml` | Publishes packed `@minip2p/*` tarballs to npm with trusted publishing. |
+| `build-node-musl.sh` | `bindings-native.yml`, `publish.yml` | Builds (and optionally tests with `--test`) Linux musl `@minip2p/node` addons in Docker. |
 | `npm-trusted-publisher-web.sh` | by hand | Wizard for the npm trusted-publisher setup of `@minip2p/web`. |
 
 ## Relay container and installer
