@@ -77,14 +77,67 @@ fn inbound_limit_is_fifo_and_replays_unacknowledged_data_before_fin() {
     assert!(matches!(&events[..], [
         SwarmEvent::StreamClosed { stream_id, .. },
         SwarmEvent::StreamReady { stream_id: next, .. },
-        SwarmEvent::StreamData { data: first, .. },
-        SwarmEvent::StreamData { data: second, .. },
+        SwarmEvent::StreamData { data, .. },
         SwarmEvent::StreamRemoteWriteClosed { .. },
-    ] if *stream_id == a && *next == b && first.as_ref() == b"leftover" && second.as_ref() == b"later"));
+    ] if *stream_id == a && *next == b && data.as_ref() == b"leftoverlater"));
     assert!(!state.actions.iter().any(|action| matches!(action,
         Action::AckStream { stream_id, .. } if *stream_id == b)));
     state.handle_stream_closed(conn, b);
     assert_eq!(ready(&drain_events(&mut state)), [c]);
+}
+
+#[test]
+fn queued_events_follow_the_upgraded_connection_identity() {
+    let (mut state, conn, old) = setup();
+    let [active, queued] = [1, 2].map(StreamId::new);
+    incoming(&mut state, conn, active, LIMITED, &[]);
+    incoming(&mut state, conn, queued, LIMITED, b"held");
+    state.handle_stream_remote_write_closed(conn, queued);
+    drain_events(&mut state);
+    let verified = PeerId::from_public_key_protobuf(b"verified-admission");
+    state.upgrade_connection_identity(conn, verified, None, 0);
+    assert_eq!(state.conn_to_peer.get(&conn), Some(&verified));
+    drain_events(&mut state);
+    state.handle_stream_closed(conn, active);
+    let events = drain_events(&mut state);
+    assert_eq!(ready(&events), [queued]);
+    for event in &events {
+        if let SwarmEvent::StreamReady { peer_id: peer, .. }
+        | SwarmEvent::StreamData { peer_id: peer, .. }
+        | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, .. } = event
+        {
+            assert_eq!(*peer, verified, "queued event retained {old}");
+        }
+    }
+}
+
+#[test]
+fn queued_data_coalesces_only_across_consecutive_data_events() {
+    let (mut state, conn, _) = setup();
+    let [active, queued] = [1, 2].map(StreamId::new);
+    incoming(&mut state, conn, active, LIMITED, &[]);
+    incoming(&mut state, conn, queued, LIMITED, b"a");
+    state.actions.clear();
+    for _ in 0..100 {
+        state.handle_stream_data(conn, queued, Bytes::from_static(b"b"), 0);
+    }
+    state.handle_stream_write_stopped(conn, queued, 0);
+    state.handle_stream_data(conn, queued, Bytes::from_static(b"c"), 0);
+    state.handle_stream_remote_write_closed(conn, queued);
+    assert!(state.actions.is_empty());
+    drain_events(&mut state);
+    state.handle_stream_closed(conn, active);
+    let events = drain_events(&mut state);
+    assert!(matches!(&events[..], [
+        SwarmEvent::StreamClosed { .. },
+        SwarmEvent::StreamReady { .. },
+        SwarmEvent::StreamData { data: first, .. },
+        SwarmEvent::StreamWriteStopped { .. },
+        SwarmEvent::StreamData { data: last, .. },
+        SwarmEvent::StreamRemoteWriteClosed { .. },
+    ] if first.len() == 101 && first.first() == Some(&b'a')
+        && first.iter().skip(1).all(|byte| *byte == b'b') && last.as_ref() == b"c"));
+    assert!(state.actions.is_empty());
 }
 
 #[test]
@@ -94,14 +147,14 @@ fn queued_reset_is_silent_and_acknowledges_discarded_bytes() {
     incoming(&mut state, conn, a, LIMITED, &[]);
     drain_events(&mut state);
     incoming(&mut state, conn, b, LIMITED, b"discard");
+    state.handle_stream_data(conn, b, Bytes::from_static(b"later"), 0);
     incoming(&mut state, conn, c, LIMITED, &[]);
     state.actions.clear();
     state.handle_stream_closed(conn, b);
     assert!(
-        state
-            .actions
-            .iter()
-            .any(|a| matches!(a, Action::AckStream { stream_id, bytes: 7, .. } if *stream_id == b))
+        state.actions.iter().any(
+            |a| matches!(a, Action::AckStream { stream_id, bytes: 12, .. } if *stream_id == b)
+        )
     );
     assert!(drain_events(&mut state).is_empty());
     state.handle_stream_closed(conn, a);

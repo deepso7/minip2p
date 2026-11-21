@@ -458,7 +458,9 @@ pub(crate) struct SwarmState {
     stream_owner: BTreeMap<OwnedStream, ProtocolKind>,
     pub(crate) inbound_limits: BTreeMap<String, NonZeroUsize>,
     admitted_inbound: BTreeMap<(ConnectionId, StreamId), String>,
-    queued_inbound: VecDeque<admission::QueuedInbound>,
+    queued_inbound: BTreeMap<(ConnectionId, StreamId), admission::QueuedInbound>,
+    inbound_order: VecDeque<(ConnectionId, StreamId)>,
+    inbound_promotion_needed: bool,
     /// User streams for which a reset has already been queued.
     reset_pending: BTreeSet<(ConnectionId, StreamId)>,
     /// Streams deliberately forgotten by their consumer until transport close.
@@ -622,7 +624,9 @@ impl SwarmState {
             stream_owner: BTreeMap::new(),
             inbound_limits: BTreeMap::new(),
             admitted_inbound: BTreeMap::new(),
-            queued_inbound: VecDeque::new(),
+            queued_inbound: BTreeMap::new(),
+            inbound_order: VecDeque::new(),
+            inbound_promotion_needed: false,
             reset_pending: BTreeSet::new(),
             abandoned_streams: BTreeSet::new(),
             inbound_protocols,

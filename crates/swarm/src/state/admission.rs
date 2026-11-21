@@ -1,9 +1,8 @@
 use super::*;
 
 pub(super) struct QueuedInbound {
-    key: (ConnectionId, StreamId),
     protocol: String,
-    events: VecDeque<SwarmEvent>,
+    pub(super) events: VecDeque<SwarmEvent>,
 }
 
 impl SwarmState {
@@ -23,11 +22,14 @@ impl SwarmState {
         let key = (conn_id, stream_id);
         if self.inbound_limits.contains_key(protocol) {
             if !self.inbound_has_room(protocol) {
-                self.queued_inbound.push_back(QueuedInbound {
+                self.inbound_order.push_back(key);
+                self.queued_inbound.insert(
                     key,
-                    protocol: protocol.into(),
-                    events: VecDeque::from([event]),
-                });
+                    QueuedInbound {
+                        protocol: protocol.into(),
+                        events: VecDeque::from([event]),
+                    },
+                );
                 return;
             }
             self.admitted_inbound.insert(key, protocol.into());
@@ -51,11 +53,18 @@ impl SwarmState {
         stream: StreamId,
         event: SwarmEvent,
     ) {
-        if let Some(queued) = self
-            .queued_inbound
-            .iter_mut()
-            .find(|q| q.key == (conn, stream))
-        {
+        if let Some(queued) = self.queued_inbound.get_mut(&(conn, stream)) {
+            if let SwarmEvent::StreamData { data, .. } = &event
+                && let Some(SwarmEvent::StreamData { data: held, .. }) = queued.events.back_mut()
+            {
+                let mut buffer = match core::mem::take(held).try_into_mut() {
+                    Ok(buffer) => buffer,
+                    Err(bytes) => bytes.into(),
+                };
+                buffer.extend_from_slice(data);
+                *held = buffer.freeze();
+                return;
+            }
             queued.events.push_back(event);
         } else {
             self.events.push_back(event);
@@ -63,48 +72,68 @@ impl SwarmState {
     }
 
     pub(super) fn release_inbound(&mut self, conn: ConnectionId, stream: Option<StreamId>) {
-        let matches =
-            |key: (ConnectionId, StreamId)| key.0 == conn && stream.is_none_or(|s| key.1 == s);
-        self.admitted_inbound.retain(|key, _| !matches(*key));
-        let mut retained = VecDeque::new();
-        while let Some(queued) = self.queued_inbound.pop_front() {
-            if matches(queued.key) {
-                let bytes = queued
-                    .events
-                    .iter()
-                    .filter_map(|event| match event {
-                        SwarmEvent::StreamData { data, .. } => Some(data.len()),
-                        _ => None,
-                    })
-                    .sum();
-                if bytes > 0 {
-                    self.actions.push_back(Action::AckStream {
-                        conn_id: queued.key.0,
-                        stream_id: queued.key.1,
-                        bytes,
-                    });
-                }
-            } else {
-                retained.push_back(queued);
+        if let Some(stream) = stream {
+            self.release_inbound_stream((conn, stream));
+            return;
+        }
+        let keys: Vec<_> = self
+            .admitted_inbound
+            .keys()
+            .chain(self.queued_inbound.keys())
+            .filter(|key| key.0 == conn)
+            .copied()
+            .collect();
+        for key in keys {
+            self.release_inbound_stream(key);
+        }
+    }
+
+    fn release_inbound_stream(&mut self, key: (ConnectionId, StreamId)) {
+        if self.admitted_inbound.remove(&key).is_some() {
+            self.inbound_promotion_needed = true;
+        }
+        if let Some(queued) = self.queued_inbound.remove(&key) {
+            self.inbound_promotion_needed = true;
+            let bytes = queued
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    SwarmEvent::StreamData { data, .. } => Some(data.len()),
+                    _ => None,
+                })
+                .sum();
+            if bytes > 0 {
+                self.actions.push_back(Action::AckStream {
+                    conn_id: key.0,
+                    stream_id: key.1,
+                    bytes,
+                });
             }
         }
-        self.queued_inbound = retained;
     }
 
     pub(super) fn promote_inbound(&mut self) {
+        if !core::mem::take(&mut self.inbound_promotion_needed) {
+            return;
+        }
         let mut waiting = VecDeque::new();
-        while let Some(queued) = self.queued_inbound.pop_front() {
+        while let Some(key) = self.inbound_order.pop_front() {
+            let Some(queued) = self.queued_inbound.get(&key) else {
+                continue;
+            };
             if self.inbound_has_room(&queued.protocol) {
-                self.admitted_inbound.insert(queued.key, queued.protocol);
-                self.events.extend(queued.events);
+                if let Some(queued) = self.queued_inbound.remove(&key) {
+                    self.admitted_inbound.insert(key, queued.protocol);
+                    self.events.extend(queued.events);
+                }
             } else {
-                waiting.push_back(queued);
+                waiting.push_back(key);
             }
         }
-        self.queued_inbound = waiting;
+        self.inbound_order = waiting;
     }
 
     pub(super) fn inbound_is_queued(&self, conn: ConnectionId, stream: StreamId) -> bool {
-        self.queued_inbound.iter().any(|q| q.key == (conn, stream))
+        self.queued_inbound.contains_key(&(conn, stream))
     }
 }

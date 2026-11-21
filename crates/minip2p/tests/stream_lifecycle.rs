@@ -83,6 +83,111 @@ fn inbound_limit_delivers_twenty_streams_with_at_most_four_open() {
     assert_eq!(peak, 4);
 }
 
+#[test]
+#[ignore = "diagnostic for finite QUIC connection-window starvation"]
+fn queued_inbound_can_starve_an_admitted_stream_with_a_finite_connection_window() {
+    check_queued_connection_credit(1024, true);
+    check_queued_connection_credit(usize::MAX, false);
+}
+
+fn check_queued_connection_credit(connection_window: usize, expect_starvation: bool) {
+    let mut client = bind("/ip4/127.0.0.1/udp/0/quic-v1");
+    let mut server = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("listen address")
+        .quic_limits(minip2p::QuicLimits {
+            stream_receive_window: 1024,
+            connection_receive_window: connection_window,
+            ..minip2p::QuicLimits::default()
+        })
+        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).expect("positive cap"))
+        .manual_ack_protocol(CHAT)
+        .bind()
+        .expect("bind capped server");
+    connect(&mut client, &mut server);
+    let peer = *server.peer_id();
+    client.open_stream(&peer, CHAT).expect("open active stream");
+    let deadline = Instant::now() + BACKSTOP;
+    let mut active = None;
+    let mut server_active = None;
+    while active.is_none() || server_active.is_none() {
+        assert!(Instant::now() < deadline);
+        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
+            active = Some(stream);
+        }
+        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut server) {
+            server_active = Some(stream);
+        }
+    }
+    client.open_stream(&peer, CHAT).expect("open queued stream");
+    let queued = loop {
+        assert!(Instant::now() < deadline);
+        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
+            break stream;
+        }
+        assert!(!matches!(
+            next(&mut server),
+            Some(EndpointEvent::StreamReady { .. })
+        ));
+    };
+    client
+        .send_stream(queued, vec![7; 64 * 1024])
+        .expect("flood queued stream");
+    let fill_until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < fill_until {
+        let _ = next(&mut client);
+        assert!(!matches!(
+            next(&mut server),
+            Some(EndpointEvent::StreamReady { .. } | EndpointEvent::StreamData { .. })
+        ));
+    }
+    client
+        .send_stream(active.expect("active client stream"), b"finish".to_vec())
+        .expect("send active stream marker");
+    client
+        .close_stream_write(active.expect("active client stream"))
+        .expect("finish active stream");
+    let stalled_until = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < stalled_until {
+        let _ = next(&mut client);
+        if let Some(EndpointEvent::StreamData { stream, data, .. }) = next(&mut server) {
+            assert!(!expect_starvation, "admitted stream was not starved");
+            assert_eq!(Some(stream), server_active);
+            assert_eq!(data.as_ref(), b"finish");
+            server
+                .stream_consumed(stream, data.len())
+                .expect("acknowledge marker");
+            println!(
+                "unlimited connection-window control: all 6 admitted-stream bytes arrived with queued flood still pending"
+            );
+            return;
+        }
+    }
+    assert!(
+        expect_starvation,
+        "unlimited connection-window control stalled"
+    );
+    println!(
+        "cap=1 stream_window=1024 connection_window=1024: admitted stream made no progress for 1000ms after queued flood"
+    );
+    client.reset_stream(queued).expect("reset queued stream");
+    loop {
+        assert!(Instant::now() < deadline, "reset did not restore progress");
+        let _ = next(&mut client);
+        if let Some(EndpointEvent::StreamData { stream, data, .. }) = next(&mut server) {
+            assert_eq!(Some(stream), server_active);
+            assert_eq!(data.as_ref(), b"finish");
+            server
+                .stream_consumed(stream, data.len())
+                .expect("acknowledge marker after reset");
+            println!(
+                "resetting only the queued stream restored delivery of all 6 admitted-stream bytes"
+            );
+            break;
+        }
+    }
+}
+
 fn bind(listen: &str) -> Endpoint {
     Endpoint::builder()
         .listen_on(listen)

@@ -657,7 +657,11 @@ impl SwarmState {
     }
 
     pub(super) fn migrate_buffered_events(&mut self, old: &PeerId, new: &PeerId) {
-        for event in &mut self.events {
+        for event in self.events.iter_mut().chain(
+            self.queued_inbound
+                .values_mut()
+                .flat_map(|queued| queued.events.iter_mut()),
+        ) {
             if let Some(peer_id) = event_peer_mut(event)
                 && peer_id == old
             {
