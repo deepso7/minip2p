@@ -74,7 +74,6 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let start = Instant::now();
-    // An out-of-range `--for` is as good as running forever.
     let deadline = options.run_for.and_then(|d| start.checked_add(d));
     while deadline.is_none_or(|d| Instant::now() < d) {
         let wait_until = deadline.map_or(WaitDeadline::NEVER, WaitDeadline::from);
@@ -83,8 +82,6 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Goodbyes let the other side print `expired` now instead of after the
-    // record's TTL.
     println!("[mdns] shutting down, sending goodbyes");
     for event in endpoint.close().events {
         print_event(&event, start);
@@ -113,8 +110,6 @@ fn print_event(event: &EndpointEvent, start: Instant) {
         EndpointEvent::Discovery(DiscoveryEvent::DialFailed { peer, reason }) => {
             println!("[mdns] dial-failed peer={peer} reason={reason} t=+{t:.1}s");
         }
-        // A failing mDNS socket surfaces here, not as a `wait` error; without
-        // these a broken network path looks like an empty one.
         EndpointEvent::MdnsFailed { error } => println!("[mdns] mdns-failed error={error}"),
         EndpointEvent::MdnsRecovered => println!("[mdns] mdns-recovered"),
         EndpointEvent::ConnectionEstablished { peer_id, .. } => {
