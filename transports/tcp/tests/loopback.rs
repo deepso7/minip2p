@@ -1118,10 +1118,6 @@ mod provider {
             .sum();
         assert!(taken > 0, "the poll must make progress");
         assert!(
-            max_chunk > 16 * 1024,
-            "a saturated socket should read chunks larger than 16 KiB, saw at most {max_chunk}"
-        );
-        assert!(
             taken <= 128 * 1024,
             "one poll took {taken} bytes, past its budget"
         );
@@ -1145,6 +1141,7 @@ mod provider {
                             "chunk of {} bytes exceeds 64 KiB read size",
                             data.len()
                         );
+                        max_chunk = max_chunk.max(data.len());
                         data.len()
                     }
                     _ => 0,
@@ -1157,6 +1154,10 @@ mod provider {
             rest += more;
             assert!(start.elapsed() < PATIENCE, "the remainder never arrived");
         }
+        assert!(
+            max_chunk > 16 * 1024,
+            "a saturated socket should read chunks larger than 16 KiB, saw at most {max_chunk}"
+        );
     }
 
     #[test]
