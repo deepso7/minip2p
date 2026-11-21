@@ -332,6 +332,6 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes_over_quic() {
 fn a_manual_ack_reader_stalls_its_sender_until_it_consumes_over_tcp() {
     a_manual_ack_reader_stalls_its_sender_until_it_consumes(
         "/ip4/127.0.0.1/tcp/0",
-        minip2p::TcpConfig::default().yamux.receive_window as usize,
+        minip2p::TcpConfig::std_default().yamux.receive_window as usize,
     );
 }
