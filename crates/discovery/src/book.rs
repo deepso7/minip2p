@@ -69,6 +69,8 @@ struct PeerEntry {
     mdns_order: Vec<Multiaddr>,
     dial: DialState,
     mdns_attempts: RateWindow,
+    /// This entry's key in `PeerDiscoveryAgent::expiries`.
+    indexed_expiry_ms: Option<u64>,
 }
 
 impl PeerEntry {
@@ -79,6 +81,7 @@ impl PeerEntry {
             mdns_order: Vec::new(),
             dial: DialState::Idle,
             mdns_attempts: RateWindow::default(),
+            indexed_expiry_ms: None,
         }
     }
 
@@ -99,6 +102,19 @@ impl PeerEntry {
             .max()
             .unwrap_or(0);
         beacon.max(mdns)
+    }
+
+    fn beacon_expiry_ms(&self, beacon_peer_ttl_ms: u64) -> Option<u64> {
+        self.beacon
+            .as_ref()
+            .map(|source| source.last_seen_ms.saturating_add(beacon_peer_ttl_ms))
+    }
+
+    fn earliest_expiry_ms(&self, beacon_peer_ttl_ms: u64) -> Option<u64> {
+        self.beacon_expiry_ms(beacon_peer_ttl_ms)
+            .into_iter()
+            .chain(self.mdns.values().map(|record| record.expires_at_ms))
+            .min()
     }
 
     fn assert_mdns_order(&self) {
@@ -149,6 +165,9 @@ pub struct PeerDiscoveryAgent {
     config: PeerDiscoveryConfig,
     local_peer_id: PeerId,
     book: BTreeMap<PeerId, PeerEntry>,
+    /// Each book entry's earliest source expiry, so ticks and deadline
+    /// queries visit only due peers.
+    expiries: BTreeSet<(u64, PeerId)>,
     connected: BTreeSet<PeerId>,
     actions: VecDeque<DiscoveryAction>,
     pending: BTreeMap<PeerId, PendingPeer>,
@@ -169,6 +188,7 @@ impl PeerDiscoveryAgent {
             config,
             local_peer_id,
             book: BTreeMap::new(),
+            expiries: BTreeSet::new(),
             connected: BTreeSet::new(),
             actions: VecDeque::new(),
             pending: BTreeMap::new(),
@@ -207,6 +227,7 @@ impl PeerDiscoveryAgent {
         if address_changed && matches!(entry.dial, DialState::Backoff { .. }) {
             entry.dial = DialState::Idle;
         }
+        self.reindex(&peer);
 
         let after = self.book.get(&peer).map(|entry| self.view(entry));
         if before != after {
@@ -287,6 +308,7 @@ impl PeerDiscoveryAgent {
             self.remove_peer(&peer);
             return;
         }
+        self.reindex(&peer);
 
         let after = self.book.get(&peer).map(|entry| self.view(entry));
         if before != after {
@@ -365,66 +387,58 @@ impl PeerDiscoveryAgent {
 
     /// Expires stale source records.
     pub fn handle_tick(&mut self, now_ms: u64) {
-        let peers: Vec<PeerId> = self.book.keys().cloned().collect();
-        for peer in peers {
-            let Some(entry) = self.book.get(&peer) else {
-                continue;
-            };
-            let beacon_due = entry.beacon.as_ref().is_some_and(|source| {
-                now_ms
-                    >= source
-                        .last_seen_ms
-                        .saturating_add(self.config.beacon_peer_ttl_ms)
-            });
-            let mdns_due = entry
-                .mdns
-                .values()
-                .any(|record| now_ms >= record.expires_at_ms);
-            if !beacon_due && !mdns_due {
-                continue;
-            }
+        if self
+            .expiries
+            .first()
+            .is_none_or(|(expiry_ms, _)| *expiry_ms > now_ms)
+        {
+            return;
+        }
+        let mut due: Vec<PeerId> = self
+            .expiries
+            .iter()
+            .take_while(|(expiry_ms, _)| *expiry_ms <= now_ms)
+            .map(|(_, peer)| *peer)
+            .collect();
+        due.sort_unstable();
+        for peer in due {
+            self.expire_peer(&peer, now_ms);
+        }
+    }
 
-            let before = self.book.get(&peer).map(|entry| self.view(entry));
-            let mut beacon_changed = false;
-            let mut mdns_changed = false;
-            if let Some(entry) = self.book.get_mut(&peer) {
+    fn expire_peer(&mut self, peer: &PeerId, now_ms: u64) {
+        let before = self.view(self.book.get(peer).expect("due peers are booked"));
+        let entry = self.book.get_mut(peer).expect("due peers are booked");
+        let beacon_due = entry
+            .beacon_expiry_ms(self.config.beacon_peer_ttl_ms)
+            .is_some_and(|expiry_ms| expiry_ms <= now_ms);
+        if beacon_due {
+            entry.beacon = None;
+        }
+        let mdns_len = entry.mdns.len();
+        entry.mdns.retain(|_, record| record.expires_at_ms > now_ms);
+        if entry.mdns.len() != mdns_len {
+            entry
+                .mdns_order
+                .retain(|addr| entry.mdns.contains_key(addr));
+        }
+        entry.assert_mdns_order();
+
+        if entry.is_empty() {
+            self.remove_peer(peer);
+            return;
+        }
+        self.reindex(peer);
+        let entry = self.book.get(peer).expect("due peers are booked");
+        if self.view(entry) != before {
+            self.mark_state(
+                peer,
                 if beacon_due {
-                    entry.beacon = None;
-                    beacon_changed = true;
-                }
-                if mdns_due {
-                    let expired: Vec<Multiaddr> = entry
-                        .mdns
-                        .iter()
-                        .filter(|(_, record)| now_ms >= record.expires_at_ms)
-                        .map(|(addr, _)| addr.clone())
-                        .collect();
-                    for addr in expired {
-                        entry.mdns.remove(&addr);
-                        entry.mdns_order.retain(|known| known != &addr);
-                        mdns_changed = true;
-                    }
-                }
-                entry.assert_mdns_order();
-            }
-
-            if self.book.get(&peer).is_some_and(PeerEntry::is_empty) {
-                self.remove_peer(&peer);
-                continue;
-            }
-            let after = self.book.get(&peer).map(|entry| self.view(entry));
-            if before != after {
-                self.mark_state(
-                    &peer,
-                    if beacon_changed {
-                        DiscoverySource::SignedBeacon
-                    } else if mdns_changed {
-                        DiscoverySource::Mdns
-                    } else {
-                        continue;
-                    },
-                );
-            }
+                    DiscoverySource::SignedBeacon
+                } else {
+                    DiscoverySource::Mdns
+                },
+            );
         }
     }
 
@@ -518,20 +532,9 @@ impl PeerDiscoveryAgent {
     /// deadline; `None` when the book is empty. Overdue expiries keep their
     /// past value.
     pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
-        self.book
-            .values()
-            .flat_map(|entry| {
-                let beacon = entry.beacon.as_ref().map(|source| {
-                    source
-                        .last_seen_ms
-                        .saturating_add(self.config.beacon_peer_ttl_ms)
-                });
-                beacon
-                    .into_iter()
-                    .chain(entry.mdns.values().map(|record| record.expires_at_ms))
-            })
-            .min()
-            .map(Deadline::from_millis)
+        self.expiries
+            .first()
+            .map(|(expiry_ms, _)| Deadline::from_millis(*expiry_ms))
     }
 
     /// Returns a deterministic peer-id-ordered snapshot of the address book.
@@ -688,6 +691,9 @@ impl PeerDiscoveryAgent {
         let Some(entry) = self.book.remove(peer) else {
             return;
         };
+        if let Some(expiry_ms) = entry.indexed_expiry_ms {
+            self.expiries.remove(&(expiry_ms, *peer));
+        }
         let queued = self.actions.iter().any(
             |action| matches!(action, DiscoveryAction::Dial { peer: queued, .. } if queued == peer),
         );
@@ -699,6 +705,22 @@ impl PeerDiscoveryAgent {
                 .push_back(DiscoveryAction::CancelDial { peer: *peer });
         }
         self.mark_state(peer, DiscoverySource::Mdns);
+    }
+
+    /// Re-keys `peer` in `expiries` after its sources changed.
+    fn reindex(&mut self, peer: &PeerId) {
+        let entry = self.book.get_mut(peer).expect("reindexed peers are booked");
+        let expiry_ms = entry.earliest_expiry_ms(self.config.beacon_peer_ttl_ms);
+        if entry.indexed_expiry_ms == expiry_ms {
+            return;
+        }
+        if let Some(stale) = entry.indexed_expiry_ms {
+            self.expiries.remove(&(stale, *peer));
+        }
+        if let Some(expiry_ms) = expiry_ms {
+            self.expiries.insert((expiry_ms, *peer));
+        }
+        entry.indexed_expiry_ms = expiry_ms;
     }
 
     fn mark_state(&mut self, peer: &PeerId, source: DiscoverySource) {
@@ -818,6 +840,168 @@ mod tests {
 
     fn beacon(peer: PeerId, addrs: Vec<Multiaddr>) -> Observation {
         Observation { peer, addrs }
+    }
+
+    fn indexed_expiries(agent: &PeerDiscoveryAgent) -> Vec<(u64, PeerId)> {
+        let expected: BTreeSet<(u64, PeerId)> = agent
+            .book
+            .iter()
+            .filter_map(|(peer, entry)| {
+                entry
+                    .earliest_expiry_ms(agent.config.beacon_peer_ttl_ms)
+                    .map(|expiry_ms| (expiry_ms, *peer))
+            })
+            .collect();
+        assert_eq!(agent.expiries, expected);
+        agent.expiries.iter().copied().collect()
+    }
+
+    fn quiet(beacon_peer_ttl_ms: u64) -> PeerDiscoveryAgent {
+        agent(PeerDiscoveryConfig {
+            auto_dial: false,
+            beacon_peer_ttl_ms,
+            ..PeerDiscoveryConfig::default()
+        })
+    }
+
+    #[test]
+    fn refresh_moves_the_indexed_deadline_both_ways() {
+        let mut agent = quiet(100);
+        let remote = peer(2);
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 0);
+        agent.observe_mdns(remote, vec![(addr(2), 50)], 0);
+        assert_eq!(indexed_expiries(&agent), vec![(50, remote)]);
+
+        agent.observe_mdns(remote, vec![(addr(2), 300)], 10);
+        assert_eq!(indexed_expiries(&agent), vec![(100, remote)]);
+
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 250);
+        assert_eq!(indexed_expiries(&agent), vec![(310, remote)]);
+
+        agent.observe_mdns(remote, vec![(addr(3), 5)], 260);
+        assert_eq!(indexed_expiries(&agent), vec![(265, remote)]);
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(265))
+        );
+    }
+
+    #[test]
+    fn mdns_goodbye_advances_or_clears_the_deadline() {
+        let mut agent = quiet(100);
+        let remote = peer(2);
+        agent.observe_mdns(remote, vec![(addr(1), 10), (addr(2), 40)], 0);
+        assert_eq!(indexed_expiries(&agent), vec![(10, remote)]);
+
+        agent.observe_mdns(remote, vec![(addr(1), 0)], 1);
+        assert_eq!(indexed_expiries(&agent), vec![(40, remote)]);
+
+        agent.observe_mdns(remote, vec![(addr(2), 0)], 2);
+        assert!(agent.book.is_empty());
+        assert!(indexed_expiries(&agent).is_empty());
+        assert_eq!(agent.next_deadline(Now::from_millis(2)), None);
+    }
+
+    #[test]
+    fn cap_eviction_drops_the_evicted_deadline() {
+        let mut agent = agent(PeerDiscoveryConfig {
+            auto_dial: false,
+            max_known_peers: 1,
+            beacon_peer_ttl_ms: 100,
+            ..PeerDiscoveryConfig::default()
+        });
+        agent.observe_mdns(peer(2), vec![(addr(1), 10)], 0);
+        agent.observe_beacon(beacon(peer(3), vec![addr(2)]), 5);
+        assert_eq!(indexed_expiries(&agent), vec![(105, peer(3))]);
+    }
+
+    #[test]
+    fn simultaneous_beacon_and_mdns_expiry_expires_the_peer_once() {
+        let mut agent = quiet(10);
+        let remote = peer(2);
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 0);
+        agent.observe_mdns(remote, vec![(addr(2), 10)], 0);
+        while agent.poll_event().is_some() {}
+
+        agent.handle_tick(10);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(DiscoveryEvent::PeerExpired { peer }) if peer == remote
+        ));
+        assert!(agent.poll_event().is_none());
+        assert!(indexed_expiries(&agent).is_empty());
+    }
+
+    #[test]
+    fn sparse_expiry_touches_only_due_peers_in_peer_id_order() {
+        let mut agent = agent(PeerDiscoveryConfig {
+            beacon_peer_ttl_ms: 100,
+            ..PeerDiscoveryConfig::default()
+        });
+        let mut peers: Vec<PeerId> = (2..10).map(peer).collect();
+        peers.sort();
+        let (due, live) = peers.split_at(3);
+        for (index, remote) in due.iter().enumerate() {
+            agent.observe_mdns(*remote, vec![(addr(index as u16), 12 - index as u64)], 0);
+        }
+        for (index, remote) in live.iter().enumerate() {
+            agent.observe_beacon(beacon(*remote, vec![addr(100 + index as u16)]), 0);
+            agent.observe_mdns(*remote, vec![(addr(200 + index as u16), 50)], 0);
+        }
+        while agent.poll_event().is_some() {}
+        while agent.poll_action().is_some() {}
+
+        agent.handle_tick(12);
+        let expired: Vec<PeerId> = core::iter::from_fn(|| agent.poll_event())
+            .map(|event| match event {
+                DiscoveryEvent::PeerExpired { peer } => peer,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(expired, due);
+        let cancelled: Vec<PeerId> = core::iter::from_fn(|| agent.poll_action())
+            .map(|action| match action {
+                DiscoveryAction::CancelDial { peer } => peer,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(cancelled, due);
+        assert_eq!(
+            indexed_expiries(&agent),
+            live.iter().map(|peer| (50, *peer)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mdns_expiry_behind_the_same_beacon_address_is_a_provenance_update() {
+        let mut agent = quiet(100);
+        let remote = peer(2);
+        agent.observe_beacon(beacon(remote, vec![addr(1)]), 0);
+        agent.observe_mdns(remote, vec![(addr(1), 10)], 0);
+        while agent.poll_event().is_some() {}
+
+        agent.handle_tick(10);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(DiscoveryEvent::PeerUpdated {
+                peer,
+                addrs,
+                source: DiscoverySource::Mdns,
+            }) if peer == remote && addrs == vec![addr(1)]
+        ));
+        assert!(agent.poll_event().is_none());
+        assert_eq!(indexed_expiries(&agent), vec![(100, remote)]);
+    }
+
+    #[test]
+    fn addressless_beacon_still_sets_a_deadline() {
+        let mut agent = quiet(100);
+        assert_eq!(agent.next_deadline(Now::from_millis(0)), None);
+        agent.observe_beacon(beacon(peer(2), vec![]), 7);
+        assert_eq!(indexed_expiries(&agent), vec![(107, peer(2))]);
+        agent.handle_tick(107);
+        assert_eq!(agent.next_deadline(Now::from_millis(107)), None);
+        assert!(agent.book.is_empty());
     }
 
     #[test]

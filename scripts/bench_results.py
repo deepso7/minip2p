@@ -58,6 +58,7 @@ GUNGRAUN_NAMES = {
     "sparse_send_8_of_1024_streams": "yamux/1024_streams/sparse_send_8_streams",
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
+    "tick_expire_sparse": "peer_book_128_peers_16_addrs/tick_expire_sparse_4",
     "next_deadline": "peer_book_128_peers_16_addrs/next_deadline",
     "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
     "gossipsub_forward_1_kib_8": "pubsub/gossipsub_forward_1KiB/8",

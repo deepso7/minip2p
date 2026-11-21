@@ -55,7 +55,6 @@ pub(super) fn default_listen_quic_addrs() -> [Multiaddr; 2] {
 /// What the std [`EndpointBuilder`] adds to the shared options: identity,
 /// transport limits and certificates, listen addresses, and the relay
 /// server's announce addresses and mesh.
-#[derive(Default)]
 pub struct StdBuilderState {
     keypair: Option<Ed25519Keypair>,
     #[cfg(feature = "quic")]
@@ -74,6 +73,35 @@ pub struct StdBuilderState {
     relay_mesh: Option<RelayMeshConfig>,
     #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
+}
+
+#[cfg_attr(
+    not(feature = "tcp"),
+    expect(
+        clippy::derivable_impls,
+        reason = "With `tcp`, the TCP config starts from `TcpConfig::std_default`, not `Default`."
+    )
+)]
+impl Default for StdBuilderState {
+    fn default() -> Self {
+        Self {
+            keypair: None,
+            #[cfg(feature = "quic")]
+            quic_limits: QuicLimits::default(),
+            #[cfg(feature = "quic")]
+            webtransport_certificates: WebTransportCertificates::default(),
+            #[cfg(feature = "tcp")]
+            tcp_config: TcpConfig::std_default(),
+            #[cfg(any(feature = "quic", feature = "tcp"))]
+            listen_addrs: Vec::new(),
+            #[cfg(feature = "relay-server")]
+            relay_server_announce_addrs: Vec::new(),
+            #[cfg(all(feature = "relay-server", feature = "quic"))]
+            relay_mesh: None,
+            #[cfg(feature = "relay")]
+            circuit_limits: CircuitLimits::default(),
+        }
+    }
 }
 
 impl Default for EndpointBuilder {
@@ -135,6 +163,11 @@ impl EndpointBuilder<StdBuilderState> {
     /// connection-id namespace the TCP transport allocates in. Checked at bind
     /// ([`EndpointOptionsError::InvalidLimit`]).
     ///
+    /// Without this the endpoint binds with [`TcpConfig::std_default`], whose
+    /// 2,432 KiB Yamux receive window keeps a 100 Mbit/s, 100 ms path busy
+    /// (ADR 0120). Start overrides from it: [`TcpConfig::default`] is the
+    /// portable profile, with the specification's 256 KiB window.
+    ///
     /// [`TcpConfig::handshake_timeout_ms`] (30 s) caps the Noise + Yamux
     /// upgrade on its own, so a slow link needs it raised alongside the
     /// connect and swarm deadlines. Size each from how long that exchange
@@ -157,7 +190,7 @@ impl EndpointBuilder<StdBuilderState> {
     ///     })
     ///     .tcp_config(TcpConfig {
     ///         handshake_timeout_ms: Some(60_000), // the Noise + Yamux upgrade
-    ///         ..TcpConfig::default()
+    ///         ..TcpConfig::std_default()
     ///     })
     ///     .connect_deadline(Duration::from_secs(90)) // dials plus their handshake
     ///     .bind()?;
