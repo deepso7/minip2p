@@ -1045,27 +1045,26 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         Ok(())
     }
 
-    /// Established sessions get their time sample on every call, including
-    /// the one that only drains buffered events.
-    ///
-    /// Bytes can reach a session outside the wrapped transport's poll — see
-    /// [`inject_bridge_data`](Self::inject_bridge_data) — and complete the
-    /// upgrade while events are already buffered. Skipping the session loop
-    /// then left a newly established Yamux session with no time sample and
-    /// its keepalive unarmed, so [`next_deadline`](Self::next_deadline) had
-    /// nothing real to report for it.
+    /// While events are buffered, the call only drains them and leaves the
+    /// wrapped transport unread, but an established session with no deadline
+    /// yet still gets its first time sample, so keepalive is armed whichever
+    /// path completed the upgrade (such as
+    /// [`inject_bridge_data`](Self::inject_bridge_data), which has no `now`).
+    /// Sessions that already have a deadline advance only in a call that
+    /// polls the wrapped transport first, so a keepalive reply it would
+    /// deliver in that call is seen before the timer is checked.
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        if self.pending.is_empty() {
+        let reads_inner = self.pending.is_empty();
+        if reads_inner {
             for event in self.inner.poll(now)? {
                 self.handle_inner_event(event);
             }
         }
         for id in self.circuits.keys().copied().collect::<Vec<_>>() {
-            if !self
-                .circuits
-                .get(&id)
-                .is_some_and(|circuit| circuit.session.is_established())
-            {
+            if !self.circuits.get(&id).is_some_and(|circuit| {
+                circuit.session.is_established()
+                    && (reads_inner || circuit.session.next_deadline().is_none())
+            }) {
                 continue;
             }
             let result = self.with_circuit(id, |this, circuit| {
@@ -1093,9 +1092,8 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     /// The earliest of the wrapped transport's deadline and the circuits'
     /// session keepalives, or immediate while events are buffered.
     ///
-    /// Every established session has been polled by then, so a session with
-    /// no deadline has nothing pending rather than nothing sampled, and this
-    /// reports only real deadlines.
+    /// Every established session has had a time sample by then (see
+    /// [`poll`](Self::poll)), so this reports only real deadlines.
     fn next_deadline(&self) -> Option<Deadline> {
         if !self.pending.is_empty() {
             return Some(Deadline::IMMEDIATE);
