@@ -249,15 +249,19 @@ impl fmt::Display for Multiaddr {
 impl FromStr for Multiaddr {
     type Err = MultiaddrError;
 
-    /// Parses the text form, which round-trips [`Display`](fmt::Display) for
-    /// every multiaddr including the empty one: `""` is the text form of a
-    /// multiaddr with no components, so it parses back to that rather than
-    /// being rejected.
+    /// Parses the text form. `""` is the text form of the empty multiaddr, so
+    /// it parses to [`Multiaddr::new`]; `"/"` and other malformed text are
+    /// rejected.
     ///
-    /// An address a caller must not leave empty is checked where that
-    /// requirement lives, not here — [`PeerAddr`](crate::PeerAddr) answers
-    /// `MissingPeerId` for it, and an endpoint's listen validation answers
-    /// with the transport shape it wanted.
+    /// Round-trips [`Display`](fmt::Display) for every multiaddr this parser
+    /// or [`Multiaddr::from_bytes`] accepts, the empty one included. A value
+    /// built unchecked with [`Multiaddr::from_protocols`] may print text this
+    /// rejects, such as `/dns/` from an empty DNS name.
+    ///
+    /// Callers that need a non-empty address check it where that requirement
+    /// lives: [`PeerAddr`](crate::PeerAddr) rejects `""` with
+    /// `MissingPeerId`, and endpoint listen validation rejects the empty
+    /// multiaddr.
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         parse_multiaddr(input)
     }
@@ -839,14 +843,7 @@ mod tests {
         let addr = Multiaddr::new();
         assert_eq!(addr.to_string(), "");
         assert_eq!("".parse::<Multiaddr>().unwrap(), addr);
-        assert_eq!(
-            Multiaddr::from_bytes(&[])
-                .unwrap()
-                .to_string()
-                .parse::<Multiaddr>()
-                .unwrap(),
-            addr
-        );
+        assert_eq!("/".parse::<Multiaddr>(), Err(MultiaddrError::EmptyProtocol));
     }
 
     #[test]

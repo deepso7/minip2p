@@ -590,6 +590,9 @@ pub(super) fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), Endpo
         addr: address.clone(),
         expected,
     };
+    if address.protocols().is_empty() {
+        return Err(unsupported("a non-empty transport address"));
+    }
     if address
         .protocols()
         .iter()

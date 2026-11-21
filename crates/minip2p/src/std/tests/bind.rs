@@ -118,6 +118,18 @@ fn listen_composes_quic_and_tcp() {
 
 #[test]
 fn listen_rejects_unsupported_and_contradictory_shapes() {
+    let Err(blank) = Endpoint::builder().listen_on("") else {
+        panic!("blank listen must fail");
+    };
+    assert!(
+        matches!(
+            &blank,
+            EndpointOptionsError::UnsupportedListenShape { expected, .. }
+                if expected.contains("non-empty")
+        ),
+        "{blank}"
+    );
+
     let Err(dns) = Endpoint::builder().listen_on("/dns/example.com/udp/0/quic-v1") else {
         panic!("DNS listen must fail");
     };
