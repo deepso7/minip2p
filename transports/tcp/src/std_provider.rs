@@ -19,13 +19,20 @@ use crate::provider::{
     SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider, host_and_port,
 };
 
-/// Read size per syscall. Large enough that a busy stream is not dominated by
-/// syscall overhead, small enough not to hold a big buffer per provider.
-const READ_CHUNK: usize = 16 * 1024;
+/// Read size per syscall. Matches the secure session's 64 KiB input batch, so
+/// a saturated read carries several whole Noise frames instead of splitting
+/// every 16 KiB Yamux frame across two reads, and the provider holds one
+/// buffer of this size.
+const READ_CHUNK: usize = 64 * 1024;
 
-/// Reads one socket may take from a single poll before the rest wait their
-/// turn -- 128 KiB at [`READ_CHUNK`] apiece. Without a bound, one fast peer
-/// starves every other socket and the host's timers along with it.
+/// Bytes one socket may take from a single poll before the rest wait their
+/// turn: two full [`READ_CHUNK`]s. Without a bound, one fast peer starves every
+/// other socket and the host's timers along with it.
+const MAX_READ_BYTES_PER_POLL: usize = 128 * 1024;
+
+/// Read calls one socket may make in a single poll, however little each
+/// returns. Bounds a trickling peer's syscalls while leaving room for a burst
+/// of short reads under [`MAX_READ_BYTES_PER_POLL`].
 const MAX_READS_PER_POLL: usize = 8;
 
 /// Connections accepted in a single poll, for the same reason.
@@ -507,9 +514,11 @@ impl StdTcpProvider {
         });
     }
 
-    /// Reads until the socket has nothing more to give, or the budget runs out.
+    /// Reads until the socket has nothing more to give, or the budget runs out:
+    /// [`MAX_READ_BYTES_PER_POLL`] bytes or [`MAX_READS_PER_POLL`] read calls.
     fn read_all(&mut self, handle: SocketHandle) {
-        let mut budget = MAX_READS_PER_POLL;
+        let mut reads = 0;
+        let mut bytes_read = 0;
         loop {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
@@ -525,11 +534,11 @@ impl StdTcpProvider {
                 self.readable.remove(&handle);
                 return;
             }
-            if budget == 0 {
+            if reads == MAX_READS_PER_POLL || bytes_read >= MAX_READ_BYTES_PER_POLL {
                 self.deferred_work = true;
                 return;
             }
-            budget -= 1;
+            reads += 1;
             match socket.stream.read(&mut self.read_buffer) {
                 Ok(0) => {
                     socket.read_closed = true;
@@ -540,6 +549,7 @@ impl StdTcpProvider {
                     return;
                 }
                 Ok(read) => {
+                    bytes_read += read;
                     let Some(data) = self.read_buffer.get(..read).map(ToOwned::to_owned) else {
                         self.readable.remove(&handle);
                         return;
@@ -1054,6 +1064,83 @@ mod tests {
             None,
             "read to WouldBlock, nothing left owed"
         );
+    }
+
+    #[test]
+    fn a_saturated_socket_yields_two_full_chunks_per_poll_then_stays_due() {
+        let (mut server, bound) = loopback_listener();
+        let mut peer = std::net::TcpStream::connect(
+            bound.to_string().replace("/ip4/", "").replace("/tcp/", ":"),
+        )
+        .expect("peer connects");
+        let started = Instant::now();
+        let accepted = loop {
+            assert!(started.elapsed() < Duration::from_secs(5), "never accepted");
+            if let Some(socket) = server
+                .poll(Now::from_millis(0))
+                .expect("poll")
+                .into_iter()
+                .find_map(|event| match event {
+                    TcpEvent::Accepted { socket, .. } => Some(socket),
+                    _ => None,
+                })
+            {
+                break socket;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        socket2::SockRef::from(&server.sockets[&accepted].stream)
+            .set_recv_buffer_size(1024 * 1024)
+            .expect("SO_RCVBUF");
+
+        let sent: Vec<u8> = (0..3 * READ_CHUNK).map(|i| i as u8).collect();
+        let writer = {
+            let sent = sent.clone();
+            thread::spawn(move || std::io::Write::write_all(&mut peer, &sent).map(|()| peer))
+        };
+        let mut peeked = vec![0; sent.len()];
+        while server.sockets[&accepted]
+            .stream
+            .peek(&mut peeked)
+            .unwrap_or(0)
+            <= MAX_READ_BYTES_PER_POLL
+        {
+            assert!(started.elapsed() < Duration::from_secs(5), "never buffered");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let chunks: Vec<usize> = server
+            .poll(Now::from_millis(0))
+            .expect("poll")
+            .into_iter()
+            .filter_map(|event| match event {
+                TcpEvent::Received { data, .. } => Some(data.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chunks,
+            [READ_CHUNK, READ_CHUNK],
+            "capped at the byte budget"
+        );
+        assert_eq!(
+            TcpProvider::next_deadline(&server),
+            Some(Deadline::IMMEDIATE),
+            "bytes left behind keep the provider due"
+        );
+
+        let mut received = MAX_READ_BYTES_PER_POLL;
+        while received < sent.len() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never drained");
+            for event in server.poll(Now::from_millis(0)).expect("poll") {
+                if let TcpEvent::Received { data, .. } = event {
+                    assert!(data.len() <= READ_CHUNK);
+                    received += data.len();
+                }
+            }
+        }
+        assert_eq!(received, sent.len());
+        drop(writer.join().expect("writer").expect("write"));
     }
 
     /// Asserts the options `configure_stream` sets.
