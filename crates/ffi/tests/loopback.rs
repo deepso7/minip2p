@@ -653,7 +653,7 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
             .is_some()
     );
     let opened = a.open_stream(b_peer.clone(), protocol.into())?;
-    let default_yamux_window = 256 * 1024;
+    let default_yamux_window = minip2p::TcpConfig::std_default().yamux.receive_window as usize;
     let payload: Vec<u8> = (0..4 * default_yamux_window)
         .map(|i| (i % 251) as u8)
         .collect();

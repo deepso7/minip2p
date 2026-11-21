@@ -2,6 +2,10 @@ use minip2p_secure_mux::YamuxConfig;
 use minip2p_transport::{ConnectionNamespace, InvalidLimit};
 
 /// Limits and identifiers for one [`TcpTransport`](crate::TcpTransport).
+///
+/// Two profiles: [`TcpConfig::default`] is the portable one (Yamux's 256 KiB
+/// receive window), and [`TcpConfig::std_default`] the native one, with a
+/// window sized for long, fat paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TcpConfig {
     /// Namespace this transport allocates its connection ids in.
@@ -72,6 +76,23 @@ pub struct TcpConfig {
 }
 
 impl TcpConfig {
+    /// The native profile the std `Endpoint` builder and the FFI bindings bind
+    /// TCP with: [`TcpConfig::default`] with a 2,432 KiB Yamux
+    /// [`receive_window`](YamuxConfig::receive_window), about twice the
+    /// bandwidth-delay product of 100 Mbit/s at 100 ms (ADR 0120).
+    ///
+    /// [`TcpConfig::default`] is the portable profile and keeps the
+    /// specification's 256 KiB window, which is what smoltcp and other
+    /// embedded hosts can afford. With the default 256 streams, one connection
+    /// may hold up to 608 MiB of unacknowledged received data under this
+    /// profile, against 64 MiB under the portable one; lower the window or
+    /// [`max_streams`](YamuxConfig::max_streams) where that is too much.
+    pub fn std_default() -> Self {
+        let mut config = Self::default();
+        config.yamux.receive_window = 2_432 * 1024;
+        config
+    }
+
     /// Checks the limits can work: the Yamux invariants hold. A zero
     /// [`max_buffered_send`](Self::max_buffered_send) is valid.
     pub fn validate(&self) -> Result<(), InvalidLimit> {
