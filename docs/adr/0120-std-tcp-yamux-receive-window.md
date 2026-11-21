@@ -12,13 +12,13 @@ Measured on rem (12 CPUs) against `eadf3abc`, with `endpoint_rtt`'s in-process u
 
 `scripts/rtt-sweep.sh yamux` on `100m_100ms` (BDP 1,220 KiB), median of 5 runs (10 at the cutoff). The cutoff is 10.51 MB/s, 90% of the 11.68 MB/s reference. Ping is measured on the same link while the transfer runs.
 
-| window | goodput | of reference | loaded ping p50 / p99 |
-| --- | --- | --- | --- |
-| 1,216 KiB | 7.78 MB/s | 67% | 101 / 151 ms |
-| 1,856 KiB | 10.05 MB/s | 86% | 127 / 176 ms |
-| **2,432 KiB** | **11.62 MB/s** | **100%** | 194 / 200 ms |
-| 3,072 KiB | 11.68 MB/s | 100% | 199 / 353 ms |
-| 4,864 KiB | 11.68 MB/s | 100% | 380 / 399 ms |
+| window        | goodput        | of reference | loaded ping p50 / p99 |
+| ------------- | -------------- | ------------ | --------------------- |
+| 1,216 KiB     | 7.78 MB/s      | 67%          | 101 / 151 ms          |
+| 1,856 KiB     | 10.05 MB/s     | 86%          | 127 / 176 ms          |
+| **2,432 KiB** | **11.62 MB/s** | **100%**     | 194 / 200 ms          |
+| 3,072 KiB     | 11.68 MB/s     | 100%         | 199 / 353 ms          |
+| 4,864 KiB     | 11.68 MB/s     | 100%         | 380 / 399 ms          |
 
 On `1g_20ms` (BDP 2,441 KiB) the sweep picks 4,864 KiB, which reaches 117.24 MB/s (99%). 2,432 KiB reaches 77.97 MB/s (66%), and 3,648 KiB reaches 100.36 MB/s (85%). Gigabit paths with a long RTT still need `receive_window` raised by hand. We size for the primary profile, as ADR 0021 did, rather than double the memory bound for every host.
 
