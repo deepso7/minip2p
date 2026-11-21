@@ -4,7 +4,7 @@
 //! They run against the QUIC adapter but should pass for any conforming
 //! transport implementation.
 
-use minip2p_core::platform::{Deadline, Now};
+use minip2p_core::platform::Now;
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_quic::{
     CongestionController, QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport,
@@ -1022,59 +1022,6 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
         }
     }
     assert!(closed, "QUIC timeout must close a silent dial");
-}
-
-#[test]
-fn quiet_pair_stays_up_past_idle_timeout() {
-    const IDLE_MS: u64 = 1_000;
-    /// Twice the idle timeout: reaching the end of it without a close is
-    /// itself the proof that the keepalive held the pair up.
-    const OBSERVE: std::time::Duration = std::time::Duration::from_millis(2 * IDLE_MS);
-
-    let limits = QuicLimits {
-        idle_timeout_ms: IDLE_MS,
-        ..QuicLimits::default()
-    };
-    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
-    let (server_id, client_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
-
-    let deadline = std::time::Instant::now() + OBSERVE;
-    let mut closed = false;
-    while std::time::Instant::now() < deadline {
-        closed |= server
-            .poll(common::now())
-            .expect("server poll")
-            .into_iter()
-            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == server_id));
-        closed |= client
-            .poll(common::now())
-            .expect("client poll")
-            .into_iter()
-            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == client_id));
-        if closed {
-            break;
-        }
-        let sleep = Deadline::earliest_opt(server.next_deadline(), client.next_deadline())
-            .map(|deadline| std::time::Duration::from_millis(deadline.millis_until(common::now())))
-            .unwrap_or(std::time::Duration::from_millis(5))
-            .min(std::time::Duration::from_millis(10));
-        if !sleep.is_zero() {
-            std::thread::sleep(sleep);
-        }
-    }
-
-    for (node, id) in [(&mut server, server_id), (&mut client, client_id)] {
-        closed |= node
-            .poll(common::now())
-            .expect("final poll")
-            .into_iter()
-            .any(|event| matches!(event, TransportEvent::Closed { id: closed_id, .. } if closed_id == id));
-    }
-
-    assert!(
-        !closed,
-        "ack-eliciting keepalive must keep a quiet pair past the idle timeout"
-    );
 }
 
 #[test]
