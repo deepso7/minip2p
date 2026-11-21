@@ -8,7 +8,7 @@ export interface HookEndpoint {
   listenAddrs: () => readonly string[];
   onClose: (handler: (report: EndpointCloseReport) => void) => Unsubscribe;
   peerId: () => string;
-  setActive: (active: boolean) => void;
+  resume: () => void;
 }
 
 export interface AppStateSource {
@@ -19,28 +19,25 @@ export interface AppStateSource {
   ) => { remove: () => void };
 }
 
-/** @internal */
+/**
+ * Resumes `endpoint` each time `source` returns to `"active"`.
+ *
+ * @internal
+ */
 export const bindAppStateSource = (
-  endpoint: Pick<HookEndpoint, "setActive">,
+  endpoint: Pick<HookEndpoint, "resume">,
   source: AppStateSource
 ): Unsubscribe => {
   let active = true;
-  try {
-    endpoint.setActive(source.currentState === "active");
-  } catch (error) {
-    if (error instanceof ClosedError) {
-      return () => {
-        active = false;
-      };
-    }
-    throw error;
-  }
+  let previous = source.currentState;
   const subscription = source.addEventListener("change", (state) => {
-    if (!active) {
+    const resumed = state === "active" && previous !== "active";
+    previous = state;
+    if (!active || !resumed) {
       return;
     }
     try {
-      endpoint.setActive(state === "active");
+      endpoint.resume();
     } catch (error) {
       if (!(error instanceof ClosedError)) {
         throw error;

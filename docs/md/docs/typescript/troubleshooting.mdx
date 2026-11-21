@@ -29,7 +29,7 @@ Errors are public classes exported by `@minip2p/node` and `@minip2p/react-native
 | The package cannot load in Expo Go | Expo Go does not contain minip2p | Use an Expo development build. |
 | The package is missing after installation | The app was not rebuilt | Run `expo prebuild`, then rebuild the target platform. |
 | The hook remains `starting` briefly | Endpoint creation waits for the component to commit | Render the starting state and use the endpoint only when `status` is `running`. |
-| A manually created endpoint stays active in the background | Nothing is forwarding `AppState` | Call `bindAppState(endpoint)` and release it during cleanup. |
+| A manually created endpoint is slow to become reachable through its relay after the app returns to the foreground | Nothing is forwarding `AppState` | Call `bindAppState(endpoint)` and release it during cleanup. |
 | mDNS finds no peers | Permissions are missing, multicast is blocked, or peers do not share a link | Add the documented permissions and test on a multicast-capable network. |
 | The hook enters `failed` | Endpoint creation or the running driver failed | Use `isDriverFailure`, record its typed kind, and recreate at an application-owned level. |
 

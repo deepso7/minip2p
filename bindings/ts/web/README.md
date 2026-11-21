@@ -43,7 +43,7 @@ Other limits:
 
 - Only WebTransport addresses dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. An address with certhashes pins the node's self-signed certificates. One without, such as `/dns/relay.example.com/udp/443/quic-v1/webtransport/p2p/12D3KooW…`, expects a CA-signed certificate for that domain, which the browser verifies as it would for any HTTPS page.
 - `listenAddrs()` is always empty (a reservation is `circuitAddress`), `knownPeers()` is empty and `reachability()` stays `unknown`.
-- `close()` closes every session at once with WebTransport's close capsule, without flushing accepted writes first; its timeout is ignored. `setActive()` is ignored as well: the page's own timers drive the endpoint.
+- `close()` closes every session at once with WebTransport's close capsule, without flushing accepted writes first; its timeout is ignored. Call `resume()` when the page becomes visible again, so a relay reservation lost while the tab was throttled recovers at once.
 - A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt.
 - A trapped wasm module (a Rust panic) fails the endpoint with `DriverFailedError`; its WebTransport sessions are closed from TypeScript, `close()` still resolves (`Failed`), and later calls throw `ClosedError`. Create a new endpoint to carry on.
 

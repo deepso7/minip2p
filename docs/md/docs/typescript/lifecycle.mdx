@@ -104,20 +104,15 @@ Keep the configuration factory pure and stable. React may render a component wit
 
 </Callout>
 
-## Active and idle
+## Resuming after a pause
 
-An endpoint starts active. `setActive(false)` reduces background work at the cost of higher network latency. `setActive(true)` restores normal behavior on the same endpoint. Servers normally stay active.
+A suspended app or a throttled tab stops answering its peers, so its relay connection can die while it is away, sometimes unnoticed until well after it comes back. Call `endpoint.resume()` when the host returns: the relay reservation then recovers at once instead of at its scheduled retry or renewal. A held reservation is renewed, and is reported lost and reacquired if the relay does not answer. `resume()` does nothing unless the reservation policy wants a relay reservation. Servers never need it.
 
 ### Foreground and background
 
 <Badge>React Native</Badge>
 
-The hook immediately mirrors the current React Native `AppState` and keeps it in sync:
-
-- `active` selects foreground polling;
-- every other state reduces background work.
-
-This does not destroy the endpoint. When the app returns to the foreground, the same endpoint becomes active again.
+The hook watches React Native's `AppState` and calls `resume()` each time the app returns to `active`. The endpoint itself is unchanged while the app is in the background.
 
 If the endpoint is not component-owned, bind and release `AppState` manually:
 
@@ -138,7 +133,7 @@ unbindAppState();
 endpoint.close();
 ```
 
-`bindAppState` applies the current state before it subscribes to later changes.
+`bindAppState` takes the current state as its starting point, so binding a foreground app does not resume it.
 
 ## Close is terminal
 

@@ -341,6 +341,13 @@ export class WebEndpoint {
         }
     }
     /**
+     * Tells the endpoint its page is visible again, so a relay
+     * reservation recovers at once. Does nothing once closed.
+     */
+    resume() {
+        wasm.webendpoint_resume(this.__wbg_ptr);
+    }
+    /**
      * Sends bytes on a stream: `true` once all are accepted, `false` while
      * the tail is held and `StreamWriteAccepted` is still to come.
      * @param {bigint} conn_id
@@ -356,15 +363,6 @@ export class WebEndpoint {
             throw takeFromExternrefTable0(ret[1]);
         }
         return ret[0] !== 0;
-    }
-    /**
-     * Ignored in the browser, kept for the shared SDK surface: there is no
-     * background driver whose cadence it could change. The page's own
-     * timers pump the endpoint.
-     * @param {boolean} _active
-     */
-    setActive(_active) {
-        wasm.webendpoint_setActive(this.__wbg_ptr, _active);
     }
     /**
      * Starts driving; `doorbell` is called when events become ready to drain.

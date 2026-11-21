@@ -119,7 +119,7 @@ export class MockBackend implements Minip2pBackend {
     return !this.closed;
   }
 
-  setActive(_active: boolean): void {}
+  resume(): void {}
 
   subscribe(_topic: string): boolean {
     return true;

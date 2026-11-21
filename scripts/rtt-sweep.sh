@@ -46,6 +46,11 @@ for sweep in "${sweeps[@]}"; do
     export MINIP2P_RTT_SEND
     ;;
   quic-check | yamux | retry) run "$sweep" ;;
+  yamux-check)
+    for profile in ${MINIP2P_RTT_CHECK_PROFILES:-10m_20ms 100m_10ms 100m_100ms 1g_20ms 1g_1ms}; do
+      run yamux-check "$profile"
+    done
+    ;;
   secondary)
     run quic-check 1g_20ms
     run yamux 1g_20ms
