@@ -83,6 +83,7 @@ fn config() -> EndpointConfig {
         force_relay: false,
         allow_unsigned: false,
         protocols: Vec::new(),
+        inbound_stream_limits: Default::default(),
         discovery: None,
         mdns: None,
         limits: None,
@@ -125,6 +126,45 @@ fn drain_is_bounded_and_preserves_order() {
     );
     assert!(endpoint.drain_events(1).is_empty());
     assert!(endpoint.drain_events(u32::MAX).is_empty());
+}
+
+#[test]
+fn inbound_stream_limits_reject_zero_and_register_additional_protocols() {
+    let mut invalid = config();
+    invalid.inbound_stream_limits.insert("/limited/1".into(), 0);
+    assert!(matches!(endpoint(invalid), Err(FfiError::InvalidConfig {
+        capability: crate::ConfigCapability::Options, detail,
+    }) if detail.contains("inboundStreamLimits") && detail.contains("/limited/1") && detail.contains("positive")));
+
+    let mut valid = config();
+    valid.inbound_stream_limits.insert("/limited/1".into(), 4);
+    let endpoint = endpoint(valid).expect("positive cap registers an additional protocol");
+    assert!(
+        endpoint
+            .shared
+            .lock_state()
+            .lifecycle
+            .accepting()
+            .unwrap()
+            .protocol_id("/limited/1")
+            .is_some()
+    );
+}
+
+#[test]
+fn inbound_limits_reject_finite_quic_connection_credit_as_invalid_config() {
+    let mut invalid = config();
+    invalid.inbound_stream_limits.insert("/limited/1".into(), 1);
+    invalid.limits = Some(crate::LimitsOptions {
+        quic: Some(crate::QuicLimitsOptions {
+            connection_receive_window: Some(crate::WindowLimit::Bounded { bytes: 1024 }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(endpoint(invalid), Err(FfiError::InvalidConfig {
+        capability: crate::ConfigCapability::Options, detail,
+    }) if detail.contains("connectionReceiveWindow") && detail.contains("inboundStreamLimits") && detail.contains("must be unlimited")));
 }
 
 #[test]

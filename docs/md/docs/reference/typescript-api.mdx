@@ -52,6 +52,7 @@ Setup per runtime: [Node.js](/docs/typescript/setup-node), [React Native](/docs/
 | `agentVersion` | `string` | Identify agent string. |
 | `listen` | `readonly [string, ...string[]]` | Listen multiaddresses; each address's shape selects QUIC or TCP. Omitted means dual-stack QUIC on ephemeral ports. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
+| `inboundStreamLimits` | `Readonly<Record<string, number>>` | Positive u32 inbound stream caps per protocol across all peers; entries also register the protocol. Excess streams wait FIFO before `stream` is emitted. Outbound streams do not count; unlisted protocols remain uncapped. |
 | `relays` | `readonly string[]` | Direct QUIC or TCP relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
 | `forceRelay` | `boolean` | Route outbound connectivity through relays only. |

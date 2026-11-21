@@ -316,13 +316,7 @@ impl SwarmState {
         if self.inbound_protocols.iter().any(|p| p == protocol) {
             self.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(protocol.to_string()));
             self.mark_control(conn_id, stream_id, false);
-            self.events.push_back(SwarmEvent::StreamReady {
-                peer_id,
-                conn_id,
-                stream_id,
-                protocol_id: protocol.to_string(),
-                initiated_locally: false,
-            });
+            self.admit_inbound(conn_id, stream_id, protocol);
         }
     }
 

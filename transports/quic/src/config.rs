@@ -1,6 +1,7 @@
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_transport::ConnectionNamespace;
+use quinn_proto::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Resource and flow-control limits for the synchronous QUIC adapter.
@@ -165,6 +166,16 @@ pub enum CongestionController {
     /// than reacting to loss, aiming to keep queues short. quinn marks its
     /// implementation experimental.
     Bbr,
+}
+
+impl QuicLimits {
+    /// Whether the connection receive window uses the unlimited sentinel or
+    /// reaches QUIC's maximum representable window.
+    pub fn connection_receive_window_is_unlimited(&self) -> bool {
+        self.connection_receive_window == usize::MAX
+            || u64::try_from(self.connection_receive_window).unwrap_or(u64::MAX)
+                >= VarInt::MAX.into_inner()
+    }
 }
 
 impl Default for QuicLimits {
@@ -362,5 +373,26 @@ impl QuicNamespaces {
 impl Default for QuicNamespaces {
     fn default() -> Self {
         Self::QUIC
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_connection_windows_match_quic_encoding() {
+        let mut limits = QuicLimits::default();
+        assert!(limits.connection_receive_window_is_unlimited());
+        limits.connection_receive_window = 1024;
+        assert!(!limits.connection_receive_window_is_unlimited());
+        if let Ok(maximum) = usize::try_from(VarInt::MAX.into_inner()) {
+            limits.connection_receive_window = maximum - 1;
+            assert!(!limits.connection_receive_window_is_unlimited());
+            limits.connection_receive_window = maximum;
+            assert!(limits.connection_receive_window_is_unlimited());
+            limits.connection_receive_window = maximum + 1;
+            assert!(limits.connection_receive_window_is_unlimited());
+        }
     }
 }

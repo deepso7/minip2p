@@ -1,6 +1,10 @@
 //! Foreign-facing endpoint configuration.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroUsize;
+
+use crate::{ConfigCapability, FfiError};
 
 /// Signed-discovery configuration.
 #[derive(Clone)]
@@ -273,6 +277,9 @@ pub struct EndpointConfig {
     pub allow_unsigned: bool,
     /// Application protocol ids registered before the endpoint starts.
     pub protocols: Vec<String>,
+    /// Per-protocol inbound concurrency caps across all peers. Each entry also
+    /// registers its protocol. Limits must be positive; excess streams wait FIFO.
+    pub inbound_stream_limits: HashMap<String, u32>,
     /// Signed-discovery settings, or no discovery when absent.
     pub discovery: Option<DiscoveryOptions>,
     /// Local-link mDNS settings, or no mDNS discovery when absent.
@@ -337,10 +344,25 @@ impl fmt::Debug for EndpointConfig {
             .field("force_relay", &self.force_relay)
             .field("allow_unsigned", &self.allow_unsigned)
             .field("protocols", &self.protocols)
+            .field("inbound_stream_limits", &self.inbound_stream_limits)
             .field("discovery", &self.discovery)
             .field("mdns", &self.mdns)
             .field("limits", &self.limits)
             .field("timeouts", &self.timeouts)
             .finish()
+    }
+}
+
+impl EndpointConfig {
+    /// Validates inbound caps for the platform before constructing an endpoint.
+    pub fn resolve_inbound_stream_limits(&self) -> Result<Vec<(String, NonZeroUsize)>, FfiError> {
+        self.inbound_stream_limits.iter().map(|(protocol, limit)| {
+            let limit = usize::try_from(*limit).ok().and_then(NonZeroUsize::new)
+                .ok_or_else(|| FfiError::InvalidConfig {
+                    capability: ConfigCapability::Options,
+                    detail: format!("inboundStreamLimits[{protocol:?}] must be a positive integer that fits this platform's usize"),
+                })?;
+            Ok((protocol.clone(), limit))
+        }).collect()
     }
 }

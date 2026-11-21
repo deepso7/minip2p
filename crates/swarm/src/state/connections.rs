@@ -338,6 +338,7 @@ impl SwarmState {
         self.conn_to_remote_addr.remove(&conn_id);
         self.forget_connection_streams(conn_id);
         self.actions.push_back(Action::CloseConnection { conn_id });
+        self.promote_inbound();
     }
 
     /// Clears Ping and Identify state for `peer_id`, including a ping
@@ -544,6 +545,7 @@ impl SwarmState {
                 });
             }
         }
+        self.promote_inbound();
     }
 
     pub(super) fn register_connection(
@@ -622,7 +624,11 @@ impl SwarmState {
     }
 
     pub(super) fn migrate_buffered_events(&mut self, old: &PeerId, new: &PeerId) {
-        for event in &mut self.events {
+        for event in self.events.iter_mut().chain(
+            self.queued_inbound
+                .values_mut()
+                .flat_map(|queued| queued.events.iter_mut()),
+        ) {
             if let Some(peer_id) = event_peer_mut(event)
                 && peer_id == old
             {
@@ -693,11 +699,13 @@ impl SwarmState {
             );
         }
         self.forget_connection_streams(conn_id);
+        self.promote_inbound();
     }
 
     /// Drops the per-stream state of `conn_id`, which is leaving, and its
     /// first-Identify bookkeeping.
     pub(super) fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
+        self.release_inbound(conn_id, None);
         self.first_identify.remove(&conn_id);
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);

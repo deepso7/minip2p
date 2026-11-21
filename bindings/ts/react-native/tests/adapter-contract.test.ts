@@ -3,7 +3,7 @@ import type {
   NativeConnectionInfo,
   NativeEventLiteral,
 } from "@minip2p/test-fixtures/adapter-contract";
-import { afterEach, vi } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
 import {
@@ -77,6 +77,17 @@ const neutralLimits = (value: unknown): unknown => {
 
 afterEach(() => {
   FakeNativeEndpoint.latest = undefined;
+});
+
+test("inbound stream limits reach UniFFI as a map", () => {
+  const endpoint = Minip2p.create({
+    inboundStreamLimits: { "/chat/1": 4 },
+    secretKey: new Uint8Array(32),
+  });
+  expect(FakeNativeEndpoint.current().config).toMatchObject({
+    inboundStreamLimits: new Map([["/chat/1", 4]]),
+  });
+  endpoint.close();
 });
 
 describeAdapterContract("React Native", {

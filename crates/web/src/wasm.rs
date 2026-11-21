@@ -386,6 +386,8 @@ struct WebEndpointConfig {
     force_relay: bool,
     allow_unsigned: bool,
     protocols: Vec<String>,
+    #[serde(default)]
+    inbound_stream_limits: std::collections::HashMap<String, u32>,
     discovery: Option<WebDiscoveryOptions>,
     mdns: Option<WebMdnsOptions>,
     /// Read only to be refused: the browser build has no limits to tune.
@@ -432,6 +434,7 @@ impl From<WebEndpointConfig> for EndpointConfig {
             force_relay: config.force_relay,
             allow_unsigned: config.allow_unsigned,
             protocols: config.protocols,
+            inbound_stream_limits: config.inbound_stream_limits,
             discovery: config.discovery.map(|options| DiscoveryOptions {
                 topic: options.topic,
                 beacon_interval_ms: options.beacon_interval_ms,
