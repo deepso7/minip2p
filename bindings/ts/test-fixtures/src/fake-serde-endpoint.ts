@@ -66,7 +66,6 @@ export class FakeSerdeEndpoint implements SerdeEndpoint {
 
   /** Queues native drain batches, oldest first. */
   enqueue(...batches: readonly (readonly unknown[])[]): void {
-    // Scripted events are deliberately loose, malformed ones included.
     this.#batches.push(...(batches as NativeEvent[][]));
   }
 
@@ -227,7 +226,6 @@ export const serdeContractNative = (
   ),
   consumed: fake.consumed,
   deliver: (events: readonly NativeEventLiteral[]) => {
-    // Serde shells hand bytes over as `Uint8Array`s, not `ArrayBuffer`s.
     fake.enqueue(
       events.map(({ inner, tag }) => ({
         inner: Object.fromEntries(

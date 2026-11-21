@@ -173,16 +173,12 @@ mod tests {
         assert!(limiter.consume("a", 0));
         assert!(limiter.consume("b", 0));
 
-        // Full of depleted buckets: a new key is refused, and no existing
-        // bucket is evicted to make room.
         assert!(!limiter.allows(&"c", 50));
         assert!(!limiter.consume("c", 50));
         assert!(!limiter.allows(&"a", 50));
         assert_eq!(limiter.len(), 2);
         assert!(limiter.due.values().map(Vec::len).sum::<usize>() <= 2);
 
-        // At 100 `b` is full again and dropped, freeing a slot; `a` has only
-        // its one refilled token.
         assert!(limiter.allows(&"c", 100));
         assert!(limiter.consume("c", 100));
         assert!(limiter.consume("a", 100));
@@ -221,8 +217,6 @@ mod tests {
         }
         assert!(!limiter.consume(1, u64::MAX - 10));
 
-        // Ten elapsed intervals refill only to capacity, even at the end of
-        // the monotonic timeline. Further access cannot schedule past MAX.
         assert!(limiter.consume(1, u64::MAX));
         assert!(limiter.consume(1, u64::MAX));
         assert!(limiter.consume(1, u64::MAX));

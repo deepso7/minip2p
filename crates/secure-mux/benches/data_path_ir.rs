@@ -152,9 +152,6 @@ fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>, Vec<u8>) {
     (session, active, vec![0x5a; SPARSE_LEN], refills)
 }
 
-// Many open, idle streams with a few doing work: the per-poll cost of
-// finding the streams that owe a frame, then the window updates that refill
-// the spent credit.
 #[library_benchmark]
 #[bench::sparse_send_8_of_1024_streams(idle_streams_sender())]
 fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>, Vec<u8>)) {

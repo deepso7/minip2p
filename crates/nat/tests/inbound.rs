@@ -255,7 +255,6 @@ fn malformed_stop_connect_tears_the_circuit_down() {
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
 
-    // A STATUS frame where a CONNECT is required.
     h.stream_data(stream, hop_status(minip2p_relay::Status::Ok), at(10));
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
@@ -287,9 +286,6 @@ fn unparsable_source_peer_id_is_rejected() {
 
 #[test]
 fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
-    // #356: circuits have their own admission limit, counting circuits the
-    // transport holds (live or unsettled) and STOPs accepted but not yet
-    // adopted. Past it, STOP is refused before acceptance.
     let mut h = inbound_harness(NatConfig {
         max_circuits: 2,
         ..NatConfig::default()
@@ -305,7 +301,6 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         Some(Status::Ok)
     );
     promoted_circuit(&actions);
-    // The transport now holds the adopted circuit too.
     h.agent.swarm.circuit_slots = 2;
 
     let refused = StreamId::new(STOP_STREAM + 4);
@@ -317,8 +312,6 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         Some(Status::ResourceLimitExceeded)
     );
     assert!(refused_with_fin(&actions, refused), "{actions:?}");
-    // Draining the status and FIN, the stream stays NAT's: late relay bytes
-    // never surface as an application stream.
     let conn = minip2p_transport::ConnectionId::new(1);
     assert!(h.agent.owns_stream(conn, refused));
     h.stream_data(refused, vec![1, 2, 3], at(35));
@@ -339,8 +332,6 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
             .any(|action| matches!(action, Out::PromoteBridge { .. }))
     );
 
-    // The adopted circuit ends, freeing its slot. A STOP whose adoption
-    // then fails releases its reservation, so the next STOP still fits.
     h.agent.swarm.circuit_slots = 1;
     h.agent
         .swarm
@@ -396,8 +387,6 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
     .enumerate()
     {
         let stream = StreamId::new(STOP_STREAM + offset as u64);
-        // Even the configured relay may open only STOP. Use an untrusted
-        // peer for STOP to cover its additional trust gate.
         let remote = if protocol_id == STOP_PROTOCOL_ID {
             h.target
         } else {

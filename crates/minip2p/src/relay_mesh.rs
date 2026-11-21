@@ -249,12 +249,8 @@ impl Links {
                 }
                 link.conn = None;
                 if std::mem::replace(&mut link.up, false) {
-                    // A link that was up: redial from the reset backoff.
                     link.schedule(now);
                 } else if link.dial.is_none() {
-                    // Rejected, timed out or dropped before it was
-                    // verified: a failed attempt. With a dial out, its own
-                    // outcome decides.
                     link.failed(now);
                 }
             }
@@ -264,8 +260,6 @@ impl Links {
                     return;
                 };
                 link.dial = None;
-                // The losing dial of a simultaneous pair leaves the winner
-                // to its proof.
                 if link.conn.is_none() {
                     link.failed(now);
                 }
@@ -409,7 +403,6 @@ mod tests {
         let mut links = Links::new(&identity.peer_id(), [own, other.clone()]);
         assert_eq!(links.due(at(0)), vec![other]);
 
-        // An unlisted member that dialed in and dropped is left to redial.
         let unlisted = Ed25519Keypair::generate().peer_id();
         links.observe(&established(&unlisted, conn(5)), at(0));
         links.verified(&unlisted, conn(5));
@@ -422,20 +415,16 @@ mod tests {
         let addr = member();
         let peer = *addr.peer_id();
         let mut links = links([addr.clone()]);
-        // Two failures first, so the backoff has grown.
         for index in 0..2 {
             links.dialed(&peer, Some(conn(index)), at(0));
             links.observe(&dial_failed(&addr, conn(index)), at(0));
         }
 
-        // The member dials us: no redial while it proves itself, and the
-        // backoff resets once the agent verifies it.
         links.observe(&established(&peer, conn(9)), at(10));
         assert_eq!(links.next_deadline(), None);
         links.verified(&peer, conn(9));
         links.observe(&closed(&peer, conn(9)), at(20));
         assert_eq!(redial_in(&links, at(20)), Some(1_000));
-        // A stale close changes nothing.
         links.observe(&closed(&peer, conn(9)), at(30));
         assert_eq!(redial_in(&links, at(20)), Some(1_000));
     }
@@ -450,7 +439,6 @@ mod tests {
         for index in 0..3 {
             links.dialed(&peer, Some(conn(index)), at(now));
             links.observe(&established(&peer, conn(index)), at(now));
-            // Rejected by either side, or timed out: never verified.
             links.observe(&closed(&peer, conn(index)), at(now));
             let delay = redial_in(&links, at(now)).expect("redial scheduled");
             delays.push(delay);
@@ -458,8 +446,6 @@ mod tests {
         }
         assert_eq!(delays, [1_000, 2_000, 4_000]);
 
-        // A verification for a connection that is no longer current is
-        // ignored.
         links.dialed(&peer, Some(conn(7)), at(now));
         links.observe(&established(&peer, conn(7)), at(now));
         links.observe(
@@ -486,8 +472,6 @@ mod tests {
         let addr = member();
         let peer = *addr.peer_id();
 
-        // Our dial loses to the member's: it reports `DialFailed` while the
-        // winner is mid-proof.
         let mut links = links([addr.clone()]);
         links.dialed(&peer, Some(conn(1)), at(0));
         links.observe(&established(&peer, conn(2)), at(0));
@@ -495,8 +479,6 @@ mod tests {
         assert_eq!(links.next_deadline(), None);
         assert!(links.due(at(60_000)).is_empty());
 
-        // The member's dial loses: established, then closed, while ours is
-        // still handshaking. Ours decides.
         let mut links = self::links([addr.clone()]);
         links.dialed(&peer, Some(conn(1)), at(0));
         links.observe(&established(&peer, conn(2)), at(0));

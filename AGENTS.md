@@ -50,7 +50,7 @@ Before adding an Endpoint capability or Cargo feature, an `EndpointEvent` varian
 
 - YAGNI: concise, simple solutions over clever or heavy abstractions. If a substantially simpler approach exists, use it or surface it.
 - Lean on the type system.
-- Comment sparingly: a concise note above a definition on how it is used, not line-by-line narration. Keep comments in sync with the code.
+- No implementation comments (`//`, `/* */`, `#` in scripts); rustdoc and JSDoc are fine. Let names and types carry the meaning, record a non-obvious decision in an ADR, and file an issue for a known shortcut instead of excusing it. `scripts/check-comments.py` ratchets the remaining count down in CI; `/delete-comment` runs a sweep.
 - Tests are focused: no endless smoke tests or "regression tests" for deleted features.
 - TypeScript: inferred types, never `any`; no one-line casting wrappers; idiomatic TS that Matt Pocock and Theo would be proud of. Prefer Effect for application services, concurrency, resource management, and typed errors; keep it out of trivial pure code.
 

@@ -185,7 +185,6 @@ export class JsIo {
           void this.#acceptIncoming(id, session);
         }
       },
-      // `closed` rejects too and reports it.
       () => {}
     );
     transport.closed.then(
@@ -197,7 +196,6 @@ export class JsIo {
           session: id,
         });
       },
-      // Never came up, or lost (the network going away): not an orderly close.
       (error: unknown) => {
         this.#endSession({
           kind: "sessionFailed",
@@ -250,7 +248,6 @@ export class JsIo {
     if (accepted <= 0) {
       return 0;
     }
-    // `data` views wasm memory, which may move: copy before returning.
     const copy = data.slice(0, accepted);
     stream.inFlight += accepted;
     writer.write(copy).then(
@@ -264,7 +261,6 @@ export class JsIo {
           });
         }
       },
-      // A rejected write reports nothing: the stream's end releases it.
       () => {}
     );
     return accepted;
@@ -274,7 +270,6 @@ export class JsIo {
   closeWrite(streamId: number): void {
     quietly(() => {
       const stream = this.#streams.get(streamId);
-      // Resolves once every accepted write has resolved, and been reported.
       stream?.writer?.close().then(
         () => {
           if (!stream.dead) {
@@ -283,9 +278,6 @@ export class JsIo {
           stream.writeEnded = true;
           this.#retireIfDone(streamId, stream);
         },
-        // A stop `writer.closed` already reported, a local reset or an
-        // ended session report themselves; anything else would leave the
-        // FIN pending for good, so it ends the write side as a stop.
         (error: unknown) => {
           if (stream.dead || stream.writeEnded) {
             return;
@@ -351,14 +343,12 @@ export class JsIo {
       if (session === undefined) {
         return;
       }
-      // Rust forgets the session's streams with it.
       for (const id of session.streams) {
         const stream = this.#streams.get(id);
         if (stream !== undefined) {
           this.#forget(id, stream);
         }
       }
-      // Throws once already closed, when `closed` reports the end anyway.
       session.transport.close({ closeCode: code, reason });
     });
   }
@@ -376,7 +366,6 @@ export class JsIo {
   dispose(): void {
     this.#disposed = true;
     this.#events.length = 0;
-    // `close` retires each session's streams, silencing their callbacks.
     for (const id of this.#sessions.keys()) {
       this.close(id, 0, "");
     }
@@ -419,8 +408,6 @@ export class JsIo {
   ): void {
     stream.writer = bidi.writable.getWriter();
     stream.reader = chunkReader(bidi.readable);
-    // The peer's STOP_SENDING errors the write side. A rejected
-    // `closeWrite` rejects this too, after its own handler reported it.
     stream.writer.closed.catch((error: unknown) => {
       const code = peerStreamCode(error);
       if (!stream.dead && !stream.writeEnded && code !== undefined) {
@@ -429,7 +416,6 @@ export class JsIo {
         this.#retireIfDone(id, stream);
       }
     });
-    // The peer's RESET_STREAM errors the read side, read pending or not.
     stream.reader.closed.catch((error: unknown) => {
       this.#readFailed(id, stream, error);
     });

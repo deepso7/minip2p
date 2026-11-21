@@ -224,12 +224,9 @@ impl Carry {
         if self.held_messages + self.held_others <= MAX_CARRY_EVENTS {
             return false;
         }
-        // Both queues together name every droppable event, so one is found.
         let dropped = self
             .pop_live(Queue::Messages)
             .or_else(|| self.pop_live(Queue::Others));
-        // A lost stream terminal or write settlement can no longer happen,
-        // so only Connection-attempt terminals need naming.
         if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
             self.dropped_terminal_connect_ids.insert(connect_id);
         }
@@ -311,8 +308,6 @@ impl Carry {
     /// whether it ended (or replaced) one that carried no data, which leaves
     /// the carry with its events instead.
     fn track_connection(&mut self, event: &P2pEvent) -> bool {
-        // Connection-attempt terminals answer the application's own connect,
-        // so they are delivered even naming a connection it never saw.
         if terminal_connect_id(event).is_none()
             && connection_ids(event)
                 .iter()
@@ -360,8 +355,6 @@ impl Carry {
             P2pEvent::ConnectionReplaced { old_conn_id, .. } => {
                 self.known_connections.remove(old_conn_id);
             }
-            // Only the events below leave a connection unseen: anything else
-            // naming it is something the binding acts on or must hear about.
             P2pEvent::PeerReady { .. }
             | P2pEvent::IdentifyReceived { .. }
             | P2pEvent::IdentifyFailed { .. }
@@ -500,15 +493,12 @@ impl Carry {
                 {
                     self.unseen_streams.remove(&(*conn_id, *stream_id));
                 }
-                // The binding has now seen the connections it names.
                 for conn_id in connection_ids(&event) {
                     self.unseen_connections.remove(&conn_id);
                 }
                 batch.push(event);
             }
         }
-        // `take` removes the oldest events and the queues are in id order,
-        // so the stale ids it leaves form a prefix: prune that.
         for ids in [&mut self.message_ids, &mut self.other_ids] {
             while ids.front().is_some_and(|id| !self.events.contains_key(id)) {
                 ids.pop_front();
@@ -627,8 +617,6 @@ fn ingest(
     stats.dropped = stats.dropped.saturating_add(dropped);
     overflow.pending = overflow.pending.saturating_add(dropped);
     overflow.total = overflow.total.saturating_add(dropped);
-    // Each Connect ID settles exactly one terminal, so the list cannot
-    // contain duplicates.
     overflow
         .terminal_connect_ids
         .extend(carry.take_dropped_terminal_connect_ids());
@@ -733,8 +721,6 @@ mod tests {
             }),
             Some(10)
         );
-        // Path progress carries a Connect ID but is not a terminal: it can
-        // follow an attempt that settled on a provisional path.
         assert_eq!(
             terminal_connect_id(&P2pEvent::PathUpgraded {
                 connect_id: 11,
@@ -791,8 +777,6 @@ mod tests {
         let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();
-        // 5000 one-byte data events, each between two messages so none
-        // coalesce, far past the cap.
         ingest(
             [ready.clone()].into_iter().chain(
                 (0..5000_u32).flat_map(|index| [message(index as u8), data(7, &[index as u8])]),
@@ -849,8 +833,6 @@ mod tests {
     #[test]
     fn peer_stream_churn_without_data_does_not_grow_an_undrained_carry() {
         let mut carry = Carry::default();
-        // A peer opens and closes streams without sending a byte while the
-        // binding drains nothing: each stream it never saw leaves no trace.
         for stream_id in 0..10_000 {
             for event in lifecycle(stream_id, false) {
                 assert!(!carry.push(event));
@@ -858,8 +840,6 @@ mod tests {
         }
         assert!(carry.is_empty());
 
-        // Streams the binding must hear about are kept: its own, one that
-        // carried data, and one whose StreamReady it already drained.
         let [ready, closed] = lifecycle(1, true);
         carry.push(ready.clone());
         carry.push(closed.clone());
@@ -930,9 +910,6 @@ mod tests {
 
     #[test]
     fn unseen_connections_that_end_without_data_leave_the_carry_whole() {
-        // #356: a peer connecting and disconnecting while the binding drains
-        // nothing leaves no trace, peer streams and all, whichever side
-        // dialed: such a connection frees its transport slot at once.
         let mut carry = Carry::default();
         for conn_id in 0..10_000 {
             for event in [
@@ -945,11 +922,8 @@ mod tests {
             }
         }
         assert!(carry.is_empty());
-        // Elided events leave no stale ids behind for long.
         assert!(carry.other_ids.len() <= 2, "{}", carry.other_ids.len());
 
-        // Kept: a connection that carried data, one the binding opened a
-        // stream on, and one an attempt terminal names.
         let terminal = P2pEvent::PathEstablished {
             connect_id: 9,
             peer_id: "peer".into(),
@@ -987,7 +961,6 @@ mod tests {
         }
         assert!(carry.is_empty());
 
-        // A connection the binding saw keeps it, ahead of the close.
         carry.push(established(2));
         assert_eq!(carry.take(1), [established(2)]);
         carry.push(identify_failed(2));
@@ -999,11 +972,8 @@ mod tests {
     fn an_abandon_stands_if_the_endpoint_took_it_or_the_close_is_still_carried() {
         let mut carry = EventCarry::default();
         carry.ingest([data_on(1, 1), data_on(1, 2)]);
-        // Refused by the Endpoint, with no close here: the carry keeps it all.
         assert_eq!(carry.abandon_stream(1, 1, false), None);
-        // Accepted by the Endpoint: the stream's events go, with their bytes.
         assert_eq!(carry.abandon_stream(1, 1, true), Some(1));
-        // Refused by an Endpoint that already handed the close over: stands.
         let [_, close] = lifecycle(2, false);
         carry.ingest([close]);
         assert_eq!(carry.abandon_stream(1, 2, false), Some(1));
@@ -1032,13 +1002,11 @@ mod tests {
         carry.push(closed(1));
         assert_eq!(carry.take(10), [peer_ready(1), closed(1)]);
 
-        // So is one whose id the binding learned from a command.
         carry.push(established(2));
         carry.mark_connection_seen(2);
         carry.push(closed(2));
         assert_eq!(carry.take(10), [established(2), closed(2)]);
 
-        // A ping the application waits on keeps its connection.
         carry.push(established(5));
         let ping = P2pEvent::PingFailed {
             peer_id: "peer".into(),
@@ -1049,8 +1017,6 @@ mod tests {
         carry.push(closed(5));
         assert_eq!(carry.take(10), [established(5), ping, closed(5)]);
 
-        // An elided circuit takes the path events reported after its end
-        // with it, as does a folded-away one.
         let path = |conn_id| P2pEvent::InboundPathEstablished {
             peer_id: "peer".into(),
             conn_id,
@@ -1068,8 +1034,6 @@ mod tests {
         });
         assert_eq!(carry.take(10), [established(8)]);
 
-        // An attempt terminal naming an elided connection is never elided:
-        // a connection can establish and close before its connect settles.
         let settled = P2pEvent::PathEstablished {
             connect_id: 10,
             peer_id: "peer".into(),
@@ -1079,7 +1043,6 @@ mod tests {
         carry.push(settled.clone());
         assert_eq!(carry.take(10), [settled]);
 
-        // Even when an unseen predecessor folds into it afterwards.
         carry.push(established(3));
         carry.mark_connection_seen(4);
         carry.push(replaced(3, 4));
@@ -1095,18 +1058,14 @@ mod tests {
         carry.push(replaced(1, 2));
         carry.push(peer_ready(2));
         carry.push(replaced(2, 3));
-        // The chain reads as one connection; the old connections' readiness
-        // is not attributed to the survivor.
         carry.push(peer_ready(3));
         assert_eq!(carry.take(10), [established(3), peer_ready(3)]);
 
-        // A survivor that also ends unseen leaves nothing at all.
         carry.push(established(4));
         carry.push(replaced(4, 5));
         carry.push(closed(5));
         assert!(carry.is_empty());
 
-        // A replaced connection the binding saw is reported as replaced.
         carry.push(established(6));
         let _ = carry.take(1);
         carry.push(replaced(6, 7));
@@ -1119,7 +1078,6 @@ mod tests {
         let mut carry = Carry::default();
         carry.push(established(1));
         carry.push(established(2));
-        // Other droppable events push both openings out.
         for index in 0..MAX_CARRY_EVENTS - 1 {
             carry.push(P2pEvent::PingFailed {
                 peer_id: index.to_string(),
@@ -1232,8 +1190,6 @@ mod tests {
             cause: crate::PingFailure::TimedOut,
         };
 
-        // A full carry of non-payload events drops the oldest event — the
-        // terminal — under the fallback rule.
         let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();
@@ -1261,8 +1217,6 @@ mod tests {
                 .is_none()
         );
 
-        // Payload events drop before lifecycle events, so the terminal is
-        // retained and no Connect ID is reported.
         let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();
@@ -1302,9 +1256,6 @@ mod tests {
         };
         let lost = MAX_CARRY_EVENTS as u64;
 
-        // Terminals pushed first are the oldest events, so enough later
-        // non-payload pushes drop every one of them — more than a single
-        // carry's worth, across two ingests before one delivery.
         let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();

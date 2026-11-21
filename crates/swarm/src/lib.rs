@@ -50,8 +50,6 @@ pub use crate::state::{
     IDENTIFY_TIMEOUT_MS, OUTBOUND_NEGOTIATION_TIMEOUT_MS, RESERVED_PROTOCOL_IDS,
     SIMULTANEOUS_DIAL_WINDOW_MS, SwarmTimeouts,
 };
-// Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
-// consumers can name the type without depending on `minip2p-identify`.
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_transport::ConnectionCloseReason;
 
@@ -60,11 +58,8 @@ pub use crate::builder::SwarmBuilder;
 pub use crate::driver::{PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
 #[cfg(feature = "std")]
 pub use crate::wait_deadline::WaitDeadline;
-// Re-exported so callers need not depend on minip2p-core directly.
 #[cfg(feature = "std")]
 pub use minip2p_core::platform::{Clock, StdClock};
-// The handles `Swarm` hands out, re-exported so callers need not depend on
-// the transport crate to name them.
 pub use minip2p_core::platform::{Deadline, EntropySource, Now};
 #[cfg(feature = "std")]
 pub use minip2p_transport::{WaitHandle, WakeHandle};

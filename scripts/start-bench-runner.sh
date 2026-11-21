@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Wake the bench instance for one Bench run. Sets the `bench-lease-until` tag
-# so the idle watchdog keeps the instance up while the run's job is queued,
-# then starts it and waits until EC2 reports it running. Safe beside another
-# starter or a watchdog poweroff: every pass rechecks the state instead of
-# waiting on a transition someone else may already have moved past.
 set -euo pipefail
 
 : "${AWS_REGION:?AWS_REGION is required}"

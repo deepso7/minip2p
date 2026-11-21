@@ -1,4 +1,4 @@
-// RFC 9204 Appendix A, generated from the RFC text.
+/// RFC 9204 Appendix A, generated from the RFC text.
 pub(crate) const STATIC_TABLE: [(&[u8], &[u8]); 99] = [
     (b":authority", b""),
     (b":path", b"/"),

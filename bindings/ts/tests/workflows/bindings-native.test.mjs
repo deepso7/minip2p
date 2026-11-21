@@ -66,7 +66,6 @@ test("weekly workflow executes the suite on native runners and musl containers",
     ({ name }) => name === "Build addon"
   ).run;
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
-  // The container installs the pnpm pinned by the root packageManager field.
   assert.match(
     muslBuild,
     /--prefix \/opt\/pnpm "\$\(node -p "require\(\\"\/work\/package\.json\\"\)\.packageManager/u

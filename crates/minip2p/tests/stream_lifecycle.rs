@@ -52,8 +52,6 @@ fn stream_ready_carries_the_handle_open_stream_takes() {
         bind("/ip4/127.0.0.1/udp/0/quic-v1"),
         bind("/ip4/127.0.0.1/udp/0/quic-v1"),
     );
-    // The builder's protocol comes first; `add_protocol` numbers the next
-    // one and returns the same handle for a protocol it already has.
     let chat = a.protocol_id(CHAT).expect("builder protocol has a handle");
     let file = a.add_protocol(FILE).expect("register");
     assert_eq!(a.add_protocol(FILE).expect("again"), file);
@@ -90,7 +88,6 @@ fn stream_ready_carries_the_handle_open_stream_takes() {
             remote = Some(protocol);
         }
     }
-    // Each side names it with its own handle.
     assert_eq!((local, remote), (Some(file), Some(b_file)));
 }
 
@@ -133,7 +130,6 @@ fn short_lived_sender(listen: &str, ending: Ending) -> (Vec<u8>, bool) {
             match next(&mut receiver) {
                 Some(EndpointEvent::StreamData { data, .. }) => received.extend_from_slice(&data),
                 Some(EndpointEvent::StreamRemoteWriteClosed { .. }) => return (received, true),
-                // The connection closing first means the FIN never came.
                 Some(EndpointEvent::ConnectionClosed { .. }) => return (received, false),
                 _ => {}
             }
@@ -179,8 +175,6 @@ fn short_lived_sender(listen: &str, ending: Ending) -> (Vec<u8>, bool) {
             drop(sender.close_within(timeout));
         }
         Ending::CloseWithin => {
-            // The receiver closes once it has read the FIN, which ends the
-            // TCP socket's wait in time.
             let report = sender.close_within(BACKSTOP);
             assert_eq!(report.outcome, CloseOutcome::Drained, "{report:?}");
         }

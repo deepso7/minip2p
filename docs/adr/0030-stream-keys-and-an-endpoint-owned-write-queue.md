@@ -20,3 +20,7 @@ Three things made application streams awkward on the Endpoint ([plan](../plans/d
 - With the default budget, a single payload over 8 MiB is refused as `TooLarge`; split it or raise the budget. `write_budget(0)` costs nothing beyond an empty map, for callers that use `try_send_stream` only.
 - While a stream has queued bytes, `try_send_stream` on it accepts nothing and returns the whole payload as `Full`, and its Writable is reported as `StreamWriteAccepted` (then passed on to a bare caller still waiting for it), so bytes never reorder. Once a write-side close is deferred behind them, `try_send_stream` fails with `SwarmError::WriteClosed` instead: no Writable follows a FIN.
 - `send_stream` is the hottest path; with nothing queued it adds one map lookup and the admission check to the bare write.
+
+## Amendments: implementation details
+
+- **Small appends coalesce into the last queued chunk.** `WriteQueue::send` appends a queued write to the stream's last chunk when the two together fit in `COALESCE_LIMIT` (16 KiB), instead of queueing it as a chunk of its own, so a slow reader's tiny writes cost their bytes, not one queue entry each. The chunk is grown in place (`Bytes::try_into_mut`) while the queue owns its buffer alone, and copied once otherwise, so a run of tiny appends is amortized rather than a copy of the whole chunk per append. The budget charge of the merged chunk is its new length.

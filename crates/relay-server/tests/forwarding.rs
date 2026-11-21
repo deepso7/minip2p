@@ -154,8 +154,6 @@ fn a_full_destination_pauses_the_source_until_writable() {
     } = connected_circuit(RelayServerConfig::default(), 0);
     let now = at(1);
 
-    // The destination takes three bytes: only those are acknowledged, so the
-    // source's credit stays withheld for the rest.
     node.swarm.credit.insert(stop_stream, 3);
     node.data(&source, source_stream, b"abcdef", now);
     let paused = node.calls();
@@ -163,11 +161,9 @@ fn a_full_destination_pauses_the_source_until_writable() {
     assert_eq!(acked(&paused, source_stream), 3);
     assert!(node.events().is_empty(), "the circuit stays open");
 
-    // More source bytes queue behind the held tail.
     node.data(&source, source_stream, b"gh", now);
     assert!(node.calls().is_empty());
 
-    // The destination's Writable resumes forwarding, in order.
     node.swarm.credit.remove(&stop_stream);
     assert!(node.writable(&destination, stop_stream, now));
     let resumed = node.calls();
@@ -220,12 +216,9 @@ fn a_leg_that_closes_gracefully_keeps_the_other_direction_draining() {
         stop_stream,
     } = connected_circuit(RelayServerConfig::default(), 0);
     let now = at(1);
-    // The source finishes first; its FIN reaches the destination.
     node.half_close(&source, source_stream, now);
     assert_eq!(closes(&node.calls()), [stop_stream]);
 
-    // The destination answers, the source leg is full, then the destination
-    // finishes and its stream closes cleanly.
     node.swarm.credit.insert(source_stream, 3);
     node.data(&destination, stop_stream, b"reply", now);
     node.half_close(&destination, stop_stream, now);
@@ -234,8 +227,6 @@ fn a_leg_that_closes_gracefully_keeps_the_other_direction_draining() {
     let closed = node.calls();
     assert!(resets(&closed).is_empty(), "nothing is reset: {closed:?}");
 
-    // The held reply still reaches the source, then its FIN. The wakeup
-    // that finishes the circuit is still the relay's, not the application's.
     node.swarm.credit.remove(&source_stream);
     assert!(node.writable(&source, source_stream, now));
     let drained = without_acks(node.calls());
@@ -269,8 +260,6 @@ fn pipelined_payload_from_both_sides_is_acknowledged_once_forwarded() {
     node.data(&source, source_stream, b"abcd", now);
     assert_eq!(acked(&node.calls(), source_stream), 0);
 
-    // The STOP response carries destination payload behind it; the
-    // destination takes only half of what the source pipelined.
     node.swarm.credit.insert(stop_stream, 2);
     let status = stop_status(Status::Ok);
     let mut response = status.clone();
@@ -312,7 +301,6 @@ fn payload_coalesced_with_connect_is_acknowledged_only_once_forwarded() {
         connect_request(&destination),
         b"abcd",
     );
-    // The CONNECT read acknowledged only its own frame.
     let connect = encode_frame(&connect_request(&destination).encode());
     let opened = node.calls();
     assert_eq!(acked(&opened, source_stream), connect.len());
@@ -360,16 +348,12 @@ fn tiny_reads_to_a_paused_destination_are_coalesced_in_order() {
     node.data(&source, source_stream, b"\xff", now);
     node.calls();
 
-    // One-byte reads while the destination is full cost one queue entry per
-    // coalesced run, not one per read.
     let expected: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
     for byte in &expected {
         node.data(&source, source_stream, &[*byte], now);
     }
     assert!(node.calls().is_empty());
 
-    // Resuming delivers every byte in order, in a few coalesced writes, and
-    // acknowledges each once.
     node.swarm.credit.remove(&stop_stream);
     node.writable(&destination, stop_stream, now);
     let resumed = node.calls();
@@ -482,8 +466,6 @@ fn closing_releases_the_credit_of_bytes_never_forwarded() {
     node.data(&source, source_stream, b"ef", now);
     assert_eq!(acked(&node.calls(), source_stream), 2);
 
-    // The source resets: its stream is not reset by the relay, so it stays
-    // unsettled until the four held bytes are acknowledged.
     node.stream_closed(&source, source_stream, now);
     assert_eq!(acked(&node.calls(), source_stream), 4);
 }

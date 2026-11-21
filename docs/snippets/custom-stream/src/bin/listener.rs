@@ -15,7 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("listen={}", local_dialable(&address));
     }
 
-    // A `StreamKey` names a stream by its connection and its id.
     let mut echo_streams: HashSet<StreamKey> = HashSet::new();
 
     loop {
@@ -32,9 +31,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 echo_streams.insert(stream);
             }
             EndpointEvent::StreamData { stream, data, .. } if echo_streams.contains(&stream) => {
-                // `send_stream` queues what a full stream cannot take yet and
-                // resends it on its own, so every chunk is echoed in order.
-                // A failure ends this stream, not the listener.
                 if let Err(error) = node.send_stream(stream, data) {
                     eprintln!("echo on stream {stream} failed: {error}");
                     echo_streams.remove(&stream);
@@ -44,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             EndpointEvent::StreamRemoteWriteClosed { stream, .. }
                 if echo_streams.remove(&stream) =>
             {
-                // The FIN waits behind every echoed byte still queued.
                 if let Err(error) = node.close_stream_write(stream) {
                     eprintln!("closing stream {stream} failed: {error}");
                 }

@@ -66,8 +66,6 @@ use minip2p::{
     ConnectionId, Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol, StreamId, StreamKey,
 };
 
-// The `uniffi` feature makes this crate its own UniFFI namespace, so the
-// UniFFI shell exports these records, enums and errors without mirroring them.
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 

@@ -85,13 +85,10 @@ export class NativeCloseLatch {
     let closed: BackendClosed;
     try {
       stop();
-      // Without a driver, native released the endpoint at once.
       closed = started
         ? await this.#closed
         : { outcome: CloseOutcome.Drained, unfinished: [] };
     } catch {
-      // Native failed to stop (a trap): no `EndpointClosed` will come, but
-      // close still never rejects and still releases.
       closed = { outcome: CloseOutcome.Failed, unfinished: [] };
     }
     try {
@@ -256,7 +253,6 @@ export interface NativeErrorFields {
   readonly capability?: string | undefined;
 }
 
-// Each capability's name is its value, so an own key is a capability.
 const isConfigCapability = (name: string): name is ConfigCapability =>
   Object.hasOwn(ConfigCapability, name);
 

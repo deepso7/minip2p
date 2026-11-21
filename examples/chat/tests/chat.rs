@@ -54,9 +54,6 @@ impl Peer {
                 sink.lock().expect("line sink").push(line);
             }
         });
-        // Capture stderr into the same sink (prefixed) so a crashing child
-        // leaves its actual error in the failure output instead of a
-        // mystifying "expected line never arrived".
         let stderr = child.stderr.take().expect("stderr is piped");
         let sink = Arc::clone(&lines);
         thread::spawn(move || {
@@ -177,28 +174,21 @@ impl Peer {
 fn three_peer_star_chats_end_to_end() {
     let deadline = Instant::now() + TEST_DEADLINE;
 
-    // --- 1. Host binds and prints its join address. ---
     let host = Peer::spawn("host", &["host", "--nick", "hostess", "--no-mesh"]);
     let bound = host.wait_line(deadline, |line| line.starts_with("[host] bound="));
     let addr = bound.trim_start_matches("[host] bound=").to_string();
 
-    // --- 2. Two joiners dial the host; nobody knows anybody else. ---
     let mut alice = Peer::spawn("alice", &["join", &addr, "--nick", "alice", "--no-mesh"]);
     let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob", "--no-mesh"]);
 
-    // --- 3. Each joiner gates stdin on the host's topic announcement, and
-    //        the hub eagerly admits both leaves before its first heartbeat. ---
     for peer in [&alice, &bob] {
         peer.wait_line(deadline, |line| line.contains("pubsub-ready"));
     }
     host.wait_count(deadline, 2, |line| line.contains("peer-subscribed"));
 
-    // --- 4. Alice speaks: the host hears it directly, bob hears it
-    //        THROUGH the host (they share no connection). ---
     alice.say("hello everyone");
     host.wait_line(deadline, |line| line.contains("alice: hello everyone"));
     bob.wait_line(deadline, |line| line.contains("alice: hello everyone"));
-    // Alice sees her own line only as the local echo, never re-delivered.
     alice.wait_line(deadline, |line| {
         line.starts_with("[you] alice: hello everyone")
     });
@@ -208,18 +198,15 @@ fn three_peer_star_chats_end_to_end() {
         "no self-delivery: {:?}",
         alice.all_lines()
     );
-    // Bob got exactly one copy (seen-cache dedup across the star).
     assert_eq!(
         bob.count_lines(|line| line.contains("alice: hello everyone")),
         1
     );
 
-    // --- 5. Bob replies; alice and the host both hear it. ---
     bob.say("hi alice");
     host.wait_line(deadline, |line| line.contains("bob: hi alice"));
     alice.wait_line(deadline, |line| line.contains("bob: hi alice"));
 
-    // --- 6. Everyone leaves cleanly on stdin EOF. ---
     alice.leave(deadline);
     bob.leave(deadline);
     host.leave(deadline);
@@ -311,8 +298,6 @@ fn three_peer_mesh_survives_host_death() {
             && line.contains(&alice_id)
             && line.contains("minip2p-chat")
     });
-    // Subscription exchange now performs low-watermark mesh admission, so
-    // direct peers are routable without a heartbeat-sized sleep.
 
     host.kill();
     alice.say("still here");

@@ -2,8 +2,6 @@
 //! protocols each configuration advertises (as a peer learns them through
 //! Identify), auto-NAT, and seeding from the engine's entropy.
 
-// Which capability fields exist depends on the build, so a struct update
-// that fills the rest is needless in some builds only.
 #![allow(
     clippy::needless_update,
     reason = "capability fields exist only in some builds"
@@ -566,8 +564,6 @@ fn discovery_turns_nat_on_without_advertising_it() {
         assert!(!has(&protocols, id), "{protocols:?}");
     }
 
-    // Only NAT that discovery turned on goes without a server: an explicit
-    // config still needs one.
     let capabilities = Capabilities {
         nat: Some(super::no_reservation_nat()),
         ..discovery_only()

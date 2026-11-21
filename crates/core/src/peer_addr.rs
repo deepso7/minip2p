@@ -57,7 +57,6 @@ impl PeerAddr {
     /// Extracts a peer address from a multiaddr with a terminal `/p2p/<peer-id>`.
     pub fn from_multiaddr(multiaddr: &Multiaddr) -> Result<Self, PeerAddrError> {
         let protocols = multiaddr.protocols();
-        // Find the last /p2p component; it must be the final protocol (terminal).
         let last = protocols
             .iter()
             .rposition(|protocol| matches!(protocol, Protocol::P2p(_)))
@@ -67,8 +66,6 @@ impl PeerAddr {
             return Err(PeerAddrError::NonTerminalPeerId);
         };
 
-        // Find the first /p2p component; if it differs from `last`, there are
-        // multiple /p2p segments, which is not allowed.
         let first = protocols
             .iter()
             .position(|protocol| matches!(protocol, Protocol::P2p(_)))
@@ -216,7 +213,6 @@ mod tests {
         assert_eq!(v6.transport().to_string(), "/ip6/::1/tcp/4001");
         assert!(v6.transport().is_tcp_transport());
 
-        // Round-trips back out of the combined form.
         let parsed = PeerAddr::from_multiaddr(&v6.to_multiaddr()).expect("round trip");
         assert_eq!(parsed, v6);
     }

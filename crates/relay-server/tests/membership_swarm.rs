@@ -156,10 +156,7 @@ fn proofs_completing_in_the_poll_that_replaces_the_connection_promote_nothing() 
     drive(&mut swarm, &mut agent, 0);
     let proof = sign_member_proof(&relay_identity(), &remote.peer_id());
 
-    // The remote's proof checks out and is answered on the live connection.
     let outbound = prove_remote(&mut swarm, &mut agent, first, &proof, 10);
-    // In one poll: the remote's accept of this node's proof, then a second
-    // connection that replaces the first.
     swarm.transport_mut().events.extend(
         accept(first, outbound)
             .into_iter()
@@ -181,7 +178,6 @@ fn proofs_completing_in_the_poll_that_replaces_the_connection_promote_nothing() 
         assert_eq!(proposals(&swarm, id, DIRECTORY_PROTOCOL_ID), 0, "{id}");
     }
 
-    // The replacement runs its own exchange and becomes the link.
     let outbound = prove_remote(&mut swarm, &mut agent, second, &proof, 30);
     swarm
         .transport_mut()

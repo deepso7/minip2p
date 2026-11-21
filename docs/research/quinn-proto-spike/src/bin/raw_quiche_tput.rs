@@ -64,7 +64,7 @@ impl Io {
                         dest = Some(info.to);
                         if seg == 0 { seg = n }
                         len += n;
-                        if n != seg { break } // a short packet ends the train
+                        if n != seg { break }
                     }
                     Err(quiche::Error::Done) => break,
                     Err(e) => panic!("send: {e}"),

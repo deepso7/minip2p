@@ -90,8 +90,6 @@ impl RelayMachine {
             EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } => {
                 let key = (peer_id, stream);
                 if let Some((_, other)) = self.bridges.get(&key).copied() {
-                    // A FIN can race teardown of the other bridge half; that
-                    // stale close must not replace the original lifecycle event.
                     match endpoint.close_stream_write(other) {
                         Ok(()) | Err(_) => {}
                     }
@@ -100,8 +98,6 @@ impl RelayMachine {
             EndpointEvent::StreamClosed { peer_id, stream } => {
                 self.drop_stream(endpoint, &(peer_id, stream))
             }
-            // A replaced connection ends its streams without per-stream
-            // `StreamClosed` events, exactly like a closed one.
             EndpointEvent::ConnectionClosed {
                 peer_id, conn_id, ..
             }
@@ -122,10 +118,6 @@ impl RelayMachine {
                 data.len(),
                 key
             ));
-            // Like a FIN, data can race teardown of the other half: its
-            // connection may already be closing before its `ConnectionClosed`
-            // arrives, and the transport rejects writes there. That ends the
-            // bridge; any other failure (`Full` included) is a relay fault.
             match send_all(endpoint, other, data) {
                 Ok(()) => {}
                 Err(error) if other_half_is_gone(&error) => {
@@ -366,8 +358,6 @@ impl RelayServer {
                 match receiver.try_recv() {
                     Ok(Command::CutAll) => {
                         for peer in endpoint.connected_peers() {
-                            // A peer can close between the snapshot and this
-                            // command; its lifecycle event remains authoritative.
                             match endpoint.disconnect(&peer) {
                                 Ok(()) | Err(_) => {}
                             }
@@ -447,8 +437,6 @@ impl RelayServer {
 
 impl Drop for RelayServer {
     fn drop(&mut self) {
-        // The relay thread may already have stopped after recording its
-        // failure; joining and `assert_healthy` below preserve that outcome.
         match self.commands.send(Command::Stop) {
             Ok(()) | Err(_) => {}
         }

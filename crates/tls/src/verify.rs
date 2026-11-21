@@ -43,42 +43,33 @@ use crate::{LIBP2P_EXTENSION_OID, SIGNATURE_PREFIX, TlsError};
 /// that presents a chain of more than one certificate; the transport, which
 /// sees the whole chain, enforces that.
 pub fn verify_libp2p_certificate(cert_der: &[u8], now: Duration) -> Result<PeerId, TlsError> {
-    // Step 1: Parse the X.509 certificate.
     let cert = Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
 
-    // Step 2: Verify the certificate's self-signature.
     verify_self_signature(cert_der, &cert)?;
 
-    // Step 3: Check the validity period.
     check_validity(&cert, now)?;
 
-    // Step 4: Find the single libp2p extension.
     let tbs = cert.tbs_certificate();
     let libp2p_ext = find_libp2p_extension(tbs.extensions().map_or(&[], |exts| exts))?;
 
-    // Step 5: Decode SignedKey from the extension value.
     let ext_bytes = libp2p_ext.extn_value.as_bytes();
     let (public_key_bytes, signature_bytes) =
         decode_signed_key(ext_bytes).map_err(|e| TlsError::InvalidExtension(format!("{e}")))?;
 
-    // Step 6a: Decode the protobuf-encoded libp2p PublicKey.
     let libp2p_public_key = PublicKey::decode_protobuf(&public_key_bytes)
         .map_err(|e| TlsError::InvalidPublicKey(format!("{e}")))?;
 
-    // Step 6b: Get the certificate's SubjectPublicKeyInfo DER.
     let spki_der = tbs
         .subject_public_key_info()
         .to_der()
         .map_err(|e| TlsError::Der(format!("{e}")))?;
 
-    // Step 6c: Build the signed message and verify.
     let mut message = Vec::with_capacity(SIGNATURE_PREFIX.len() + spki_der.len());
     message.extend_from_slice(SIGNATURE_PREFIX);
     message.extend_from_slice(&spki_der);
 
     verify_host_signature(&libp2p_public_key, &message, &signature_bytes)?;
 
-    // Step 7: Derive PeerId from the verified public key.
     Ok(PeerId::from_public_key(&libp2p_public_key))
 }
 
@@ -170,9 +161,7 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
     use ecdsa::signature::Verifier;
     use p256::ecdsa::{DerSignature, VerifyingKey};
 
-    // Check that the signature algorithm is ECDSA with SHA-256.
     let sig_alg_oid = cert.signature_algorithm().oid;
-    // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
     let ecdsa_sha256_oid = const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
     if sig_alg_oid != ecdsa_sha256_oid {
         return Err(TlsError::UnsupportedSignatureAlgorithm(format!(
@@ -180,17 +169,13 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
         )));
     }
 
-    // RFC 5280 Section 4.1.1.2: the outer signatureAlgorithm and the TBS
-    // signature field MUST be identical.
     let tbs_sig_oid = cert.tbs_certificate().signature().oid;
     if tbs_sig_oid != sig_alg_oid {
         return Err(TlsError::InvalidSelfSignature);
     }
 
-    // Extract the raw TBS DER bytes from the original certificate encoding.
     let tbs_der = extract_tbs_der(cert_der)?;
 
-    // Extract the P-256 public key from SubjectPublicKeyInfo.
     let tbs = cert.tbs_certificate();
     let spki = tbs.subject_public_key_info();
     let pk_bytes = spki.subject_public_key.raw_bytes();
@@ -201,7 +186,6 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
     let verifying_key =
         VerifyingKey::from_sec1_bytes(pk_bytes).map_err(|_| TlsError::InvalidSelfSignature)?;
 
-    // Extract and verify the signature.
     let sig_bytes = cert.signature().raw_bytes();
     #[expect(
         clippy::map_err_ignore,
@@ -227,17 +211,14 @@ fn extract_tbs_der(cert_der: &[u8]) -> Result<&[u8], TlsError> {
 
     let mut reader = SliceReader::new(cert_der).map_err(map_err)?;
 
-    // Parse the outer Certificate SEQUENCE header.
     let _outer_header = der::Header::decode(&mut reader).map_err(map_err)?;
 
-    // Record where the TBSCertificate starts (right after outer header).
     let remaining_before = usize::try_from(reader.remaining_len()).map_err(map_err)?;
     let tbs_start = cert_der
         .len()
         .checked_sub(remaining_before)
         .ok_or(TlsError::Der("TBS starts beyond certificate".into()))?;
 
-    // Parse the TBSCertificate header to determine its total encoded length.
     let tbs_header = der::Header::decode(&mut reader).map_err(map_err)?;
     let remaining_after = usize::try_from(reader.remaining_len()).map_err(map_err)?;
     let tbs_header_len = remaining_before
@@ -280,8 +261,6 @@ fn decode_signed_key(der_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), der::Error>
             signature.as_bytes().to_vec(),
         ))
     })?;
-    // Reject trailing data after the SEQUENCE — strict DER parsing for this
-    // security-critical path.
     reader.finish()?;
     Ok(result)
 }
@@ -325,7 +304,6 @@ fn verify_ecdsa_p256(spki_der: &[u8], message: &[u8], signature: &[u8]) -> Resul
     use ecdsa::signature::Verifier;
     use p256::ecdsa::{DerSignature, VerifyingKey};
 
-    // id-ecPublicKey and the P-256 (secp256r1) named curve.
     const ID_EC_PUBLIC_KEY: const_oid::ObjectIdentifier =
         const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
     const SECP256R1: const_oid::ObjectIdentifier =
@@ -381,8 +359,6 @@ mod tests {
         out
     }
 
-    // -- Spec test vectors from https://github.com/libp2p/specs/blob/master/tls/tls.md --
-
     const ED25519_CERT_HEX: &str = "308201ae30820156a0030201020204499602d2300a06082a8648ce3d040302302031123010060355040a13096c69627032702e696f310a300806035504051301313020170d3735303130313133303030305a180f34303936303130313133303030305a302031123010060355040a13096c69627032702e696f310a300806035504051301313059301306072a8648ce3d020106082a8648ce3d030107034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569ea37c307a3078060a2b0601040183a25a0101046a3068042408011220a77f1d92fedb59dddaea5a1c4abd1ac2fbde7d7b879ed364501809923d7c11b90440d90d2769db992d5e6195dbb08e706b6651e024fda6cfb8846694a435519941cac215a8207792e42849cccc6cd8136c6e4bde92a58c5e08cfd4206eb5fe0bf909300a06082a8648ce3d0403020346003043021f50f6b6c52711a881778718238f650c9fb48943ae6ee6d28427dc6071ae55e702203625f116a7a454db9c56986c82a25682f7248ea1cb764d322ea983ed36a31b77";
     const ED25519_PEER_ID: &str = "12D3KooWM6CgA9iBFZmcYAHA6A2qvbAxqfkmrYiRQuz3XEsk4Ksv";
 
@@ -405,8 +381,6 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cert_signature_mismatch() {
-        // This cert has a valid structure but the extension signature does not
-        // match the host key that supposedly signed it.
         let cert_der = decode_hex(INVALID_CERT_HEX);
         let result = verify_libp2p_certificate(&cert_der, VECTOR_NOW);
         assert!(

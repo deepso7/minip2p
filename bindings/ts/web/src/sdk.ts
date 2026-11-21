@@ -117,7 +117,6 @@ class Pump {
       try {
         delay = this.#poll();
       } catch {
-        // The endpoint failed, and its owner already reported it.
         this.stop();
         return;
       }
@@ -129,7 +128,6 @@ class Pump {
         return;
       }
     }
-    // Still busy: let the page run, then carry on.
     this.#arm(0);
   }
 
@@ -187,8 +185,6 @@ class WasmCalls {
 
 function webBackend(config: Minip2pConfig): Minip2pBackend {
   const module = wasm();
-  // A trapped instance can neither close its sessions nor be freed: close
-  // them from TypeScript.
   const calls = new WasmCalls((detail) => {
     pump.stop();
     io.dispose();
@@ -207,7 +203,6 @@ function webBackend(config: Minip2pConfig): Minip2pBackend {
       )
   );
   const backend = new SerdeBackend(endpoint, {
-    // Every command may queue work (a dial, a write): pump after it.
     call: (operation) => {
       try {
         return calls.call(operation);
@@ -216,8 +211,6 @@ function webBackend(config: Minip2pConfig): Minip2pBackend {
       }
     },
     circuitAddress,
-    // Closed and drained: stop pumping and free the wasm object, which
-    // drops its doorbell and `JsIo`.
     release: () => {
       pump.stop();
       calls.release(() => {

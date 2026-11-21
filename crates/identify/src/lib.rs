@@ -37,10 +37,6 @@ const MAX_MESSAGE_SIZE: usize = 8192;
 /// two: the base message, then its signed peer record on its own.
 const MAX_MESSAGE_PARTS: usize = 2;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 /// Configuration for the identify protocol.
 ///
 /// Note: `listen_addrs` is **not** a field here -- the swarm driver
@@ -59,10 +55,6 @@ pub struct IdentifyConfig {
     /// The local node's public key (protobuf-encoded).
     pub public_key: Vec<u8>,
 }
-
-// ---------------------------------------------------------------------------
-// Actions and events
-// ---------------------------------------------------------------------------
 
 /// Commands the host must execute on behalf of the identify protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,10 +120,6 @@ pub enum IdentifyError {
     MessageTooLarge { len: usize },
 }
 
-// ---------------------------------------------------------------------------
-// Per-peer state
-// ---------------------------------------------------------------------------
-
 /// State for a single peer's identify exchange.
 #[derive(Clone, Debug, Default)]
 struct PeerIdentifyState {
@@ -141,10 +129,6 @@ struct PeerIdentifyState {
     /// the frames buffered for it so far.
     inbound_streams: BTreeMap<StreamId, FrameExchange>,
 }
-
-// ---------------------------------------------------------------------------
-// Protocol state machine
-// ---------------------------------------------------------------------------
 
 /// Sans-IO state machine for the identify protocol.
 ///
@@ -210,26 +194,13 @@ impl IdentifyProtocol {
             return Err(IdentifyError::StreamAlreadyRegistered { peer_id });
         }
 
-        // libp2p's Identify spec prescribes multicodec-based binary
-        // encoding for observed_addr and listen_addrs (see
-        // <https://github.com/multiformats/multiaddr>). `to_bytes()`
-        // produces the on-wire shape foreign libp2p peers expect.
         let observed_addr_bytes = observed_addr.map(|addr| addr.to_bytes());
-        // A wildcard host (`0.0.0.0`, `::`) is a bind address, not one a
-        // peer can dial, so it is left out.
         let listen_addrs_bytes: Vec<Vec<u8>> = listen_addrs
             .iter()
             .filter(|addr| !addr.is_wildcard_host())
             .map(|addr| addr.to_bytes())
             .collect();
 
-        // libp2p Identify is wire-framed as a varint length prefix
-        // followed by the protobuf body (see
-        // <https://github.com/libp2p/specs/blob/master/identify/README.md>).
-        // Omitting the prefix causes remote decoders to interpret the
-        // first bytes of the protobuf body as a length varint -- which
-        // commonly lands on wire type 4 and is rejected as
-        // "deprecated group".
         let msg = IdentifyMessage {
             protocol_version: Some(self.config.protocol_version.clone()),
             agent_version: Some(self.config.agent_version.clone()),
@@ -240,9 +211,6 @@ impl IdentifyProtocol {
         };
 
         let encoded = msg.encode();
-        // Everything that can fail happens before the stream is recorded: a
-        // message we refuse to send leaves no registration behind, so the next
-        // identify on this peer is not rejected as already registered.
         if encoded.len() > MAX_MESSAGE_SIZE {
             return Err(IdentifyError::MessageTooLarge { len: encoded.len() });
         }
@@ -268,8 +236,6 @@ impl IdentifyProtocol {
     pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
         state.inbound_streams.entry(stream_id).or_insert_with(|| {
-            // Room for every part at its maximum: the first frame is covered by
-            // the exchange itself, the rest ride behind it as trailing bytes.
             let frame_len = MAX_MESSAGE_SIZE + uvarint_len(MAX_MESSAGE_SIZE as u64);
             FrameExchange::with_trailing(MAX_MESSAGE_SIZE, (MAX_MESSAGE_PARTS - 1) * frame_len)
         });
@@ -287,19 +253,12 @@ impl IdentifyProtocol {
         if let Some(frames) = state.inbound_streams.get_mut(&stream_id)
             && let Err(fault) = frames.push(data)
         {
-            // The bytes are refused before they are buffered: nothing legal
-            // can still be growing towards one identify message.
             self.events.push_back(IdentifyEvent::Error {
                 peer_id,
                 stream_id,
                 error: alloc::format!("identify message rejected: {fault}"),
             });
             state.inbound_streams.remove(&stream_id);
-            // Reset rather than half-close: dropping the stream's state means
-            // the remote's half-close finds nothing to act on, and a remote
-            // that never sends one would otherwise keep the stream — and its
-            // swarm and transport state — allocated for the life of the
-            // connection.
             self.actions
                 .push_back(IdentifyAction::ResetStream { peer_id, stream_id });
         }
@@ -330,12 +289,6 @@ impl IdentifyProtocol {
             },
         });
 
-        // Close our own write side. We never send data on an initiator
-        // identify stream, but multistream-select did, so the QUIC transport
-        // still considers the local write side open. Without this FIN the
-        // stream never transitions to `Closed` and both the swarm's
-        // stream_owner entry and the transport's per-stream state leak for
-        // the lifetime of the connection.
         self.actions
             .push_back(IdentifyAction::CloseStreamWrite { peer_id, stream_id });
     }
@@ -477,7 +430,6 @@ mod tests {
     }
 
     fn sample_peer() -> PeerId {
-        // Deterministic peer id so test output is stable across runs.
         PeerId::from_public_key_protobuf(b"test-fixture-identify-lib")
     }
 
@@ -596,8 +548,6 @@ mod tests {
             identify.poll_events().as_slice(),
             [IdentifyEvent::Error { .. }]
         ));
-        // A half-close racing the reset finds the stream already gone; it
-        // must not produce a close.
         identify.on_stream_remote_write_closed(peer, stream);
         assert!(identify.poll_actions().is_empty());
     }
@@ -632,7 +582,6 @@ mod tests {
 
     #[test]
     fn a_frame_that_never_completes_is_reported_at_end_of_stream() {
-        // Declares 255 bytes, ships three.
         let mut framed = Vec::new();
         write_uvarint(255, &mut framed);
         framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
@@ -649,7 +598,6 @@ mod tests {
     #[test]
     fn trailing_bytes_after_the_message_are_reported() {
         let mut framed = encode_frame(&body_of_len(64));
-        // `t` declares a 116-byte frame that the rest never fills.
         framed.extend_from_slice(b"trailing");
 
         let events = receive(&framed);
@@ -710,8 +658,6 @@ mod tests {
 
     #[test]
     fn a_refused_message_leaves_no_registered_stream() {
-        // The refusal must not consume the peer's outbound slot: a later
-        // identify on the same live peer has to be able to register.
         let mut identify = IdentifyProtocol::new(IdentifyConfig {
             protocol_version: "minip2p/test".into(),
             agent_version: "x".repeat(MAX_MESSAGE_SIZE),
@@ -747,12 +693,6 @@ mod tests {
 
     #[test]
     fn register_outbound_stream_emits_length_prefixed_payload() {
-        // Regression test for the rust-libp2p interop bug: the bytes
-        // handed to the transport MUST begin with a varint whose value
-        // equals the length of the remaining bytes -- otherwise remote
-        // libp2p implementations reject the message as a malformed
-        // protobuf (historically surfacing as "deprecated group" /
-        // "unsupported wire type 4").
         let mut identify = IdentifyProtocol::new(sample_config());
         let peer = sample_peer();
         let stream = StreamId::new(1);
@@ -775,8 +715,6 @@ mod tests {
             })
             .expect("expected a Send action");
 
-        // The frame must decode as `<varint prefix><body>` and the body
-        // must itself be a valid IdentifyMessage.
         let FrameDecode::Complete { payload: body, .. } =
             minip2p_core::decode_frame(&data, MAX_MESSAGE_SIZE)
         else {
@@ -786,8 +724,6 @@ mod tests {
         assert_eq!(msg.agent_version.as_deref(), Some("minip2p-test/0.0.1"));
         assert_eq!(msg.protocol_version.as_deref(), Some("minip2p/test"));
 
-        // listen_addrs are encoded as binary multicodec bytes, one per
-        // multiaddr passed in -- the regression we're guarding against.
         assert_eq!(msg.listen_addrs.len(), 1);
         let decoded = Multiaddr::from_bytes(&msg.listen_addrs[0]).expect("listen_addr round-trips");
         assert_eq!(decoded, listen_addrs[0]);
@@ -826,11 +762,6 @@ mod tests {
 
     #[test]
     fn on_stream_remote_write_closed_decodes_framed_payload() {
-        // Round-trip via the whole protocol: one side sends its identify
-        // through `register_outbound_stream` and the other side decodes
-        // it via the initiator path (`register_inbound_stream` +
-        // `on_stream_data` + `on_stream_remote_write_closed`). No wire
-        // errors should surface.
         let mut responder = IdentifyProtocol::new(sample_config());
         let mut initiator = IdentifyProtocol::new(IdentifyConfig {
             protocol_version: "other".into(),
@@ -842,7 +773,6 @@ mod tests {
         let i_peer = PeerId::from_public_key_protobuf(b"initiator");
         let stream = StreamId::new(7);
 
-        // Responder emits the framed bytes.
         responder
             .register_outbound_stream(i_peer, stream, None, &[])
             .unwrap();
@@ -854,8 +784,6 @@ mod tests {
             }
         }
 
-        // Initiator receives byte-for-byte and decodes after the remote
-        // half-close.
         initiator.register_inbound_stream(r_peer, stream);
         initiator.on_stream_data(r_peer, stream, &framed);
         initiator.on_stream_remote_write_closed(r_peer, stream);

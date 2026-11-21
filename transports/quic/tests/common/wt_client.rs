@@ -351,14 +351,11 @@ impl QuinnIo {
         if session.conn.is_drained() {
             return;
         }
-        // A closed session still reads the CONNECT stream, for the log, and
-        // sends what the engine has; its streams are gone.
         if session.closed {
             self.read_connect(handle);
             self.transmit(handle, now);
             return;
         }
-        // The held control stream goes out a while after a stream has.
         if !session.control_sent {
             match session.control_at {
                 Some(at) if at <= now => send_control(session),
@@ -560,7 +557,6 @@ impl QuinnIo {
             let mut send = session.conn.send_stream(state.id);
             while let Some(segment) = state.outbox.front_mut() {
                 if std::mem::take(&mut state.split) {
-                    // The first half of a split prefix went out last time.
                     state.hold = Some(Instant::now() + SPLIT_DELAY);
                 }
                 if state.hold.is_some_and(|at| at > Instant::now()) {
@@ -580,7 +576,6 @@ impl QuinnIo {
                     && !done.report
                     && state.outbox.front().is_some_and(|next| !next.report)
                 {
-                    // Only the first half goes in this packet.
                     state.split = true;
                     break;
                 }

@@ -82,8 +82,6 @@ fn a_queued_write_completes_on_writable_and_the_fin_waits_for_it() {
         "a write past the send caps is queued"
     );
     assert!(writer.queued_write_bytes() > 0);
-    // Behind queued bytes a write is queued whole, and a bare write accepts
-    // nothing, so bytes stay in order.
     writer.send_stream(stream, vec![7]).expect("queued behind");
     assert_eq!(
         writer.try_send_stream(stream, vec![8]).expect("try"),
@@ -92,7 +90,6 @@ fn a_queued_write_completes_on_writable_and_the_fin_waits_for_it() {
         }
     );
 
-    // Requested behind the queue: the FIN must follow every byte.
     writer.close_stream_write(stream).expect("close write");
     let closing = writer
         .send_stream(stream, vec![2])
@@ -102,8 +99,6 @@ fn a_queued_write_completes_on_writable_and_the_fin_waits_for_it() {
         "{closing:?}"
     );
     assert!(!closing.is_retryable() && !closing.is_stream_gone());
-    // No Writable follows the deferred FIN, so a bare write is refused
-    // rather than told to wait for one.
     assert!(matches!(
         writer.try_send_stream(stream, vec![3]),
         Err(DriverError::Swarm(SwarmError::WriteClosed { .. }))
@@ -189,8 +184,6 @@ fn a_queued_tail_is_aborted_when_its_stream_or_connection_ends() {
 
     writer.send_stream(stream, payload()).expect("write");
     assert!(writer.is_write_pending(stream));
-    // The held tail is charged against the budget, so a write that only
-    // fits the whole budget must wait for it (checked before any send).
     let other = StreamKey::new(stream.conn_id(), StreamId::new(u64::MAX));
     let waiting = writer
         .send_stream(other, payload())
@@ -200,13 +193,11 @@ fn a_queued_tail_is_aborted_when_its_stream_or_connection_ends() {
         "{waiting:?}"
     );
 
-    // A local reset aborts at once.
     writer.reset_stream(stream).expect("reset");
     assert!(!writer.is_write_pending(stream));
     assert_eq!(writer.queued_write_bytes(), 0, "the budget is released");
     until_aborted(&mut writer, &mut reader, stream);
 
-    // The connection ending aborts it too, right after the close.
     let stream = open(&mut writer, &mut reader);
     writer.send_stream(stream, payload()).expect("write");
     assert!(writer.is_write_pending(stream));
@@ -239,7 +230,6 @@ fn a_write_past_the_budget_is_refused_before_anything_is_sent() {
     writer.send_stream(stream, vec![0; 16]).expect("fits");
     assert!(!writer.is_write_pending(stream));
 
-    // Errors from the endpoint keep their predicates.
     let gone = writer
         .send_stream(
             StreamKey::new(ConnectionId::new(u64::MAX), stream.stream_id()),
@@ -326,8 +316,6 @@ fn a_portable_endpoint_finishes_a_queued_write_and_the_deferred_fin() {
         .close_stream_write(stream)
         .expect("close write");
 
-    // `flush` drives the writer without handing out its events: they are
-    // all still there for the poll after it.
     let (mut received, mut fin) = (Vec::new(), false);
     let mut flushed = false;
     while !flushed || !fin {
@@ -378,8 +366,6 @@ fn assert_aborted(events: &[EndpointEvent], stream: StreamKey) {
 
 #[test]
 fn closing_an_endpoint_aborts_writes_it_still_queues() {
-    // An immediate close ends before the transport reports the connection
-    // closed, so the abort cannot wait for that event.
     let mut reader = bind(0);
     let mut writer = bind(PAYLOAD);
     let stream = open(&mut writer, &mut reader);
@@ -405,12 +391,10 @@ fn a_bare_write_waiting_on_writable_is_woken_after_the_queue_drains() {
     let mut writer = bind(2 * PAYLOAD);
     let stream = open(&mut writer, &mut reader);
 
-    // The bare write fills the stream and waits for its Writable...
     let SendOutcome::Full { unsent } = writer.try_send_stream(stream, payload()).expect("try")
     else {
         panic!("a write past the send caps is not accepted whole");
     };
-    // ...which the queued write behind it then consumes to drain itself.
     writer.send_stream(stream, payload()).expect("queued");
     assert!(writer.is_write_pending(stream));
 

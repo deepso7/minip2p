@@ -56,14 +56,9 @@ impl Default for StdClock {
 
 impl Clock for StdClock {
     fn now(&mut self) -> Now {
-        // Saturating at the last permitted instant rather than the `NEVER`
-        // sentinel: ~584 million years of uptime, so the clamp is unreachable
-        // in practice but keeps the cast total.
         let monotonic_ms = u64::try_from(self.epoch.elapsed().as_millis())
             .unwrap_or(u64::MAX)
             .min(Now::MAX_MONOTONIC_MS);
-        // `None` when the system clock is set before 1970 — an honest "no
-        // usable wall clock" rather than a fabricated timestamp.
         let unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -140,8 +135,6 @@ mod tests {
 
         let epoch = Instant::now();
         let mut shared = StdClock::with_epoch(epoch);
-        // An epoch further in the past must read as further along the
-        // timeline, by exactly the offset between the two epochs.
         let mut older = StdClock::with_epoch(
             epoch
                 .checked_sub(Duration::from_millis(OFFSET_MS))
@@ -171,10 +164,6 @@ mod tests {
         sleep(Duration::from_millis(5));
         let after = second.now().monotonic_ms;
 
-        // Read across two clocks, the sleep must be visible as elapsed time on
-        // the shared timeline. Only a lower bound: a clock with its own epoch
-        // would read near zero here, while a busy or suspended host may
-        // overshoot the sleep by any amount.
         assert!(
             after >= before + 5,
             "sleep not observable across clocks: {before} -> {after}"
@@ -185,17 +174,11 @@ mod tests {
     fn reports_a_plausible_wall_clock() {
         let mut clock = StdClock::new();
         let unix_seconds = clock.now().unix_seconds.expect("hosts have a wall clock");
-        // Sometime after 2020; catches a stubbed or zeroed implementation.
         assert!(unix_seconds > 1_577_836_800);
     }
 
     #[test]
     fn entropy_fills_the_whole_buffer() {
-        // Random bytes may legitimately be zero, so "was this byte written?"
-        // can't be asked of one byte. Pre-fill with a sentinel and require
-        // every window to contain a non-sentinel byte: a partial fill leaves a
-        // run of untouched bytes, while a fully-written window surviving as
-        // all-sentinel has probability 256^-WINDOW.
         const SENTINEL: u8 = 0x5a;
         const WINDOW: usize = 16;
 

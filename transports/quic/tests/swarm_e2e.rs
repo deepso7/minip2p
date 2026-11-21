@@ -96,7 +96,6 @@ fn listen_on_bound_addr_keeps_first_address_contract() {
 
 #[test]
 fn swarm_ping_roundtrip_with_auto_identify() {
-    // Set up server.
     let mut server = make_swarm(Ed25519Keypair::generate());
     let peer_addr = server
         .core_mut()
@@ -104,7 +103,6 @@ fn swarm_ping_roundtrip_with_auto_identify() {
         .expect("server listen");
     let server_peer_id = *peer_addr.peer_id();
 
-    // Set up client and dial -- no ConnectionId ceremony, no `now_ms` plumbing.
     let mut client = make_swarm(Ed25519Keypair::generate());
     let _conn = client.core_mut().dial(&peer_addr).expect("dial");
 
@@ -169,8 +167,6 @@ fn swarm_ping_roundtrip_with_auto_identify() {
             }
         }
 
-        // One-call ping: opens a stream if needed, sends the payload as soon
-        // as it's negotiated. No `open_ping` + `send_ping` two-step required.
         if client_ready && !ping_issued {
             client.ping(&server_peer_id).expect("ping");
             ping_issued = true;
@@ -288,7 +284,6 @@ fn swarm_user_protocol_round_trip() {
                     stream_id,
                     ref data,
                 } if !server_echo_sent => {
-                    // Echo the data back on the same stream.
                     server
                         .send_stream(peer_id, conn_id, stream_id, data.clone())
                         .expect("server echo");
@@ -444,8 +439,6 @@ fn identify_exchange_carries_observed_addr() {
         "client-side observed_addr must not be empty"
     );
 
-    // Identify now encodes observed_addr per the libp2p spec -- varint
-    // multicodec + value -- so decode with Multiaddr::from_bytes.
     let addr = Multiaddr::from_bytes(&client_bytes)
         .expect("observed_addr should decode as binary multiaddr");
     assert!(
@@ -496,10 +489,6 @@ fn rapid_ping_calls_do_not_open_duplicate_streams() {
             }
         }
 
-        // Once identified, fire three ping() calls back-to-back before the
-        // stream has a chance to negotiate. With the bug, this would open
-        // three outbound streams and trigger "OutboundStreamExists" errors
-        // on the second and third.
         if client_identified && !ping_bursts_fired {
             client.ping(&server_peer_id).expect("first ping");
             client.ping(&server_peer_id).expect("second ping");
@@ -535,7 +524,6 @@ fn ping_completes_while_stuck_application_streams_fill_the_send_queue() {
         .expect("server listen");
     let server_peer_id = *peer_addr.peer_id();
 
-    // Two stuck streams fill the application share; the reserve is left.
     let keypair = Ed25519Keypair::generate();
     let limits = QuicLimits {
         max_pending_bytes_per_stream: 64 * 1024,
@@ -558,12 +546,8 @@ fn ping_completes_while_stuck_application_streams_fill_the_send_queue() {
         .expect("register protocol");
     client.core_mut().dial(&peer_addr).expect("dial");
 
-    // The server never acknowledges what it reads, so these streams stall
-    // once the peer's stream window is spent.
     let chunk = Bytes::from(vec![7u8; 256 * 1024]);
     let mut ready = Vec::new();
-    // Rounds in a row in which no stream accepted a byte: the peer's credit
-    // is spent and the queue holds all it may.
     let mut stalled_rounds = 0;
     let mut ping_issued = false;
     let mut rtt_measured = false;

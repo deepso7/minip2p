@@ -122,7 +122,6 @@ class ReactNativeBackend implements Minip2pBackend {
           });
           return;
         }
-        // The SDK has stopped listening; only `EndpointClosed` matters now.
         if (this.#close.requested) {
           return;
         }
@@ -660,8 +659,6 @@ function normalizeGenericEvent(
       return [field, sdkName(pair, value)] as const;
     }
   );
-  // The generated event and the SDK event share one shape (see the
-  // `minip2p-ffi-core` UniFFI derives) once integers and enums are converted.
   const normalized = {
     inner: { ...inner, ...Object.fromEntries(enumFields) },
     tag: event.tag,
@@ -712,8 +709,6 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
-    // QUIC stop and close codes are 62-bit varints the remote picks: keep
-    // them whole.
     if (key === "errorCode" || key === "code") {
       return value;
     }

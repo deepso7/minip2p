@@ -1,0 +1,20 @@
+# The smoltcp TCP provider accounts for every socket and never strands a packet
+
+`SmoltcpProvider` targets devices that budget a handful of sockets and drives a smoltcp interface that only moves when polled. So every socket, port and backlog slot is accounted for and given back, and its poll order and `next_deadline` decide whether packets wait.
+
+## Poll order and deadlines
+
+- **Order inside `poll`.** Ingress first (bounded per poll, so a flooded link cannot keep a poll running with nothing on the host able to preempt it, yet it still drains over later polls); then egress, which drains to exhaustion because the transmit rings bound it, so what just arrived is acknowledged in the same poll. Per stream, reads drain the receive ring fully before end-of-stream is judged, so `!may_recv()` really is the end of the stream rather than a full ring and no `Received` follows `RemoteWriteClosed`. `reclaim` runs before the listeners re-arm, so a socket freed this poll refills the backlog now; otherwise a SYN arriving before the next poll is lost and the peer waits out a retransmit.
+- **Queued is not sent.** `connect` queues a SYN and `abort` queues a reset; both set `egress_pending`, and `next_deadline` is `IMMEDIATE` while egress or ingress is pending, so a host sleeping on the last poll's deadline does not strand a dial or leave the peer holding a connection to nobody. `close_write` needs no flush of its own, since smoltcp sends the FIN behind queued data. Retransmits are driven only by the deadline the provider reports.
+- **Time.** `instant` saturates at `i64::MAX / 1000` milliseconds: smoltcp keeps microseconds in an `i64`, and saturating at `i64::MAX` would overflow the conversion. The mDNS smoltcp carrier caps time the same way.
+
+## Sockets, ports and backlog
+
+- **Default buffers.** `SmoltcpConfig::default` uses 8 KiB receive and transmit rings, about four maximum-size segments each way: enough to keep a link with some latency busy, small enough that a device with a few connections fits in tens of kilobytes.
+- **One owner per port.** Ephemeral port allocation skips ports a listener holds, even though smoltcp tells a dial and a listener apart by four-tuple, so a reservation means one thing. Listeners on the same port but different concrete addresses do not conflict (smoltcp matches the local address too), but a wildcard listener conflicts with every address on its port. Only a port drawn from the pool is returned on a failed `listen`/`connect`. A retired outbound socket keeps its port until `reclaim` finds the socket closed, because `TIME-WAIT` still owns the four-tuple.
+- **Inbound attempts are invisible until established.** A listener's socket that leaves `Listen` becomes an entry of its own but is announced only once it has a remote endpoint; if it dies first (including a reset in `SYN-RECEIVED`, which puts the socket back into `Listen`) it is retired without an event, since no handle was ever handed over. The backlog refills either way.
+- **Give up instead of retransmitting forever.** smoltcp retransmits SYN and SYN-ACK for as long as the socket lives, so outbound connects carry a deadline (`OpeningUntil`, dated when the dial is first polled, not from an old sample) and half-open inbound sockets are bounded too, so peers walking away mid-handshake cannot hold the socket budget. A socket given up on is forced closed with `abort`; an outbound one reports `Closed` with "the connection attempt failed", an inbound one leaves silently.
+- **Closed has no reason.** smoltcp does not distinguish a reset from an orderly shutdown, so `TcpEvent::Closed` carries `reason: None`; a truncated stream is a fault the session above detects.
+- **`send` on a shut transmit half accepts zero bytes.** smoltcp's `InvalidState` there means the connection is closing or gone, which is a socket taking nothing, already on its way to `Closed`.
+- **`abort` discards nothing queued**, because `poll` hands over every event it produces before returning.
+- **A wildcard listener reports every address the interface holds**, not just the one `listen` returned.

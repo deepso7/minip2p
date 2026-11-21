@@ -107,8 +107,6 @@ fn replacement_discards_undrained_old_actions() {
     core.reset_stream(&peer_id, original, stream)
         .expect("old connection stream should initially be active");
 
-    // Replace before draining the original connection's automatic
-    // Identify open or the application-requested stream actions.
     feed(
         &mut core,
         TransportEvent::Connected {
@@ -196,8 +194,6 @@ fn stream_ops_for_an_old_connection_never_reach_its_successor() {
                 "replace={replace}"
             );
         }
-        // Abandoning settles the old stream in the transport, never the
-        // successor's.
         abandon.expect("abandoning after the connection ended succeeds");
         assert!(
             matches!(
@@ -249,9 +245,6 @@ fn abandoning_an_old_connection_stream_keeps_the_successors_events() {
 
 #[test]
 fn abandoning_after_the_close_was_delivered_settles_the_stream_in_the_transport() {
-    // ADR 0012 (#356): abandonment goes top-down. With the connection's
-    // terminal event long delivered, the swarm drops what it still holds
-    // and the transport settles the stream outright.
     let (mut core, peer_id, old, new, stream) = peer_with_stream_on_two_generations(false);
     core.abandon_stream(&peer_id, old, stream)
         .expect("no terminal event is needed as proof");
@@ -260,14 +253,12 @@ fn abandoning_after_the_close_was_delivered_settles_the_stream_in_the_transport(
         [Action::SettleStream { conn_id, stream_id }]
             if *conn_id == old && *stream_id == stream
     ));
-    // A caller that no longer knows the peer gets the same.
     core.abandon_ended_stream(old, stream)
         .expect("an ended connection");
     assert!(matches!(
         drain_actions(&mut core).as_slice(),
         [Action::SettleStream { conn_id, .. }] if *conn_id == old
     ));
-    // A connection the swarm still routes keeps the strict rules.
     assert!(matches!(
         core.abandon_stream(&peer_id, new, StreamId::new(99)),
         Err(SwarmError::StreamNotFound { .. })
@@ -285,7 +276,6 @@ fn data_from_a_replaced_connection_is_acknowledged_and_queued_acks_survive() {
     let (old, new) = (ConnectionId::new(50), ConnectionId::new(51));
     connect_again(&mut core, &peer_id, old, false);
     drain_actions(&mut core);
-    // Bytes for a stream nobody owns are the state's to acknowledge.
     feed(
         &mut core,
         TransportEvent::StreamData {
@@ -295,7 +285,6 @@ fn data_from_a_replaced_connection_is_acknowledged_and_queued_acks_survive() {
         },
     );
     connect_again(&mut core, &peer_id, new, false);
-    // The replaced connection's late data is dropped, and acknowledged.
     feed(
         &mut core,
         TransportEvent::StreamData {
@@ -345,7 +334,6 @@ fn replacement_on_dial_and_listen_side_reports_only_connection_replaced() {
             "the new connection is re-identified (inbound={inbound})"
         );
 
-        // The transport's close of the retired connection is silent.
         feed(
             &mut core,
             TransportEvent::Closed {
@@ -437,8 +425,6 @@ fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
         "the old connection must not linger as an orphan"
     );
 
-    // Late events on the retired id never re-register it, and its close
-    // is not reported a second time.
     feed(
         &mut core,
         TransportEvent::PeerIdentityVerified {
@@ -465,7 +451,6 @@ fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
             data: Bytes::from(multistream_frame(MULTISTREAM_PROTOCOL_ID)),
         },
     );
-    // Only the acknowledgement of the data it drops.
     assert!(matches!(
         core::iter::from_fn(|| core.poll_output()).collect::<Vec<_>>().as_slice(),
         [Output::Action(Action::AckStream { conn_id, .. })] if *conn_id == original
@@ -498,7 +483,6 @@ fn readiness_belongs_to_the_current_connection() {
     assert!(!core.is_peer_ready(&peer_id), "readiness ends with `old`");
     assert!(core.peer_readiness(&peer_id).is_none());
     assert!(core.peer_info(&peer_id).is_none());
-    // Stale Identify data from `old` must not reject the open.
     core.open_stream(&peer_id, "/app/1")
         .expect("not ready yet, so no protocol rejection");
 
@@ -550,8 +534,6 @@ fn peer_ready_queued_before_a_replacement_is_stale() {
     identify_on(&mut core, original, StreamId::new(1), &[]);
     connect_again(&mut core, &peer_id, replacement, false);
 
-    // Both events are still delivered; only the first is stale by the
-    // time a host sees the batch.
     let events = drain_events(&mut core);
     assert_eq!(ready_conns(&events), [original]);
     let ready = events
@@ -568,7 +550,7 @@ fn peer_ready_queued_before_a_replacement_is_stale() {
 
 #[test]
 fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
-    let mut core = test_core(); // default ping_ms = 10_000
+    let mut core = test_core();
     let peer_id = PeerId::from_public_key_protobuf(b"ping-replaced-peer");
     let original = ConnectionId::new(60);
     let replacement = ConnectionId::new(61);
@@ -595,7 +577,6 @@ fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
         "the deadline restarts at the hand-over"
     );
 
-    // Past the original deadline: no failure for the hand-over.
     core.handle_tick(12_000);
     assert!(
         !drain_events(&mut core)
@@ -630,7 +611,7 @@ fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
 
 #[test]
 fn overdue_ping_times_out_instead_of_being_resent_on_replacement() {
-    let mut core = test_core(); // default request_timeout_ms = 10_000
+    let mut core = test_core();
     let peer_id = PeerId::from_public_key_protobuf(b"ping-overdue-peer");
     let other = PeerId::from_public_key_protobuf(b"ping-other-peer");
     let replacement = ConnectionId::new(63);
@@ -642,8 +623,6 @@ fn overdue_ping_times_out_instead_of_being_resent_on_replacement() {
         .expect("ping in flight");
     let _ = drain_actions(&mut core);
 
-    // The replacement arrives in the same poll as the overdue tick, ahead
-    // of it.
     core.handle_transport_event(
         TransportEvent::Connected {
             id: replacement,

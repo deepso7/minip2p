@@ -34,8 +34,6 @@ fn loopback(config: QuicNodeConfig) -> QuicTransport {
 /// transport's id for each raw connection, in order.
 fn connect_twice() -> (QuicTransport, RawPeer, [ConnectionId; 2]) {
     let mut server = loopback(QuicNodeConfig::generate().with_limits(QuicLimits {
-        // Accept each Initial directly, so connection order is creation
-        // order.
         require_address_validation: false,
         ..QuicLimits::default()
     }));
@@ -69,8 +67,6 @@ fn connect_twice() -> (QuicTransport, RawPeer, [ConnectionId; 2]) {
 fn each_connection_from_a_shared_address_gets_only_its_own_data() {
     let (mut server, mut client, _) = connect_twice();
 
-    // Each client connection names itself on a stream; the transport must
-    // deliver each label on a different connection.
     for index in 0..2 {
         client.send(index, format!("connection {index}").as_bytes());
     }
@@ -100,8 +96,6 @@ fn each_connection_from_a_shared_address_gets_only_its_own_data() {
         "each label arrives once, on its own connection"
     );
 
-    // Each connection's reply reaches only the client connection that sent
-    // the label.
     for (id, (stream, label)) in &labels {
         let mut reply = b"reply to ".to_vec();
         reply.extend_from_slice(label);
@@ -130,8 +124,6 @@ fn unknown_cid_datagrams_from_a_shared_address_leave_both_connections_intact() {
     let (mut server, mut client, ids) = connect_twice();
     let server_addr = server.local_socket_addrs().remove(0);
 
-    // Short header with an unknown DCID (answered with a stateless reset at
-    // most), unparseable bytes, and a runt, all from the shared address.
     for junk in [&[0x40u8; 64][..], &[0xff; 64], &[0x00]] {
         client.socket.send_to(junk, server_addr).expect("send junk");
     }

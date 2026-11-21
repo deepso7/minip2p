@@ -200,8 +200,6 @@ mod tests {
                 "as_deadline was not due at {now:?}"
             );
         }
-        // `u64::MAX` is reserved for `Deadline::NEVER`, which is why clocks
-        // stop one millisecond short of it.
         assert_eq!(Now::MAX_MONOTONIC_MS, u64::MAX - 1);
         assert_eq!(Now::from_millis(u64::MAX).as_deadline(), Deadline::NEVER);
     }

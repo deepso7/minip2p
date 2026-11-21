@@ -64,8 +64,6 @@ describe("React Native connection identities", () => {
     expect(opened).toHaveLength(NATIVE_IDS.length + 1);
     expect(opened.every(isSafeId)).toBe(true);
     expect(closedIds).toEqual([opened[2], opened[0]]);
-    // A released ID never comes back: the late error and the new connection
-    // both get numbers distinct from every ID handed out before.
     const seen = [...opened, ...lateErrors];
     expect(new Set(seen).size).toBe(seen.length);
     endpoint.close();

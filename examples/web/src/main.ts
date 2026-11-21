@@ -30,7 +30,6 @@ node.on("connectionClosed", ({ peerId, reason }) => {
 const run = async (target: string): Promise<void> => {
   const path = await node.connect(target, TIMEOUT);
   print(`connected to ${path.peerId} (${path.path.kind})`);
-  // The default timeout allows for the full Identify deadline.
   const { protocols } = await node.waitPeerReady(path.peerId);
   print(`identified: ${protocols.join(", ")}`);
   print(`ping ${await node.ping(path.peerId, TIMEOUT)} ms`);

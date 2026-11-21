@@ -22,7 +22,6 @@ const ECHO_PROTOCOL: &str = "/minip2p/tests/nat-echo/1.0.0";
 fn nat_endpoint() -> Endpoint {
     Endpoint::builder()
         .nat_config(NatConfig {
-            // Unroutable, so the agent runs without traffic a test sees.
             autonat_servers: vec![
                 PeerAddr::new(
                     "/ip4/192.0.2.250/udp/4001/quic-v1"
@@ -55,8 +54,6 @@ fn direct_candidate_wins_over_loopback() {
 
     let id = a.connect(&b_addr).expect("connect starts");
 
-    // Drive both endpoints; no relay is configured, so the only leg is the
-    // direct dial of the provided candidate.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut path = None;
     let mut settled = None;
@@ -147,8 +144,6 @@ fn waiting_for_peer_ready_drives_the_nat_agent() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    // The endpoint wait drives only `a`, so keep the remote's socket serviced
-    // concurrently.
     let (stop_remote, remote_stop) = std::sync::mpsc::channel();
     let remote = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -163,8 +158,6 @@ fn waiting_for_peer_ready_drives_the_nat_agent() {
     });
 
     let id = a.connect(&b_addr).expect("connect starts");
-    // Waiting for PeerReady must feed ConnectionEstablished to the NAT agent
-    // on the way; its path event arrives on the same stream.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut events = Vec::new();
     loop {
@@ -422,11 +415,6 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
 #[cfg(feature = "tcp")]
 #[test]
 fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
-    // Everything above the transport is the same code: HOP and STOP are
-    // ordinary streams on an established connection to the relay, and the
-    // circuit rides that connection. A device with no operating system has
-    // only TCP, so if relaying were QUIC-shaped anywhere above the dial, it
-    // would be out of reach of every one of them.
     let relay = relay_support::RelayServer::spawn_tcp();
     let relay_addr = relay.addr().clone();
     assert!(
@@ -535,10 +523,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             .is_circuit()
     );
 
-    // The responder advertises the reservation as a circuit through a TCP
-    // relay, and it crossed the wire in identify -- the address shape that
-    // was rejected outright before this stage, on the leg that was the whole
-    // reason for rejecting it.
     let advertised: Vec<_> = initiator
         .peer_info(&responder_peer)
         .expect("identify completed over the circuit")
@@ -554,9 +538,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         "expected a circuit through a TCP relay, got {advertised:?}"
     );
 
-    // Ping over the circuit, because identify and ping are what the default
-    // swarm runs on every connection: if the stack above the dial were not
-    // shared, this is where it would show.
     initiator
         .ping(&responder_peer)
         .expect("ping over a circuit on a TCP relay");
@@ -577,8 +558,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         relay.assert_healthy();
     }
 
-    // And it carries application traffic, which is the only thing that
-    // proves the whole stack negotiated over it rather than merely opened.
     let stream = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream over circuit");
@@ -640,10 +619,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     }
     assert_eq!(echoed.as_deref(), Some(payload.as_slice()));
 
-    // A circuit is only as alive as the connection carrying it, and on a TCP
-    // relay that connection is a TCP one. Cutting it has to close the circuit
-    // on both sides rather than leave either holding a connection to a peer
-    // it can no longer reach.
     relay.cut_all();
     let close_deadline = Instant::now() + Duration::from_secs(5);
     let mut initiator_closed = false;
@@ -682,9 +657,6 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     let relay = relay_support::RelayServer::spawn();
     let relay_addr = relay.addr().clone();
 
-    // A `force_relay` holder never starts DCUtR on its inbound circuits,
-    // and so does not advertise it; registering the id by hand makes it a
-    // remote that offers DCUtR yet never starts a round.
     let mut responder = Endpoint::builder()
         .protocol("/libp2p/dcutr")
         .relay(relay_addr.clone())
@@ -719,7 +691,6 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
         .connect(responder_peer)
         .expect("start relayed connect");
 
-    // The 30 s connect deadline is far off; the start timeout settles it.
     let deadline = started + Duration::from_secs(10);
     let mut relayed_at = None;
     let (outcome, settled_at) = loop {
@@ -753,8 +724,6 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
         other => panic!("expected Connected on the circuit, got {other:?}"),
     }
     let relayed_at = relayed_at.expect("the Relayed path was reported first");
-    // The budget starts when the path becomes usable, a little before the
-    // test sees `PathEstablished`; allow for that and millisecond rounding.
     assert!(
         settled_at - relayed_at >= Duration::from_millis(start_timeout_ms - 100),
         "the attempt waited for the remote to start DCUtR"
@@ -771,7 +740,6 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
 fn a_real_dcutr_punch_settles_the_connect_as_punched() {
     let relay = relay_support::RelayServer::spawn();
     let relay_addr = relay.addr().clone();
-    // Loopback is not global unicast: both sides must opt in to punch it.
     let punch_config = |reservation_policy| NatConfig {
         reservation_policy,
         allow_private_punch_targets: true,
@@ -797,8 +765,6 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
         .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
-    // No candidates: the circuit is the only way in, so a direct connection
-    // can only come from the punch.
     let connect_id = initiator
         .connect(responder_peer)
         .expect("start relayed connect");
@@ -854,7 +820,6 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
     assert_eq!(path, Path::Punched, "{trace:#?}");
     assert_eq!(Some(conn_id), punched, "settled on the punched connection");
     assert_eq!(initiator.path(&responder_peer), Some(Path::Punched));
-    // The replacement itself says the relay was left for the punch.
     let relayed = Path::Relayed {
         relay: *relay.addr().peer_id(),
     };

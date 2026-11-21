@@ -126,7 +126,6 @@ test("connects, pings, waits for Identify and echoes a stream with FIN and a res
     expect(result.protocols).toContain(ECHO);
     expect(result.rtt).toBeGreaterThanOrEqual(0);
     expect(result.echoed).toBe("hello over webtransport");
-    // A reset stream takes no more writes.
     expect(result.afterReset).not.toBe("accepted");
   } finally {
     await native.node.close();
@@ -147,8 +146,6 @@ test("a large transfer round-trips under backpressure", async ({ page }) => {
         window.node = node;
         const path = await node.connect(address, timeout);
         const stream = await node.openStream(path.peerId, protocol, timeout);
-        // Well past every window on the way: the JS in-flight cap, the
-        // client's send caps and both receive windows.
         const size = 8 * 1024 * 1024;
         const payload = Uint8Array.from({ length: size }, (_, i) => i % 251);
         const writing = (async () => {
@@ -184,7 +181,6 @@ test("closes are orderly both ways", async ({ browserName, page }) => {
   const native = nativePeer();
   try {
     await openPage(page);
-    // The browser closes: the native side sees a clean remote close.
     await page.evaluate(
       async ({ address, timeout }) => {
         const { Minip2p, generateSecretKey: key } = window.web;
@@ -198,7 +194,6 @@ test("closes are orderly both ways", async ({ browserName, page }) => {
       .poll(() => native.closes)
       .toEqual([{ code: 0n, kind: "remote" }]);
 
-    // The native side closes: the browser's `closed` fulfils with code 0.
     const browserPeer = await page.evaluate(
       async ({ address, timeout }) => {
         const { Minip2p, generateSecretKey: key } = window.web;
@@ -217,13 +212,6 @@ test("closes are orderly both ways", async ({ browserName, page }) => {
       { address: native.address, timeout: TIMEOUT }
     );
     native.node.disconnect(browserPeer);
-    // Chromium sometimes rejects `closed` with "Connection lost" anyway, so
-    // the SDK reports an error: when the CONNECT stream completes before
-    // Chrome reports the session closed, its network service sends
-    // `OnClosed` without the required `final_stats` and the renderer drops
-    // the message (seen in Chrome 156 and current Chromium). The server's
-    // side of that orderly close is covered by
-    // `a_server_close_keeps_quic_open_for_the_closing_phase`.
     const chromeLostReason = (reason: string) =>
       browserName === "chromium" &&
       reason.startsWith("error: ") &&
@@ -278,7 +266,6 @@ test("reconnects to a restarted native node at the same certhash address", async
   }
   await page.waitForFunction(() => window.node?.connectedPeers().length === 0);
 
-  // Certificates derive from the key and period, so the address is unchanged.
   const second = nativePeer({ port, secretKey });
   try {
     expect(second.address).toBe(first.address);
@@ -338,7 +325,6 @@ async function startRelay(): Promise<{
     const address = /^\[relay\] webtransport=(?<address>.+)$/u.exec(line)
       ?.groups?.address;
     if (address !== undefined && quic !== undefined) {
-      // Keep draining its log so the relay never blocks on a full pipe.
       child.stdout.resume();
       return { address, process: child, quic };
     }
@@ -466,8 +452,6 @@ test("a browser reserves on the relay and another browser echoes through its cir
 
 test("a native peer dials a browser through its circuit", async ({ page }) => {
   const relay = await startRelay();
-  // Default config: the browser offers no DCUtR, so the native connect
-  // settles Relayed once Identify arrives, not at DCUtR's start timeout.
   const native = NativeNode.create({
     protocols: [ECHO],
     relays: [relay.quic],
@@ -479,7 +463,6 @@ test("a native peer dials a browser through its circuit", async ({ page }) => {
     const started = Date.now();
     const connected = await native.connect(holder, TIMEOUT);
     expect(connected.path.kind).toBe("relayed");
-    // Well inside DCUtR's 10 s start timeout.
     expect(Date.now() - started).toBeLessThan(5000);
     const stream = await native.openStream(holder, ECHO, TIMEOUT);
     await stream.write("native to browser");
@@ -513,7 +496,6 @@ test("with relays, a browser dials a native WebTransport address directly and fa
     const direct = await connectAndEcho(page, native.address, [relay.address]);
     expect(direct).toEqual({ echoed: "echo me", path: "direct" });
 
-    // The same peer at a port nothing serves: only the relay leg can land.
     const unreachable = native.address.replace(
       /\/udp\/\d+\//u,
       `/udp/${await deadUdpPort()}/`

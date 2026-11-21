@@ -321,8 +321,6 @@ fn setup_pair_with_yamux_config(
             remote_write_closed: false,
         })
         .expect("responder adoption");
-    // Circuit IDs are endpoint-local; synchronized test counters let the
-    // pair helpers refer to both deterministic IDs with one value.
     assert_eq!(a_id, b_id);
     assert!(CircuitTransport::<InMemoryTransport, CounterEntropy>::is_circuit(a_id));
     let incoming = b.poll(Now::from_millis(0)).expect("responder incoming");
@@ -388,8 +386,6 @@ fn setup_close_observed_pair() -> CloseObservedPair {
             remote_write_closed: false,
         })
         .expect("responder adoption");
-    // Circuit IDs are endpoint-local; synchronized test counters let the
-    // pair helpers refer to both deterministic IDs with one value.
     assert_eq!(a_id, b_id);
     assert!(matches!(
         b.poll(Now::from_millis(0)).expect("responder incoming").as_slice(),
@@ -516,7 +512,6 @@ fn an_unanswered_keepalive_closes_the_circuit_as_timed_out() {
     let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
     complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
 
-    // The ping goes out; the next poll dates its hand-off.
     a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
         .expect("ping");
     a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
@@ -524,7 +519,6 @@ fn an_unanswered_keepalive_closes_the_circuit_as_timed_out() {
     let answer_by = KEEPALIVE_INTERVAL_MS + KEEPALIVE_ACK_TIMEOUT_MS;
     assert_eq!(a.next_deadline(), Some(Deadline::from_millis(answer_by)));
 
-    // `b` never reads the bridge, so no acknowledgement comes back.
     let events = a.poll(Now::from_millis(answer_by)).expect("time out");
     assert!(
         events.contains(&TransportEvent::Closed {
@@ -760,8 +754,6 @@ fn wrapper_transport_contract_rejects_unknown_connection_and_stream_ids() {
         })
     );
 
-    // An id congruent to a live substream modulo 2^32 must be rejected
-    // rather than truncated onto it, on a live circuit too.
     let live = a.open_stream(circuit_id).expect("open a live substream");
     let aliased = StreamId::new(live.as_u64() + (1u64 << 32));
     for result in [
@@ -873,7 +865,6 @@ fn an_unsent_prefix_reaches_the_peer_before_the_circuit_handshake() {
     let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
     let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
     let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
-    // The relay message tail the swarm held when the bridge was Full.
     let prefix = Bytes::from_static(b"held STATUS tail");
     let circuit_id = a
         .adopt_bridge(BridgeAdoption {
@@ -1008,9 +999,6 @@ fn adoption_processes_pipelined_selection_and_noise_message() {
         .expect("real initiator adoption");
     assert_eq!(a_id, circuit_id);
 
-    // The responder already consumed the scripted copy of the dialer's
-    // selection and msg1, so discard the identical selection emitted by
-    // the real initiator before letting it consume the responder reply.
     let duplicate_selection = b
         .inner_mut()
         .poll(Now::from_millis(0))
@@ -1024,10 +1012,6 @@ fn adoption_processes_pipelined_selection_and_noise_message() {
         .poll(Now::from_millis(0))
         .expect("initiator consumes pipelined response");
 
-    // Receiving the real selection reply emits the duplicate Noise msg1
-    // before msg3 and the encrypted Yamux selection (the proposal already
-    // went out with the header). Drop that first data event, then route
-    // the remaining bridge events through the wrapper.
     let mut real_followup = b
         .inner_mut()
         .poll(Now::from_millis(0))
@@ -1048,9 +1032,6 @@ fn adoption_processes_pipelined_selection_and_noise_message() {
 fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     let (mut a, mut b, circuit_id, bridge, _a_peer, _b_peer) = setup_pair();
 
-    // Stop immediately after B reaches Ready. Its encrypted Yamux
-    // selection confirmation is now queued for A, which has authenticated
-    // B but not yet consumed that ciphertext, so it is still selecting.
     for _ in 0..32 {
         let _ = a
             .poll(Now::from_millis(0))
@@ -1065,11 +1046,6 @@ fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     assert!(selecting_yamux(&a, circuit_id));
     assert!(established(&b, circuit_id));
 
-    // Queue a Yamux SYN behind the already-encrypted selection reply,
-    // then combine both Noise transport frames into one bridge read.
-    // Noise decrypts them as two plaintexts in one output batch: the
-    // first transitions A to Ready and the second must be routed through
-    // that newly-created Ready state.
     let opened = b.open_stream(circuit_id).expect("open responder stream");
     let raw = a
         .inner_mut()
@@ -1328,9 +1304,6 @@ fn ready_close_sends_go_away_then_bridge_fin_without_reset() {
     let peer_events = b
         .poll(Now::from_millis(0))
         .expect("peer observes data then GoAway");
-    // The remote GoAway tears the substreams down the same way the local
-    // close does: a `StreamClosed` each, then `Closed`. Both ends of a
-    // graceful shutdown see the same sequence.
     assert!(
         matches!(
             peer_events.as_slice(),
@@ -1435,16 +1408,12 @@ fn a_dead_bridge_closes_the_circuit_without_an_error_event() {
     let stream = a.open_stream(circuit_id).expect("open stream");
     let _ = a.poll(Now::from_millis(0)).expect("drain local events");
 
-    // The relay connection dies between polls, so flushing what the
-    // session queued fails and ends the circuit: the send says so, which
-    // keeps the swarm from reporting the failure a second time.
     a.inner_mut().fail_send = true;
     assert!(matches!(
         a.send_stream(circuit_id, stream, Bytes::from_static(b"lost")),
         Err(TransportError::ConnectionClosed { id, .. }) if id == circuit_id
     ));
 
-    // One `Closed`, the failure its reason; no separate `Error`.
     assert!(matches!(
         a.poll(Now::from_millis(0)).expect("teardown events").as_slice(),
         [TransportEvent::Closed {
@@ -1492,9 +1461,6 @@ fn close_before_ready_resets_bridge_and_is_terminal() {
 
 #[test]
 fn a_circuit_holds_its_slot_until_its_delivered_bytes_settle() {
-    // ADR 0012 (#356): a circuit that ends -- here because its relay
-    // connection did -- keeps its circuit slot while the bytes it
-    // delivered wait to be acknowledged or abandoned.
     let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
     complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
     let held = a.open_stream(circuit_id).expect("open");
@@ -1607,8 +1573,6 @@ fn yamux_backpressure_is_stream_scoped_and_session_survives() {
     let _ = a.poll(Now::from_millis(0)).expect("local open");
     let _ = b.poll(Now::from_millis(0)).expect("remote open");
 
-    // A send beyond the stream cap is Full with the exact unsent tail;
-    // the circuit stays up.
     let payload = Bytes::from(vec![7u8; 4 * max_buffered_send]);
     let Err(TransportError::Full {
         id,
@@ -1621,7 +1585,6 @@ fn yamux_backpressure_is_stream_scoped_and_session_survives() {
     assert_eq!((id, stream_id), (circuit_id, initiator_stream));
     assert_eq!(unsent, payload.slice(max_buffered_send..));
 
-    // Flushing the accepted prefix makes the stream writable again.
     let events = a.poll(Now::from_millis(0)).expect("flush accepted prefix");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1665,15 +1628,12 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
     let stream = a.open_stream(circuit_id).expect("stream");
     let window = YamuxConfig::default().receive_window as usize;
-    // More than the window and the stream's send cap together, so the
-    // sender is left holding a tail.
     let payload = Bytes::from(vec![7u8; 4 * window]);
     let mut held = a
         .send_stream(circuit_id, stream, payload.clone())
         .err()
         .and_then(TransportError::into_unsent);
 
-    // Drives both ends; `b` acknowledges only while `ack` says so.
     let drive = |a: &mut CircuitTransport<_, _>,
                  b: &mut CircuitTransport<InMemoryTransport, _>,
                  held: &mut Option<Bytes>,
@@ -1815,7 +1775,6 @@ fn direct_connection_wins_before_and_during_circuit_handshake() {
     let events = a
         .poll(Now::from_millis(0))
         .expect("direct connection arrives");
-    // Losing to the direct connection is our own decision.
     assert!(events.contains(&TransportEvent::Closed {
         id: circuit_id,
         reason: ConnectionCloseReason::Local,
@@ -1844,17 +1803,10 @@ fn a_circuit_completing_after_a_direct_connection_never_reports_connected() {
     assert!(selecting_yamux(&a, circuit_id));
     assert!(established(&b, circuit_id));
 
-    // Register the direct connection without `record_direct`'s sweep of
-    // still-negotiating circuits. That sweep normally kills the loser
-    // first; arbitrating again when the session reports `Established` is
-    // the backstop that keeps the invariant — no established circuit to a
-    // peer that already has a direct connection — from resting on it.
     let direct = ConnectionId::new(2);
     a.direct_by_conn.insert(direct, b_peer);
     a.direct_by_peer.entry(b_peer).or_default().insert(direct);
 
-    // B's encrypted Yamux confirmation is already queued, so this poll is
-    // what carries the circuit into Ready.
     let events = a.poll(Now::from_millis(0)).expect("complete the upgrade");
     assert_eq!(
         events,
@@ -1886,10 +1838,6 @@ fn adoption_failures_leave_bridge_and_identifier_ownership_with_caller() {
         unsent_prefix: Bytes::new(),
         remote_write_closed: false,
     };
-    // Adoption peeks the next id up front but must only consume it after
-    // every fallible step, so a failure leaves the id space untouched. A
-    // peek/allocate ordering regression would silently burn a sequence
-    // number per failed adoption, which only this assertion catches.
     let unconsumed = transport
         .circuit_id_allocator
         .peek()
@@ -1934,8 +1882,6 @@ fn wrapped_high_bit_ids_are_rejected_without_becoming_circuits() {
     let _ = transport
         .poll(Now::from_millis(0))
         .expect("initial direct event");
-    // InMemoryTransport::dial is intentionally stubbed, so this fixture
-    // covers polled collisions; dial-return collisions need a dial fake.
     let collision =
         ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 77).expect("circuit id in range");
     transport

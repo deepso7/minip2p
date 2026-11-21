@@ -74,8 +74,6 @@ pub fn spawn_sink<M: Send + 'static>(
                 count += data.len() as u64;
                 let total = total.load(Ordering::Acquire);
                 assert!(count <= total, "sink received more than the transfer");
-                // Publish before reporting the end, so the client's reset for
-                // the next transfer cannot be overwritten by this one's count.
                 shared.store(count, Ordering::Release);
                 if count == total {
                     done_tx.send(mark()).expect("report transfer end");
@@ -134,7 +132,6 @@ pub fn transfer<M>(
     }
 
     let chunk = Bytes::from(vec![0x5a; CHUNK]);
-    // Per stream: bytes accepted, and the unsent tail of a Full write.
     let mut streams: Vec<(u64, Option<Bytes>)> = vec![(0, None); pending.len()];
     let start = mark();
     let started = Instant::now();
@@ -147,8 +144,6 @@ pub fn transfer<M>(
             started.elapsed() < TRANSFER_TIMEOUT,
             "transfer timed out at {sent} bytes"
         );
-        // Round-robin, a chunk per stream per turn, until every stream is
-        // done or Full, or the sender is too far ahead.
         let mut progressed = true;
         while progressed {
             progressed = false;
@@ -164,10 +159,6 @@ pub fn transfer<M>(
                 progressed |= !full;
             }
         }
-        // Flushes queued bytes. The sink's progress interrupts this wait,
-        // which returns so the window refills at once (`next_event` would
-        // swallow the interrupt and sleep out the deadline). The sender has
-        // no use for the outcome or any event.
         let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     };
     for stream in pending {

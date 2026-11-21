@@ -289,7 +289,6 @@ impl NoiseSession {
     fn begin_handshake(&mut self) -> Result<(), NoiseError> {
         match core::mem::replace(&mut self.state, State::Failed) {
             State::Idle(mut handshake) => {
-                // A start error is terminal, so the session stays `Failed`.
                 let outbound = handshake.start()?;
                 self.state = State::Handshaking(handshake);
                 if let Some(message) = outbound {
@@ -326,7 +325,6 @@ impl NoiseSession {
                         self.complete_handshake(result);
                     }
                 }
-                // Both are refused before any frame is decoded.
                 State::Idle(_) | State::Failed => return Err(NoiseError::Failed),
             }
         }
@@ -349,7 +347,6 @@ impl NoiseSession {
     /// Frames and encrypts `plaintext` in `MAX_TRANSPORT_PLAINTEXT` segments.
     /// Each segment is copied once into its outbound frame and encrypted there.
     fn encrypt_frames(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
-        // An empty write still emits one tag-only frame.
         let empty = plaintext.is_empty().then_some(&[][..]);
         for segment in plaintext.chunks(MAX_TRANSPORT_PLAINTEXT).chain(empty) {
             let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + segment.len() + cipher::TAG_LEN);
@@ -707,7 +704,6 @@ mod tests {
                 else {
                     panic!("expected outbound data");
                 };
-                // A plaintext that fits one frame is sealed in the given buffer.
                 if first && len <= MAX_TRANSPORT_PLAINTEXT {
                     assert_eq!(sealed.as_ptr(), buffer);
                 }

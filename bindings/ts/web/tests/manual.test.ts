@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 
 import { afterEach, expect, test, vi } from "vitest";
 
-// The real wasm module (`pnpm wasm:build`), instantiated in Node.
 const wasmBytes = async (): Promise<Uint8Array<ArrayBuffer>> =>
   new Uint8Array(
     await readFile(new URL("../wasm/minip2p_web_bg.wasm", import.meta.url))
@@ -23,7 +22,6 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
   const secretKey = new Uint8Array(32).fill(1);
   expect(() => web.Minip2p.create({ secretKey })).toThrow(/initMinip2p/u);
 
-  // The default `.wasm` URL 404s; a host-supplied module still loads.
   await expect(web.initMinip2p()).rejects.toThrow();
   expect(fetch).toHaveBeenCalledTimes(1);
   await web.initMinip2p({ wasm: await wasmBytes() });
@@ -38,7 +36,6 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
     reason: "close",
   });
 
-  // The browser limits come back as typed SDK errors.
   expect(() =>
     web.Minip2p.create({ listen: ["/ip4/0.0.0.0/udp/0/quic-v1"], secretKey })
   ).toThrow(web.InvalidConfigError);
@@ -60,7 +57,6 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
     message: expect.stringMatching(/omit limits/u),
   });
 
-  // Protocol deadlines do apply in the browser; zero is refused by name.
   await web.Minip2p.create({
     secretKey,
     timeouts: { identifyMs: 20_000 },

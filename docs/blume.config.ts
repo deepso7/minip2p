@@ -2,8 +2,6 @@ import { defineConfig } from "blume";
 import { cloudflare } from "blume/deploy";
 import { filesystem, githubReleases } from "blume/sources";
 
-// Brand colours, matching the tokens in theme.css: warm paper and neutral
-// ink, with the orange accent printed darker on paper and lit amber on ink.
 const brand = {
   amber: "oklch(0.770 0.135 60)",
   ink: "oklch(0.160 0.004 80)",
@@ -42,7 +40,6 @@ export default defineConfig({
       { label: "Changelog", path: "/changelog" },
     ],
   },
-  // The docs lived at the site root until the landing page took it over.
   redirects: [
     { from: "/docs", to: "/docs/intro" },
     { from: "/intro", to: "/docs/intro" },

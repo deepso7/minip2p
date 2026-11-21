@@ -97,8 +97,6 @@ impl Harness {
             Self::UnifiedTesting => format!(
                 "latency:\n  handshake_plus_one_rtt: {handshake:.3}\n  ping_rtt: {ping:.3}\n  unit: ms"
             ),
-            // `pingRTTMilllis` carries three l's in the test-plans spec and in
-            // every implementation that follows it; the runner reads that key.
             Self::TestPlans => format!(
                 "{{\"handshakePlusOneRTTMillis\": {handshake:.3}, \"pingRTTMilllis\": {ping:.3}}}"
             ),
@@ -147,7 +145,6 @@ impl Config {
         let var = |name: &str| lookup(name).ok_or_else(|| format!("{name} is not set"));
         let transport = var(names.transport)?;
         if transport == "tcp" {
-            // Standalone transports (quic-v1) get neither setting.
             for (name, supported) in [(names.security, "noise"), (names.muxer, "yamux")] {
                 let value = var(name)?;
                 if value != supported {
@@ -164,8 +161,6 @@ impl Config {
         Ok(Self {
             is_dialer: var(names.is_dialer)? == "true",
             redis_addr: match harness {
-                // unified-testing always passes it; test-plans leaves it to
-                // the compose service name.
                 Harness::UnifiedTesting => var(names.redis_addr)?,
                 Harness::TestPlans => {
                     lookup(names.redis_addr).unwrap_or_else(|| "redis:6379".to_owned())
@@ -202,9 +197,6 @@ impl Config {
 fn listener(config: &Config) -> Result<()> {
     let mut node = Endpoint::builder().listen_on(config.bind_addr())?.bind()?;
     let addr = node.listen()?.to_string();
-    // A wildcard bind cannot be dialled: publish the interface that reaches
-    // Redis, which is the one the dialer shares a network with. An address the
-    // harness pinned with `ip` is already the right one.
     let addr = if config.listen_ip == "0.0.0.0" {
         let ip = UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| s.connect(&config.redis_addr).and(s.local_addr()))?
@@ -218,8 +210,6 @@ fn listener(config: &Config) -> Result<()> {
     let mut redis = Redis::connect(&config.redis_addr)?;
     redis.command(&["RPUSH", &config.redis_key, &addr])?;
 
-    // Ping and identify are answered inside the endpoint; just keep it
-    // driven until Docker stops the container.
     loop {
         if let EndpointWaitOutcome::Event(event) = node.wait(Duration::from_secs(1))? {
             config.log(format_args!("{event:?}"));
@@ -230,7 +220,6 @@ fn listener(config: &Config) -> Result<()> {
 fn dialer(config: &Config) -> Result<()> {
     let mut redis = Redis::connect(&config.redis_addr)?;
     let timeout = config.timeout.as_secs().to_string();
-    // BLPOP answers [key, value], or a null array on timeout.
     let reply = redis.command(&["BLPOP", &config.redis_key, &timeout])?;
     let addr = reply
         .get(1)
@@ -241,14 +230,9 @@ fn dialer(config: &Config) -> Result<()> {
 
     let mut node = Endpoint::builder().listen_on(config.bind_addr())?.bind()?;
 
-    // Timed like rust-libp2p's interop-tests: the clock starts before the
-    // dial and stops at the first ping result, so the two numbers compare.
     let deadline = Instant::now() + config.timeout;
     let handshake_start = Instant::now();
     let connect_id = node.connect(target)?;
-    // Set by the first ping result. The first ping also opens and negotiates
-    // the ping stream, so `ping_rtt` comes from a second ping on that stream:
-    // rust-libp2p's RTT likewise covers only the payload echo.
     let mut handshake_plus_one_rtt = None;
     let mut ping_start = Instant::now();
     loop {
@@ -258,7 +242,6 @@ fn dialer(config: &Config) -> Result<()> {
         let EndpointWaitOutcome::Event(event) = node.wait(deadline)? else {
             continue;
         };
-        // Sampled before logging so DEBUG output does not inflate the numbers.
         let now = Instant::now();
         config.log(format_args!("{event:?}"));
         match event {
@@ -277,8 +260,6 @@ fn dialer(config: &Config) -> Result<()> {
                     node.ping(&peer)?;
                     continue;
                 };
-                // `rtt_ms` is whole milliseconds; container RTTs are below
-                // that, so time the ping here for sub-ms precision.
                 let ping_rtt = now - ping_start;
                 println!(
                     "{}",
@@ -305,7 +286,6 @@ struct Redis {
 
 impl Redis {
     fn connect(addr: &str) -> Result<Self> {
-        // Redis is a global service, but it can still be starting up.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match TcpStream::connect(addr) {
@@ -360,7 +340,7 @@ impl Redis {
         if len < 0 {
             return Ok(None);
         }
-        let mut buf = vec![0; usize::try_from(len)? + 2]; // + CRLF
+        let mut buf = vec![0; usize::try_from(len)? + 2];
         std::io::Read::read_exact(&mut self.reader, &mut buf)?;
         buf.truncate(buf.len() - 2);
         Ok(Some(String::from_utf8(buf)?))
@@ -462,11 +442,9 @@ mod tests {
         let config = Config::parse(env(TEST_PLANS_TCP)).expect("parses");
         assert_eq!(config.harness, Harness::TestPlans);
         assert!(config.is_dialer);
-        // test-plans passes neither of these unless it overrides them.
         assert_eq!(config.redis_addr, "redis:6379");
         assert_eq!(config.listen_ip, "0.0.0.0");
         assert_eq!(config.timeout, DEFAULT_TEST_TIMEOUT);
-        // The key is fixed, not derived from a per-test id.
         assert_eq!(config.redis_key, "listenerAddr");
     }
 
@@ -505,7 +483,6 @@ mod tests {
             Harness::UnifiedTesting.result(handshake, ping),
             "latency:\n  handshake_plus_one_rtt: 2.618\n  ping_rtt: 0.136\n  unit: ms"
         );
-        // Three l's in `pingRTTMilllis` is the spec's spelling, not a typo here.
         assert_eq!(
             Harness::TestPlans.result(handshake, ping),
             "{\"handshakePlusOneRTTMillis\": 2.618, \"pingRTTMilllis\": 0.136}"

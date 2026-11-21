@@ -183,8 +183,6 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
         nat_config(relay_addr, ReservationPolicy::Never),
     );
 
-    // Collect the local swarm's batch until the relay is ready: the swarm
-    // state is then ahead of every event still buffered for NAT.
     let mut buffered = VecDeque::new();
     for ms in 0..64 {
         relay.poll(SwarmNow::from_millis(ms)).expect("drive relay");
@@ -195,22 +193,16 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
     }
     assert!(local.is_peer_ready(&relay_key.peer_id()));
 
-    // The host delivers the first buffered event, then a connect starts:
-    // the swarm reports the relay ready, so the HOP stream opens at once.
     let first = buffered.pop_front().expect("a buffered event");
     agent.handle_event(&mut local, &first, false, Now::from_millis(1));
     let id = minip2p_core::ConnectId::from_u64(1);
     let target = PeerId::from_public_key_protobuf(b"target");
     agent.connect(&mut local, id, target, RELAY_NOW, Now::from_millis(1));
 
-    // The rest of the batch, including the relay's PeerReady, follows the
-    // command; it must not start a second exchange.
     for event in buffered {
         agent.handle_event(&mut local, &event, false, Now::from_millis(2));
     }
 
-    // The swarm queued the open's StreamReady after the batch NAT already
-    // handled; the HOP CONNECT goes out once it is delivered.
     let mut relay_hop = None;
     let mut relay_hop_data = 0;
     let mut hop_streams = 0;
@@ -269,7 +261,6 @@ fn the_bare_swarm_resets_a_bridge_it_cannot_promote() {
     let (inner_conn, stream_id) = local
         .open_stream(&relay_peer, HOP_PROTOCOL_ID, 64)
         .expect("open the bridge stream");
-    // Both ends negotiate the bridge, as before a HOP CONNECT.
     let (mut local_ready, mut relay_stream) = (false, None);
     for ms in 64..128 {
         for event in local.poll(SwarmNow::from_millis(ms)).expect("drive local") {
@@ -301,8 +292,6 @@ fn the_bare_swarm_resets_a_bridge_it_cannot_promote() {
 
     assert!(matches!(refused, Err(PromoteError::Failed(_))));
 
-    // The refused bridge must not stay open for later bytes to reach the
-    // application as ordinary stream events.
     let mut closed = false;
     for ms in 128..192 {
         local.poll(SwarmNow::from_millis(ms)).expect("drive local");

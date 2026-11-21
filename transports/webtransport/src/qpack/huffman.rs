@@ -94,14 +94,13 @@ pub(crate) fn decode(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<()
             len = 0;
         }
     }
-    // RFC 7541 §5.2: padding is a prefix of EOS (all ones), at most 7 bits.
     if len > 7 || code != (1 << len) - 1 {
         return Err(Error::QpackDecompressionFailed);
     }
     Ok(())
 }
 
-// RFC 7541 Appendix B: (code aligned to the LSB, bit length) per symbol, EOS last.
+/// RFC 7541 Appendix B: (code aligned to the LSB, bit length) per symbol, EOS last.
 pub(crate) const HUFFMAN_CODES: [(u32, u8); 257] = [
     (0x1ff8, 13),
     (0x7fffd8, 23),
@@ -415,11 +414,8 @@ mod tests {
 
     #[test]
     fn rejects_eos_bad_padding_and_overruns() {
-        // The 30-bit EOS code, padded with ones.
         assert_eq!(decoded("ffffffff"), Err(Error::QpackDecompressionFailed));
-        // "0" (00000) padded with zeros instead of ones.
         assert_eq!(decoded("00"), Err(Error::QpackDecompressionFailed));
-        // A whole byte of padding.
         assert_eq!(decoded("6402ff"), Err(Error::QpackDecompressionFailed));
         let mut out = Vec::new();
         assert_eq!(

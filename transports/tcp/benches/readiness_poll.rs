@@ -13,8 +13,6 @@ use minip2p_transport::{Bytes, ConnectionId, SharedPoll, StreamId, Transport, Tr
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
 
-// The locked 512-connection provider sweeps need at least 1,027 open file
-// descriptors, and the transport sweeps, which hold both ends, about 1,040.
 const COUNTS: &[usize] = &[1, 64, 256, 512];
 const CONNECT_BATCH: usize = 32;
 /// Failure backstop for one measured delivery, so a regression reports which
@@ -28,11 +26,6 @@ fn setup_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(20))
 }
-
-// Every measured poll is driven as a std host drives it (ADR 0013): the
-// polled side is attached to a shared poll once setup is done, and each poll
-// follows a zero-timeout harvest. Unattached, a provider treats every open
-// socket as possibly ready and reads each one on every poll.
 
 struct ReadySet {
     provider: StdTcpProvider,
@@ -58,7 +51,6 @@ fn readiness_poll(c: &mut Criterion) {
     }
     group.finish();
 
-    // Many connections, one of them ready: the cost of finding it.
     let mut group = c.benchmark_group("tcp/readiness_poll_sparse");
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
@@ -75,7 +67,6 @@ fn readiness_poll(c: &mut Criterion) {
 
 /// Per-poll overhead of `TcpTransport` itself over many upgraded connections.
 fn transport_poll(c: &mut Criterion) {
-    // Nothing is ready: what a poll costs before it finds any work.
     let mut group = c.benchmark_group("tcp/transport_poll_idle");
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
@@ -90,7 +81,6 @@ fn transport_poll(c: &mut Criterion) {
     }
     group.finish();
 
-    // One connection carries a byte per iteration, rotating across them.
     let mut group = c.benchmark_group("tcp/transport_poll_sparse");
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
@@ -283,7 +273,6 @@ fn upgraded(count: usize) -> UpgradedSet {
     let mut incoming = 0;
     let mut streams = Vec::with_capacity(count);
     while connected != count || incoming != count || streams.len() != count {
-        // Batched, so the listen backlog never overflows.
         while dialed < count && dialed < connected + CONNECT_BATCH {
             client.dial(&target).expect("dial");
             dialed += 1;
@@ -311,7 +300,6 @@ fn upgraded(count: usize) -> UpgradedSet {
     }
     let mut client_readiness = attached(&mut client);
     let mut server_readiness = attached(&mut server);
-    // Settle both sides so the first measured poll starts idle.
     for _ in 0..4 {
         client_readiness
             .harvest(&mut client, Duration::ZERO)
@@ -357,7 +345,6 @@ fn deliver_one(pair: &mut UpgradedSet, index: usize) {
                     pair.client
                         .ack_stream(id, stream_id, data.len())
                         .expect("ack");
-                    // Lets the server take the window update back.
                     pair.server_readiness
                         .harvest(&mut pair.server, Duration::ZERO)
                         .expect("harvest readiness");

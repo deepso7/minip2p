@@ -649,9 +649,7 @@ impl WtSession {
         }
         self.out.remove(&raw);
         if let Some(connect) = self.connect.as_mut().filter(|c| c.id == raw) {
-            // Nothing acknowledges our reset: wait out the Closing deadline.
             connect.send = SendSide::Reset;
-            // A close capsule already received keeps its code.
             self.read_connect(conn);
             self.peer_closed(0);
         } else if let Some(noise) = self.noise.as_mut().filter(|n| n.id == raw) {
@@ -688,9 +686,6 @@ impl WtSession {
         self.control = Some(stream);
         let mut bytes = Vec::new();
         let mut settings = Settings::new();
-        // Draft-02 (Chrome, Firefox) and draft-13/14 (Safari) together, as
-        // webtransport-go sends them. No QPACK settings: the table stays
-        // static-only.
         settings
             .set(setting::ENABLE_CONNECT_PROTOCOL, 1)
             .set(setting::H3_DATAGRAM, 1)
@@ -754,8 +749,6 @@ impl WtSession {
                     Ok(written) => {
                         bytes.drain(..written);
                     }
-                    // Blocked waits for credit; a stopped or closed stream
-                    // takes nothing more.
                     Err(quinn_proto::WriteError::Blocked) => return true,
                     Err(_) => return false,
                 }
@@ -825,7 +818,6 @@ impl WtSession {
 
     fn read_uni(&mut self, conn: &mut Connection, raw: u64) {
         let (bytes, end) = read_available(conn, raw);
-        // Out of the map while it is read; put back unless it ended.
         let Some(mut state) = self.peer_uni.remove(&raw) else {
             return;
         };
@@ -859,7 +851,6 @@ impl WtSession {
                     );
                     return;
                 }
-                // Only a server may open a push stream (RFC 9114 §6.2.2).
                 UniStreamType::Push => {
                     self.fail(
                         code::H3_STREAM_CREATION_ERROR,
@@ -867,7 +858,6 @@ impl WtSession {
                     );
                     return;
                 }
-                // An id no request stream has, as on bidi streams.
                 UniStreamType::WebTransport { session_id } if !session_id.is_multiple_of(4) => {
                     self.fail(
                         code::H3_ID_ERROR,
@@ -875,8 +865,6 @@ impl WtSession {
                     );
                     return;
                 }
-                // Other WebTransport uni and unknown streams: refused, never
-                // fatal.
                 UniStreamType::WebTransport { .. } | UniStreamType::Unknown(_) => {
                     stop(conn, raw, code::H3_STREAM_CREATION_ERROR);
                     return;
@@ -885,13 +873,10 @@ impl WtSession {
         }
         let failure = match &mut state {
             PeerUni::Control(control) => self.read_control(conn, control, &mut input),
-            // The table capacity is 0, so every encoder instruction is
-            // illegal.
             PeerUni::QpackEncoder if !input.is_empty() => Some((
                 code::QPACK_ENCODER_STREAM_ERROR,
                 "QPACK encoder instruction with a zero table capacity".into(),
             )),
-            // Only Stream Cancellation is legal: we never insert.
             PeerUni::QpackDecoder(reader) => reader
                 .read(input)
                 .err()
@@ -931,8 +916,6 @@ impl WtSession {
                 Ok(frame) => frame,
                 Err(error) => return Some((error.code(), format!("control stream: {error}"))),
             };
-            // Checked by type, so a skipped unknown frame before SETTINGS
-            // fails too.
             if !*saw_settings
                 && frames
                     .first_frame_type()
@@ -947,8 +930,6 @@ impl WtSession {
                 None => return None,
                 Some(Frame::Settings(settings)) if !*saw_settings => {
                     *saw_settings = true;
-                    // Legality comes before any draft is chosen, so a bad
-                    // value fails even beside a valid offer.
                     let boolean = [
                         setting::ENABLE_WEBTRANSPORT,
                         setting::ENABLE_CONNECT_PROTOCOL,
@@ -976,8 +957,6 @@ impl WtSession {
                 Some(Frame::MaxPushId(_)) => {
                     return Some((code::H3_ID_ERROR, "a smaller MAX_PUSH_ID".into()));
                 }
-                // We never send PUSH_PROMISE, so no push id was ever
-                // promised (RFC 9114 §7.2.3).
                 Some(Frame::CancelPush(_)) => {
                     return Some((
                         code::H3_ID_ERROR,
@@ -1030,8 +1009,6 @@ impl WtSession {
                 }
                 Ok(None) | Err(ReadError::Reset(_)) => {
                     let _credit = chunks.finalize();
-                    // Ended before saying what it is: nothing to keep, and
-                    // our unused side is reset so the stream is freed.
                     self.heads.remove(&raw);
                     reset(conn, raw, code::H3_REQUEST_INCOMPLETE);
                     self.count_early(consumed);
@@ -1093,7 +1070,6 @@ impl WtSession {
             send: SendSide::Open,
         });
         if stopped.is_some() {
-            // Our side is reset: nothing to answer or finish.
             if let Some(connect) = self.connect.as_mut() {
                 connect.send = SendSide::Reset;
             }
@@ -1115,10 +1091,6 @@ impl WtSession {
         if matches!(self.phase, Phase::Closing { .. }) {
             return;
         }
-        // The highest draft both sides speak: 13/14 (Safari), else 02
-        // (Chrome, Firefox). Both need HTTP/3 datagrams, in SETTINGS and as
-        // the QUIC transport parameter (draft-14 §3.1, draft-02 §3.1);
-        // every browser sends both.
         let datagrams = settings.get(setting::H3_DATAGRAM) == Some(1)
             && conn.datagrams().max_size().is_some_and(|size| size > 0);
         let draft14 = datagrams
@@ -1137,10 +1109,6 @@ impl WtSession {
             Reply::Refused
         };
         self.draft14 = draft14 && status == "200";
-        // Draft-13/14 flow control is on once both sides ask for it, with
-        // more than one session or a nonzero initial limit (draft-14 §5.1);
-        // ours are 2^60, so only the client's limits ever bind, and an
-        // omitted one is 0.
         let limits = [
             setting::WT_INITIAL_MAX_DATA,
             setting::WT_INITIAL_MAX_STREAMS_BIDI,
@@ -1168,8 +1136,6 @@ impl WtSession {
             return;
         }
         if status != "200" {
-            // The refusal ends the stream and the session; the connection
-            // closes once the status is through.
             connect.send = SendSide::Finished;
             self.enter_closing();
             self.send(conn, id, bytes, true);
@@ -1180,7 +1146,6 @@ impl WtSession {
             self.send(conn, id, bytes, false);
             self.promote_held(conn);
         }
-        // What waited for the response, and the stream's end.
         self.read_connect(conn);
     }
 
@@ -1212,7 +1177,6 @@ impl WtSession {
                 break None;
             }
             match connect.frames.decode(&mut input) {
-                // Trailers end the message (RFC 9114 §4.1).
                 Ok(Some(Frame::Data(_) | Frame::Headers(_)))
                     if connect.peer == PeerSide::Trailers =>
                 {
@@ -1229,8 +1193,6 @@ impl WtSession {
                             }
                         }
                         Ok(Some(capsule)) => {
-                            // The connection's only session: its flow-control
-                            // error closes the connection.
                             if self
                                 .credit
                                 .as_mut()
@@ -1264,16 +1226,12 @@ impl WtSession {
                         }
                     }
                 }
-                // Control-stream frames.
                 Ok(Some(frame)) => break unexpected(&format!("{frame:?}")),
                 Ok(None) => break None,
                 Err(error) => break Some((error.code(), format!("CONNECT stream: {error}"))),
             }
         };
         if trailing {
-            // The reset is in flight, with no acknowledgement to wait
-            // for: the Closing phase's deadline lets it out, whatever an
-            // acknowledgement of our FIN read in the same poll says.
             connect.peer = PeerSide::Ended;
             connect.send = SendSide::Reset;
             let id = connect.id;
@@ -1286,8 +1244,6 @@ impl WtSession {
             connect.peer = PeerSide::Ended;
             closed_with.get_or_insert(0);
         }
-        // A FIN must fall between frames and between capsules; a reset may
-        // cut anywhere.
         if matches!(end, ReadEnd::Finished) && failure.is_none() {
             if !connect.frames.is_at_frame_boundary() {
                 failure = Some((
@@ -1306,7 +1262,6 @@ impl WtSession {
         } else if let Some(code) = closed_with {
             self.peer_closed(code);
         } else {
-            // New credit may release Noise replies.
             self.release_noise(conn);
         }
     }
@@ -1320,9 +1275,6 @@ impl WtSession {
         session_id: u64,
         stopped: Option<VarInt>,
     ) {
-        // A session id is a CONNECT stream's: client-initiated bidi, so a
-        // multiple of 4. Any other cannot name a session at all (draft-14
-        // §4), unlike a valid id that is not ours.
         if !session_id.is_multiple_of(4) {
             self.fail(
                 code::H3_ID_ERROR,
@@ -1353,7 +1305,6 @@ impl WtSession {
         if self.too_many_early_streams() {
             return;
         }
-        // What already sits behind the prefix.
         self.read_held(raw, conn);
         self.promote_held(conn);
     }
@@ -1467,7 +1418,6 @@ impl WtSession {
         let take = room.min(noise.pending.len());
         let bytes: Vec<u8> = noise.pending.drain(..take).collect();
         let fin = std::mem::take(&mut noise.fin);
-        // The FIN waits for the last byte.
         noise.fin = fin && !noise.pending.is_empty();
         let fin = fin && noise.pending.is_empty();
         let raw = noise.id;
@@ -1496,7 +1446,6 @@ impl WtSession {
             return;
         };
         let Some(session) = noise.session.as_mut() else {
-            // Done: whatever follows is ignored.
             return;
         };
         if !bytes.is_empty()
@@ -1562,7 +1511,6 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     let mut regular = false;
     for field in section.iter() {
         if !field.name.starts_with(b":") {
-            // Pseudo-headers come first, so `:authority` is known here.
             let [.., authority, _] = values;
             if !valid_regular_field(&field)
                 || (field.name == b"host" && authority != Some(field.value))

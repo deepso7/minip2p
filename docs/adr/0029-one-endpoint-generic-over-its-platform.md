@@ -19,3 +19,10 @@ The std `Endpoint` and `PortableEndpoint<T, E>` already ran one private engine, 
 - Each endpoint API is written and documented once; `StreamWriter` loses its `write_at`/`close_write_at`/`observe_at` twins and works on any `Endpoint<P>` through `write`/`close_write`/`observe`.
 - Portable builders take a clock, and the endpoint type gains a type parameter (`PortableEndpoint<T, E, C>`, `SmoltcpEndpoint<D, E, C>`). `Endpoint::portable(..)` is gone: an uninferable platform cannot hang a constructor on `Endpoint`, so `PortableEndpointBuilder::new` is the entry point, on `no_std` too.
 - The engine stays monomorphized once per platform, as before: the WASM build's size is unchanged by the move.
+
+## Amendments: implementation details
+
+- **Two final drives, because a smoltcp provider sends only when polled.** Both the portable `close` (`Endpoint::close_portable`) and `Drop for Endpoint<P>` drive twice: the first drive runs the swarm's deferred closes, the second puts them on the wire. `Drop` does this even with no peer left, since an application may have disconnected one and seen its close already; the events those polls produce have no reader and are dropped.
+- **After the drives, the portable close hands over what the swarm buffered without polling again** (`take_buffered_events`): a failed drive's leftovers, such as a disconnect's close failure, or what the final drive produced. Then it aborts every write still queued (ADR 0030).
+- **An mDNS shutdown failure during close is not returned separately:** it is already queued as an event.
+- **`Drop` cannot surface failures; transports own final cleanup.** It reuses the close's clock sample when a close ran (`closed_at`), so the teardown and the drop after it share one sample. With the relay mesh, the backbone swarm is shut down and polled once, best effort like the public swarm, so its closes are sent before its sockets go.

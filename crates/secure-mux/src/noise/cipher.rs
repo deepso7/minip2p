@@ -51,7 +51,6 @@ impl CipherState {
             .encrypt_inout_detached((&nonce).into(), ad, plaintext.into())
             .map_err(|_| NoiseError::Encryption)?;
         buffer.extend_from_slice(&tag);
-        // No ciphertext was emitted on error, so the nonce is safe to reuse on retry.
         self.nonce += 1;
         Ok(())
     }
@@ -76,7 +75,6 @@ impl CipherState {
         ChaCha20Poly1305::new((&key).into())
             .decrypt_in_place((&nonce).into(), ad, buffer)
             .map_err(|_| NoiseError::Decryption)?;
-        // Noise increments n only after a successful DECRYPT operation.
         self.nonce += 1;
         Ok(())
     }

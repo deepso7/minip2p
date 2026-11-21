@@ -60,7 +60,6 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>>
                     text = fs::read_to_string(path).map_err(|error| {
                         format!("cannot read config {}: {error}", path.display())
                     })?;
-                    // Checked now, so a bad file fails before sudo matters.
                     prepare_config(Source::File(&text), None)
                         .map_err(|error| format!("config {}: {error}", path.display()))?;
                     Source::File(&text)
@@ -125,9 +124,6 @@ fn prepare_config(source: Source<'_>, existing: Option<&str>) -> Result<Prepared
     };
     let text = fill_key_paths(text)?;
     let file = config::File::parse(&text)?;
-    // The CLI's default is an ephemeral key, and another path would bypass
-    // `--import-key`'s refusal to replace the service identity. The exact
-    // spelling matters: `Path` equality ignores a trailing slash, `open` does not.
     if file.key.as_deref().map(Path::as_os_str) != Some(OsStr::new(IDENTITY_PATH)) {
         return Err(format!(
             "key must be {IDENTITY_PATH:?}, the service identity; use --import-key to install another key there"
@@ -140,7 +136,6 @@ fn prepare_config(source: Source<'_>, existing: Option<&str>) -> Result<Prepared
             "[mesh] key must be {MESH_KEY_PATH:?}, the service's backbone key"
         ));
     }
-    // The unit runs from an unspecified directory.
     if let Some(webtransport) = &file.webtransport
         && [&webtransport.cert, &webtransport.key]
             .into_iter()
@@ -184,7 +179,6 @@ fn fill_key_paths(mut text: String) -> Result<String, String> {
         }
         text = filled;
     }
-    // Top-level keys precede every table, so the start is always the root.
     if file.key.is_none() {
         text.insert_str(0, &format!("key = \"{IDENTITY_PATH}\"\n"));
     }
@@ -275,7 +269,6 @@ fn install(source: Source<'_>, import_key: Option<&Path>) -> Result<(), Box<dyn 
             Err(error) => return Err(format!("cannot read {CONFIG_PATH}: {error}").into()),
         },
     };
-    // Built first, so a rejected config fails before anything is installed.
     let prepared = prepare_config(source, existing.as_deref())?;
     let unit = unit_file(Path::new(EXECUTABLE_PATH))?;
     let imported_identity = import_key.map(read_import_identity).transpose()?;
@@ -536,8 +529,10 @@ fn install_key(encoded: &[u8], destination: &Path) -> Result<(), Box<dyn Error>>
         run_status(CHOWN, [OsStr::new(SERVICE_USER), temporary.as_os_str()])?;
         publish_identity(&temporary, destination)
     })();
-    if result.is_err() && fs::remove_file(&temporary).is_err() {
-        // The primary write/install error remains more useful to callers.
+    if result.is_err() {
+        match fs::remove_file(&temporary) {
+            Ok(()) | Err(_) => {}
+        }
     }
     result
 }
@@ -567,7 +562,6 @@ fn write_atomically(
             options.mode(mode);
         }
         let mut file = options.open(&temporary)?;
-        // The umask may have narrowed the mode `open` applied.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -581,8 +575,10 @@ fn write_atomically(
         fs::rename(&temporary, path)?;
         Ok(())
     })();
-    if result.is_err() && fs::remove_file(&temporary).is_err() {
-        // The primary write error remains more useful to callers.
+    if result.is_err() {
+        match fs::remove_file(&temporary) {
+            Ok(()) | Err(_) => {}
+        }
     }
     result
 }
@@ -737,7 +733,6 @@ WantedBy=multi-user.target\n"
             prepared.text,
             "key = \"/var/lib/minip2p-relay/identity.key\"\nhostname = \"relay.example.com\"\n"
         );
-        // The same key file on every start keeps the peer ID.
         assert_eq!(
             prepared.options.key_path.as_deref(),
             Some(Path::new(IDENTITY_PATH))
@@ -808,7 +803,6 @@ WantedBy=multi-user.target\n"
         let mesh = prepared.options.mesh.unwrap();
         assert_eq!(mesh.key_path, Path::new(MESH_KEY_PATH));
         assert_eq!(mesh.members, [MEMBER.parse().unwrap()]);
-        // A header on the last line, without its newline.
         let prepared = prepare_config(Source::File("[mesh]"), None).unwrap();
         assert!(
             prepared

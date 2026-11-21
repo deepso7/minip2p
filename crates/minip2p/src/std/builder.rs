@@ -431,8 +431,6 @@ impl EndpointBuilder<StdBuilderState> {
         {
             return Err(EndpointOptionsError::WebTransportCertificateWithoutListener.into());
         }
-        // Checked here rather than in `relay_server_announce_addrs`, which
-        // may run before the certificate option.
         #[cfg(feature = "relay-server")]
         check_webtransport_announce(
             &self.state.relay_server_announce_addrs,
@@ -501,8 +499,6 @@ impl EndpointBuilder<StdBuilderState> {
         let mut capabilities = std::mem::take(&mut self.common.capabilities);
         #[cfg(feature = "relay-server")]
         if let Some(setup) = capabilities.relay_server.as_mut() {
-            // A mesh node's agent gets the public key and the proof it
-            // signed for this node's backbone identity.
             #[cfg(feature = "quic")]
             if let Some(mesh) = &self.state.relay_mesh {
                 let mut signed =
@@ -730,9 +726,6 @@ pub(super) fn bind_transports(
                     .with_webtransport_certificates(
                         options.state.webtransport_certificates.clone(),
                     );
-                // `listen_on` allows one socket per family, which is what the
-                // transport binds; its `quic-v1` and WebTransport shapes are
-                // grouped onto that socket there.
                 let addresses: Vec<Multiaddr> =
                     quic_addrs.iter().map(|&address| address.clone()).collect();
                 let transport = QuicTransport::bind(config, &addresses).map_err(BindError::Quic)?;
@@ -808,10 +801,6 @@ pub(super) fn bind_tcp_member(
     keypair: &Ed25519Keypair,
     tcp_addrs: &[&Multiaddr],
 ) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, BindError> {
-    // Checked before a socket exists: the namespace is what routes a connection
-    // id back to the transport that minted it, so a TCP transport tagged as
-    // something else hands out ids that name the wrong carrier -- and would
-    // take a claim a QUIC member needs.
     let namespace = options.state.tcp_config.namespace;
     if namespace != ConnectionNamespace::TCP_IPV4 && namespace != ConnectionNamespace::TCP_IPV6 {
         return Err(EndpointOptionsError::TcpNamespace { namespace }.into());
@@ -825,9 +814,6 @@ pub(super) fn bind_tcp_member(
     )
     .map_err(EndpointOptionsError::InvalidLimit)?;
     for addr in tcp_addrs {
-        // Bound here, like a QUIC socket is: `Endpoint::listen` then listens
-        // on what is already bound, and a caller that asked for port 0 learns
-        // which port it got before the first event.
         transport.listen(addr).map_err(BindError::Listen)?;
     }
     Ok(transport)
@@ -866,7 +852,6 @@ pub(super) fn build_endpoint(
             options.common.timeouts,
         )
     });
-    // Numbering the protocols can only fail on a full table.
     let (swarm, parts) =
         options
             .common
@@ -897,9 +882,6 @@ pub(super) fn build_endpoint(
         Some(config) => {
             let mut sockets =
                 minip2p_mdns::MdnsSockets::new(config).map_err(BindError::MdnsSocket)?;
-            // The sockets only wake the endpoint's wait; the next batch's
-            // mDNS tick reads them, and a refresh re-registers what it
-            // rebuilds.
             poll.attach_host_source(&mut sockets)
                 .map_err(|error| BindError::readiness_poll("attaching the mDNS sockets", &error))?;
             Some(sockets)

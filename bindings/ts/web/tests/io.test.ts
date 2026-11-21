@@ -257,7 +257,6 @@ describe("JsIo", () => {
     expect(io.write(stream, source.subarray(0, 1000))).toBe(1000);
     expect(io.write(stream, source)).toBe(MAX_IN_FLIGHT_BYTES - 1000);
     expect(io.write(stream, source)).toBe(0);
-    // The caller's buffer (wasm memory) changes; queued writes keep their bytes.
     source.fill(9);
     await flush();
 
@@ -316,7 +315,6 @@ describe("JsIo", () => {
   });
 
   test("a read side failing without a stream code ends as a reset", async () => {
-    // Firefox does this when the peer stops our sending as it closes.
     const { events, fake, io, stream } = await openedStream();
     io.grantRead(stream, 10);
 
@@ -352,8 +350,6 @@ describe("JsIo", () => {
     await flush();
     expect(events()).toEqual([{ kind: "fin", stream }]);
 
-    // The write still in flight is reported, then the close, then the
-    // stream is gone.
     fake.completeWrite();
     await flush();
 
@@ -374,7 +370,6 @@ describe("JsIo", () => {
     io.closeWrite(stream);
     await flush();
 
-    // Otherwise the FIN would stay pending with the session still open.
     expect(fake.closedWrite).toBe(false);
     expect(events()).toEqual([{ code: 0, kind: "stopSending", stream }]);
   });
@@ -383,7 +378,6 @@ describe("JsIo", () => {
     const { events, fake, io, stream } = await openedStream();
     fake.closeFailure = peerStreamError(7);
 
-    // Both `close()` and `writer.closed` reject with the coded error.
     io.closeWrite(stream);
     await flush();
 
@@ -391,7 +385,6 @@ describe("JsIo", () => {
   });
 
   test("a reset carries its code through Chrome's WebTransportError, and never throws into Rust", async () => {
-    // Chrome takes one init dictionary where the spec takes (message, options).
     class ChromeWebTransportError extends Error {
       readonly streamErrorCode: number;
 

@@ -4,7 +4,6 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    // HMAC accepts keys of every length.
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     for part in parts {
         mac.update(part);

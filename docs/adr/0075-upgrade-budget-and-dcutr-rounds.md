@@ -1,0 +1,10 @@
+# Upgrade budget and DCUtR round lifecycle
+
+`UpgradeBudget` bounds the DCUtR upgrade on a Relayed path, for an outbound `Attempt` and an `InboundCircuit` alike:
+
+- **At most one stage limit is armed.** Starting a round ends the start wait; `UpgradeBudget::due` reports the stage limit or the overall deadline, whichever ran out first, and that one names the `UpgradeStop`. The attempt's own deadline caps the whole upgrade, and with it a round's exchange.
+- **Input is checked against the budget before the tick.** Transport input can arrive before the tick that would expire a budget, so `on_dcutr_stream_opened` and the inbound stream path expire the exchange or the upgrade first, as that tick would have.
+- **A spent budget keeps the Relayed path.** It is checked before the punch window in `Attempt::on_tick`, so a window the budget cut short is not reported as a failed round. On the inbound side the whole upgrade ends before any late blast goes out.
+- **Rounds end cleanly.** Once SYNC is received only the punch window bounds the rest of the round (`end_exchange`). A stalled exchange while the upgrade still runs fails the round and starts the next at once. A round that fails or is superseded by the remote's next round aborts its leftover punch dials (`abort_attempt_dials`), so they cannot land as a late `Punched` path during the next round. A refused punch dial simply does not race; the window decides.
+- **Inbound rounds are counted when opened.** `open_round` opens on the current connection after checking it is the circuit; a round that then fails to open ends coordination, so counting it is harmless. With no round left, direct connections from the source are no longer attributed as this side's punches (`end_punches`). A remote close during an exchange is judged by whether the exchange completed.
+- **The relay's budget stays armed through the circuit handshake.** A circuit that never finishes its handshake is closed and treated like any other bridge failure; a peer already direct when promotion is attempted leaves the relay nothing to time out.

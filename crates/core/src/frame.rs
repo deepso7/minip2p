@@ -49,12 +49,9 @@ pub fn decode_frame(input: &[u8], max_len: usize) -> FrameDecode<'_> {
         Err(e) => return FrameDecode::Error(e),
     };
 
-    // Check the declared length as u64 BEFORE any usize conversion so the
-    // rejection is identical on 32-bit and 64-bit targets.
     if length > max_len as u64 {
         return FrameDecode::TooLarge { len: length };
     }
-    // Cannot truncate: `length <= max_len` holds here.
     let length = length as usize;
     let Some(total) = used.checked_add(length) else {
         return FrameDecode::Incomplete;
@@ -119,7 +116,6 @@ mod tests {
 
     #[test]
     fn golden_declared_len_above_max_too_large() {
-        // 8193 as a minimal uvarint; rejected from the header alone.
         assert!(matches!(
             decode_frame(&[0x81, 0x40], 8192),
             FrameDecode::TooLarge { len } if u128::from(len) == 8193

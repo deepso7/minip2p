@@ -53,8 +53,6 @@ impl EntropySource for CountingEntropy {
     }
 }
 
-// ---------------------------------------------------------------- the link
-
 type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
 
 /// Which frames of a direction the link swallows.
@@ -197,8 +195,6 @@ impl VirtualDevice {
         }
     }
 }
-
-// ------------------------------------------------------------- the nodes
 
 fn addr(text: &str) -> Multiaddr {
     text.parse().expect("test address parses")
@@ -360,15 +356,10 @@ fn stream_data(events: &[TransportEvent], stream: StreamId) -> Vec<u8> {
         .collect()
 }
 
-// -------------------------------------------------------------- the tests
-
 #[test]
 fn two_smoltcp_nodes_complete_the_libp2p_upgrade() {
     let pair = upgraded_pair(Wire::new());
 
-    // The whole point of the seam: this is the same transport, session, and
-    // handshake the hosted provider runs, over a stack that shares no code
-    // with an operating system.
     assert_eq!(connected(&pair.dialer_events), Some(&pair.listener_peer));
     assert_eq!(connected(&pair.listener_events), Some(&pair.dialer_peer));
 
@@ -393,8 +384,6 @@ fn two_smoltcp_nodes_complete_the_libp2p_upgrade() {
 fn the_connected_endpoint_names_the_address_the_segments_came_from() {
     let pair = upgraded_pair(Wire::new());
 
-    // smoltcp reports the peer of an established socket, and the provider
-    // turns that into an address rather than echoing what was dialled.
     let sources = pair.listener.active_inbound_connection_sources();
     assert_eq!(sources.len(), 1, "one inbound connection: {sources:?}");
     let source = sources[0].to_string();
@@ -454,8 +443,6 @@ fn a_payload_larger_than_one_segment_arrives_whole_and_in_order() {
         .open_stream(pair.connection)
         .expect("dialer opens a stream");
 
-    // Larger than the MTU and larger than a socket's transmit ring, so this
-    // has to survive segmentation, short writes, and the peer's window.
     let payload: Vec<u8> = (0..40_000u32).map(|index| index as u8).collect();
     pair.dialer
         .send_stream(pair.connection, stream, Bytes::from(payload.clone()))
@@ -476,9 +463,6 @@ fn a_payload_larger_than_one_segment_arrives_whole_and_in_order() {
 fn a_lost_segment_is_retransmitted_on_the_deadline_the_transport_reported() {
     let clean = upgraded_pair(Wire::new());
 
-    // The same handshake, with the dialer's first few frames swallowed. TCP
-    // recovers by retransmitting -- but only if something asks it to, and the
-    // only thing that can is the deadline the transport reports.
     let lossy = Wire::new();
     lossy.lose_from_dialer(0, 3);
     let dropped = upgraded_pair(lossy);
@@ -501,10 +485,6 @@ fn a_lost_segment_is_retransmitted_on_the_deadline_the_transport_reported() {
         dropped.elapsed,
         clean.elapsed
     );
-    // And it has to be the retransmit that recovered it, on a retransmit's
-    // timescale. Reaching the dial timeout would mean the connection was
-    // rebuilt from scratch rather than repaired, which is a different thing
-    // passing for the same result.
     assert!(
         dropped.elapsed < dial_timeout,
         "loss should cost retransmits, not a whole dial timeout: {}ms of {dial_timeout}ms",
@@ -541,7 +521,6 @@ fn closing_a_connection_ends_it_for_the_peer_too() {
                 .any(|event| matches!(event, TransportEvent::Closed { .. }))
         },
     );
-    // We closed it; the peer saw our orderly Yamux GoAway.
     assert!(
         pair.dialer_events.contains(&TransportEvent::Closed {
             id: pair.connection,
@@ -572,9 +551,6 @@ fn a_dial_nothing_answers_fails_once_the_connect_timeout_expires() {
         identity(1),
         10,
     );
-    // A peer that exists on the link but never speaks: its SYNs go nowhere,
-    // and smoltcp on its own would retransmit them for as long as the socket
-    // lives.
     let mut silent = node(
         wire.listener_device(),
         &format!("{LISTENER_IP4}/24"),
@@ -623,11 +599,6 @@ fn a_dial_nothing_answers_fails_once_the_connect_timeout_expires() {
         "a dial must not be abandoned before its timeout: gave up after {elapsed}ms"
     );
 }
-
-// ------------------------------------------------- straight at the provider
-//
-// Some of the seam is invisible from above: what an address is allowed to look
-// like, what a listener reports, and what a ceiling does when it is reached.
 
 mod provider {
     use super::*;
@@ -743,8 +714,6 @@ mod provider {
     #[test]
     fn an_address_with_anything_trailing_is_refused() {
         let mut provider = lone_provider(SmoltcpConfig::default());
-        // A `/p2p-circuit` suffix is somebody else's business; dialing it as if
-        // the suffix were not there would connect somewhere nobody asked for.
         let error = provider
             .connect(&addr(&format!("/ip4/{LISTENER_IP4}/tcp/4001/p2p-circuit")))
             .expect_err("a decorated address is not a bare dial target");
@@ -783,8 +752,6 @@ mod provider {
         provider
             .listen(&addr("/ip4/0.0.0.0/tcp/4001"))
             .expect("binds the wildcard");
-        // A wildcard really is reachable at both, so reporting only the one
-        // `listen` happened to name would hide half the ways in.
         let reported: Vec<String> = provider
             .local_addresses()
             .iter()
@@ -864,10 +831,6 @@ mod provider {
         });
         let mut provider = SmoltcpTcpProvider::new(device, iface, SmoltcpConfig::default());
 
-        // One port per address is two endpoints, not one taken twice: smoltcp
-        // matches a segment on the local address as well as the port. A host
-        // binding a fixed port on each family would otherwise be told the
-        // second one was in use.
         provider
             .listen(&addr("/ip4/192.168.1.1/tcp/4001"))
             .expect("the first address binds");
@@ -876,8 +839,6 @@ mod provider {
             .expect("the second address is a listener of its own");
         assert_eq!(provider.local_addresses().len(), 2);
 
-        // A wildcard answers for every address on its port, so that one really
-        // does collide with both.
         let error = provider
             .listen(&addr("/ip4/0.0.0.0/tcp/4001"))
             .expect_err("a wildcard overlaps what is already bound");
@@ -896,9 +857,6 @@ mod provider {
             .listen(&host_port(LISTENER_IP4, 4001))
             .expect("listener binds");
 
-        // Far more than one poll's worth, all of it already waiting: a poll
-        // that drained the link would be doing unbounded work with nothing on
-        // this host able to preempt it.
         let flood = 500;
         for _ in 0..flood {
             wire.dialer_out.borrow_mut().push_back(vec![0xff; 64]);
@@ -916,8 +874,6 @@ mod provider {
             "what did not fit is due now, or nothing would come back for it"
         );
 
-        // And it does drain: a budget that stranded packets would be worse
-        // than the flood.
         for step in 0..MAX_STEPS {
             if wire.dialer_out.borrow().is_empty() {
                 break;
@@ -935,8 +891,6 @@ mod provider {
     #[test]
     fn listening_on_an_address_the_interface_does_not_hold_is_refused() {
         let mut provider = lone_provider(SmoltcpConfig::default());
-        // smoltcp would take the endpoint and then never match a packet,
-        // leaving a listener that silently hears nothing.
         let error = provider
             .listen(&host_port(LISTENER_IP4, 4001))
             .expect_err("not this interface's address");
@@ -954,8 +908,6 @@ mod provider {
             .listen(&host_port(DIALER_IP4, 4001))
             .expect("the listener takes one socket");
 
-        // Two left, then the ceiling: a device that budgeted for three sockets
-        // gets three, not three plus however many dials it attempts.
         let target = host_port(LISTENER_IP4, 4001);
         provider.connect(&target).expect("first dial fits");
         provider.connect(&target).expect("second dial fits");
@@ -968,9 +920,6 @@ mod provider {
         let mut provider = lone_provider(SmoltcpConfig {
             max_sockets: 1,
             backlog: 1,
-            // Two ports and one socket, so the second dial reserves a port and
-            // then fails on the socket -- which is the only ordering in which a
-            // leaked port is observable.
             ephemeral_ports: 51000..=51001,
             ..SmoltcpConfig::default()
         });
@@ -990,8 +939,6 @@ mod provider {
     #[test]
     fn a_handshake_still_in_flight_does_not_hold_the_backlog() {
         let mut duo = Duo::with_config(SmoltcpConfig {
-            // One slot, so whether it is freed is the difference between a
-            // second connection and none.
             backlog: 1,
             ..SmoltcpConfig::default()
         });
@@ -1000,10 +947,6 @@ mod provider {
             .listen(&host_port(LISTENER_IP4, 0))
             .expect("listener binds");
 
-        // Swallow the dialer's acknowledgement, so the listener's socket is
-        // left half-open: past `Listen`, not yet established, and going nowhere
-        // until a retransmit. A backlog slot it still occupied would be a slot
-        // any peer could take out of service by walking away mid-handshake.
         duo.wire.lose_from_dialer(1, 1);
         duo.dialer.connect(&bound).expect("first dial starts");
         duo.drain();
@@ -1035,9 +978,6 @@ mod provider {
         duo.dialer.close_write(socket).expect("half-closes");
         duo.drain();
 
-        // `RemoteWriteClosed` promises no `Received` follows it. A provider
-        // that read end-of-stream off the socket's state rather than off its
-        // receive buffer would announce the end with bytes still in hand.
         let ended = duo
             .listener_events
             .iter()
@@ -1069,10 +1009,6 @@ mod provider {
             .expect("listener binds");
         duo.drain();
 
-        // The host had nothing to do for far longer than a dial is allowed to
-        // take, and then dialled -- without polling first, which nothing
-        // requires it to do. A countdown dated from the last poll's time sample
-        // would already have run out before this dial reached the wire.
         duo.now = 10
             * SmoltcpConfig::default()
                 .connect_timeout_ms
@@ -1103,10 +1039,6 @@ mod provider {
         duo.drain();
         duo.forget();
 
-        // A peer that sends a `SYN` and never acknowledges the reply. No handle
-        // was ever handed over for it, so the listener has nothing to say: not
-        // an `Accepted` for a connection that never existed, and not a `Closed`
-        // against a handle its caller has never seen.
         duo.wire.lose_from_dialer(1, 1);
         duo.dialer.connect(&bound).expect("dial starts");
         duo.drain();
@@ -1133,10 +1065,6 @@ mod provider {
             .listen(&host_port(LISTENER_IP4, 0))
             .expect("listener binds");
 
-        // Six peers that open a connection and walk away mid-handshake.
-        // smoltcp retransmits its `SYN-ACK` for as long as the socket exists,
-        // so a listener with no countdown of its own spends its entire socket
-        // budget on connections that will never be -- and never gets it back.
         for _ in 0..6 {
             duo.wire.lose_from_dialer(1, 1);
             duo.dialer.connect(&bound).expect("dial starts");
@@ -1160,8 +1088,6 @@ mod provider {
     #[test]
     fn a_retired_connection_gives_its_port_back() {
         let mut duo = Duo::with_config(SmoltcpConfig {
-            // One port, so a connection that failed to return it is the
-            // difference between dialing again and never dialing again.
             ephemeral_ports: 51000..=51000,
             ..SmoltcpConfig::default()
         });
@@ -1178,8 +1104,6 @@ mod provider {
     #[test]
     fn a_port_is_not_reused_while_time_wait_still_holds_it() {
         let mut duo = Duo::with_config(SmoltcpConfig {
-            // One port, so whether it is free is observable rather than
-            // statistical.
             ephemeral_ports: 51000..=51000,
             ..SmoltcpConfig::default()
         });
@@ -1193,16 +1117,11 @@ mod provider {
             })
             .expect("the listener's handle");
 
-        // Close from this end first, which is what leaves it in `TIME-WAIT`
-        // holding the four-tuple.
         duo.dialer.close_write(socket).expect("half-closes");
         duo.drain();
         duo.listener.close_write(peer).expect("peer half-closes");
         duo.drain();
 
-        // The connection is over as far as the caller is concerned, but the
-        // stack is still absorbing what the old one might retransmit. Handing
-        // its port to a fresh dial would put two connections on one tuple.
         let bound = duo.listener.local_addresses()[0].clone();
         let error = duo
             .dialer
@@ -1220,9 +1139,6 @@ mod provider {
             .expect("listener binds");
 
         let socket = duo.dialer.connect(&bound).expect("dial starts");
-        // The SYN is queued, not sent. A host that trusted the last poll's
-        // deadline here would sleep on a connection that has not left the
-        // building.
         assert_eq!(
             duo.dialer.next_deadline(),
             Some(Deadline::IMMEDIATE),
@@ -1262,8 +1178,6 @@ mod provider {
         duo.forget();
 
         duo.dialer.abort(socket);
-        // The reset is queued, not sent. A host asleep on the last poll's
-        // deadline would leave the peer holding a connection to nobody.
         assert_eq!(
             duo.dialer.next_deadline(),
             Some(Deadline::IMMEDIATE),
@@ -1276,8 +1190,6 @@ mod provider {
             "an aborted handle is owed nothing further, got {:?}",
             duo.dialer_events
         );
-        // The reset still has to reach the peer, or an abort is a leak on the
-        // other end rather than a teardown.
         let closed: Vec<&TcpEvent> = duo
             .listener_events
             .iter()
@@ -1290,8 +1202,6 @@ mod provider {
             duo.listener_events
         );
 
-        // And the peer's handle is spent with it. A provider that reported the
-        // end but kept the stream would hold its buffers for good.
         let peer_socket = duo
             .listener_events
             .iter()
@@ -1322,9 +1232,6 @@ mod provider {
             .expect("write");
         assert!(accepted < 64 * 1024, "the ring should refuse most of this");
 
-        // `Writable` is a hint rather than a requirement, but a provider that
-        // never offers it makes an idle host wait for a timer to discover what
-        // the peer already told it.
         duo.drain();
         assert!(
             duo.dialer_events.iter().any(
@@ -1338,9 +1245,6 @@ mod provider {
     #[test]
     fn a_dial_to_a_port_nobody_is_listening_on_fails_without_waiting() {
         let mut duo = Duo::new();
-        // The peer is there and answers -- with a reset, because nothing is
-        // bound. That is a failure the dialer learns at once, rather than the
-        // silence it would have to time out on.
         let socket = duo
             .dialer
             .connect(&host_port(LISTENER_IP4, 4001))
@@ -1359,7 +1263,6 @@ mod provider {
             })
             .unwrap_or_else(|| panic!("the dial should fail: {:?}", duo.dialer_events));
         assert_eq!(reason.as_deref(), Some("the connection attempt failed"));
-        // Nothing was ever established, so nothing else may be claimed for it.
         assert!(
             !duo.dialer_events
                 .iter()
@@ -1388,7 +1291,6 @@ mod provider {
             "the peer should see end-of-stream, once: {:?}",
             duo.listener_events
         );
-        // Half-close is not a teardown: the peer may still write back.
         assert!(
             !duo.listener_events
                 .iter()
@@ -1406,8 +1308,6 @@ mod provider {
         });
         let socket = duo.connect();
 
-        // Short writes are the provider contract's first promise, and a ring
-        // buffer is where they come from on this stack.
         let accepted = duo
             .dialer
             .send(socket, &vec![7u8; 64 * 1024])
@@ -1426,9 +1326,6 @@ mod provider {
             .listen(&host_port(LISTENER_IP4, 0))
             .expect("listener binds");
 
-        // Each accepted socket is taken out of the backlog, so a listener that
-        // did not refill it would serve exactly `backlog` connections and then
-        // go quiet.
         for round in 0..4 {
             duo.forget();
             duo.dialer.connect(&bound).expect("dial starts");
@@ -1449,15 +1346,11 @@ mod provider {
         let socket = duo.connect();
         duo.dialer.abort(socket);
 
-        // The handle is spent. Taking a write against it would strand bytes
-        // nobody can ever deliver.
         let error = duo
             .dialer
             .send(socket, b"gone")
             .expect_err("a spent handle takes nothing");
         assert!(error.to_string().contains("is not open"), "got {error}");
-        // Aborting it again is a no-op, because the caller's intent is already
-        // satisfied.
         duo.dialer.abort(socket);
     }
 }

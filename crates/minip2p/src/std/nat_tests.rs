@@ -68,8 +68,6 @@ fn negotiated_bridge() -> BridgePair {
     let local_addr = local.listen().expect("local listens");
     local.core_mut().dial(&relay_addr).expect("dial relay");
 
-    // A failure backstop only: under a loaded test run the loopback handshake
-    // can take seconds (see .config/nextest.toml).
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     let mut inner_conn = None;
     let mut relay_conn = None;
@@ -196,11 +194,6 @@ fn drain_nat_events(client: &mut Endpoint, nat_events: &mut Vec<NatEvent>) {
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 #[test]
 fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
-    // The timeout has to be long enough that a stall cannot expire the relay
-    // connection: the transport keeps a quiet connection alive at half of it,
-    // so one would have to exceed half of `IDLE_MS`. This test also runs alone
-    // (see `.config/nextest.toml`), since it drives both endpoints from one
-    // thread.
     const IDLE_MS: u64 = 1_500;
     const KEEPALIVE_MS: u64 = 300;
     /// Failure backstop for a keepalive that never lands, not a window.
@@ -235,15 +228,6 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
 
     let mut reservation_events = drive_until_reserved(&mut client, &mut relay, "QUIC");
 
-    // Drive until a ping round trip completes after the transport timeout
-    // would have expired an untouched connection. That ping proves the relay
-    // connection outlived the timeout, so the loop ends on it rather than on a
-    // fixed window.
-    //
-    // A ping is counted when it is read, not when it completed, so a stall
-    // across the mark could hand over one that finished before it. Crossing
-    // the mark therefore drains everything already queued first; only a round
-    // trip read after that can end the loop.
     let past_idle = Instant::now() + std::time::Duration::from_millis(IDLE_MS);
     let backstop = Instant::now() + BACKSTOP;
     let mut drained_at_mark = false;
@@ -273,9 +257,6 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         }
     }
 
-    // A loss can be queued behind the ping that ended the loop. Drain the
-    // client before judging rather than reading state the last poll never
-    // caught up with.
     drain_nat_events(&mut client, &mut reservation_events);
 
     assert!(client.active_reservation().is_some());
@@ -331,7 +312,6 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let begun = Instant::now();
     let lookup: super::dial::Lookup = std::sync::Arc::new(move |_: &str| {
-        // The test may have ended and dropped its receiver.
         match started_tx.send(begun.elapsed()) {
             Ok(()) | Err(_) => {}
         }
@@ -358,8 +338,6 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
     let wake = client.platform.poll.wake_handle();
     client.platform.resolver = super::dial::Resolver::with_lookup(move || wake.wake(), lookup);
 
-    // One long wait on an idle endpoint: without an early start, the
-    // lookup would begin only once the sleep ended at this deadline.
     let wait = std::time::Duration::from_millis(500);
     while begun.elapsed() < wait {
         if !matches!(
@@ -381,8 +359,6 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
 #[cfg(feature = "relay-server")]
 #[test]
 fn a_relay_configured_by_name_is_resolved_off_the_driver_and_reserved() {
-    // The transports refuse `/dns*`, so a relay dial reaches one only
-    // because the endpoint resolved the name first.
     let mut relay = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([86; 32]))
         .relay_server()
@@ -513,8 +489,6 @@ fn autonat_listen_addrs_are_seeded_by_bind() {
         .expect("quic listen address")
         .bind()
         .expect("bind endpoint");
-    // `bind` already accepts on the QUIC socket, so AutoNAT may offer it
-    // for dial-back without a separate `listen` call.
     endpoint
         .next_event(std::time::Duration::from_millis(10))
         .expect("drive endpoint");
@@ -564,7 +538,6 @@ fn confirmed_public_addresses_are_advertised_and_cleared() {
             new: ReachabilityState::Public,
             confirmed_addrs: vec![public.clone()],
         });
-    // One batch merges NAT's change; the next advertises it.
     endpoint.poll().expect("merge address contributions");
     endpoint.poll().expect("refresh identify addresses");
     assert!(endpoint.core().local_addresses().contains(&public));
@@ -579,7 +552,6 @@ fn confirmed_public_addresses_are_advertised_and_cleared() {
             new: ReachabilityState::Private,
             confirmed_addrs: Vec::new(),
         });
-    // One batch merges NAT's change; the next advertises it.
     endpoint.poll().expect("merge address contributions");
     endpoint.poll().expect("refresh identify addresses");
     assert!(!endpoint.core().local_addresses().contains(&public));
@@ -653,9 +625,6 @@ fn promotion_uses_handoff_connection_after_same_batch_relay_replacement() {
     let relay_peer = *pair.relay_addr.peer_id();
     let (mut driver, promotion) = promotion_driver(&pair, false);
 
-    // Replace the relay connection, but stop as soon as both public
-    // ConnectionReplaced events have been delivered. At this seam the core
-    // points at B while the transport close of A is still deferred.
     pair.relay
         .core_mut()
         .dial(&pair.local_addr)
@@ -741,8 +710,6 @@ fn driver_resets_failed_adoptions_but_not_unknown_connections() {
 
 #[test]
 fn driver_prunes_promotions_on_every_external_cleanup_path() {
-    // A remote bridge FIN is routed through the promoted transport even
-    // though the raw stream was forgotten by the swarm at adoption.
     let mut fin_pair = negotiated_bridge();
     let (mut fin, handoff) = promotion_driver(&fin_pair, false);
     promote(&mut fin, handoff, &mut fin_pair.local).expect("adopted");
@@ -756,7 +723,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         minip2p_core::platform::Now::from_millis(10),
     ));
 
-    // Exact bridge closure is terminal and removes the keyed adoption.
     let mut closed_pair = negotiated_bridge();
     let closed_key = (closed_pair.inner_conn, closed_pair.stream);
     let (mut closed, handoff) = promotion_driver(&closed_pair, false);
@@ -772,8 +738,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     ));
     assert!(!closed.promoted().contains_key(&closed_key));
 
-    // An inner relay connection that closes, or is replaced (its streams end
-    // with it), drops every circuit riding it.
     for replaced in [false, true] {
         let mut inner_pair = negotiated_bridge();
         let inner_key = (inner_pair.inner_conn, inner_pair.stream);
@@ -817,7 +781,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         );
     }
 
-    // A circuit lifecycle close also removes its reverse map entry.
     let mut circuit_pair = negotiated_bridge();
     let circuit_key = (circuit_pair.inner_conn, circuit_pair.stream);
     let (mut circuit, handoff) = promotion_driver(&circuit_pair, false);
@@ -834,8 +797,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     );
     assert!(!circuit.promoted().contains_key(&circuit_key));
 
-    // Reconciliation catches transport-side removal even if no lifecycle
-    // event passed through the driver.
     let mut swept_pair = negotiated_bridge();
     let swept_key = (swept_pair.inner_conn, swept_pair.stream);
     let (mut swept, handoff) = promotion_driver(&swept_pair, false);
@@ -847,7 +808,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         .transport_mut()
         .close(promoted)
         .expect("transport-side close");
-    // The batch's capability pass runs the bounded safety sweep.
     swept.tick(
         swept_pair.local.core_mut(),
         minip2p_core::platform::Now::from_millis(10),
@@ -869,8 +829,6 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         .reset_stream(pair.relay_conn, pair.stream)
         .expect("reset bridge at relay");
 
-    // The circuit never established, so its failure surfaces as a transport
-    // error naming it rather than as a ConnectionClosed.
     let deadline = Instant::now() + std::time::Duration::from_secs(2);
     let mut circuit_failed = false;
     while Instant::now() < deadline && !circuit_failed {
@@ -908,8 +866,6 @@ fn remote_bridge_reset_closes_promoted_circuit() {
             .circuit_ids()
             .contains(&promoted)
     );
-    // The circuit vanished without a lifecycle event the driver saw; the
-    // next batch's capability pass forgets its promotion.
     let now = pair.local.now();
     driver.tick(pair.local.core_mut(), now);
     assert!(!driver.promoted().contains_key(&key));
@@ -1031,9 +987,6 @@ fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
         relay.assert_healthy();
     }
 
-    // DCUtR off and no direct candidate: the leg's circuit settles the
-    // attempt the moment it is established, while the agent, never told,
-    // still holds it as the circuit it promoted.
     let mut initiator = Endpoint::builder()
         .relay(relay_addr)
         .nat_config(NatConfig {
@@ -1205,7 +1158,6 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
     drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
-    // `drive` consumed the NAT path event; the State snapshot keeps the truth.
     assert!(matches!(
         a.path(&b_peer),
         Some(Path::Relayed { relay: found_relay }) if &found_relay == relay.addr().peer_id()
@@ -1222,11 +1174,6 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         saw_message(&all[1], b"over relay")
     });
 
-    // A direct connection replaces the ready circuit. The public sequence is
-    // one ConnectionReplaced (never a close or a second establishment), and
-    // the pubsub driver must re-open and re-announce subscriptions.
-    // A raw swarm dial forces the direct replacement; `connect` would
-    // settle against the existing relayed connection.
     a.core_mut().dial(&b_addr).expect("manual direct upgrade");
     let upgrade_deadline = Instant::now() + Duration::from_secs(15);
     let mut a_sequence = Vec::new();
@@ -1257,8 +1204,6 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
                     old_path,
                     new_path,
                 } if peer_id == b_peer => {
-                    // The event itself tells the upgrade off the relay
-                    // apart from a lost link.
                     assert_eq!(
                         old_path,
                         Path::Relayed {
@@ -1334,7 +1279,6 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
         .bind()
         .expect("bind client");
 
-    // The server vouches for every address it is asked about, five times.
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
     let mut vouched = 0;
     let mut machines = std::collections::BTreeMap::new();
@@ -1386,7 +1330,6 @@ fn a_single_autonat_server_cannot_confirm_addresses() {
             _ => {}
         }
     }
-    // Let the client take in the last answer.
     for _ in 0..20 {
         if let Some(event) = client
             .next_event(std::time::Duration::from_millis(5))
@@ -1436,10 +1379,6 @@ fn relay_close_reports_the_reservations_it_ends() {
         .bind()
         .expect("bind client");
     drive_until_reserved(&mut client, &mut relay, "QUIC");
-    // Runs alone (see `.config/nextest.toml`): it asserts on what close()'s
-    // fixed drain collects.
-    // The relay may still hold the commit event; only the close's own
-    // reservation terminal matters here.
     while relay
         .next_event(std::time::Duration::ZERO)
         .expect("drain relay")

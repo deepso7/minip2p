@@ -707,11 +707,7 @@ impl ConnectEngine {
                 peer_id, old, new, ..
             } => {
                 self.unannounced.remove(new);
-                // `old` has ended as surely as a closed one, even when `new`
-                // is already gone too and so takes no attempt's place.
                 self.provisional_ended(*old);
-                // `new` satisfies every pending attempt for the peer exactly
-                // as a first establishment would, whichever side made it.
                 self.peer_connected(peer_id, *new, runtime, now_ms);
                 false
             }
@@ -767,21 +763,7 @@ impl ConnectEngine {
         runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) {
-        // Abort Ok(false) tombstones may never see DialFailed once the
-        // candidate has established — drop the stale id here.
         self.suppressed.remove(&conn_id);
-        // The swarm registers a whole transport batch before the engine sees
-        // any of it, so a later connection in the same batch (another of our
-        // candidates winning the same-direction race) may already hold the
-        // slot. Settle on that now rather than on a connection the swarm has
-        // already let go: waiting for its queued `ConnectionReplaced` would let
-        // a `DialFailed` queued in between exhaust the attempt. Retired without
-        // failing, `conn_id` leaves the race, so nothing aborts it. (When the
-        // slot is already empty again, every connection of the batch is gone
-        // and settling on `conn_id` is as good as any; its close is queued.
-        // Not for a circuit: the swarm forgot the address naming its relay,
-        // so it has no path to settle on, and it leaves the race.) The slot
-        // holder's own event is still queued, so its path waits for it.
         if let Some(current) = runtime.connection_id(peer_id)
             && current != conn_id
         {
@@ -796,13 +778,6 @@ impl ConnectEngine {
         let Ok(circuit_relay) = settle_record(runtime, conn_id) else {
             return;
         };
-        // A kept dial that took the slot leaves the race; the rest stay in
-        // it, as one may still win at the peer. A direct connection taking
-        // the slot restarts the swarm's window, so theirs restarts with it.
-        // Whether it is our dial comes from the swarm, which records it for
-        // the slot holder: the attempt that made it, or its retained entry,
-        // may be gone by the time the engine sees it establish. Engine
-        // bookkeeping covers a slot already empty again.
         let ours = runtime.is_outbound(conn_id).unwrap_or_else(|| {
             self.owner(conn_id).is_some()
                 || self
@@ -820,8 +795,6 @@ impl ConnectEngine {
                     .max(now_ms.saturating_add(runtime.simultaneous_dial_window_ms()));
             }
         } else if !circuit {
-            // The peer's dial won as the lower peer: every dial of ours now
-            // loses on both sides, including those kept from earlier.
             self.abort_retained(peer_id, runtime);
         }
         let ids: Vec<ConnectId> = self
@@ -850,7 +823,6 @@ impl ConnectEngine {
                 if keep_dials {
                     let pending: Vec<ConnectionId> = pending.collect();
                     self.suppressed.extend(pending.iter().copied());
-                    // A later settle opens a new window for every kept dial.
                     let expires_ms = now_ms.saturating_add(runtime.simultaneous_dial_window_ms());
                     if let Some(retained) = self.retained.get_mut(peer_id) {
                         retained.expires_ms = retained.expires_ms.max(expires_ms);
@@ -870,7 +842,6 @@ impl ConnectEngine {
                 self.push_connected(id, attempt.peer, conn_id, circuit_relay);
                 continue;
             }
-            // Only a circuit reaches here, so its relay is known.
             if let Some(circuit_relay) = circuit_relay
                 && let RelayLeg::Pending { policy, relay }
                 | RelayLeg::Provisional { policy, relay, .. } = attempt.relay
@@ -1101,8 +1072,6 @@ impl ConnectEngine {
                 error,
             } => {
                 if let Some(attempt) = self.attempts.get_mut(connect_id) {
-                    // Track the relay even when it was refused before it
-                    // started, so `ConnectFailed` for it is not recorded twice.
                     attempt.relay.set_relay(relay.clone());
                     attempt.relay_failures.push(RelayFailure {
                         relay: Some(relay.clone()),
@@ -1116,8 +1085,6 @@ impl ConnectEngine {
                 let Some(mut attempt) = self.attempts.remove(connect_id) else {
                     return;
                 };
-                // The last relay's own failure is already recorded; any
-                // other leg-ending error is added once.
                 let failure = RelayFailure {
                     relay: attempt.relay.relay().cloned(),
                     reason: error.to_string(),
@@ -1199,8 +1166,6 @@ impl ConnectEngine {
         conn_id: ConnectionId,
     ) {
         match runtime.abort_dial(conn_id) {
-            // Aborted before it could fail, so no `DialFailed` will come to
-            // consume a tombstone (a kept dial already has one).
             Ok(true) => {
                 self.suppressed.remove(&conn_id);
             }
@@ -1500,8 +1465,6 @@ impl ConnectEngine {
         #[cfg(feature = "autonat")]
         if let Some(nat) = legs.nat.as_deref_mut() {
             while let Some(event) = nat.take_unrouted() {
-                // An outcome produced in the turn the attempt settled,
-                // before the agent learned of it.
                 if is_attempt_outcome(&event)
                     && event.connect_id().is_some_and(|id| !self.is_pending(id))
                 {

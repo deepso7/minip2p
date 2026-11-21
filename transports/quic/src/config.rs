@@ -178,12 +178,10 @@ impl Default for QuicLimits {
             max_pending_datagrams: 1_024,
             idle_timeout_ms: 30_000,
             require_address_validation: true,
-            // quinn's own defaults (ADR 0022).
             stream_receive_window: 1_250_000,
             connection_receive_window: usize::MAX,
             send_window: 10_000_000,
             webtransport_handshake_timeout_ms: 10_000,
-            // quinn's own loss-detection and congestion defaults (#478).
             congestion_controller: CongestionController::Cubic,
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,

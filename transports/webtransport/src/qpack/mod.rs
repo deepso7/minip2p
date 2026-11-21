@@ -123,9 +123,6 @@ impl QpackDecoder {
         self.buf.clear();
         self.spans.clear();
         let input = &mut block;
-        // Required Insert Count must be 0; the Base is then unused, but a
-        // sign bit would make it 0 - Delta Base - 1, which is negative
-        // (RFC 9204 §4.5.1.2).
         if decode_int(input, 8)? != 0 || input.first().is_some_and(|&byte| byte & 0x80 != 0) {
             return Err(Error::QpackDecompressionFailed);
         }
@@ -139,29 +136,24 @@ impl QpackDecoder {
             if size > MAX_FIELD_SECTION_SIZE {
                 return Err(Error::QpackDecompressionFailed);
             }
-            // Name and value bytes may fill what the accounting has left.
             let limit = self.buf.len() + (MAX_FIELD_SECTION_SIZE - size);
             let start = self.buf.len();
             let name_len = if first & 0x80 != 0 {
-                // Indexed field line: 1 T index(6).
                 let (name, value) = static_entry(first & 0x40, decode_int(input, 6)?)?;
                 push(&mut self.buf, name, limit)?;
                 push(&mut self.buf, value, limit)?;
                 name.len()
             } else if first & 0x40 != 0 {
-                // Literal with name reference: 0 1 N T index(4), value.
                 let (name, _) = static_entry(first & 0x10, decode_int(input, 4)?)?;
                 push(&mut self.buf, name, limit)?;
                 decode_string(input, 7, &mut self.buf, limit)?;
                 name.len()
             } else if first & 0x20 != 0 {
-                // Literal with literal name: 0 0 1 N H len(3), name, value.
                 decode_string(input, 3, &mut self.buf, limit)?;
                 let name_len = self.buf.len() - start;
                 decode_string(input, 7, &mut self.buf, limit)?;
                 name_len
             } else {
-                // Post-base indexed or post-base name reference: dynamic.
                 return Err(Error::QpackDecompressionFailed);
             };
             size += self.buf.len() - start;
@@ -203,10 +195,8 @@ impl DecoderStreamReader {
     pub fn read(&mut self, input: &[u8]) -> Result<(), Error> {
         for &byte in input {
             self.continuation = match self.continuation {
-                // A stream id needs no more than 2^62, as in `decode_int`.
                 Some(shift) if shift > 56 => return Err(Error::QpackDecoderStream),
                 Some(shift) => (byte & 0x80 != 0).then_some(shift + 7),
-                // Stream Cancellation: 0 1 stream id(6).
                 None if byte & 0xc0 == 0x40 => (byte & 0x3f == 0x3f).then_some(0),
                 None => return Err(Error::QpackDecoderStream),
             };
@@ -314,7 +304,6 @@ pub fn encode_field_section<'a>(
     fields: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
     out: &mut Vec<u8>,
 ) {
-    // Required Insert Count 0, Base 0.
     out.extend_from_slice(&[0x00, 0x00]);
     for (name, value) in fields {
         if let Some(index) = STATIC_TABLE
@@ -391,7 +380,6 @@ mod tests {
 
     #[test]
     fn decodes_a_huffman_value_from_rfc_7541_c4() {
-        // :authority (static 0) with "www.example.com" Huffman-coded.
         let block = [
             0x00, 0x00, 0x50, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90,
             0xf4, 0xff,
@@ -399,7 +387,6 @@ mod tests {
         let mut decoder = QpackDecoder::new();
         let section = decoder.decode(&block).unwrap();
         assert_eq!(section.get(b":authority"), Some(&b"www.example.com"[..]));
-        // A literal name, Huffman-coded ("custom-key"), with a Huffman value.
         let block = [
             0x00, 0x00, 0x2f, 0x01, 0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9, 0x7d, 0x7f, 0x89, 0x25,
             0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf,
@@ -411,11 +398,11 @@ mod tests {
     #[test]
     fn dynamic_table_references_are_rejected() {
         let cases: [&[u8]; 5] = [
-            &[0x03, 0x81, 0x10], // RFC 9204 B.2: Required Insert Count 2, post-base index
-            &[0x00, 0x00, 0x80], // indexed, dynamic
-            &[0x00, 0x00, 0x40, 0x00], // name reference, dynamic
-            &[0x00, 0x00, 0x10], // post-base indexed
-            &[0x00, 0x00, 0x00, 0x00], // post-base name reference
+            &[0x03, 0x81, 0x10],
+            &[0x00, 0x00, 0x80],
+            &[0x00, 0x00, 0x40, 0x00],
+            &[0x00, 0x00, 0x10],
+            &[0x00, 0x00, 0x00, 0x00],
         ];
         let mut decoder = QpackDecoder::new();
         for block in cases {
@@ -430,7 +417,6 @@ mod tests {
     #[test]
     fn a_negative_base_is_rejected_and_an_unused_positive_one_accepted() {
         let mut decoder = QpackDecoder::new();
-        // Required Insert Count 0 with the Delta Base sign set: Base -1.
         for block in [&[0x00, 0x80, 0xd9][..], &[0x00, 0x85, 0xd9]] {
             assert_eq!(
                 decoder.decode(block).err(),
@@ -444,15 +430,11 @@ mod tests {
 
     #[test]
     fn decoder_streams_carry_only_stream_cancellations() {
-        // Stream Cancellation of streams 4 and 1000 (a continued integer),
-        // split byte by byte.
         let mut stream = DecoderStreamReader::new();
         for byte in [0x44, 0x7f, 0xa9, 0x0f] {
             assert_eq!(stream.read(&[byte]), Ok(()));
         }
         assert!(stream.is_at_instruction_boundary());
-        // An Insert Count Increment of 0 or 1, and a Section Acknowledgment,
-        // all refer to a dynamic table this encoder never uses.
         for bytes in [&[0x00][..], &[0x01], &[0x84], &[0x44, 0x01]] {
             assert_eq!(
                 DecoderStreamReader::new().read(bytes),
@@ -460,7 +442,6 @@ mod tests {
                 "{bytes:02x?}"
             );
         }
-        // A cancellation whose integer runs past 2^62.
         let mut overflow = vec![0x7f];
         overflow.resize(12, 0xff);
         assert_eq!(
@@ -472,10 +453,10 @@ mod tests {
     #[test]
     fn malformed_blocks_are_rejected() {
         let cases: [&[u8]; 4] = [
-            &[],                             // no prefix
-            &[0x00, 0x00, 0xff],             // static index past the table, truncated int
-            &[0x00, 0x00, 0xff, 0x24],       // static index 99
-            &[0x00, 0x00, 0x51, 0x05, b'/'], // value shorter than its length
+            &[],
+            &[0x00, 0x00, 0xff],
+            &[0x00, 0x00, 0xff, 0x24],
+            &[0x00, 0x00, 0x51, 0x05, b'/'],
         ];
         let mut decoder = QpackDecoder::new();
         for block in cases {
@@ -490,10 +471,6 @@ mod tests {
     #[test]
     fn a_2_kib_headers_frame_expanding_past_8_kib_hits_the_size_cap() {
         use crate::h3::{Frame, FrameDecoder, encode_frame, frame_type};
-        // 63 references to the static content-security-policy (108 bytes
-        // each as counted) and a `:path` whose Huffman value of `huffman`
-        // zero bytes expands to 8/5 as many characters: 64 fields, within
-        // the field cap whatever the size.
         fn headers(huffman: usize) -> Vec<u8> {
             let csp = STATIC_TABLE
                 .iter()
@@ -510,7 +487,6 @@ mod tests {
             encode_frame(frame_type::HEADERS, &block, &mut frame).unwrap();
             frame
         }
-        // The field section a HEADERS frame carries.
         fn block(frame: &[u8]) -> Vec<u8> {
             let mut input = frame;
             let Ok(Some(Frame::Headers(block))) = FrameDecoder::new().decode(&mut input) else {
@@ -519,10 +495,8 @@ mod tests {
             block
         }
         let mut decoder = QpackDecoder::new();
-        // 6804 + 837 bytes decoded: under 8 KiB.
         let fields = decoder.decode(&block(&headers(500))).map(|s| s.len());
         assert_eq!(fields, Ok(64));
-        // 6804 + 3077 bytes decoded from a frame under 2 KiB.
         let frame = headers(1900);
         assert!(frame.len() <= 2 * 1024, "{}", frame.len());
         assert_eq!(
@@ -546,10 +520,7 @@ mod tests {
 
     #[test]
     fn decoded_size_is_capped_however_small_the_encoding() {
-        // Each value is 2045 bytes of Huffman `0` codes (5 bits each), which
-        // expand to 3272 bytes: three such fields pass 8 KiB.
         fn huffman_zeros(block: &mut Vec<u8>) {
-            // `:path` name reference, Huffman value of 2045 bytes.
             block.push(0x51);
             encode_int(block, 0x80, 7, 2045);
             block.resize(block.len() + 2045, 0x00);
@@ -569,7 +540,6 @@ mod tests {
 
     #[test]
     fn the_size_cap_counts_32_bytes_per_field() {
-        // One literal-name field whose name + value + 32 is exactly 8 KiB.
         let value = vec![b'v'; MAX_FIELD_SECTION_SIZE - 32 - 1];
         let mut block = Vec::new();
         encode_field_section([(&b"x"[..], value.as_slice())], &mut block);
@@ -596,7 +566,6 @@ mod tests {
         ];
         let mut block = Vec::new();
         encode_field_section(request, &mut block);
-        // `:method CONNECT` and `:scheme https` are indexed static entries.
         assert_eq!(block.get(..3), Some(&[0x00, 0x00, 0xcf][..]));
         let mut decoder = QpackDecoder::new();
         let section = decoder.decode(&block).unwrap();

@@ -29,7 +29,6 @@ function formatChange(change) {
   return `${change >= 0 ? "+" : ""}${change.toFixed(1)}%`;
 }
 
-// Report every artifact before failing, so one regression doesn't hide the rest.
 const regressions = [];
 for (const [name, relativePath] of Object.entries(artifacts)) {
   const bytes = statSync(path.join(packageRoot, relativePath)).size;

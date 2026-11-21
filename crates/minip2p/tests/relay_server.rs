@@ -468,7 +468,6 @@ mod bulk {
             assert!(data[..] == payload[..], "every byte, once, in order");
         }
 
-        // Judged before the clients go: their teardown can race a last forward.
         let relay_events: Vec<_> = pair.relay_events.try_iter().collect();
         let failure = relay_events.iter().find(|event| {
             matches!(

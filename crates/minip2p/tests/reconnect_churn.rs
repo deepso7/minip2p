@@ -111,8 +111,6 @@ struct Driver {
 impl Driver {
     /// Stops the thread and returns the endpoint it was driving.
     fn stop(self) -> Endpoint {
-        // A send error means the thread already left on its backstop, which
-        // the join below reports as the panic it is.
         match self.stop.send(()) {
             Ok(()) | Err(_) => {}
         }
@@ -139,10 +137,6 @@ fn spawn_driver(mut endpoint: Endpoint, what: &'static str) -> Driver {
         let backstop = Instant::now() + DRIVER_BACKSTOP;
         loop {
             match stopped.try_recv() {
-                // A disconnected channel means the test dropped the driver
-                // without stopping it — a panic on the way to `stop()`. Leave
-                // rather than drive on to the backstop and panic detached,
-                // which would bury the real failure under 30s of silence.
                 Ok(()) | Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => {}
             }
@@ -214,8 +208,6 @@ fn listener_reclaims_state_after_dialer_close() {
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
 
-    // Drive the listener so QUIC close can complete; otherwise Drop would
-    // be the only path that notifies the peer.
     let remote = spawn_driver(listener, "drive listener during close");
 
     let events = clean_close(dialer, "close flushes disconnects");
@@ -240,7 +232,6 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
     let dialer_peer = *dialer.peer_id();
     dialer.connect(&listener_addr).expect("connect to listener");
 
-    // Do not wait for Identify; the connection may still be handshaking.
     for _ in 0..8 {
         let _ = listener
             .next_event(Duration::from_millis(10))
@@ -272,8 +263,6 @@ fn close_drains_replacement_connection() {
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     outlive_race_window(&mut listener, &mut dialer);
 
-    // Queue a same-peer handshake without polling the listener, so close()
-    // is the first drive that can establish the replacement.
     let mut replacement = short_window()
         .identity(dialer_key)
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -343,8 +332,6 @@ fn close_drains_pending_replacement_handshake() {
             .next_event(Duration::from_millis(10))
             .expect("send replacement initial");
     }
-    // Accept the Initial without waiting for Connected; close() must keep
-    // polling until the replacement connection is gone.
     let _ = listener
         .next_event(Duration::from_millis(10))
         .expect("accept replacement initial");

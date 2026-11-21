@@ -36,8 +36,6 @@ struct ChatEndpoint {
     endpoint: Endpoint,
 }
 
-// --- endpoint construction --------------------------------------------------
-
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -70,7 +68,6 @@ fn build_endpoint(
                 ..PeerDiscoveryConfig::default()
             });
     }
-    // Without relays, discovery's own NAT agent dials the mesh directly.
     if !relays.is_empty() {
         builder = builder.nat_config(NatConfig {
             force_relay: options.relay_only,
@@ -107,8 +104,6 @@ fn topic_and_nick(options: &ChatOptions, endpoint: &Endpoint) -> (String, String
     (topic, nick)
 }
 
-// --- host -------------------------------------------------------------------
-
 /// Hosts a room: bind, print join addresses, chat until stdin EOF. With
 /// `--relay`, also hold a reservation and print the circuit address NAT'd
 /// joiners use.
@@ -121,10 +116,6 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
     let first = peer_addrs
         .first()
         .ok_or("listen completed without any bound peer addresses")?;
-    // `bound=` is same-host pasteable (wildcards rewritten to loopback,
-    // which the e2e test relies on); the raw `listen-addr=` lines carry
-    // the real binds -- remote joiners substitute this machine's public
-    // address for a wildcard host.
     println!("[host] bound={}", local_dialable_peer_addr(first));
     for addr in &peer_addrs {
         println!("[host] listen-addr={addr}");
@@ -160,7 +151,6 @@ fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(),
                     EndpointEvent::Nat(NatEvent::RelayReserved { relay: reserved, .. })
                         if reserved == relay.peer_id()
                 );
-                // Prints the `circuit=` line for the reservation too.
                 handle_event(endpoint, "host", Some(relay), event);
                 if reserved {
                     return Ok(());
@@ -178,8 +168,6 @@ fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(),
     }
 }
 
-// --- join -------------------------------------------------------------------
-
 /// Joins a room through the NAT agent, then chats over either a direct or
 /// promoted relay-circuit connection until stdin EOF.
 pub fn run_join(
@@ -187,7 +175,6 @@ pub fn run_join(
     relay: Option<PeerAddr>,
     options: ChatOptions,
 ) -> Result<(), Box<dyn Error>> {
-    // The circuit target's relay leads the list; --relay adds a fallback.
     let mut relays: Vec<PeerAddr> = Vec::new();
     if let JoinTarget::Circuit { relay, .. } = &target {
         relays.push(relay.clone());
@@ -199,15 +186,11 @@ pub fn run_join(
     }
 
     let ChatEndpoint { mut endpoint } = build_endpoint("join", &relays, &options)?;
-    // Listening seeds the agent's bound addresses — the local half of the
-    // DCUtR candidate set.
     endpoint
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
     println!("[join] us={}", endpoint.peer_id());
     let (topic, nick) = topic_and_nick(&options, &endpoint);
-    // The host announces its topic once per connection, and that can land
-    // while the joiner is still waiting for a path or Identify.
     let mut host_subscribed = false;
 
     let (host_peer, connect_id) = match &target {
@@ -245,7 +228,6 @@ pub fn run_join(
             EndpointWaitOutcome::Event(event) => {
                 host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
                 handle_event(&endpoint, "join", None, event);
-                // A failed first Identify closes the connection.
                 if endpoint.connection_id(&host_peer).is_none() {
                     return Err("the connection closed before identify completed".into());
                 }
@@ -356,8 +338,6 @@ fn is_topic_subscription(event: &EndpointEvent, peer: &PeerId, topic: &str) -> b
     )
 }
 
-// --- the chat loop ----------------------------------------------------------
-
 /// Reads stdin lines on a background thread; `None` marks EOF.
 fn spawn_stdin_reader() -> mpsc::Receiver<Option<String>> {
     let (tx, rx) = mpsc::channel();
@@ -369,8 +349,6 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Option<String>> {
                 return;
             }
         }
-        // EOF is best-effort: the receiver may have exited after an endpoint
-        // error, which is already the primary outcome.
         match tx.send(None) {
             Ok(()) | Err(_) => {}
         }
@@ -390,9 +368,6 @@ fn run_chat(
     let input = spawn_stdin_reader();
     eprintln!("[{role}] type to chat; Ctrl-D to leave");
 
-    // A pipe can produce lines faster than a human ever will; bounding the
-    // per-tick drain keeps the network pump (`wait` below) live even
-    // under a stdin flood.
     const MAX_LINES_PER_TICK: usize = 32;
 
     loop {
@@ -445,10 +420,6 @@ fn handle_event(endpoint: &Endpoint, role: &str, relay: Option<&PeerAddr>, event
         EndpointEvent::Gossipsub(event) => print_gossipsub_event(role, event),
         EndpointEvent::Nat(event) => {
             print_nat_event(role, &event);
-            // A reservation that lands late (after the startup wait
-            // warned) or is re-acquired after a loss still needs its
-            // circuit address printed -- joiners have nothing to
-            // paste otherwise.
             if let Some(relay) = relay
                 && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
                     if reserved == relay.peer_id())

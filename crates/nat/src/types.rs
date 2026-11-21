@@ -1,7 +1,5 @@
-use minip2p_core::PeerId;
-// The connection path NAT events report; owned by core so the Endpoint can
-// name it without NAT.
 pub use minip2p_core::Path;
+use minip2p_core::PeerId;
 
 /// Opaque correlation token the agent allocates for a dial whose result the
 /// host may report later: a dial the host parked to resolve its named

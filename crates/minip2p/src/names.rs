@@ -111,8 +111,6 @@ pub(crate) fn name_of(addr: &PeerAddr) -> Result<Option<Name<'_>>, String> {
             "a /dns component must contain a DNS name, not an IP address",
         ));
     }
-    // Nothing to dial without a port, and guessing one would dial a service
-    // the caller never named.
     if !rest
         .iter()
         .any(|protocol| matches!(protocol, Protocol::Tcp(_) | Protocol::Udp(_)))
@@ -220,9 +218,6 @@ mod tests {
             "2001:db8::2".parse().expect("v6"),
         ];
 
-        // Two dials over the same socket to the same peer is a wasted
-        // connection, not a second path -- the point of trying more than one
-        // is trying more than one *way*.
         let targets = answer_for(&addr, &answers("example.invalid", Ok(ips)))
             .expect("answered")
             .expect("targets");

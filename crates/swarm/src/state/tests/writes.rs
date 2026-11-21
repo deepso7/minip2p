@@ -16,7 +16,6 @@ fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
         data: Bytes::copy_from_slice(data),
     };
 
-    // The listener's multistream header comes back Full after 3 bytes.
     feed(
         &mut core,
         TransportEvent::IncomingStream {
@@ -43,7 +42,6 @@ fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
         header.len(),
     );
 
-    // The protocol echo queues behind the held tail instead of going out.
     let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
     offer.extend_from_slice(&multistream_frame(PROTOCOL));
     let offer_len = offer.len();
@@ -55,8 +53,6 @@ fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
             data: Bytes::from(offer),
         },
     );
-    // The stream stays a control stream while the core holds its reply,
-    // so the held bytes keep the control reserve.
     assert_eq!(
         drain_actions(&mut core),
         [Action::AckStream {
@@ -67,7 +63,6 @@ fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
         "only the offer's ack goes out"
     );
 
-    // The application cannot overtake it either, and its close waits.
     let payload = Bytes::from_static(b"app");
     assert_eq!(
         core.send_stream(&peer_id, conn_id, stream_id, payload.clone()),
@@ -126,8 +121,6 @@ fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
 #[test]
 fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
     const PROTOCOL: &str = "/test/1";
-    // Whether the demotion is still queued or already held behind the
-    // tail when the stream changes hands.
     for demotion_held in [false, true] {
         let mut core = test_core();
         core.add_protocol(PROTOCOL).expect("register protocol");
@@ -137,8 +130,6 @@ fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
         core.conn_to_peer.insert(conn_id, peer_id);
         core.peer_to_conn.insert(peer_id, conn_id);
 
-        // The negotiation header comes back Full, and the echo queues
-        // behind it.
         feed(
             &mut core,
             TransportEvent::IncomingStream {
@@ -177,8 +168,6 @@ fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
         expected.extend_from_slice(&multistream_frame(PROTOCOL));
         assert_eq!(owed, expected, "the held tail, then the queued echo");
         assert!(!core.held.is_held(conn_id, stream_id));
-        // The new owner writes application data, so the stream must not
-        // keep the control reserve.
         assert_eq!(
             control_marks(&drain_actions(&mut core), stream_id),
             [false],
@@ -210,7 +199,6 @@ fn a_writable_waits_while_the_replayed_tail_comes_back_full() {
         stream_id,
     };
 
-    // The replay is Full again: the user is not woken yet.
     feed(&mut core, writable.clone());
     assert!(matches!(
         core.poll_output(),
@@ -219,7 +207,6 @@ fn a_writable_waits_while_the_replayed_tail_comes_back_full() {
     core.handle_send_full(conn_id, stream_id, tail, 4);
     assert!(core.poll_output().is_none());
 
-    // The next replay goes through, and then the user is woken.
     feed(&mut core, writable);
     let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
     assert!(matches!(
@@ -272,7 +259,6 @@ fn closing_or_resetting_a_stream_ends_its_writable_notices() {
     let reset = StreamId::new(5);
     for stream_id in [closed, reset] {
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
-        // One notice already queued, and one still in the transport.
         feed(
             &mut core,
             TransportEvent::StreamWritable {

@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# The checks that are not host feature rows (scripts/run-feature-matrix.sh
-# holds those). `just` and CI both call this, so the lists live only here.
-#
-#   nostd          every no_std crate, and the Endpoint's portable feature
-#                  sets, on a real no_std target
-#   wasm           the browser build's crates on wasm32
-#   docs           rustdoc, with -D warnings where the docs are kept clean
-#   package-check  every published crate ships its README, and the publish
-#                  order resolves; pass --allow-dirty to package a dirty tree
 set -eu
 
 operation=${1:-}

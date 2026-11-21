@@ -96,7 +96,6 @@ struct Mark {
 
 impl Mark {
     fn now(roles: &Roles) -> Self {
-        // A fixed array, so taking the mark allocates nothing.
         let mut datagrams = [DatagramCounters::default(); 3];
         for (slot, (_, peer)) in datagrams.iter_mut().zip(&roles.0) {
             *slot = datagram_counters(peer);

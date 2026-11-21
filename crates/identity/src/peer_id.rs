@@ -387,7 +387,6 @@ mod tests {
 
     #[test]
     fn rejects_multihashes_that_are_not_peer_ids() {
-        // Fuzz find: code 0x02 decoded, printed as "9q", and failed to parse.
         assert_eq!(
             PeerId::from_bytes(&[0x02, 0x00]),
             Err(PeerIdError::UnsupportedMultihashCode(0x02))
@@ -400,7 +399,6 @@ mod tests {
             Err(PeerIdError::InvalidIdentityDigestLength { actual: 43 })
         );
 
-        // Every accepted shape prints text that parses back.
         let inline = PeerId::from_bytes(&[0x00, 0x00]).expect("empty identity");
         assert_eq!(inline.to_string().parse::<PeerId>(), Ok(inline));
     }

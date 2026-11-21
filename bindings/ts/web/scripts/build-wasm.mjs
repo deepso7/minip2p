@@ -1,14 +1,3 @@
-// Builds `crates/web` for wasm32 and generates its wasm-bindgen glue into
-// `wasm/`: the `.js` and `.d.ts` glue is committed (it is what typecheck
-// and the adapter import), the `.wasm` is a build output.
-//
-// Needs the `wasm32-unknown-unknown` target and the wasm-bindgen CLI at the
-// version `crates/web` pins (`cargo install wasm-bindgen-cli --version …`).
-//
-// The shipped `.wasm` drops its `name` section (Rust function names, ~62% of
-// the raw bytes and ~24% of the brotli size). Set `MINIP2P_WASM_NAMES=1` to
-// keep it, for readable browser stack traces or `twiggy` profiling.
-
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +18,6 @@ run("cargo", [
   "--profile",
   "wasm-release",
 ]);
-// Cargo's target directory, honoring `CARGO_TARGET_DIR` and `build.target-dir`.
 const { target_directory: targetDir } = JSON.parse(
   execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     cwd: root,

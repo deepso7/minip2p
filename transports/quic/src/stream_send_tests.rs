@@ -79,7 +79,6 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     assert!(pending_write_bytes(&server, stopper_id) > 0);
 
     stopper.stop(raw, 42);
-    // The silent peer stops answering, so only its idle timer can close it.
     silent.mute = true;
     let mut events = Vec::new();
     drive_until(
@@ -95,7 +94,6 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     );
     assert_eq!(pending_write_bytes(&server, stopper_id), 0);
 
-    // The read half is still open.
     assert_eq!(stopper.write(raw, b"more"), 4);
     stopper.finish(raw);
     drive_until(
@@ -147,7 +145,6 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
     let mut server = server_with_idle_timeout(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
 
-    // STOP_SENDING and FIN leave together, before the server ever writes.
     let raw = peer.open();
     peer.write(raw, b"hi");
     peer.finish(raw);
@@ -186,13 +183,11 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
 #[test]
 fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
     let mut server = server_with_idle_timeout(30_000);
-    // The peer never reads, so it never raises this connection-level limit.
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
         config.receive_window(VarInt::from_u32(2_000));
     });
 
     let first = open_streams(&mut server, &mut peer, &[b"hi"])[0];
-    // Use up the connection's send credit.
     server
         .send_stream(id, StreamId::new(first), Bytes::from(vec![7; 10_000]))
         .expect("send");
@@ -253,7 +248,6 @@ fn data_beyond_one_receive_buffer_arrives_once_and_idle_polls_stay_silent() {
     }
     assert_eq!(stream_bytes(&events, raw), payload);
 
-    // Let the final acknowledgements settle, then go quiet.
     peer.pump();
     std::thread::sleep(Duration::from_millis(20));
     let mut idle = server.poll(now()).expect("poll");
@@ -282,11 +276,9 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
         .send_stream(id, first, Bytes::from_static(b"x"))
         .expect("send");
     server.close_stream_write(id, first).expect("fin first");
-    // The peer has granted one server stream; this FIN has to wait.
     let second = server.open_stream(id).expect("second stream");
     server.close_stream_write(id, second).expect("queue fin");
 
-    // Finishing the first stream lets the peer grant another.
     let mut events = Vec::new();
     let mut first_done = false;
     let mut second_fin = false;
@@ -331,13 +323,11 @@ fn stream_opened_waits_for_the_peers_stream_credit() {
     };
 
     let first = server.open_stream(id).expect("first stream");
-    // Beyond the peer's credit: handed out, but not on the wire yet.
     let second = server.open_stream(id).expect("second stream");
     let mut events = server.poll(now()).expect("poll");
     assert!(opened(&events, first), "{events:?}");
     assert!(!opened(&events, second), "{events:?}");
 
-    // Finishing the first stream lets the peer grant another.
     server.close_stream_write(id, first).expect("fin first");
     let mut first_done = false;
     let start = Instant::now();
@@ -367,8 +357,6 @@ fn connection_fatal_send_error_closes_only_that_connection() {
     server
         .send_stream(faulty_id, StreamId::new(raw), Bytes::from(vec![7; 10_000]))
         .expect("most of the write queues");
-    // The engine forgets the stream behind the adapter's back, so the next
-    // drain of its queue meets a closed stream.
     server
         .connections
         .get_mut(&faulty_id)
@@ -396,8 +384,6 @@ fn connection_fatal_send_error_closes_only_that_connection() {
                     .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { id, .. } if *id == healthy_id))
         },
     );
-    // The failure is the close's reason, reported once: the failed write is
-    // dropped, not retried on every drain.
     assert!(
         events.contains(&TransportEvent::Closed {
             id: faulty_id,
@@ -479,8 +465,6 @@ fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
     let (mut server, mut peer, id, _, reset) = two_full_streams();
     assert_eq!(server.connections[&id].writable_armed_count(), 2);
 
-    // Resetting a stream that queued nothing frees no room, so no wake runs:
-    // the reset itself must disarm it.
     peer.reset(reset.as_u64(), 5);
     let mut events = Vec::new();
     drive_until(
@@ -502,13 +486,8 @@ fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
 fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
     let (mut server, mut peer, id, filler, reset) = two_full_streams();
 
-    // The peer's reset is on the wire when the application resets the
-    // filler, which frees the shared queue and queues a Writable for the
-    // other stream before the next poll reads that reset.
     peer.reset(reset.as_u64(), 5);
     peer.service();
-    // Wait until the reset is waiting on the server's socket (peeking leaves
-    // it there), so the next poll is sure to read it.
     let start = Instant::now();
     while !socket::has_queued_input(&server.socket().udp) {
         assert!(
@@ -544,8 +523,6 @@ fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
 fn a_local_close_retracts_queued_writables() {
     let (mut server, _peer, id, filler, _) = two_full_streams();
 
-    // Resetting the filler frees the shared queue and queues a Writable for
-    // the other stream; closing the connection before the poll retracts it.
     server.reset_stream(id, filler).expect("local reset");
     server.close(id).expect("close");
     let events = server.poll(now()).expect("poll");
@@ -566,9 +543,6 @@ fn a_fin_behind_bytes_the_engine_holds_stays_pending_until_acknowledged() {
     let _ = peer.read(raw);
     let stream = StreamId::new(raw);
 
-    // Far past the initial congestion window, then the FIN: the engine
-    // takes it all, but without the peer's acknowledgements most of it
-    // stays in the engine. Only the FIN's acknowledgement says it left.
     const LEN: usize = 256 * 1024;
     server
         .send_stream(id, stream, Bytes::from(vec![7; LEN]))
@@ -595,7 +569,6 @@ fn a_fin_behind_bytes_the_engine_holds_stays_pending_until_acknowledged() {
         received += data.len();
         fin |= done;
     }
-    // Drained means acknowledged: the peer has every byte and the FIN.
     for _ in 0..3 {
         peer.pump();
         let (data, done) = peer.read(raw);
@@ -613,8 +586,6 @@ fn a_peer_reset_ends_the_wait_for_an_unacknowledged_fin() {
     let raw = open_streams(&mut server, &mut peer, &[b"hi"])[0];
     let stream = StreamId::new(raw);
 
-    // The FIN goes out, and the peer resets the stream before reading it:
-    // the engine never reports the FIN acknowledged.
     server
         .send_stream(id, stream, Bytes::from_static(b"bye"))
         .expect("send");
@@ -623,7 +594,6 @@ fn a_peer_reset_ends_the_wait_for_an_unacknowledged_fin() {
     assert!(server.has_pending_writes(), "the FIN waits on its ack");
     peer.reset(raw, 5);
     peer.service();
-    // Only the server runs, so the peer acknowledges nothing it sent.
     let mut events = Vec::new();
     drive_until(&mut server, &mut [], &mut events, "reset", |events| {
         events.contains(&TransportEvent::StreamClosed {

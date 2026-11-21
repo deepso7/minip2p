@@ -334,19 +334,15 @@ mod tests {
         assert_eq!(ledger.next_deadline(), Some(100));
 
         assert_eq!(path(&mut ledger, conn(1), None, 99), Path::Punched);
-        // An attempt's own direct connection stays Direct inside the window.
         let claim = Some(Claim::Direct(attempt(1)));
         assert_eq!(path(&mut ledger, conn(2), claim, 99), Path::Direct);
-        // Another peer's connection is not in the window.
         let other = ledger.attribute(conn(3), &peer(2), false, None, 99);
         assert_eq!(other.map(|a| a.path), Some(Path::Direct));
-        // The deadline is exclusive, with or without a tick.
         assert_eq!(path(&mut ledger, conn(4), None, 100), Path::Direct);
         ledger.on_tick(100);
         assert!(ledger.is_quiet());
         assert_eq!(path(&mut ledger, conn(5), None, 50), Path::Direct);
 
-        // A holder that gives up closes the window early.
         ledger.expect_punches(peer(1), 200);
         ledger.end_punches(&peer(1));
         assert!(ledger.is_quiet());
@@ -370,7 +366,6 @@ mod tests {
             )
             .expect("attributed");
 
-        // Relayed to punch.
         punch_dial(&mut ledger, conn(1), id);
         let punched = ledger
             .attribute(conn(1), &peer(1), false, None, 0)
@@ -384,19 +379,16 @@ mod tests {
             })
         );
 
-        // Punch to punch.
         punch_dial(&mut ledger, conn(2), id);
         path(&mut ledger, conn(2), None, 0);
         assert_eq!(ledger.replaced(&punched, conn(2)), None);
 
-        // Relayed to direct.
         path(&mut ledger, conn(3), None, 0);
         assert_eq!(
             ledger.replaced(&relayed, conn(3)).map(|up| up.to),
             Some(Path::Direct)
         );
 
-        // Relayed to relayed.
         let claim = Claim::Circuit {
             relay: peer(8),
             owner: Owner::Attempt(id),

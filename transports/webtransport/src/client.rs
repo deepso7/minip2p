@@ -326,13 +326,11 @@ impl Session {
                     state.in_flight += front.bytes.len();
                     state.writes.pop_front();
                 }
-                // The rest waits for a WriteCompleted.
                 Ok(written) => {
                     state.in_flight += written;
                     front.advance(written);
                     return false;
                 }
-                // The platform refused the stream: nothing more goes out.
                 Err(_) => {
                     self.drop_writes(handle);
                     return true;
@@ -455,7 +453,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         for handle in session.streams.keys() {
             self.by_stream.remove(handle);
         }
-        // The session's end stands for its streams' held resets.
         self.held_resets
             .retain(|(handle, _)| !session.streams.contains_key(handle));
         self.unsettled.insert(
@@ -522,7 +519,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             IoEvent::Fin { stream } => self.on_fin(stream),
             IoEvent::WriteClosed { stream } => self.write_closed(stream),
             IoEvent::Reset { stream, .. } => match self.owner(stream) {
-                // A caller stream's reset may be its session ending.
                 Some((_, false)) => self.held_resets.push((
                     stream,
                     now.monotonic_ms.saturating_add(SESSION_END_GRACE_MS),
@@ -530,7 +526,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 _ => self.on_reset(stream),
             },
             IoEvent::StopSending { stream, code } => {
-                // A FIN the stream may still hold can no longer be sent.
                 self.write_closed(stream);
                 self.on_stop_sending(stream, code);
             }
@@ -543,8 +538,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                     conn.flush(&mut self.io, stream)
                 });
                 if refused && noise {
-                    // The Noise stream is the client's own: no stream event,
-                    // the handshake fails.
                     self.fail(id, NOISE_REFUSED.into());
                     return;
                 }
@@ -706,7 +699,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 ..
             } = &mut conn.state
             else {
-                // Anything after the handshake is ignored.
                 return;
             };
             if let Err(error) = session.on_data(bytes.to_vec()) {
@@ -724,7 +716,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         if state.remote_closed {
-            // Late: the read side already ended.
             return;
         }
         state.granted = state.granted.saturating_sub(bytes.len());
@@ -767,7 +758,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             }
         }
         let hash = noise.handshake_hash();
-        // Handshake bytes are the client's own, not counted against the caps.
         if let Some(state) = conn.streams.get_mut(&handle) {
             state
                 .writes
@@ -790,7 +780,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             self.fail(id, reason);
             return;
         }
-        // Message three goes out, then the Noise stream is finished.
         if let Some(state) = conn.streams.get_mut(&handle) {
             state.write = Write::FinQueued;
         }
@@ -842,8 +831,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         if noise {
-            // Once the server's messages are verified it has nothing more
-            // to send, so its FIN is no failure.
             if self
                 .connections
                 .get(&id)
@@ -894,8 +881,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
 
     fn on_reset(&mut self, handle: StreamHandle) {
         let Some((id, noise)) = self.owner(handle) else {
-            // A stream retired once both halves closed may still have its
-            // FIN with the platform; the reset ends that wait.
             self.write_closed(handle);
             return;
         };
@@ -907,7 +892,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             {
                 self.fail(id, "the server reset the Noise stream".into());
             } else if let Some(conn) = self.connections.get_mut(&id) {
-                // A reset ends the platform's wait for the Noise FIN too.
                 conn.closing.remove(&handle);
             }
             return;
@@ -915,8 +899,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
-        // The peer reset only its sending side: reset ours too, as the QUIC
-        // server does, so the platform stream is freed.
         self.io.reset(handle, 0);
         conn.drop_writes(handle);
         if let Some(state) = conn.streams.get_mut(&handle) {
@@ -933,7 +915,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         if noise {
-            // Message three can no longer reach the server.
             if self
                 .connections
                 .get(&id)
@@ -952,8 +933,6 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         if state.write == Write::Stopped {
             return;
         }
-        // After StreamClosed nothing more is reported, but writes still in
-        // the platform are released: a stopped stream never completes them.
         let notify = !state.closed_notified;
         conn.drop_writes(handle);
         self.drop_writable(id, handle);
@@ -1071,7 +1050,6 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
                 operation: "dialing anything but /webtransport addresses",
             });
         }
-        // Empty for a CA-certificate dial: the platform verifies the chain.
         let certhashes: Vec<Multihash> = addr.transport().certhashes().copied().collect();
         let url = webtransport_url(addr.transport())?;
         if self.connections.len() + self.unsettled.len() >= self.limits.max_connections {
@@ -1238,7 +1216,6 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         if !self.connections.contains_key(&id) {
-            // Abandoning a stream of an ended connection only settles it.
             return if self.unsettled.abandon(id, stream_id) {
                 Ok(())
             } else {
@@ -1269,12 +1246,10 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         bytes: usize,
     ) -> Result<(), TransportError> {
         if !self.connections.contains_key(&id) {
-            // An ended connection's bytes are released without credit.
             return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
         let window = self.limits.stream_receive_window;
         let Ok((conn, io, handle)) = self.caller_stream(id, stream_id) else {
-            // A settled or unknown stream has nothing to acknowledge.
             return Ok(());
         };
         let Some(state) = conn.streams.get_mut(&handle) else {
@@ -1301,7 +1276,6 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
             && let Some(state) = conn.streams.get_mut(&handle)
         {
             state.control = control;
-            // Promotion can open the reserve to a stream waiting on Full.
             self.wake_writable(id);
         }
     }

@@ -183,7 +183,6 @@ fn setup_outbound_ping_stream(
         },
     );
     while core.poll_output().is_some() {}
-    // Only ping's timer is under test.
     core.first_identify.clear();
     core.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
     core.ping
@@ -224,7 +223,6 @@ fn negotiating_user_stream(now_ms: u64) -> (SwarmState, ConnectionId, StreamId) 
     );
     drain_actions(&mut core);
     drain_events(&mut core);
-    // Only the user stream's timer is under test.
     core.first_identify.clear();
     core.add_protocol("/app/1").expect("register");
     core.open_stream(&peer, "/app/1").expect("admit open");

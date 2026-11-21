@@ -247,7 +247,6 @@ impl DatagramTally {
                 .buffers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // 0 means the OS could not say, so it never wins the minimum.
             let min = |known: usize, granted: usize| match (known, granted) {
                 (0, granted) => granted,
                 (known, 0) => known,

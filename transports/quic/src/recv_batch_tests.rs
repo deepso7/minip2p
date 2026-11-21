@@ -152,7 +152,6 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
                     data,
                 } => {
                     received.extend_from_slice(&data);
-                    // A reader that keeps up acknowledges what it read.
                     server.ack_stream(id, stream_id, data.len()).expect("ack");
                 }
                 TransportEvent::StreamRemoteWriteClosed { .. } => fin_received = true,
@@ -234,8 +233,6 @@ fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
     let stream = peer.open();
 
-    // A window the reader leaves unacknowledged gates the stream, so what
-    // follows stays in the engine.
     assert_eq!(peer.write(stream, &[1; WINDOW]), WINDOW);
     let mut events = Vec::new();
     drive_until(
@@ -245,10 +242,6 @@ fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
         "window",
         |events| stream_bytes(events, stream).len() == WINDOW,
     );
-    // The read returns the window's credit, but loopback may deliver the
-    // server's MAX_STREAM_DATA after the poll that sent it (macOS does), so
-    // wait for it rather than assume it arrived. Nothing is sent once the
-    // marker is accepted, so it leaves in the packet built below.
     let start = Instant::now();
     while peer.write(stream, b"marker") == 0 {
         assert!(
@@ -260,17 +253,12 @@ fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
         server.poll(now()).expect("poll");
     }
 
-    // One stream datagram, then junk of the same size in the same burst: one
-    // receive call where the platform batches receives, and one GRO batch
-    // where it coalesces a segmented train. Where the platform does neither,
-    // each datagram has its own call and allocation anyway.
     let mut train = Vec::new();
     let transmit = peer
         .conn()
         .poll_transmit(Instant::now(), 1, &mut train)
         .expect("the marker's packet");
     let (to, len) = (transmit.destination, transmit.size);
-    // No fixed bit: the endpoint drops these unread.
     train.resize(len * (1 + JUNK), 0);
     let state = quinn_udp::UdpSocketState::new((&peer.socket).into()).expect("peer state");
     let segmented = state.max_gso_segments() > JUNK;
@@ -311,8 +299,6 @@ fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
         .expect("not reset")
         .expect("the marker is buffered");
     assert_eq!(&chunk.bytes[..], b"marker");
-    // The allocation from the chunk's start to its end: the rest of its
-    // datagram, or the rest of the whole receive call when they share one.
     let retained = allocation_len(chunk.bytes);
     assert!(
         retained < len,

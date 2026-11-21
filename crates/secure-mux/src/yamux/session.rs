@@ -328,7 +328,6 @@ impl YamuxSession {
         });
         Self {
             role,
-            // A peer may frame up to the credit it was granted.
             decoder: FrameDecoder::new(config.receive_window),
             config,
             streams: BTreeMap::new(),
@@ -516,7 +515,6 @@ impl YamuxSession {
     pub fn set_control(&mut self, stream: u32, control: bool) {
         if let Some(state) = self.streams.get_mut(&stream) {
             state.control = control;
-            // A control stream may have room an application one lacked.
             self.wake_writable();
         }
     }
@@ -550,7 +548,6 @@ impl YamuxSession {
     /// that never reads the resets fails the session with
     /// [`YamuxError::ControlReserveExhausted`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
-        // Settling needs no wire, so it works after the session ended too.
         if self.unsettled.remove(&stream).is_some() {
             return Ok(());
         }
@@ -562,7 +559,6 @@ impl YamuxSession {
         let peer_opened = self.valid_remote_stream_id(stream);
         self.remove_stream(stream, true);
         self.unsettled.remove(&stream);
-        // A stream whose SYN never went out is unknown to the peer.
         if unannounced {
             return Ok(());
         }
@@ -809,8 +805,6 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            // An unsettled id is still in use: reopening it would replace
-            // its unacknowledged count.
             if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
@@ -845,7 +839,6 @@ impl YamuxSession {
                 return Err(YamuxError::ReceiveWindowExceeded { stream });
             }
             state.receive_window -= payload_len;
-            // Credit returns only as the reader acknowledges these bytes.
             state.unacked = state
                 .unacked
                 .checked_add(payload_len)
@@ -884,8 +877,6 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            // An unsettled id is still in use: reopening it would replace
-            // its unacknowledged count.
             if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
@@ -941,7 +932,6 @@ impl YamuxSession {
         if frame.flags() == FLAG_SYN {
             self.queue_peer_control(Frame::ping(FLAG_ACK, frame.value())?)?;
         } else if self.probe.is_some_and(|probe| probe.nonce == frame.value()) {
-            // Only our own nonce answers the probe; a stray ACK is ignored.
             self.probe = None;
         }
         Ok(())
@@ -955,8 +945,6 @@ impl YamuxSession {
         let flags = state.take_open_flag();
         let credit = state.pending_credit.min(u64::from(u32::MAX)) as u32;
         state.pending_credit -= u64::from(credit);
-        // Pending credit is only ever what the window gave up, so this never
-        // saturates.
         state.receive_window = state.receive_window.saturating_add(credit);
         self.index_work(stream);
         Some(Frame::window_update(stream, flags, credit).ok()?.encode())
@@ -966,7 +954,6 @@ impl YamuxSession {
     /// `FIN` once its accepted bytes have all gone, in a buffer with `room`.
     fn data_frame(&mut self, room: FrameRoom) -> Option<Vec<u8>> {
         let after = self.send_cursor;
-        // Exclusive, so a sendable `u32::MAX` cannot keep the turn.
         let stream = *self
             .sendable
             .range((Bound::Excluded(after), Bound::Unbounded))
@@ -1001,7 +988,6 @@ impl YamuxSession {
                 self.total_buffered_send -= sent;
                 frame
             }
-            // Only a pending close is sendable with nothing buffered.
             _ => {
                 flags |= FLAG_FIN;
                 Frame::encode_data_with_room(stream, flags, &[], room)
@@ -1123,8 +1109,6 @@ impl YamuxSession {
             if emit {
                 self.events.push_back(YamuxOutput::StreamClosed { stream });
             }
-            // Its unframed bytes left the shared cap without a frame being
-            // pulled, so streams blocked on that cap must hear about it here.
             if state.buffered_send != 0 {
                 self.wake_writable();
             }
@@ -1139,7 +1123,6 @@ impl YamuxSession {
         self.writable_armed.clear();
         self.control_due.clear();
         self.sendable.clear();
-        // Every write side ended: no Writable, not even one already queued.
         self.events
             .retain(|event| !matches!(event, YamuxOutput::Writable { .. }));
         self.total_buffered_send = 0;
@@ -1184,15 +1167,12 @@ impl YamuxSession {
     /// and no stream gets a terminal event of its own; the failure ends them.
     fn fail(&mut self) {
         self.lifecycle = Lifecycle::Failed;
-        // Data still queued is dropped below and never delivered, so it is
-        // nobody's to acknowledge.
         for event in &self.events {
             if let YamuxOutput::Data { stream, data } = event {
                 let len = data.len() as u32;
                 if let Some(state) = self.streams.get_mut(stream) {
                     state.unacked = state.unacked.saturating_sub(len);
                 } else if let Some(unacked) = self.unsettled.get_mut(stream) {
-                    // The stream already closed within this same input.
                     *unacked = unacked.saturating_sub(len);
                 }
             }

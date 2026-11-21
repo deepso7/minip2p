@@ -127,7 +127,6 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
                     }
                 }
             } else if !closed_write {
-                // Every byte is accepted, so the FIN may follow.
                 writer.close_stream_write(stream).expect("close write");
                 closed_write = true;
             }
@@ -167,15 +166,12 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
 #[cfg(feature = "quic")]
 #[test]
 fn a_bulk_transfer_to_a_slow_reader_over_quic_completes_without_teardown() {
-    // Past QUIC's default connection queue (1 MiB) plus its send and
-    // connection windows (2 and 3 MiB).
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/udp/0/quic-v1", 24 * 1024 * 1024);
 }
 
 #[cfg(feature = "tcp")]
 #[test]
 fn a_bulk_transfer_to_a_slow_reader_over_tcp_completes_without_teardown() {
-    // Past Yamux's 256 KiB stream cap and the kernel's socket buffer.
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/tcp/0", 8 * 1024 * 1024);
 }
 
@@ -252,16 +248,6 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
     let mut reader_stream = None;
     let deadline = Instant::now() + BACKSTOP;
 
-    // Never acknowledging: delivery stops at one window, give or take the
-    // negotiation bytes. Over TCP, Yamux spent part of the initial window on
-    // the negotiation the endpoint consumed itself and returns credit in half
-    // windows, so delivery stops just short of `window`. Over QUIC, the gate
-    // is a delivery budget the endpoint restores for the bytes it consumed
-    // itself, so delivery reaches the full window.
-    //
-    // Progress drives the exit: keep delivering until the lower bound holds
-    // (only BACKSTOP bounds that), then require a quiet window to confirm
-    // nothing past one window arrives. The quiet check is best effort.
     let mut quiet_since = Instant::now();
     loop {
         assert!(
@@ -270,7 +256,6 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             received.len()
         );
         sender.turn(&mut writer, stream);
-        // Sampled before the drain, so a closed window gets one more poll.
         let quiet_closed = quiet_since.elapsed() >= Duration::from_millis(500);
         let mut arrived = false;
         while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
@@ -308,7 +293,6 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
         "an over-ack names both counts and fails: {over_ack:?}"
     );
 
-    // Consuming resumes the sender, and the transfer completes.
     reader
         .stream_consumed(reader_stream, received.len())
         .expect("consume the window");

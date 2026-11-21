@@ -311,7 +311,6 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         at(20),
     );
 
-    // Per-relay progress (`RelayStarted`) comes first.
     assert!(matches!(
         core::iter::from_fn(|| source_nat.poll_event())
             .find(|event| !matches!(event, NatEvent::RelayStarted { .. })),
@@ -415,7 +414,6 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
         &reserve_request,
         at(5),
     );
-    // The reservation's `Present` crosses the backbone.
     mesh.pump(at(5));
     let (_, reserve_response) = mesh_send(&mut mesh, HOLDING);
     destination_nat.handle_event(
@@ -471,7 +469,6 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     };
     let connect_request = source_swarm.take_sent();
     mesh.nodes[ENTRY].data(&source, source_key, &connect_request, at(15));
-    // B forwards; A opens STOP on the destination's reserved connection.
     mesh.pump(at(15));
     let stop_key = common::opened(&mesh.calls(HOLDING)).expect("STOP open on the holding node");
     assert_eq!(stop_key.conn_id, DESTINATION_RELAY_CONN);
@@ -504,7 +501,6 @@ fn two_nat_agents_on_different_mesh_nodes_connect_across_the_backbone() {
     let stop_response = destination_swarm.take_sent();
     let destination_circuit = destination_swarm.promoted_circuit();
     mesh.nodes[HOLDING].data(&destination, stop_key, &stop_response, at(18));
-    // A's forward `OK` reaches B, which answers the source's CONNECT.
     mesh.pump(at(18));
     let (_, hop_response) = mesh_send(&mut mesh, ENTRY);
     source_nat.handle_event(

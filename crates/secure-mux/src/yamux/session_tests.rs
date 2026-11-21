@@ -17,7 +17,6 @@ fn config() -> YamuxConfig {
         max_streams: 8,
         max_buffered_send: DEFAULT_RECEIVE_WINDOW as usize,
         max_total_buffered_send: DEFAULT_RECEIVE_WINDOW as usize * 2,
-        // Tests shrink the caps; a reserve is opted into where tested.
         control_stream_reserve: 0,
         ..YamuxConfig::default()
     }
@@ -160,12 +159,10 @@ fn idle_open_and_accept_emit_standalone_control_frames() {
 fn accepted_bytes_count_until_pulled_and_queue_past_the_window() {
     let mut limits = config();
     limits.max_buffered_send *= 2;
-    // Frames large enough that only the window bounds them.
     limits.max_frame_len = u32::MAX;
     let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
     let stream = client.open_stream().unwrap();
     let data = Bytes::from(alloc::vec![7; DEFAULT_RECEIVE_WINDOW as usize + 5]);
-    // Peer credit does not decide acceptance; only the caps do.
     client.send(stream, data).unwrap();
     assert_eq!(
         client.total_buffered_send(),
@@ -226,7 +223,6 @@ fn data_frames_rotate_across_sendable_streams() {
     limits.max_frame_len = 2;
     let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
     let [a, b, c, idle] = [(); 4].map(|_| client.open_stream().unwrap());
-    // Streams with nothing to send open with standalone SYNs first.
     client.send(a, Bytes::from(b"a1a2a3".to_vec())).unwrap();
     client.send(c, Bytes::from(b"c1".to_vec())).unwrap();
     let next = |client: &mut YamuxSession| {
@@ -236,7 +232,6 @@ fn data_frames_rotate_across_sendable_streams() {
     assert_eq!(next(&mut client), (b, Vec::new()));
     assert_eq!(next(&mut client), (idle, Vec::new()));
     assert_eq!(next(&mut client), (a, b"a1".to_vec()));
-    // A stream that becomes sendable joins the rotation in id order.
     client.send(b, Bytes::from(b"b1b2".to_vec())).unwrap();
     assert_eq!(next(&mut client), (b, b"b1".to_vec()));
     assert_eq!(next(&mut client), (c, b"c1".to_vec()));
@@ -335,7 +330,6 @@ fn a_write_past_the_caps_returns_the_exact_unsent_suffix() {
         &b"e"[..]
     );
     assert_eq!(session.total_buffered_send(), 4);
-    // The shared cap leaves two bytes for the second stream.
     assert_eq!(
         unsent(session.send(second, Bytes::from_static(b"xyz"))),
         &b"z"[..]
@@ -396,7 +390,6 @@ fn writable_fires_once_per_full_and_for_shared_cap_blocks() {
     let busy = session.open_stream().unwrap();
     let starved = session.open_stream().unwrap();
     session.send(busy, Bytes::from(alloc::vec![1; 8])).unwrap();
-    // `starved` has nothing queued; only the shared cap blocks it.
     assert!(matches!(
         session.send(starved, Bytes::from_static(b"x")),
         Err(YamuxError::Full { .. })
@@ -437,7 +430,6 @@ fn control_streams_queue_into_the_reserve_application_streams_cannot_fill() {
     session.set_control(control, true);
 
     session.send(app, Bytes::from(alloc::vec![1; 8])).unwrap();
-    // Application streams stop at the cap less the reserve.
     assert!(matches!(
         session.send(other_app, Bytes::from_static(b"xyz")),
         Err(YamuxError::Full { unsent, .. }) if unsent == b"xyz"[..]
@@ -447,7 +439,6 @@ fn control_streams_queue_into_the_reserve_application_streams_cannot_fill() {
         .expect("the reserve holds a control write");
     assert_eq!(session.total_buffered_send(), 12);
 
-    // Back to an application stream, it no longer reaches the reserve.
     session.set_control(control, false);
     while session.poll_frame().is_some() {}
     assert!(matches!(
@@ -470,7 +461,6 @@ fn a_full_control_stream_wakes_once_the_reserve_frees_even_when_it_is_small() {
     let control = session.open_stream().unwrap();
     session.set_control(control, true);
 
-    // Stalled application streams hold their whole share for good.
     for app in apps {
         session.streams.get_mut(&app).unwrap().send_window = 0;
         match session.send(app, Bytes::from(alloc::vec![1; 8])) {
@@ -484,7 +474,6 @@ fn a_full_control_stream_wakes_once_the_reserve_frees_even_when_it_is_small() {
         Err(YamuxError::Full { unsent, .. }) if unsent.len() == 2
     ));
 
-    // Only the reserve can free, and that must be enough to wake it.
     while session.poll_frame().is_some() {}
     let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
     assert!(
@@ -512,7 +501,6 @@ fn a_reset_that_frees_the_shared_cap_wakes_blocked_streams() {
     let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
     let hog = session.open_stream().unwrap();
     let blocked = session.open_stream().unwrap();
-    // No remote credit, so nothing is ever framed from `hog`.
     session.streams.get_mut(&hog).unwrap().send_window = 0;
     session.send(hog, Bytes::from(alloc::vec![1; 8])).unwrap();
     assert!(matches!(
@@ -607,8 +595,6 @@ fn resets_of_peer_opened_streams_spend_the_control_reserve() {
     let mut limits = config();
     limits.max_pending_control = 2;
     let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
-    // The peer opens a stream, we reset it, and the slot is free again:
-    // only the reserve bounds the RSTs a non-reading peer piles up.
     let mut reset_inbound = |stream: u32| {
         session
             .handle_data(&Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode())
@@ -657,7 +643,6 @@ fn inbound_events_do_not_wait_behind_unpulled_frames() {
     server
         .handle_data(&Frame::ping(FLAG_SYN, 7).unwrap().encode())
         .unwrap();
-    // Frames are queued, yet events come out without pulling any.
     assert_eq!(
         server.poll_event(),
         Some(YamuxOutput::IncomingStream { stream })
@@ -677,7 +662,6 @@ fn close_waits_for_buffered_data_and_reset_is_immediate() {
     session.send(stream, Bytes::from_static(b"queued")).unwrap();
     session.close_write(stream).unwrap();
     assert_eq!(session.streams[&stream].write, WriteSide::FinPending);
-    // Only the standalone SYN can go before credit arrives.
     assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
     assert_eq!(session.poll_frame(), None);
     session
@@ -704,7 +688,6 @@ fn server_with_delivered(limits: YamuxConfig, len: usize, flags: u16) -> YamuxSe
     let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
     let frame = Frame::encode_data(1, FLAG_SYN | flags, &alloc::vec![7; len]).unwrap();
     server.handle_data(&frame).unwrap();
-    // The SYN's ACK is not credit; take it so only window updates remain.
     assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_ACK);
     server
 }
@@ -715,7 +698,6 @@ fn window_credit_returns_only_for_acknowledged_bytes() {
     let mut server = server_with_delivered(config(), window, 0);
     while server.poll_event().is_some() {}
     assert_eq!(server.poll_frame(), None, "unread bytes return no credit");
-    // A peer past the budget is violating the window it was given.
     let more = Frame::encode_data(1, 0, &[0]).unwrap();
     assert_eq!(
         server_with_delivered(config(), window, 0).handle_data(&more),
@@ -724,7 +706,6 @@ fn window_credit_returns_only_for_acknowledged_bytes() {
 
     server.ack(1, window / 2 - 1).unwrap();
     assert_eq!(server.poll_frame(), None, "credit returns in half windows");
-    // Exactly half, so frames that divide the window return it in halves.
     server.ack(1, 1).unwrap();
     let update = decode(&outbound(&mut server));
     assert_eq!(update.frame_type(), FrameType::WindowUpdate);
@@ -752,7 +733,6 @@ fn an_over_ack_names_the_stream_and_both_counts_and_acks_nothing() {
             unacked: 0,
         })
     );
-    // Unknown streams have nothing to acknowledge.
     server.ack(9, 1_000).unwrap();
 }
 
@@ -770,7 +750,6 @@ fn a_closed_stream_keeps_its_slot_until_its_bytes_are_acknowledged() {
     );
     let open = |stream| Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode();
 
-    // Unsettled: the next stream is refused, locally and from the peer.
     assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
     server.handle_data(&open(3)).unwrap();
     assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_RST);
@@ -787,7 +766,6 @@ fn a_closed_stream_keeps_its_slot_until_its_bytes_are_acknowledged() {
         })
     );
 
-    // The last acknowledged byte frees the slot.
     server.ack(1, 6).unwrap();
     server.handle_data(&open(7)).unwrap();
     assert_eq!(
@@ -804,8 +782,6 @@ fn stream_churn_with_an_unread_reader_stays_within_max_streams_times_the_window(
     let window = limits.receive_window as usize;
     let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
     let mut delivered = 0;
-    // The peer opens a stream, fills its window, and resets it, over and
-    // over; the reader never acknowledges anything.
     for stream in (1..200).step_by(2) {
         let frame = Frame::encode_data(stream, FLAG_SYN, &alloc::vec![7; window]).unwrap();
         server.handle_data(&frame).unwrap();
@@ -828,7 +804,6 @@ fn a_peer_cannot_reopen_an_unsettled_stream_id() {
     server
         .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
         .unwrap();
-    // Reopening stream 1 would replace its unacknowledged count.
     let reopen = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
     assert_eq!(
         server.handle_data(&reopen),
@@ -853,7 +828,6 @@ fn a_local_reset_abandons_unacknowledged_bytes() {
     server.reset(1).unwrap();
     assert_eq!(server.open_stream(), Ok(2), "the reset settled stream 1");
 
-    // A stream the peer reset stays unsettled until our own reset.
     let mut server = server_with_delivered(limits, 10, 0);
     server
         .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
@@ -869,8 +843,6 @@ fn unsettled(session: &YamuxSession) -> Vec<(u32, usize)> {
 
 #[test]
 fn the_session_ending_keeps_unacknowledged_counts_for_its_host() {
-    // A local GoAway, a remote one, and a protocol failure all end every
-    // stream; what was delivered stays the host's to settle.
     let go_away = Frame::go_away(0).encode();
     let garbage = [0xff; 12];
     for end in 0..3 {
@@ -899,16 +871,12 @@ fn the_session_ending_keeps_unacknowledged_counts_for_its_host() {
 
 #[test]
 fn a_protocol_failure_counts_only_data_it_still_delivers() {
-    // The failure drops events still queued, so their bytes never reach
-    // the host and must not be left for it to acknowledge.
     let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
     let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
     input.extend_from_slice(&[0xff; 12]);
     assert!(server.handle_data(&input).is_err());
     assert_eq!(unsettled(&server), []);
 
-    // Also when the peer reset the stream before the failure, which had
-    // already left its count unsettled.
     let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
     let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
     input.extend(Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode());
@@ -953,8 +921,6 @@ fn local_capacity_and_id_exhaustion_do_not_damage_existing_streams() {
 
 #[test]
 fn receive_window_violation_emits_protocol_go_away() {
-    // Each frame fits the decoder's limit; together they exceed the
-    // stream's credit.
     let mut server = YamuxSession::new(YamuxRole::Server);
     let full = Frame::data(1, FLAG_SYN, alloc::vec![0; DEFAULT_RECEIVE_WINDOW as usize])
         .unwrap()
@@ -1140,7 +1106,6 @@ fn peer_acknowledged_sends_postpone_the_probe() {
     let mut session = YamuxSession::new(YamuxRole::Client);
     session.poll(Now::from_millis(0)).unwrap();
 
-    // Dated by the next poll, like a received frame.
     session.note_peer_acked();
     session.poll(Now::from_millis(5)).unwrap();
     session
@@ -1183,7 +1148,6 @@ fn a_ping_not_handed_off_in_time_fails_the_session() {
         session.next_deadline(),
         Some(Deadline::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS))
     );
-    // The peer is still talking, but the ping cannot leave.
     session
         .handle_data(&Frame::ping(FLAG_SYN, 9).unwrap().encode())
         .unwrap();
@@ -1346,8 +1310,6 @@ fn large_window_config() -> YamuxConfig {
 
 #[test]
 fn a_frame_as_large_as_the_granted_credit_is_accepted() {
-    // A window past `max_frame_len`: a peer that frames up to its
-    // credit must not fail the session.
     let config = large_window_config();
     let window = config.receive_window as usize;
     assert!(window > config.max_frame_len as usize);
@@ -1385,7 +1347,6 @@ fn a_window_past_the_initial_credit_is_granted_with_the_open() {
     server.poll_events();
     let window = window as usize;
     let payload = Bytes::from(alloc::vec![7; window]);
-    // The server may now send the whole window without an update.
     let mut sent = 0;
     while sent < window {
         let unsent = match server.send(stream, payload.slice(sent..)) {

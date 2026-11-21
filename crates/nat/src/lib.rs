@@ -80,17 +80,13 @@ pub use config::{MAX_DCUTR_ROUNDS, NatConfig, ReservationPolicy};
 pub use events::{NatAction, NatEvent};
 pub use housekeeping::{AUTONAT_VOTE_TTL_MS, MAX_RESERVATION_RETRY_BACKOFF_MS};
 pub use inbound::MAX_PUNCH_CANDIDATES;
+pub use minip2p_core::platform::{Deadline, Now};
 pub use swarm::{BridgeHandoff, BridgeRole, DialStart, NatSwarm, NatSwarmError, is_named};
 pub use types::{
     NatError, NatToken, Path, PromoteError, ReachabilityState, RelayStage, ReservationInfo,
     UpgradeStop,
 };
-// The component time sample and deadline, re-exported so callers need not
-// depend on minip2p-core to name them.
-pub use minip2p_core::platform::{Deadline, Now};
 
-// Protocol ids for everything the agent drives, so a driver can register
-// them from one place.
 pub use crate::autonat::AUTONAT_PROTOCOL_ID;
 pub use crate::dcutr::DCUTR_PROTOCOL_ID;
 pub use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};

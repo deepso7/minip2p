@@ -1,9 +1,6 @@
 #!/usr/bin/env sh
 set -eu
 
-# Maintainer-only helper. It downloads the exact producer crate, verifies the
-# crates.io checksum, and applies two test-only substitutions so rust-libp2p's
-# otherwise-random Noise static and ephemeral keys are reproducible.
 version=0.46.1
 checksum=bc73eacbe6462a0eb92a6527cac6e63f02026e5407f8831bde8293f19217bfbf
 fixture_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

@@ -399,8 +399,6 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             a.at(now).send_stream(stream, PAYLOAD.to_vec()).unwrap();
             sent = true;
         }
-        // B's current connection to A: stream ids are only unique per
-        // connection, so delivery is matched on it too.
         let b_conn = b_events.iter().rev().find_map(|event| match event {
             EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == &a_peer => {
                 Some(*conn_id)
@@ -489,8 +487,6 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
             .protocol(APP_PROTOCOL)
             .build()
             .unwrap();
-    // Renews every two seconds: this endpoint has no wall clock, so renewal
-    // runs at half the default TTL.
     let mut b =
         PortableEndpointBuilder::new(&b_identity, CountingEntropy(70), ManualClock::default())
             .smoltcp(stack(bus.device(1), B_IP))
@@ -560,7 +556,6 @@ fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
             a.at(now).send_stream(stream, PAYLOAD.to_vec()).unwrap();
             sent = true;
         }
-        // Inbound: B receives A's data on a circuit connection.
         let received = b_events.iter().any(|event| {
             matches!(event, EndpointEvent::StreamData { peer_id, stream, data, .. }
                 if peer_id == &a_peer && stream.conn_id().is_circuit() && data == PAYLOAD)
@@ -727,7 +722,6 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
                 .build()
                 .unwrap();
 
-        // Starting well after zero catches deadlines anchored to an internal epoch.
         let start = Now::from_millis(50_000);
         let id = endpoint.at(start).connect(peer).unwrap();
         let mut events = endpoint.at(start).poll().unwrap();
@@ -751,7 +745,6 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
         }
         events.extend(endpoint.at(Now::from_millis(50_050)).poll().unwrap());
         endpoint.at(Now::from_millis(50_050)).cancel_connect(id);
-        // Advancing beyond the abandoned relay dial must not settle the attempt again.
         events.extend(endpoint.at(Now::from_millis(100_000)).poll().unwrap());
         let outcomes: Vec<_> = events
             .iter()

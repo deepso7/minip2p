@@ -32,8 +32,6 @@ release_url="https://github.com/deepso7/minip2p/releases/download/v$version"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/minip2p-relay-install.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-# Releases ship static musl binaries; releases up to v0.11.0 have only glibc
-# ones, which need glibc 2.39 or newer.
 for libc in musl gnu; do
   target="$arch-unknown-linux-$libc"
   archive="minip2p-relay-server-v$version-$target"

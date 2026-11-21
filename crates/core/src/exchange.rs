@@ -98,7 +98,6 @@ impl FrameExchange {
                 max: self.max_len,
             });
         }
-        // Frame straight into the send buffer rather than through a temporary.
         write_uvarint(payload.len() as u64, &mut self.outbound);
         self.outbound.extend_from_slice(payload);
         Ok(())
@@ -185,8 +184,6 @@ impl FrameExchange {
             *slot = *byte;
             len += 1;
         }
-        // `len` never exceeds `head`; `get` only satisfies the workspace's
-        // no-panicking-slices lint.
         read_uvarint(head.get(..len)?)
             .ok()
             .map(|(declared, _)| declared)
@@ -248,7 +245,6 @@ mod tests {
     #[test]
     fn declared_len_above_max_is_refused_from_the_header() {
         let mut ex = FrameExchange::new(MAX);
-        // 8193 as a minimal uvarint, with no payload behind it.
         assert_eq!(
             ex.push(&[0x81, 0x40]).unwrap_err(),
             FrameFault::TooLarge {
@@ -315,7 +311,6 @@ mod tests {
     #[test]
     fn a_stalled_frame_cannot_grow_past_the_limit() {
         let mut ex = FrameExchange::new(MAX);
-        // A header promising a maximal payload, then bytes that never complete it.
         ex.push(&encode_frame(&vec![0u8; MAX])[..MAX]).unwrap();
         assert!(ex.next_frame(identity).unwrap().is_none());
 
@@ -378,7 +373,6 @@ mod tests {
     #[test]
     fn a_malformed_header_is_a_wire_fault() {
         let mut ex = FrameExchange::new(MAX);
-        // Non-minimal length prefix.
         ex.push(&[0x81, 0x00, 0xaa]).unwrap();
         assert!(matches!(
             ex.next_frame(identity).unwrap_err(),
