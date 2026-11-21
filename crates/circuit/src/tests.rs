@@ -531,6 +531,54 @@ fn an_unanswered_keepalive_closes_the_circuit_as_timed_out() {
 }
 
 #[test]
+fn buffered_events_never_expire_keepalive_ahead_of_an_unread_pong() {
+    let (mut a, mut b, circuit_id, bridge, a_peer, b_peer) = setup_close_observed_pair();
+    complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    let inner_conn = a
+        .circuits
+        .get(&circuit_id)
+        .expect("initiator circuit")
+        .inner_conn;
+
+    a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("ping");
+    a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("date the hand-off");
+    let ping_bytes = b
+        .inner_mut()
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("read ping from bridge")
+        .into_iter()
+        .find_map(|event| match event {
+            TransportEvent::StreamData {
+                stream_id, data, ..
+            } if stream_id == bridge => Some(data),
+            _ => None,
+        })
+        .expect("Yamux ping bytes crossed the bridge");
+    b.inject_bridge_data(inner_conn, bridge, ping_bytes);
+
+    let stream_id = a.open_stream(circuit_id).expect("open stream");
+    let answer_by = Now::from_millis(KEEPALIVE_INTERVAL_MS + KEEPALIVE_ACK_TIMEOUT_MS);
+
+    assert_eq!(
+        a.poll(answer_by).expect("drain buffered events"),
+        vec![TransportEvent::StreamOpened {
+            id: circuit_id,
+            stream_id,
+        }]
+    );
+    let events = a.poll(answer_by).expect("read the pong");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { .. })),
+        "a pong unread when the deadline came still answers the ping: {events:?}"
+    );
+    assert!(a.circuit_ids().contains(&circuit_id));
+}
+
+#[test]
 fn circuit_runs_noise_yamux_and_stream_contract() {
     let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
     complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
@@ -1071,7 +1119,7 @@ fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     assert_eq!(
         a.next_deadline(),
         Some(Deadline::IMMEDIATE),
-        "an injected handshake completion must schedule keepalive arming"
+        "an injected handshake completion queues events to deliver"
     );
 
     let events = a
@@ -1089,17 +1137,18 @@ fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
     )));
     assert_eq!(
         a.next_deadline(),
-        Some(Deadline::IMMEDIATE),
-        "draining pending events must leave an immediate wakeup"
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "the drain armed the session it established, so the next deadline is real"
     );
     assert!(
         a.poll(Now::from_millis(0))
-            .expect("arm keepalive")
+            .expect("nothing left to do")
             .is_empty()
     );
     assert_eq!(
         a.next_deadline(),
-        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "and no extra wakeup was needed to get there"
     );
 }
 
