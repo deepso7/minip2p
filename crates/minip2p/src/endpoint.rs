@@ -365,6 +365,22 @@ impl<P: Platform> Endpoint<P> {
         self.engine.disconnect(peer_id, now)
     }
 
+    /// Tells the endpoint its host is back from a pause, such as a mobile
+    /// app returning to the foreground. Call it on every resume.
+    ///
+    /// A paused host stops answering its peers, and a clock that stood
+    /// still meanwhile can hide that its connections died. Resuming
+    /// recovers the relay reservation now instead of at its scheduled time:
+    /// a pending retry runs at once, its backoff starts over, and a held
+    /// reservation is renewed at once. If the relay does not answer the
+    /// renewal within `NatConfig::relay_timeout_ms`, the reservation is
+    /// reported lost and reacquired. This does nothing unless the
+    /// reservation policy wants a relay reservation.
+    pub fn resume(&mut self) {
+        let now = self.now();
+        self.engine.resume(now);
+    }
+
     /// Returns the [`Path`] of `peer_id`'s established connection; `None`
     /// only while the peer is not connected.
     ///

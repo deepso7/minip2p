@@ -46,10 +46,9 @@ export type UseMinip2pResult = Minip2pHookState & {
   readonly close: () => void;
 };
 
-/** Mirrors the current and future React Native AppState into an endpoint. */
-export const bindAppState = (
-  endpoint: Pick<Minip2p, "setActive">
-): Unsubscribe => bindAppStateSource(endpoint, AppState);
+/** Resumes an endpoint each time the React Native app returns to the foreground. */
+export const bindAppState = (endpoint: Pick<Minip2p, "resume">): Unsubscribe =>
+  bindAppStateSource(endpoint, AppState);
 
 /**
  * Owns a native endpoint for a committed component lifetime.

@@ -1463,10 +1463,19 @@ export class Minip2pBase {
     return !this.#closed && this.#backend.isRunning();
   }
 
-  /** Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline. */
-  setActive(active: boolean): void {
+  /**
+   * Tells the endpoint its host is back from a pause: an app returning to
+   * the foreground, or a page becoming visible again.
+   *
+   * A paused host stops answering its peers, and its connections can die
+   * unnoticed meanwhile. Resuming recovers the relay reservation at once
+   * instead of at its scheduled retry or renewal: a held reservation is
+   * renewed, and reported lost and reacquired if the relay does not answer.
+   * It does nothing unless the reservation policy wants a relay reservation.
+   */
+  resume(): void {
     this.#assertOpen();
-    this.#backend.setActive(active);
+    this.#backend.resume();
   }
 
   /** Subscribes to a pubsub topic; returns whether the set changed. */
