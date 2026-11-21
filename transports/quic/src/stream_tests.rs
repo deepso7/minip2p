@@ -565,10 +565,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
 
     let third = server.open_stream(id).expect("third");
     assert_eq!(server.connections[&id].local_slots_used(), 3);
-    assert!(matches!(
-        server.open_stream(id),
-        Err(TransportError::ResourceExhausted { .. })
-    ));
     server
         .send_stream(id, second, second_payload.clone())
         .expect("resent");

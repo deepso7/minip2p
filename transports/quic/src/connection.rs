@@ -428,8 +428,7 @@ impl QuicConnection {
         self.send_queues.len()
     }
 
-    /// Local stream slots in use: opened streams still held plus pending
-    /// opens.
+    /// Local streams retained: opened streams still held plus pending opens.
     #[cfg(test)]
     pub(crate) fn local_slots_used(&self) -> u64 {
         self.bound_local_bidi_streams + self.pending_opens.len() as u64
@@ -478,6 +477,7 @@ impl QuicConnection {
                 self.after_wt(now, cx.events);
                 self.poll_wt_close(now);
             }
+            self.gc_closed_streams();
             self.bind_pending_opens(now, cx.events);
             self.drain_send_queues(now, cx.events);
             while let Some(event) = self.conn.poll_endpoint_events() {
@@ -494,7 +494,6 @@ impl QuicConnection {
         let failure = self.transmit(now, cx);
         let wt = self.wt.as_ref().and_then(WtSession::poll_timeout);
         self.timeout = [self.conn.poll_timeout(), wt].into_iter().flatten().min();
-        self.gc_closed_streams();
         failure
     }
 
@@ -1028,10 +1027,13 @@ impl QuicConnection {
         }
     }
 
-    /// Opens pending streams in the engine, in order, as peer credit allows,
-    /// reporting each as `StreamOpened`.
+    /// Opens pending streams in order as local capacity and peer credit allow,
+    /// reporting each live stream as `StreamOpened`.
     fn bind_pending_opens(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
-        while !self.pending_opens.is_empty() && !self.is_closing() {
+        while !self.pending_opens.is_empty()
+            && !self.is_closing()
+            && self.bound_local_bidi_streams < self.max_streams
+        {
             if self.wt.as_ref().is_some_and(|wt| !wt.may_open_stream()) {
                 return;
             }
@@ -1083,11 +1085,6 @@ impl QuicConnection {
                 id: self.id,
                 state: self.state,
                 expected: ConnectionState::Connected,
-            });
-        }
-        if self.bound_local_bidi_streams + self.pending_opens.len() as u64 >= self.max_streams {
-            return Err(TransportError::ResourceExhausted {
-                resource: "local QUIC bidirectional streams",
             });
         }
         let raw = self.next_local_bidi_stream_id;

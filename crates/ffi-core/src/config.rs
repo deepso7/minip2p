@@ -84,7 +84,9 @@ pub struct QuicLimitsOptions {
     /// Simultaneous connections, inbound and outbound.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_connections: Option<u64>,
-    /// Locally initiated bidirectional streams per connection.
+    /// Bound locally initiated bidirectional streams per connection.
+    /// Excess opens wait FIFO with an immediate ID. The pending queue is
+    /// unbounded and local-caller-only, so peers cannot use it for DoS.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub max_streams_per_connection: Option<u64>,
     /// Bytes queued per stream beyond what the engine accepts; non-zero.

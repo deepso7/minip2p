@@ -57,7 +57,11 @@ export interface Minip2pLimits {
 export interface Minip2pQuicLimits {
   /** Simultaneous connections, inbound and outbound. */
   readonly maxConnections?: number;
-  /** Locally initiated bidirectional streams per connection. */
+  /**
+   * Bound locally initiated bidirectional streams per connection (default 128).
+   * Excess opens wait FIFO for local capacity and peer credit. The pending
+   * queue has no length cap: only local callers enqueue, not remote peers.
+   */
   readonly maxStreamsPerConnection?: number;
   /** Bytes queued per stream beyond what the engine accepts; non-zero. */
   readonly maxPendingBytesPerStream?: number;

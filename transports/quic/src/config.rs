@@ -54,7 +54,13 @@ pub struct QuicLimits {
     /// slot held, dials fail with `ResourceExhausted` and Initials are
     /// ignored.
     pub max_connections: usize,
-    /// Maximum locally initiated bidirectional streams per connection.
+    /// Maximum bound locally initiated bidirectional streams per connection.
+    ///
+    /// Opens beyond this cap receive an ID immediately and wait FIFO for
+    /// local capacity and peer stream credit. Pending opens are unbounded:
+    /// only local callers enqueue them, so peers cannot use the queue for DoS.
+    /// Closed streams with unacknowledged bytes retain their bound slot.
+    /// Also sets the concurrent bidirectional stream credit granted to peers.
     pub max_streams_per_connection: u64,
     /// Maximum application bytes queued per stream beyond what the QUIC
     /// engine accepts immediately. Must be non-zero.
