@@ -701,15 +701,19 @@ fn fuzz_noise(data: &[u8]) {
     }
 }
 
-/// Exercises the bounded frame decoder and both stream-ID roles.
+/// Exercises the bounded frame decoder, both when it adopts a pushed buffer
+/// and when it appends to a partial frame, and both stream-ID roles.
 fn fuzz_yamux(data: &[u8]) {
+    let (head, tail) = data.split_at(data.len() / 2);
     let mut decoder = YamuxFrameDecoder::new(64 * 1024);
-    decoder.push(data);
+    decoder.push(head.to_vec());
+    while matches!(decoder.next_frame(), Ok(Some(_))) {}
+    decoder.push(tail.to_vec());
     while matches!(decoder.next_frame(), Ok(Some(_))) {}
 
     for role in [YamuxRole::Client, YamuxRole::Server] {
         let mut session = YamuxSession::new(role);
-        let _ = session.handle_data(data);
+        let _ = session.handle_data(data.to_vec());
         while session.poll_output().is_some() {}
     }
 }

@@ -46,7 +46,7 @@ fn receiver() -> (YamuxSession, Vec<u8>) {
 #[bench::session_receive_and_drain(receiver())]
 fn session_receive_and_drain(input: (YamuxSession, Vec<u8>)) {
     let (mut session, bytes) = input;
-    session.handle_data(&bytes).expect("receive");
+    session.handle_data(bytes).expect("receive");
     black_box(session.poll_output());
     black_box(session.poll_output());
 }
@@ -70,7 +70,7 @@ fn drained_data(session: &mut YamuxSession) -> Vec<u8> {
     let mut decoder = FrameDecoder::new(u32::MAX);
     while let Some(output) = session.poll_output() {
         if let YamuxOutput::Outbound(bytes) = output {
-            decoder.push(&bytes);
+            decoder.push(bytes);
         }
     }
     let mut data = Vec::new();
@@ -97,7 +97,9 @@ fn queued_sender() -> (YamuxSession, u32, Vec<u8>, Vec<u8>) {
     session
         .send(stream, Bytes::from(queued.clone()))
         .expect("send");
-    session.handle_data(&updates).expect("window updates");
+    session
+        .handle_data(updates.clone())
+        .expect("window updates");
     assert!(
         drained_data(&mut session) == queued,
         "window updates must frame the whole queued chunk"
@@ -112,7 +114,7 @@ fn queued_sender() -> (YamuxSession, u32, Vec<u8>, Vec<u8>) {
 fn queued_send_16kib_window_updates(input: (YamuxSession, u32, Vec<u8>, Vec<u8>)) {
     let (mut session, stream, data, updates) = input;
     session.send(stream, Bytes::from(data)).expect("send");
-    session.handle_data(&updates).expect("window updates");
+    session.handle_data(updates).expect("window updates");
     while let Some(output) = session.poll_output() {
         black_box(output);
     }
@@ -164,7 +166,7 @@ fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>, Vec<u8
     while let Some(frame) = session.poll_frame() {
         black_box(frame);
     }
-    session.handle_data(&refills).expect("window updates");
+    session.handle_data(refills).expect("window updates");
 }
 
 library_benchmark_group!(

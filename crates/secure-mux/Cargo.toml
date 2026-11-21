@@ -24,6 +24,7 @@ std = [
 ]
 
 [dependencies]
+bytes = { workspace = true }
 minip2p-core = { path = "../core", version = "0.14.0", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.14.0", default-features = false, features = [
   "ed25519",
