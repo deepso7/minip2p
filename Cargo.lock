@@ -1214,9 +1214,8 @@ dependencies = [
 
 [[package]]
 name = "minip2p-mdns-demo"
-version = "0.11.11"
+version = "0.13.0"
 dependencies = [
- "minip2p-example-common",
  "minip2p-rs",
 ]
 

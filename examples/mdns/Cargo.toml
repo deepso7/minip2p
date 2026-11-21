@@ -16,8 +16,4 @@ name = "minip2p-mdns"
 path = "src/main.rs"
 
 [dependencies]
-minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = [
-  "mdns",
-  "tcp",
-] }
-minip2p-example-common = { path = "../common" }
+minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = ["mdns"] }
