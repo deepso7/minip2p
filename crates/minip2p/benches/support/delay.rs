@@ -59,13 +59,18 @@ impl Profile {
         rtt: Duration::from_millis(20),
     };
 
-    /// The profile's name: the rate in Mbit/s (`m`) or Gbit/s (`g`) and the
-    /// RTT in ms, such as `100m_100ms` or `1g_20ms`.
+    /// The profile's name: the rate in kbit/s (`k`), Mbit/s (`m`) or Gbit/s
+    /// (`g`) and the RTT in ms, such as `100m_100ms`, `1g_20ms` or
+    /// `64k_400ms`. The largest unit that divides the rate exactly wins, so
+    /// the name round-trips through [`named`](Self::named) for any whole
+    /// number of kbit/s.
     pub fn name(&self) -> String {
         let rate = if self.rate_bits_per_s.is_multiple_of(1_000_000_000) {
             format!("{}g", self.rate_bits_per_s / 1_000_000_000)
-        } else {
+        } else if self.rate_bits_per_s.is_multiple_of(1_000_000) {
             format!("{}m", self.rate_bits_per_s / 1_000_000)
+        } else {
+            format!("{}k", self.rate_bits_per_s / 1_000)
         };
         format!("{rate}_{}ms", self.rtt.as_millis())
     }
@@ -76,11 +81,13 @@ impl Profile {
         let rtt_ms: u64 = rtt.strip_suffix("ms")?.parse().ok()?;
         let rate_bits_per_s = if let Some(gbit) = rate.strip_suffix('g') {
             gbit.parse::<u64>().ok()?.checked_mul(1_000_000_000)?
+        } else if let Some(mbit) = rate.strip_suffix('m') {
+            mbit.parse::<u64>().ok()?.checked_mul(1_000_000)?
         } else {
-            rate.strip_suffix('m')?
+            rate.strip_suffix('k')?
                 .parse::<u64>()
                 .ok()?
-                .checked_mul(1_000_000)?
+                .checked_mul(1_000)?
         };
         (rate_bits_per_s > 0 && rtt_ms > 0).then(|| Self {
             rate_bits_per_s,
