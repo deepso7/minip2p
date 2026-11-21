@@ -124,16 +124,15 @@ export class WebEndpoint {
      */
     resetStream(conn_id: bigint, stream_id: bigint): void;
     /**
+     * Tells the endpoint its page is visible again, so a relay
+     * reservation recovers at once. Does nothing once closed.
+     */
+    resume(): void;
+    /**
      * Sends bytes on a stream: `true` once all are accepted, `false` while
      * the tail is held and `StreamWriteAccepted` is still to come.
      */
     sendStream(conn_id: bigint, stream_id: bigint, data: Uint8Array): boolean;
-    /**
-     * Ignored in the browser, kept for the shared SDK surface: there is no
-     * background driver whose cadence it could change. The page's own
-     * timers pump the endpoint.
-     */
-    setActive(_active: boolean): void;
     /**
      * Starts driving; `doorbell` is called when events become ready to drain.
      */
@@ -201,8 +200,8 @@ export interface InitOutput {
     readonly webendpoint_pump: (a: number) => [number, number];
     readonly webendpoint_reachability: (a: number) => [number, number, number];
     readonly webendpoint_resetStream: (a: number, b: bigint, c: bigint) => [number, number];
+    readonly webendpoint_resume: (a: number) => void;
     readonly webendpoint_sendStream: (a: number, b: bigint, c: bigint, d: number, e: number) => [number, number, number];
-    readonly webendpoint_setActive: (a: number, b: number) => void;
     readonly webendpoint_start: (a: number, b: any) => [number, number];
     readonly webendpoint_streamConsumed: (a: number, b: bigint, c: bigint, d: number) => [number, number];
     readonly webendpoint_subscribe: (a: number, b: number, c: number) => [number, number, number];

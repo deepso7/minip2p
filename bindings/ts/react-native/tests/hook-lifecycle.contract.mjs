@@ -33,11 +33,11 @@ export const verifyHookLifecycle = ({
       return "peer";
     }
 
-    setActive(active) {
+    resume() {
       if (this.closed) {
         throw new ClosedError();
       }
-      this.log.push(["active", active]);
+      this.log.push("resume");
     }
 
     terminal(reason) {
@@ -65,12 +65,15 @@ export const verifyHookLifecycle = ({
     };
     const unbind = bindAppStateSource(endpoint, source);
     handler("active");
+    handler("active");
+    handler("inactive");
+    handler("background");
+    handler("active");
     unbind();
+    handler("background");
+    handler("active");
 
-    assert.deepEqual(endpoint.log, [
-      ["active", false],
-      ["active", true],
-    ]);
+    assert.deepEqual(endpoint.log, ["resume", "resume"]);
     assert.equal(removed, true);
   }
 
@@ -87,12 +90,12 @@ export const verifyHookLifecycle = ({
           },
         };
       },
-      currentState: "active",
+      currentState: "background",
     };
     bindAppStateSource(endpoint, source);
     endpoint.closed = true;
 
-    assert.doesNotThrow(() => handler("background"));
+    assert.doesNotThrow(() => handler("active"));
     assert.equal(removed, true);
   }
 

@@ -830,6 +830,26 @@ fn a_real_dcutr_punch_settles_the_connect_as_punched() {
     );
 }
 
+#[test]
+fn resume_renews_the_held_reservation_at_once() {
+    let relay = relay_support::RelayServer::spawn();
+    let mut endpoint = Endpoint::builder()
+        .relay(relay.addr().clone())
+        .nat_config(NatConfig {
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind endpoint");
+    endpoint.listen().expect("endpoint listens");
+    await_reservation(&mut endpoint, &relay);
+
+    endpoint.resume();
+    await_reservation(&mut endpoint, &relay);
+}
+
 /// Drives `responder` until it holds a reservation on `relay`.
 fn await_reservation(responder: &mut Endpoint, relay: &relay_support::RelayServer) {
     let deadline = Instant::now() + Duration::from_secs(10);

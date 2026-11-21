@@ -603,6 +603,18 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         path_of(&self.core, is_punched(&self.nat, conn_id), conn_id)
     }
 
+    /// See `Endpoint::resume`.
+    #[cfg_attr(
+        not(feature = "autonat"),
+        expect(unused_variables, reason = "only NAT recovers on resume")
+    )]
+    pub(crate) fn resume(&mut self, now: Now) {
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = self.nat.as_mut() {
+            nat.resume(&mut self.core, now);
+        }
+    }
+
     #[cfg(feature = "relay")]
     pub(crate) fn active_reservation(&self) -> Option<minip2p_nat::ReservationInfo> {
         self.nat
