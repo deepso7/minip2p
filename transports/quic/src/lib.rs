@@ -2143,4 +2143,55 @@ mod tests {
             assert_eq!(running, controller);
         }
     }
+
+    /// A quiet connection sends an ack-eliciting packet at least every
+    /// keepalive interval (plus slack) for longer than the idle timeout, so
+    /// neither side idles out. The raw peer sends nothing ack-eliciting
+    /// itself, so the PING frames it receives are the server's keepalives,
+    /// and the cadence holds whatever PTO the handshake measured.
+    #[test]
+    fn quiet_connection_sends_keepalives_past_the_idle_timeout() {
+        use crate::test_peer::{accept, now, server_with_idle_timeout};
+        use std::time::Instant;
+
+        const IDLE_MS: u64 = 1_000;
+        let interval = Duration::from_millis(IDLE_MS / 2);
+        let max_gap = interval + interval / 2;
+        let window = Duration::from_millis(2 * IDLE_MS);
+
+        let mut server = server_with_idle_timeout(IDLE_MS);
+        let (mut peer, id) = accept(&mut server, &mut [], |config| {
+            config.keep_alive_interval(None);
+        });
+
+        let start = Instant::now();
+        let mut arrivals = vec![start];
+        let mut pings = peer.conn().stats().frame_rx.ping;
+        let mut closed = false;
+        while start.elapsed() < window {
+            std::thread::sleep(Duration::from_millis(2));
+            closed |= server.poll(now()).expect("poll").iter().any(
+                |event| matches!(event, TransportEvent::Closed { id: closed, .. } if *closed == id),
+            );
+            peer.pump();
+            let seen = peer.conn().stats().frame_rx.ping;
+            if seen > pings {
+                pings = seen;
+                arrivals.push(Instant::now());
+            }
+        }
+        arrivals.push(Instant::now());
+
+        assert!(!closed, "the server must not idle out");
+        assert!(!peer.is_closed(), "the peer must not idle out");
+        let longest = arrivals
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .expect("at least two instants");
+        assert!(
+            longest <= max_gap,
+            "the server went quiet for {longest:?}, longer than {max_gap:?}"
+        );
+    }
 }

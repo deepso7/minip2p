@@ -16,7 +16,7 @@ Integration tests across the workspace run real sockets and real protocol timers
 - **Loopback can deliver a datagram after the poll that sent it** (macOS does). Tests that need a peer's MAX_STREAM_DATA or FIN wait until it is observable, or until it is queued on the receiving socket (`socket::has_queued_input`, which peeks and leaves it there), rather than assume it arrived; tests that must isolate one reply first sleep and drain stragglers.
 - **Junk the endpoint drops unread**: datagrams without QUIC's fixed bit, short headers with an unknown DCID (answered at most by a stateless reset), unparseable bytes and runts. Tests use these to fill receive batches and GRO trains without creating connections.
 - **Latency tests take the best of three trials** against their bound, so one descheduled thread on a busy runner cannot fail them.
-- **Idle-timeout tests** pick timeouts long enough that a stall between the handshake and the check cannot expire the connection; the engine's effective idle timeout is max(idle, 3×PTO), so "the connection stays up" tests run alone (`threads-required`) to keep PTO near loopback scale.
+- **Idle-timeout tests** pick timeouts long enough that a stall between the handshake and the check cannot expire the connection. The engine's effective idle timeout is max(idle, 3×PTO), so a stretched PTO can hide a missing keepalive from a test that only checks the connection stays up. The keepalive test (`quiet_connection_sends_keepalives_past_the_idle_timeout`) therefore asserts the cadence of the server's keepalive packets at a raw peer, which no PTO affects; the remaining "stays up" tests run alone (`threads-required`) to keep PTO near loopback scale.
 
 ## TCP (`transports/tcp/tests/loopback.rs`)
 
