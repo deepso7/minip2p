@@ -505,6 +505,9 @@ struct Forward {
     /// sending tiny frames costs memory in proportion to its bytes, not its
     /// reads.
     small: Vec<u8>,
+    /// Allocation size of the head once a partial Full copied it into an
+    /// exact-sized buffer; zero while the head is still the upstream read.
+    head_counted: usize,
     /// The target answered Full; the head waits for its Writable.
     blocked: bool,
     fin: FinState,
@@ -569,13 +572,18 @@ impl Forward {
 
     /// Records that the target accepted the head up to an `unsent` tail.
     ///
-    /// A partial tail is copied into its own buffer so a short slice never
-    /// compounds an upstream buffer's spare capacity past ADR 0012's bound.
+    /// The first partial tail is copied into an exact-sized buffer so it
+    /// sheds any upstream spare capacity; later partial retries reuse that
+    /// buffer until fewer than half its bytes remain (ADR 0012).
     fn accept(&mut self, unsent: Option<Bytes>) {
         let head = self.queue.pop_front().unwrap_or_default();
+        let counted = core::mem::take(&mut self.head_counted);
         if let Some(mut unsent) = unsent.filter(|unsent| !unsent.is_empty()) {
-            if unsent.len() < head.len() {
+            if unsent.len() < head.len() && (counted == 0 || unsent.len() < counted / 2) {
                 unsent = Bytes::copy_from_slice(&unsent);
+                self.head_counted = unsent.len();
+            } else {
+                self.head_counted = counted;
             }
             self.queue.push_front(unsent);
             self.blocked = true;
@@ -3134,6 +3142,19 @@ mod tests {
         let held = forward.head().unwrap();
         assert_eq!(held, Bytes::from_static(b"cdef"));
         assert!(!original_range.contains(&held.as_ptr()));
+        let held_range = held.as_ptr_range();
+        let retry_tail = held.slice(1..);
+        forward.accept(Some(retry_tail));
+        forward.blocked = false;
+        let reused = forward.head().unwrap();
+        assert_eq!(reused, Bytes::from_static(b"def"));
+        assert!(held_range.contains(&reused.as_ptr()));
+        let small_tail = reused.slice(2..);
+        forward.accept(Some(small_tail));
+        forward.blocked = false;
+        let recopied = forward.head().unwrap();
+        assert_eq!(recopied, Bytes::from_static(b"f"));
+        assert!(!held_range.contains(&recopied.as_ptr()));
         forward.accept(None);
         assert_eq!(forward.head().unwrap(), Bytes::from_static(b"ghij"));
         forward.accept(None);
