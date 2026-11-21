@@ -32,7 +32,20 @@ if [[ ${#ids_to_delete[@]} -eq 0 ]]; then
   exit 0
 fi
 
+deleted=0
+failed=0
 for id in "${ids_to_delete[@]}"; do
-  gh api --method DELETE "repos/$repo/actions/caches/$id" >/dev/null || true
+  if err="$(gh api --method DELETE "repos/$repo/actions/caches/$id" 2>&1 >/dev/null)"; then
+    deleted=$((deleted + 1))
+  elif [[ "$err" == *"HTTP 404"* ]]; then
+    echo "cache $id already evicted; skipping"
+  else
+    echo "failed to delete cache $id: $err" >&2
+    failed=$((failed + 1))
+  fi
 done
-echo "pruned ${#ids_to_delete[@]} superseded cache entries on $ref"
+echo "pruned $deleted superseded cache entries on $ref"
+if [[ "$failed" -gt 0 ]]; then
+  echo "$failed cache deletions failed on $ref" >&2
+  exit 1
+fi
