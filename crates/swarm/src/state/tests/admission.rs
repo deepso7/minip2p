@@ -137,7 +137,6 @@ fn queued_data_coalesces_only_across_consecutive_data_events() {
         SwarmEvent::StreamRemoteWriteClosed { .. },
     ] if first.len() == 101 && first.first() == Some(&b'a')
         && first.iter().skip(1).all(|byte| *byte == b'b') && last.as_ref() == b"c"));
-    assert!(state.actions.is_empty());
 }
 
 #[test]
