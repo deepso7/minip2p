@@ -128,10 +128,6 @@ pub fn link(to: usize) -> ConnectionId {
     ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, to as u64 + 1).expect("in range")
 }
 
-fn link_node(conn_id: ConnectionId) -> usize {
-    conn_id.sequence() as usize - 1
-}
-
 /// Node `i`'s verified links to every other node, in node order.
 fn others_links(i: usize, count: usize) -> Vec<(PeerId, ConnectionId)> {
     let mut links: Vec<_> = (0..count)
@@ -145,6 +141,10 @@ fn others_links(i: usize, count: usize) -> Vec<(PeerId, ConnectionId)> {
 /// A mesh of nodes under one public identity, every pair linked.
 pub struct Mesh {
     pub nodes: Vec<Node>,
+    /// Each node's backbone connections: the node at the other end and its
+    /// name for the same connection.
+    links: BTreeMap<(usize, ConnectionId), (usize, ConnectionId)>,
+    next_link: u64,
     /// Client-facing commands each node issued, for the test to read.
     client_calls: Vec<Vec<Call>>,
     /// Backbone streams each node opened, with their protocol.
@@ -174,8 +174,17 @@ impl Mesh {
                 node
             })
             .collect();
+        let links = (0..count)
+            .flat_map(|i| {
+                (0..count)
+                    .filter(move |&j| j != i)
+                    .map(move |j| ((i, link(j)), (j, link(i))))
+            })
+            .collect();
         let mut mesh = Self {
             nodes,
+            links,
+            next_link: count as u64 + 1,
             client_calls: vec![Vec::new(); count],
             opened: BTreeMap::new(),
             held: held.iter().copied().collect(),
@@ -247,18 +256,46 @@ impl Mesh {
         self.opened
             .iter()
             .filter(|((node, stream), protocol)| {
-                *node == i && stream.conn_id == link(to) && *protocol == protocol_id
+                *node == i && self.links[&(i, stream.conn_id)].0 == to && *protocol == protocol_id
             })
             .map(|((_, stream), _)| *stream)
             .collect()
     }
 
-    /// Node `to`'s name for a stream node `from` opened as `stream`.
-    pub fn remote(from: usize, stream: StreamKey) -> StreamKey {
+    /// The other end's name for a stream node `from` opened as `stream`.
+    pub fn remote(&self, from: usize, stream: StreamKey) -> StreamKey {
         StreamKey {
-            conn_id: link(from),
+            conn_id: self.links[&(from, stream.conn_id)].1,
             stream_id: stream.stream_id,
         }
+    }
+
+    /// Replaces the backbone link between nodes `i` and `j` with a new
+    /// connection on both ends at `now_ms`, drops the directory traffic held on
+    /// the old one, and pumps. Returns node `i`'s name for the new link.
+    pub fn replace(&mut self, i: usize, j: usize, now_ms: u64) -> ConnectionId {
+        let new = ConnectionId::namespaced(ConnectionNamespace::MESH_IPV4, self.next_link)
+            .expect("in range");
+        self.next_link += 1;
+        for (from, to) in [(i, j), (j, i)] {
+            let old = self.current_link(from, to);
+            self.held_calls.retain(|(node, call)| {
+                *node != from || call_stream(call).is_none_or(|s| s.conn_id != old)
+            });
+            self.links.insert((from, new), (to, new));
+            self.nodes[from].replace(&member(to), old, new, false, now_ms);
+        }
+        self.pump(at(now_ms));
+        new
+    }
+
+    fn current_link(&self, from: usize, to: usize) -> ConnectionId {
+        self.links
+            .iter()
+            .filter(|((node, _), (peer, _))| *node == from && *peer == to)
+            .map(|((_, conn_id), _)| *conn_id)
+            .max()
+            .expect("a link")
     }
 
     /// The directory stream `from` publishes to `to` on closes on both ends,
@@ -268,7 +305,8 @@ impl Mesh {
             .opened(from, to, DIRECTORY_PROTOCOL_ID)
             .last()
             .expect("a directory stream");
-        self.nodes[to].stream_closed(&member(from), Self::remote(from, stream), now);
+        let remote = self.remote(from, stream);
+        self.nodes[to].stream_closed(&member(from), remote, now);
         self.nodes[from].stream_closed(&member(to), stream, now);
         self.pump(now);
     }
@@ -291,24 +329,13 @@ impl Mesh {
     /// Routes one command node `i` issued; returns whether it was a
     /// backbone one.
     fn route(&mut self, i: usize, call: Call, now: Now) -> bool {
-        let stream = match &call {
-            Call::Open {
-                opened: Some(stream),
-                ..
-            }
-            | Call::Send { stream, .. }
-            | Call::Close { stream, .. }
-            | Call::Reset { stream, .. } => *stream,
-            _ => {
-                self.client_calls[i].push(call);
-                return false;
-            }
-        };
-        if !is_backbone_connection(stream.conn_id) {
+        let Some(stream) =
+            call_stream(&call).filter(|stream| is_backbone_connection(stream.conn_id))
+        else {
             self.client_calls[i].push(call);
             return false;
-        }
-        let j = link_node(stream.conn_id);
+        };
+        let (j, remote_conn) = self.links[&(i, stream.conn_id)];
         let directory = self
             .opened
             .get(&(i, stream))
@@ -317,7 +344,10 @@ impl Mesh {
             self.held_calls.push((i, call));
             return true;
         }
-        let remote = Self::remote(i, stream);
+        let remote = StreamKey {
+            conn_id: remote_conn,
+            stream_id: stream.stream_id,
+        };
         match call {
             Call::Open { protocol_id, .. } => {
                 self.opened.insert((i, stream), protocol_id.clone());
@@ -437,6 +467,20 @@ impl Mesh {
     pub fn hop_status(&mut self, i: usize, stream: StreamKey) -> (Option<Status>, Vec<Vec<u8>>) {
         let calls = self.calls(i);
         hop_status(&calls, stream)
+    }
+}
+
+/// The stream `call` acts on, if it acts on one.
+fn call_stream(call: &Call) -> Option<StreamKey> {
+    match call {
+        Call::Open {
+            opened: Some(stream),
+            ..
+        }
+        | Call::Send { stream, .. }
+        | Call::Close { stream, .. }
+        | Call::Reset { stream, .. } => Some(*stream),
+        _ => None,
     }
 }
 
