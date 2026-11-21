@@ -30,6 +30,7 @@ export interface BackendEndpointConfig {
     readonly topic: string;
   };
   readonly forceRelay: boolean;
+  readonly inboundStreamLimits: Record<string, number>;
   readonly limits?: BackendLimits;
   /** Listen multiaddresses, or `undefined` for the native QUIC dual-stack defaults. */
   readonly listen?: string[];
@@ -109,6 +110,17 @@ export function resolveEndpointConfig(
     autonatServers: [...(config.autonatServers ?? [])],
     discovery: resolveDiscovery(config.discovery),
     forceRelay: config.forceRelay ?? false,
+    inboundStreamLimits: Object.fromEntries(
+      Object.entries(config.inboundStreamLimits ?? {}).map(
+        ([protocol, limit]) => {
+          const name = `inboundStreamLimits[${JSON.stringify(protocol)}]`;
+          if (u32(limit, name) === 0) {
+            throw new RangeError(`${name} must be a positive integer`);
+          }
+          return [protocol, limit];
+        }
+      )
+    ),
     limits: config.limits && resolveLimits(config.limits),
     listen: config.listen && [...config.listen],
     mdns: resolveMdns(config.mdns, config.discovery),

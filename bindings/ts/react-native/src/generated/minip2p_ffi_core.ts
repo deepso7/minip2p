@@ -6,7 +6,7 @@
 import nativeModule from "./minip2p_ffi_core-ffi";
 import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct,
 } from "./minip2p_ffi_core-ffi";
-import { type UniffiByteArray, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterFloat32, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt64, FfiConverterUInt8, RustBuffer, UniffiEnum, UniffiError, UniffiInternalError, UniffiRustCaller, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiTypeNameSymbol, variantOrdinalSymbol,
+import { type UniffiByteArray, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterFloat32, FfiConverterMap, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt64, FfiConverterUInt8, RustBuffer, UniffiEnum, UniffiError, UniffiInternalError, UniffiRustCaller, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
 const uniffiCaller = new UniffiRustCaller(() => ({ code: 0 }));
 
@@ -1311,6 +1311,11 @@ export type EndpointConfig = {
      */
     protocols: Array<string>,
     /**
+     * Per-protocol inbound concurrency caps across all peers. Each entry also
+     * registers its protocol. Limits must be positive; excess streams wait FIFO.
+     */
+    inboundStreamLimits: Map<string, number>,
+    /**
      * Signed-discovery settings, or no discovery when absent.
      */
     discovery?: DiscoveryOptions,
@@ -1356,6 +1361,7 @@ const FfiConverterTypeEndpointConfig = (() => {
                 forceRelay: FfiConverterBool.readFromCursor(c),
                 allowUnsigned: FfiConverterBool.readFromCursor(c),
                 protocols: FfiConverterSequenceString.readFromCursor(c),
+                inboundStreamLimits: FfiConverterMapStringUInt32.readFromCursor(c),
                 discovery: FfiConverterOptionalTypeDiscoveryOptions.readFromCursor(c),
                 mdns: FfiConverterOptionalTypeMdnsOptions.readFromCursor(c),
                 limits: FfiConverterOptionalTypeLimitsOptions.readFromCursor(c),
@@ -1370,6 +1376,7 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterBool.writeIntoCursor(value.forceRelay, c);
             FfiConverterBool.writeIntoCursor(value.allowUnsigned, c);
             FfiConverterSequenceString.writeIntoCursor(value.protocols, c);
+            FfiConverterMapStringUInt32.writeIntoCursor(value.inboundStreamLimits, c);
             FfiConverterOptionalTypeDiscoveryOptions.writeIntoCursor(value.discovery, c);
             FfiConverterOptionalTypeMdnsOptions.writeIntoCursor(value.mdns, c);
             FfiConverterOptionalTypeLimitsOptions.writeIntoCursor(value.limits, c);
@@ -1383,6 +1390,7 @@ const FfiConverterTypeEndpointConfig = (() => {
              FfiConverterBool.allocationSize(value.forceRelay) +
              FfiConverterBool.allocationSize(value.allowUnsigned) +
              FfiConverterSequenceString.allocationSize(value.protocols) +
+             FfiConverterMapStringUInt32.allocationSize(value.inboundStreamLimits) +
              FfiConverterOptionalTypeDiscoveryOptions.allocationSize(value.discovery) +
              FfiConverterOptionalTypeMdnsOptions.allocationSize(value.mdns) +
              FfiConverterOptionalTypeLimitsOptions.allocationSize(value.limits) +
@@ -5681,6 +5689,9 @@ const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverter
 
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
+
+// FfiConverter for Map<string, number>
+const FfiConverterMapStringUInt32 = new FfiConverterMap(FfiConverterString, FfiConverterUInt32);
 
 // FfiConverter for DiscoveryOptions | undefined
 const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiConverterTypeDiscoveryOptions);

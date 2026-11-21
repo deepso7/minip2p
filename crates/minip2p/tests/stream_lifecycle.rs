@@ -15,6 +15,159 @@ const CHAT: &str = "/minip2p/lifecycle/chat/1";
 const FILE: &str = "/minip2p/lifecycle/file/1";
 const BACKSTOP: Duration = Duration::from_secs(30);
 
+#[test]
+fn inbound_limit_delivers_twenty_streams_with_at_most_four_open() {
+    let mut client = bind("/ip4/127.0.0.1/udp/0/quic-v1");
+    let mut server = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .unwrap()
+        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(4).unwrap())
+        .bind()
+        .unwrap();
+    connect(&mut client, &mut server);
+    let peer = *server.peer_id();
+    for _ in 0..20 {
+        client.open_stream(&peer, CHAT).unwrap();
+    }
+    let deadline = Instant::now() + BACKSTOP;
+    let mut active = std::collections::HashSet::new();
+    let mut delivered = 0;
+    let mut closed = 0;
+    let mut peak = 0;
+    let mut client_ready = 0;
+    let mut pending_fin = Vec::new();
+    let mut draining = false;
+    while closed < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "streams stalled: {delivered} delivered, {closed} closed"
+        );
+        if let Some(EndpointEvent::StreamReady { stream, .. }) = next(&mut client) {
+            client_ready += 1;
+            client.send_stream(stream, b"message".to_vec()).unwrap();
+            client.close_stream_write(stream).unwrap();
+        }
+        match next(&mut server) {
+            Some(EndpointEvent::StreamReady { stream, .. }) => {
+                assert!(active.insert(stream));
+                peak = peak.max(active.len());
+                assert!(active.len() <= 4);
+            }
+            Some(EndpointEvent::StreamData { stream, data, .. }) => {
+                assert!(active.contains(&stream));
+                assert_eq!(data.as_ref(), b"message");
+                delivered += 1;
+            }
+            Some(EndpointEvent::StreamRemoteWriteClosed { stream, .. }) => {
+                if draining {
+                    server.close_stream_write(stream).unwrap();
+                } else {
+                    pending_fin.push(stream);
+                }
+            }
+            Some(EndpointEvent::StreamClosed { stream, .. }) => {
+                assert!(active.remove(&stream));
+                closed += 1;
+            }
+            None if client_ready == 20 && !draining => {
+                assert_eq!(active.len(), 4);
+                draining = true;
+                for stream in pending_fin.drain(..) {
+                    server.close_stream_write(stream).unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(delivered, 20);
+    assert_eq!(peak, 4);
+}
+
+#[test]
+fn inbound_limit_requires_an_unlimited_quic_connection_window() {
+    let no_listen = Endpoint::builder()
+        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+        .quic_limits(minip2p::QuicLimits {
+            connection_receive_window: 1024,
+            ..minip2p::QuicLimits::default()
+        })
+        .bind();
+    assert!(
+        matches!(
+            no_listen,
+            Err(minip2p::BindError::Options(
+                minip2p::EndpointOptionsError::InboundLimitWithFiniteQuicWindow
+            ))
+        ),
+        "unsafe QUIC credit must be rejected even without listen addresses"
+    );
+    let builder = || {
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .unwrap()
+            .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+    };
+    let result = builder()
+        .quic_limits(minip2p::QuicLimits {
+            stream_receive_window: 1024,
+            connection_receive_window: 1024,
+            ..minip2p::QuicLimits::default()
+        })
+        .bind();
+    assert!(
+        matches!(
+            result,
+            Err(minip2p::BindError::Options(
+                minip2p::EndpointOptionsError::InboundLimitWithFiniteQuicWindow
+            ))
+        ),
+        "finite QUIC window with an inbound cap must be rejected"
+    );
+    assert!(
+        builder().bind().is_ok(),
+        "default unlimited window must work"
+    );
+    let uncapped = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .unwrap()
+        .quic_limits(minip2p::QuicLimits {
+            connection_receive_window: 1024,
+            ..minip2p::QuicLimits::default()
+        })
+        .protocol(CHAT)
+        .bind();
+    assert!(
+        uncapped.is_ok(),
+        "finite windows without inbound caps remain supported"
+    );
+    if let Ok(unlimited) = usize::try_from((1_u64 << 62) - 1) {
+        assert!(
+            builder()
+                .quic_limits(minip2p::QuicLimits {
+                    connection_receive_window: unlimited,
+                    ..minip2p::QuicLimits::default()
+                })
+                .bind()
+                .is_ok(),
+            "QUIC's maximum window is also unlimited"
+        );
+    }
+    #[cfg(feature = "tcp")]
+    assert!(
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .unwrap()
+            .quic_limits(minip2p::QuicLimits {
+                connection_receive_window: 1024,
+                ..minip2p::QuicLimits::default()
+            })
+            .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+            .bind()
+            .is_ok(),
+        "TCP-only endpoints do not use QUIC's window"
+    );
+}
+
 fn bind(listen: &str) -> Endpoint {
     Endpoint::builder()
         .listen_on(listen)
