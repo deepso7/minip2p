@@ -3,13 +3,17 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use minip2p_identity::Ed25519Keypair;
-use probe::peer::{Options, Peer};
-use quinn_proto::{ConnectionHandle, Dir, Event, ReadError, StreamEvent, StreamId, VarInt, WriteError};
+use probe::peer::{Options, Peer, transport_config};
+use quinn_proto::{ConnectionError, ConnectionHandle, Dir, Event, ReadError, StreamEvent, StreamId, TransportConfig, VarInt, WriteError};
 
 fn pair() -> (Peer, Peer, ConnectionHandle, ConnectionHandle) {
+    pair_with(transport_config)
+}
+
+fn pair_with(transport: fn() -> TransportConfig) -> (Peer, Peer, ConnectionHandle, ConnectionHandle) {
     let opts = || Options { quinn_udp: false, require_address_validation: true };
-    let mut server = Peer::new(&Ed25519Keypair::generate(), "127.0.0.1:0", opts());
-    let mut client = Peer::new(&Ed25519Keypair::generate(), "127.0.0.1:0", opts());
+    let mut server = Peer::with_transport(&Ed25519Keypair::generate(), "127.0.0.1:0", opts(), transport());
+    let mut client = Peer::with_transport(&Ed25519Keypair::generate(), "127.0.0.1:0", opts(), transport());
     let cch = client.connect(Instant::now(), server.local_addr());
     let (mut c_ok, mut s_ch) = (false, None);
     for _ in 0..500 {
@@ -150,28 +154,38 @@ fn reset_surfaces_on_read() {
 /// timeout, and does not keep a dead one alive: it still times out.
 #[test]
 fn keepalive_keeps_live_paths_and_dead_paths_still_time_out() {
-    let (mut server, mut client, _sch, cch) = pair();
+    const IDLE: Duration = Duration::from_secs(1);
+    let short_idle = || {
+        let mut t = transport_config();
+        t.max_idle_timeout(Some(IDLE.try_into().unwrap()));
+        t.keep_alive_interval(Some(Duration::from_millis(300)));
+        t
+    };
+    let (mut server, mut client, sch, cch) = pair_with(short_idle);
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
+    while start.elapsed() < 5 * IDLE {
         drive(&mut server, &mut client);
     }
-    assert!(client.has_conn(cch));
+    assert!(server.has_conn(sch) && client.has_conn(cch));
+    let lost_while_live = |e: &(ConnectionHandle, Event)| matches!(e.1, Event::ConnectionLost { .. });
+    assert!(!server.events.iter().chain(&client.events).any(lost_while_live));
+    client.events.clear();
     drop(server);
     let dead = Instant::now();
     let mut lost = None;
-    while dead.elapsed() < Duration::from_secs(60) {
+    while dead.elapsed() < 10 * IDLE {
         client.drive(Instant::now());
         while let Some((_, ev)) = client.events.pop_front() {
-            println!("{:?} event {ev:?}", dead.elapsed());
             if let Event::ConnectionLost { reason } = ev {
-                lost = Some((dead.elapsed(), reason.to_string()));
+                lost = Some((dead.elapsed(), reason));
             }
         }
         if lost.is_some() || !client.has_conn(cch) { break }
         std::thread::sleep(Duration::from_millis(20));
     }
     let (after, reason) = lost.expect("dead path must close");
-    assert!(after >= Duration::from_secs(40) && after <= Duration::from_secs(50), "{after:?} {reason}");
+    assert!(matches!(reason, ConnectionError::TimedOut), "{reason}");
+    assert!(after <= 2 * IDLE, "{after:?}");
     println!("dead path closed after {after:?}: {reason}");
 }
 
