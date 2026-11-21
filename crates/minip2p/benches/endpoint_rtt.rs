@@ -368,7 +368,7 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
         config.yamux.receive_window = u32::try_from(window).expect("window fits u32");
         config
     };
-    let min_yamux = TcpConfig::default().yamux.receive_window as usize;
+    let min_yamux = minip2p_secure_mux::yamux::DEFAULT_RECEIVE_WINDOW as usize;
     let tcp_point = |label, tcp| point(label, Transport::Tcp, 1, QuicLimits::default(), tcp);
     let candidates = |percents: &[u64]| -> Vec<usize> {
         percents
