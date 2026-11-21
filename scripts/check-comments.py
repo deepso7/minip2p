@@ -179,7 +179,7 @@ def c_like_comments(text, rust):
                 open_braces.append("brace")
             elif c == "}" and open_braces:
                 open_braces.pop()
-            if c == "/" and (prev == "" or prev in "(,=:[!&|?{};+-*%<>~^" or re.search(r"\b(return|typeof|case|in|of|delete|void|throw|new|yield|await)\s*$", text[max(0, i - 12):i])):
+            if c == "/" and (prev == "" or prev in "(,=:[!&|?{;+-*%<>~^" or re.search(r"\b(return|typeof|case|in|of|delete|void|throw|new|yield|await)\s*$", text[max(0, i - 12):i])):
                 j, in_class = i + 1, False
                 while j < n and text[j] != "\n":
                     if text[j] == "\\":
