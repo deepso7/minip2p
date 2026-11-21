@@ -12,7 +12,9 @@ are not counted; a `//` directive's following `//` lines count as part of it.
 still has. A file may only go down: more comments than its baseline fails, and
 so does a file that dropped below its baseline without updating it.
 
-  check-comments.py              check the ratchet (CI)
+  check-comments.py              check the ratchet
+  check-comments.py --base REF   also fail if the baseline allows more than
+                                 it did at REF (CI, on pull requests)
   check-comments.py --update     lower the baseline to the current counts
   check-comments.py --list [P..] print every counted comment, optionally
                                  under the given paths
@@ -31,17 +33,20 @@ BASELINE = ROOT / "scripts" / "comment-baseline.json"
 
 C_LIKE = {".rs", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
 HASH = {".sh", ".py"}
-EXCLUDED = (
+EXCLUDED_DIRS = (
     ".agents/",
     ".claude/",
     "code-ref/",
     "fuzz/corpus/",
     "bindings/ts/react-native/src/generated/",
+    "bindings/ts/web/wasm/",
+)
+EXCLUDED_FILES = {
     "bindings/ts/react-native/src/NativeMinip2p.ts",
     "bindings/ts/react-native/src/native.tsx",
     "bindings/ts/node/src/addon.d.ts",
-    "bindings/ts/web/wasm/",
-)
+}
+TS_TRIPLE_SLASH = re.compile(r"/\s*<(reference|amd-module|amd-dependency)\b")
 DIRECTIVE = re.compile(
     r"^(SAFETY:|(?:ox|es)lint-(?:disable|enable)|@ts-|@vitest-|"
     r"noqa|type:\s*ignore|shellcheck|pragma|prettier-ignore|biome-ignore|"
@@ -54,7 +59,7 @@ def tracked_files():
         ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True
     ).stdout
     for name in out.decode().split("\0"):
-        if not name or name.startswith(EXCLUDED):
+        if not name or name.startswith(EXCLUDED_DIRS) or name in EXCLUDED_FILES:
             continue
         suffix = Path(name).suffix
         if suffix in C_LIKE or suffix in HASH:
@@ -88,7 +93,7 @@ def c_like_comments(text, rust):
     character `prev`, so `//` inside them is not mistaken for a comment.
     `open_braces` tells a `}` closing a template's `${` from a block's."""
     i, n, line = 0, len(text), 1
-    directive_until = 0
+    directive_until = None
     prev = ""
     open_braces = []
 
@@ -109,12 +114,18 @@ def c_like_comments(text, rust):
             end = text.find("\n", i)
             end = n if end == -1 else end
             body = text[i + 2 : end]
-            doc = (body.startswith("/") and not body.startswith("//")) or (
-                rust and body.startswith("!")
-            )
-            if is_directive(body) or directive_until == line - 1:
-                directive_until = line
-            elif not doc:
+            if rust:
+                doc = (body.startswith("/") and not body.startswith("//")) or body.startswith("!")
+            else:
+                doc = bool(TS_TRIPLE_SLASH.match(body))
+            whole_line = text[text.rfind("\n", 0, i) + 1 : i].strip() == ""
+            continues = whole_line and directive_until == line - 1
+            if doc:
+                pass
+            elif is_directive(body) or continues:
+                if whole_line:
+                    directive_until = line
+            else:
                 yield line, text[i:end].strip()
             i = end
             continue
@@ -212,17 +223,24 @@ def python_comments(text):
         return
 
 
+HEREDOC = re.compile(r"<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|([^\s'\"<>;|&()]+))")
+
+
 def shell_comments(text):
-    heredoc = None
+    """Yield (line, text) for each `#` comment. Quotes carry across lines, a
+    heredoc body is skipped up to its full delimiter (tabs stripped for
+    `<<-`), and `#` starts a comment only at a token boundary, so `$#` and
+    `${#var}` are not comments."""
+    quote, heredocs, body_of = None, [], None
     for number, raw in enumerate(text.split("\n"), 1):
-        if heredoc:
-            if raw.strip() == heredoc:
-                heredoc = None
+        if body_of:
+            delimiter, strip_tabs = body_of
+            if (raw.lstrip("\t") if strip_tabs else raw) == delimiter:
+                body_of = heredocs.pop(0) if heredocs else None
             continue
         if number == 1 and raw.startswith("#!"):
             continue
-        m = re.search(r"<<-?\s*['\"]?([A-Za-z_]+)['\"]?", raw)
-        quote, k = None, 0
+        k, boundary = 0, True
         while k < len(raw):
             ch = raw[k]
             if quote:
@@ -233,14 +251,25 @@ def shell_comments(text):
             elif ch in "'\"":
                 quote = ch
             elif ch == "\\":
-                k += 1
-            elif ch == "#" and (k == 0 or raw[k - 1] in " \t;"):
+                k += 2
+                boundary = False
+                continue
+            elif raw.startswith("<<<", k):
+                k += 2
+            elif (m := HEREDOC.match(raw, k)):
+                word = next(g for g in m.groups()[1:] if g is not None)
+                heredocs.append((word.replace("\\", ""), m.group(1) == "-"))
+                k = m.end()
+                boundary = False
+                continue
+            elif ch == "#" and boundary:
                 if not is_directive(raw[k + 1 :]):
                     yield number, raw[k:].strip()
                 break
+            boundary = not quote and ch in " \t;|&()"
             k += 1
-        if m:
-            heredoc = m.group(1)
+        if heredocs and not quote and not raw.endswith("\\"):
+            body_of = heredocs.pop(0)
 
 
 def comments(path):
@@ -254,6 +283,12 @@ def comments(path):
 
 
 def main(argv):
+    base_ref = None
+    if argv[:1] == ["--base"] and len(argv) == 2:
+        base_ref, argv = argv[1], []
+    elif argv and argv[0] != "--list" and argv != ["--update"]:
+        print(__doc__)
+        return 2
     if argv[:1] == ["--list"]:
         prefixes = tuple(argv[1:])
         for path in tracked_files():
@@ -272,7 +307,7 @@ def main(argv):
 
     if argv[:1] == ["--update"]:
         raised = sorted(p for p, c in counts.items() if c > baseline.get(p, 0))
-        if raised and baseline:
+        if raised and BASELINE.exists():
             print("--update only lowers the baseline; these files gained comments:")
             for p in raised:
                 print(f"  {p}: {baseline.get(p, 0)} -> {counts[p]}")
@@ -282,6 +317,24 @@ def main(argv):
         return 0
 
     failed = False
+    if base_ref is not None:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"],
+            cwd=ROOT, capture_output=True,
+        )
+        if resolved.returncode != 0:
+            print(f"--base {base_ref}: not a commit")
+            return 2
+        shown = subprocess.run(
+            ["git", "show", f"{base_ref}:scripts/comment-baseline.json"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if shown.returncode == 0:
+            base = json.loads(shown.stdout)
+            for path, allowed in sorted(baseline.items()):
+                if allowed > base.get(path, 0):
+                    failed = True
+                    print(f"{path}: baseline raised from {base.get(path, 0)} to {allowed}")
     for path, found in sorted(counts.items()):
         allowed = baseline.get(path, 0)
         if found > allowed:

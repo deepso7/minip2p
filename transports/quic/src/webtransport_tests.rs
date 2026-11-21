@@ -1532,8 +1532,8 @@ fn legal_push_and_qpack_instructions_leave_the_session_up() {
     let mut peer = H3Peer::connect(&mut server, &mut events);
     let max_push_id_2_twice = [0x0d, 0x01, 0x02, 0x0d, 0x01, 0x02];
     peer.control_bytes(&after_settings(&max_push_id_2_twice));
-    let cancel_streams_0_and_1000 = [0x03, 0x40, 0x7f, 0xa9, 0x0f];
-    peer.uni(&cancel_streams_0_and_1000);
+    let cancel_streams_0_and_2024 = [0x03, 0x40, 0x7f, 0xa9, 0x0f];
+    peer.uni(&cancel_streams_0_and_2024);
     peer.libp2p_connect();
     peer.authenticate(&mut server, &mut events);
 }
