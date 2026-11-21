@@ -505,9 +505,6 @@ struct Forward {
     /// sending tiny frames costs memory in proportion to its bytes, not its
     /// reads.
     small: Vec<u8>,
-    /// Length of the payload the head was cut from, while the head is the
-    /// unsent tail of a Full; zero while the head is a whole payload.
-    head_counted: usize,
     /// The target answered Full; the head waits for its Writable.
     blocked: bool,
     fin: FinState,
@@ -571,19 +568,14 @@ impl Forward {
     }
 
     /// Records that the target accepted the head up to an `unsent` tail.
+    ///
+    /// A partial tail is copied into its own buffer so a short slice never
+    /// compounds an upstream buffer's spare capacity past ADR 0012's bound.
     fn accept(&mut self, unsent: Option<Bytes>) {
         let head = self.queue.pop_front().unwrap_or_default();
-        let counted = if self.head_counted == 0 {
-            head.len()
-        } else {
-            self.head_counted
-        };
-        self.head_counted = 0;
         if let Some(mut unsent) = unsent.filter(|unsent| !unsent.is_empty()) {
-            if unsent.len() < counted / 2 {
+            if unsent.len() < head.len() {
                 unsent = Bytes::copy_from_slice(&unsent);
-            } else if unsent.len() < counted {
-                self.head_counted = counted;
             }
             self.queue.push_front(unsent);
             self.blocked = true;
@@ -3124,17 +3116,24 @@ mod tests {
     #[test]
     fn small_reads_to_a_blocked_forward_are_coalesced_in_order() {
         let mut forward = Forward::default();
-        forward.push(Bytes::from_static(b"abcdef"));
-        forward.accept(Some(Bytes::from_static(b"def")));
+        let mut backing = Vec::with_capacity(2048);
+        backing.extend_from_slice(b"abcdef");
+        let original = Bytes::from(backing);
+        let original_range = original.as_ptr_range();
+        let tail = original.slice(2..);
+        forward.push(original);
+        forward.accept(Some(tail));
         assert!(forward.blocked);
-        assert_eq!(forward.unacked(), 3);
+        assert_eq!(forward.unacked(), 4);
         forward.push(Bytes::from_static(b"gh"));
         forward.push(Bytes::from_static(b"ij"));
         assert_eq!(forward.small, b"ghij");
-        assert_eq!(forward.unacked(), 7);
+        assert_eq!(forward.unacked(), 8);
 
         forward.blocked = false;
-        assert_eq!(forward.head().unwrap(), Bytes::from_static(b"def"));
+        let held = forward.head().unwrap();
+        assert_eq!(held, Bytes::from_static(b"cdef"));
+        assert!(!original_range.contains(&held.as_ptr()));
         forward.accept(None);
         assert_eq!(forward.head().unwrap(), Bytes::from_static(b"ghij"));
         forward.accept(None);
