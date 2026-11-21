@@ -96,7 +96,12 @@ impl SwarmState {
             self.inbound_promotion_needed.insert(protocol);
         }
         if let Some(queued) = self.queued_inbound.remove(&key) {
-            self.inbound_promotion_needed.insert(queued.protocol);
+            if let Some(order) = self.inbound_order.get_mut(&queued.protocol) {
+                order.retain(|queued_key| *queued_key != key);
+                if order.is_empty() {
+                    self.inbound_order.remove(&queued.protocol);
+                }
+            }
             let bytes = queued
                 .events
                 .iter()

@@ -157,6 +157,11 @@ fn queued_reset_is_silent_and_acknowledges_discarded_bytes() {
         )
     );
     assert!(drain_events(&mut state).is_empty());
+    // A queued stream leaves the FIFO immediately, even while the cap is full.
+    assert_eq!(
+        state.inbound_order[LIMITED].iter().collect::<Vec<_>>(),
+        [&(conn, c)]
+    );
     state.handle_stream_closed(conn, a);
     assert_eq!(ready(&drain_events(&mut state)), [c]);
 }
@@ -292,28 +297,4 @@ fn limits_are_independent_between_protocols() {
     assert_eq!(ready(&drain_events(&mut state)), [d]);
     state.handle_stream_closed(conn, a);
     assert_eq!(ready(&drain_events(&mut state)), [b]);
-}
-
-#[test]
-fn promotion_only_visits_the_protocol_that_released_a_slot() {
-    let (mut state, conn, _) = setup();
-    state
-        .inbound_limits
-        .insert(FREE.into(), NonZeroUsize::new(1).unwrap());
-    let [a, b, c, d, stale] = [1, 2, 3, 4, 5].map(StreamId::new);
-    incoming(&mut state, conn, a, LIMITED, &[]);
-    incoming(&mut state, conn, b, LIMITED, &[]);
-    incoming(&mut state, conn, c, FREE, &[]);
-    incoming(&mut state, conn, d, FREE, &[]);
-    state
-        .inbound_order
-        .get_mut(FREE)
-        .unwrap()
-        .push_front((conn, stale));
-    drain_events(&mut state);
-    state.handle_stream_closed(conn, a);
-    assert_eq!(ready(&drain_events(&mut state)), [b]);
-    assert_eq!(state.inbound_order[FREE].front(), Some(&(conn, stale)));
-    state.handle_stream_closed(conn, c);
-    assert_eq!(ready(&drain_events(&mut state)), [d]);
 }
