@@ -232,7 +232,7 @@ fn outbound_dial_allocates_unique_ids() {
 }
 
 #[test]
-fn local_stream_limit_is_enforced_before_allocating_state() {
+fn local_stream_limit_queues_opens_until_gc_frees_capacity() {
     let limits = QuicLimits {
         max_streams_per_connection: 1,
         ..QuicLimits::default()
@@ -240,16 +240,108 @@ fn local_stream_limit_is_enforced_before_allocating_state() {
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    client.open_stream(client_conn).expect("first stream");
-    let error = client
+    let first = client.open_stream(client_conn).expect("first stream");
+    let second = client
         .open_stream(client_conn)
-        .expect_err("second stream must exceed limit");
-    assert!(matches!(
-        error,
-        TransportError::ResourceExhausted {
-            resource: "local QUIC bidirectional streams"
+        .expect("second stream queues");
+    assert_ne!(first, second);
+    let opened = TransportEvent::StreamOpened {
+        id: client_conn,
+        stream_id: second,
+    };
+    for _ in 0..3 {
+        let (_, events) = drive_pair_once(&mut server, &mut client);
+        assert!(!events.contains(&opened), "{events:?}");
+    }
+    client
+        .reset_stream(client_conn, first)
+        .expect("reset first");
+    let start = std::time::Instant::now();
+    loop {
+        let (_, events) = drive_pair_once(&mut server, &mut client);
+        if events.contains(&opened) {
+            break;
         }
-    ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+}
+
+#[test]
+fn reset_open_past_local_stream_limit_consumes_its_tombstone() {
+    let limits = QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let first = client.open_stream(client_conn).expect("first");
+    let cancelled = client.open_stream(client_conn).expect("queued second");
+    let third = client.open_stream(client_conn).expect("queued third");
+    assert_eq!(cancelled.as_u64(), first.as_u64() + 4);
+    assert_eq!(third.as_u64(), cancelled.as_u64() + 4);
+    client
+        .reset_stream(client_conn, cancelled)
+        .expect("cancel second");
+    let mut events = client.poll(common::now()).expect("poll cancellation");
+    assert!(events.contains(&TransportEvent::StreamClosed {
+        id: client_conn,
+        stream_id: cancelled,
+    }));
+    assert!(!events.contains(&TransportEvent::StreamOpened {
+        id: client_conn,
+        stream_id: third,
+    }));
+    client
+        .reset_stream(client_conn, first)
+        .expect("reset first");
+    let mut sent = false;
+    let start = std::time::Instant::now();
+    loop {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        events.extend(client_events);
+        if !sent
+            && events.contains(&TransportEvent::StreamOpened {
+                id: client_conn,
+                stream_id: third,
+            })
+        {
+            client
+                .send_stream(client_conn, third, Bytes::from_static(b"third"))
+                .expect("send admitted third");
+            sent = true;
+        }
+        if server_events.iter().any(|event| {
+            matches!(event,
+                TransportEvent::StreamData { id, stream_id, data }
+                if *id == server_conn && *stream_id == third && data.as_ref() == b"third"
+            )
+        }) {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{events:?}"
+        );
+    }
+    assert!(!events.contains(&TransportEvent::StreamOpened {
+        id: client_conn,
+        stream_id: cancelled,
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event
+                == TransportEvent::StreamClosed {
+                    id: client_conn,
+                    stream_id: cancelled,
+                })
+            .count(),
+        1
+    );
+    assert!(events.contains(&TransportEvent::StreamOpened {
+        id: client_conn,
+        stream_id: third,
+    }));
 }
 
 #[test]
@@ -805,32 +897,31 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     );
 }
 
-/// Opens a stream from `client` and writes to it; reports whether that
-/// worked, and whether the server announced the stream.
+/// Opens a stream and retries its write; reports whether it worked and the server announced it.
 fn open_and_watch(
     server: &mut QuicTransport,
     client: &mut QuicTransport,
     client_conn: ConnectionId,
 ) -> (bool, bool) {
-    let mut stream = None;
+    let stream = client.open_stream(client_conn).expect("open");
+    let mut sent = false;
     for _ in 0..100 {
-        if stream.is_none()
-            && let Ok(opened) = client.open_stream(client_conn)
+        if !sent
             && client
-                .send_stream(client_conn, opened, Bytes::from_static(b"hi"))
+                .send_stream(client_conn, stream, Bytes::from_static(b"hi"))
                 .is_ok()
         {
-            stream = Some(opened);
+            sent = true;
         }
         let (server_events, _) = drive_pair_once(server, client);
         if server_events
             .iter()
-            .any(|event| matches!(event, TransportEvent::IncomingStream { stream_id, .. } if Some(*stream_id) == stream))
+            .any(|event| matches!(event, TransportEvent::IncomingStream { stream_id, .. } if *stream_id == stream))
         {
-            return (true, true);
+            return (sent, true);
         }
     }
-    (stream.is_some(), false)
+    (sent, false)
 }
 
 #[test]

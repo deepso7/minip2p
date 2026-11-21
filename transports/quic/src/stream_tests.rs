@@ -543,32 +543,47 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
 
     let first = server.open_stream(id).expect("first");
     let second = server.open_stream(id).expect("second");
-    server
-        .send_stream(id, first, Bytes::from(vec![1; 4_000]))
-        .expect("queued in full");
+    assert!(matches!(
+        server.send_stream(id, first, Bytes::from(vec![1; 4_000])),
+        Err(TransportError::Full { .. })
+    ));
     server.close_stream_write(id, first).expect("queued FIN");
     let second_payload = Bytes::from(vec![2; 100]);
     let Err(TransportError::Full { unsent, .. }) =
         server.send_stream(id, second, second_payload.clone())
     else {
-        panic!("the shared queue is full");
+        panic!("the stream is not admitted");
     };
     assert_eq!(unsent, second_payload);
 
     server.reset_stream(id, first).expect("reset pending");
     assert_eq!(server.connections[&id].pending_write_bytes(), 0);
     let mut events = server.poll(now()).expect("poll");
-    assert!(events.contains(&TransportEvent::StreamWritable {
+    assert!(!events.contains(&TransportEvent::StreamWritable {
         id,
         stream_id: second
     }));
 
     let third = server.open_stream(id).expect("third");
     assert_eq!(server.connections[&id].local_slots_used(), 3);
-    assert!(matches!(
-        server.open_stream(id),
-        Err(TransportError::ResourceExhausted { .. })
-    ));
+    peer.conn()
+        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(3));
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "pending streams admitted",
+        |events| {
+            events.contains(&TransportEvent::StreamOpened {
+                id,
+                stream_id: third,
+            })
+        },
+    );
+    assert!(events.contains(&TransportEvent::StreamWritable {
+        id,
+        stream_id: second
+    }));
     server
         .send_stream(id, second, second_payload.clone())
         .expect("resent");
@@ -578,8 +593,6 @@ fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
         .expect("third");
     server.close_stream_write(id, third).expect("FIN");
 
-    peer.conn()
-        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(3));
     let mut received = [Vec::new(), Vec::new()];
     let mut finished = [false, false];
     let start = Instant::now();

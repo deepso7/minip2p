@@ -71,7 +71,8 @@ pub struct TcpConfig {
     /// would spin on it, since there is always work outstanding and never any
     /// progress.
     pub send_stall_timeout_ms: Option<u64>,
-    /// Limits applied to each connection's Yamux session.
+    /// Limits applied to each connection's Yamux session. Local opens beyond
+    /// `max_streams` wait FIFO in an unbounded local-caller-only queue.
     pub yamux: YamuxConfig,
 }
 

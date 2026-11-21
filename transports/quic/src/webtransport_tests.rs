@@ -1062,10 +1062,13 @@ fn draft14_server_streams_wait_for_the_clients_stream_credit() {
         (setting::ENABLE_WEBTRANSPORT, 1),
     ]);
     let (mut server, mut peer, id) = established(&settings);
-    let streams = [
-        server_stream(&mut server, id, b"a"),
-        server_stream(&mut server, id, b"b"),
-    ];
+    let first = server_stream(&mut server, id, b"a");
+    let second = server.open_stream(id).expect("queued second");
+    assert!(matches!(
+        server.send_stream(id, second, Bytes::from_static(b"b")),
+        Err(TransportError::Full { .. })
+    ));
+    let streams = [first, second.as_u64()];
     let mut read = [None, None];
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut read),
@@ -1073,6 +1076,16 @@ fn draft14_server_streams_wait_for_the_clients_stream_credit() {
     );
 
     peer.capsule(&Capsule::MaxStreamsBidi(2));
+    let mut events = Vec::new();
+    peer.drive(&mut server, &mut events, "second writable", |_, events| {
+        events.contains(&TransportEvent::StreamWritable {
+            id,
+            stream_id: second,
+        })
+    });
+    server
+        .send_stream(id, second, Bytes::from_static(b"b"))
+        .expect("retry after admission");
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut read),
         [Some(b"a".to_vec()), Some(b"b".to_vec())]
@@ -1095,11 +1108,25 @@ fn more_than_one_session_enables_flow_control_with_zero_initial_credit() {
             _ => None,
         })
         .expect("connected");
-    let streams = [server_stream(&mut server, id, b"a")];
+    let first = server.open_stream(id).expect("queued first");
+    assert!(matches!(
+        server.send_stream(id, first, Bytes::from_static(b"a")),
+        Err(TransportError::Full { .. })
+    ));
+    let streams = [first.as_u64()];
     let mut read = [None];
     assert_eq!(settle(&mut server, &mut peer, &streams, &mut read), [None]);
 
     peer.capsule(&Capsule::MaxStreamsBidi(1));
+    peer.drive(&mut server, &mut events, "first writable", |_, events| {
+        events.contains(&TransportEvent::StreamWritable {
+            id,
+            stream_id: first,
+        })
+    });
+    server
+        .send_stream(id, first, Bytes::from_static(b"a"))
+        .expect("retry after admission");
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut read),
         [Some(b"a".to_vec())]

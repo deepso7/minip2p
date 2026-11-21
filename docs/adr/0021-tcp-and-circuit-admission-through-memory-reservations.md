@@ -1,6 +1,6 @@
 # TCP and circuit admission through memory reservations
 
-> Partly superseded by ADR 0022: the TCP and circuit memory budgets, circuit claims and the 2,432 KiB Yamux default are gone. The decoder caps, `InvalidLimit` for broken Yamux invariants, the "Yamux streams" refusal and the builder options stand.
+> Partly superseded by ADR 0022: the TCP and circuit memory budgets, circuit claims and the 2,432 KiB Yamux default are gone. The decoder caps, `InvalidLimit` for broken Yamux invariants and the builder options stand. ADR 0038 supersedes local stream-open refusals: IDs are allocated immediately, and opens beyond the active-plus-unsettled cap queue FIFO without a length cap. Only local callers can enqueue; inbound opens beyond capacity remain refused.
 
 Supplements ADRs 0012 and 0019. ADR 0019 gave QUIC a memory budget; TCP and circuits (secure-mux over Yamux) were bounded only by counts. A TCP transport could hold `max_connections` (1024) × Yamux `max_streams` (256) × the receive window of received data, and each session also pinned about 10 MiB of its own: twice the 4 MiB Yamux send cap (a queued write may keep a slice of its caller's payload, ADR 0012), the outbound buffer and the decoders. Circuits were capped only by NAT's `max_circuits`. Raising the Yamux window to what a real RTT needs (#361) multiplies all of that, so the budget and the new window land together (#357). We decided:
 

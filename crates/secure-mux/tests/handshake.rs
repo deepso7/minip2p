@@ -600,6 +600,10 @@ fn stream_bytes_are_encrypted_only_when_pulled_and_full_wakes_writable() {
     assert!(written >= 64 * 1024, "pulling frames the accepted bytes");
     assert_eq!(
         dialer.poll_output(),
+        Some(SessionOutput::StreamOpened { stream })
+    );
+    assert_eq!(
+        dialer.poll_output(),
         Some(SessionOutput::StreamWritable { stream })
     );
     dialer

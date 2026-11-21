@@ -173,7 +173,7 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
   Only its id, marked `reset_on_bind`, stays in `pending_opens`, so the id sequence never diverges.
 
 - Binding a `reset_on_bind` entry calls `open()`, then `send_stream.reset(0)` and `recv_stream.stop(0)`, before any queue drain.
-- **Slot accounting.** Each `pending_opens` entry holds one reservation against `max_streams_per_connection`, separate from stream state. Stream-state GC therefore can't release it early. A live pending stream's reservation becomes its open stream's slot when it binds. A `reset_on_bind` entry releases its reservation exactly once, when it binds. The queue is therefore bounded by the local cap.
+- **Slot accounting (updated by ADR 0048).** Only bound local streams count against `max_streams_per_connection`; pending opens wait FIFO for both local capacity and peer credit. The queue is unbounded and local-caller-only. A `reset_on_bind` tombstone consumes its engine ID without taking a bound slot. Closed bound streams keep their slot until their delivered bytes settle; GC then allows queued opens to bind.
 
 **Close.** `conn.close(now, 0, b"bye")` sets the state to `Closing` and clears armed writables, as today. A failed send under `fail_connection` becomes `close(now, 1, b"stream send failed")`.
 

@@ -71,6 +71,11 @@ pub enum SessionOutput {
         /// The new substream.
         stream: StreamId,
     },
+    /// A local substream's SYN was pulled into the encrypted write queue.
+    StreamOpened {
+        /// Locally allocated substream.
+        stream: StreamId,
+    },
     /// Data arrived on a substream.
     StreamData {
         /// Substream the data belongs to.
@@ -321,7 +326,8 @@ impl SecureMuxSession {
     /// has room: once the session is up, each call pulls and encrypts the
     /// next Yamux frame, and stream bytes count against Yamux's send caps
     /// until they are pulled here. That is what keeps ciphertext bounded
-    /// (ADR 0012). Pulling may queue [`SessionOutput::StreamWritable`].
+    /// (ADR 0012). Pulling may queue [`SessionOutput::StreamOpened`] when a
+    /// SYN is framed, or [`SessionOutput::StreamWritable`] as send caps free.
     ///
     /// An error is fatal: the session cannot continue.
     pub fn poll_write(&mut self) -> Result<Option<Vec<u8>>, SessionError> {
@@ -1024,6 +1030,9 @@ fn push_yamux_events(
     while let Some(output) = yamux.poll_event() {
         let stream = |id: u32| StreamId::new(u64::from(id));
         let output = match output {
+            YamuxOutput::StreamOpened { stream: id } => {
+                SessionOutput::StreamOpened { stream: stream(id) }
+            }
             YamuxOutput::IncomingStream { stream: id } => {
                 SessionOutput::IncomingStream { stream: stream(id) }
             }
