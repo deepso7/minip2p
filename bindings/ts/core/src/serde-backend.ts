@@ -69,7 +69,7 @@ export interface SerdeEndpoint {
   connectedPeers: () => string[];
   isPeerReady: (peerId: string) => boolean;
   peerInfo: (peerId: string) => NativeIdentifyInfo | null;
-  setActive: (active: boolean) => void;
+  resume: () => void;
   subscribe: (topic: string) => boolean;
   unsubscribe: (topic: string) => boolean;
   publish: (topic: string, data: Uint8Array) => void;
@@ -312,9 +312,9 @@ export class SerdeBackend implements Minip2pBackend {
     return this.#native((native) => native.reachability());
   }
 
-  setActive(active: boolean): void {
+  resume(): void {
     this.#native((native) => {
-      native.setActive(active);
+      native.resume();
     });
   }
 

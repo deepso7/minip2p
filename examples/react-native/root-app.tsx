@@ -50,10 +50,15 @@ const App = () => {
 
   useEffect(() => {
     const registry = endpoints.current;
+    let previous = AppState.currentState;
     const appState = AppState.addEventListener("change", (state) => {
-      const active = state === "active";
+      const resumed = state === "active" && previous !== "active";
+      previous = state;
+      if (!resumed) {
+        return;
+      }
       for (const endpoint of registry) {
-        endpoint.setActive(active);
+        endpoint.resume();
       }
     });
 

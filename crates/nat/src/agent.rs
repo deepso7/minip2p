@@ -990,6 +990,23 @@ impl NatAgent {
         self.reap_done();
     }
 
+    /// Tells the agent its host is back from a pause, such as a mobile app
+    /// returning to the foreground, and its connections may have died
+    /// unnoticed meanwhile.
+    ///
+    /// The relay reservation recovers now instead of at its scheduled
+    /// time: earlier failures stop counting toward the retry backoff, a
+    /// waiting retry runs at once, and a held reservation is renewed at
+    /// once. The renewal doubles as a liveness check: if the relay does not
+    /// answer within [`NatConfig::relay_timeout_ms`], the reservation is
+    /// reported lost and reacquired. Nothing happens unless the reservation
+    /// policy wants a reservation.
+    pub fn resume<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
+        self.holding(swarm, |agent, swarm| {
+            agent.housekeeping.resume(swarm, &mut agent.shared, now);
+        });
+    }
+
     /// Whether a dial the host parked ([`DialStart::Deferred`]) is still
     /// wanted, retiring it when it is not.
     ///

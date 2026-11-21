@@ -52,8 +52,8 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_publish(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_reachability(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_reset_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_resume(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_set_active(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_start(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_stream_consumed(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -90,8 +90,8 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_publish(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_resume(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_start(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stream_consumed(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);

@@ -802,6 +802,25 @@ impl ReservationManager {
         }
     }
 
+    /// See [`NatAgent::resume`](crate::NatAgent::resume): forgets earlier
+    /// failures and makes a waiting retry or a held reservation's renewal
+    /// due now.
+    fn resume(
+        &mut self,
+        verdict: ReachabilityState,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        self.failures = 0;
+        match &mut self.state {
+            ResState::Backoff { until } => *until = now.monotonic_ms,
+            ResState::Reserved { info, .. } => info.renew_at_mono_ms = now.monotonic_ms,
+            ResState::Idle | ResState::Acquiring { .. } => {}
+        }
+        self.sync(verdict, swarm, shared, now);
+    }
+
     /// Drops any held reservation and stops acquiring (policy says no).
     fn release(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         match core::mem::replace(&mut self.state, ResState::Idle) {
@@ -1232,6 +1251,11 @@ impl Housekeeping {
         self.prober.on_tick(swarm, shared, now);
         self.reservations
             .sync(self.prober.verdict, swarm, shared, now);
+    }
+
+    pub(crate) fn resume(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.reservations
+            .resume(self.prober.verdict, swarm, shared, now);
     }
 
     pub(crate) fn on_peer_ready(

@@ -150,11 +150,12 @@ impl WebEndpoint {
         js_result(self.host.peer_info(peer_id))
     }
 
-    /// Ignored in the browser, kept for the shared SDK surface: there is no
-    /// background driver whose cadence it could change. The page's own
-    /// timers pump the endpoint.
-    #[wasm_bindgen(js_name = setActive)]
-    pub fn set_active(&self, _active: bool) {}
+    /// Tells the endpoint its page is visible again, so a relay
+    /// reservation recovers at once. Does nothing once closed.
+    pub fn resume(&mut self) {
+        let now = self.now();
+        self.host.resume(now);
+    }
 
     /// Subscribes to a pubsub topic.
     pub fn subscribe(&mut self, topic: String) -> Result<bool, JsValue> {

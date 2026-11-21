@@ -191,7 +191,7 @@ export class FakeSerdeEndpoint implements SerdeEndpoint {
     return true;
   }
 
-  setActive(): void {}
+  resume(): void {}
 
   subscribe(): boolean {
     return true;

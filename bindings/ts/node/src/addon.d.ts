@@ -37,8 +37,8 @@ export declare class NodeEndpoint {
   isPeerReady(peerId: string): boolean
   /** Returns the latest Identify snapshot. */
   peerInfo(peerId: string): NativeIdentifyInfo | null
-  /** Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline. */
-  setActive(active: boolean): void
+  /** Tells the endpoint its host is back from a pause, so a relay reservation recovers at once. */
+  resume(): void
   /** Subscribes to a pubsub topic. */
   subscribe(topic: string): boolean
   /** Unsubscribes from a pubsub topic. */
