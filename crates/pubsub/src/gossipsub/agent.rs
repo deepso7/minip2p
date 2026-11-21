@@ -1883,11 +1883,15 @@ impl GossipsubAgent {
     /// the previous sender, or `None` for an unknown peer.
     fn set_sender(&mut self, peer: &PeerId, sender: SendState) -> Option<SendState> {
         let state = self.peers.get_mut(peer)?;
-        if let Some(since) = state.sender.establishment_since() {
-            self.establishing.remove(&(since, *peer));
-        }
-        if let Some(since) = sender.establishment_since() {
-            self.establishing.insert((since, *peer));
+        let old_since = state.sender.establishment_since();
+        let new_since = sender.establishment_since();
+        if old_since != new_since {
+            if let Some(since) = old_since {
+                self.establishing.remove(&(since, *peer));
+            }
+            if let Some(since) = new_since {
+                self.establishing.insert((since, *peer));
+            }
         }
         Some(core::mem::replace(&mut state.sender, sender))
     }
@@ -2232,13 +2236,6 @@ mod tests {
         assert!(agent.backoff.values().all(|peers| !peers.is_empty()));
     }
 
-    fn timeout_deadline(agent: &GossipsubAgent) -> Option<u64> {
-        agent
-            .establishing
-            .first()
-            .map(|(since, _)| since + agent.config.send_timeout_ms)
-    }
-
     #[test]
     fn topic_index_tracks_subscriptions_and_peer_lifecycle() {
         let (mut agent, first) = agent_with_peer(&["a", "b"]);
@@ -2287,55 +2284,83 @@ mod tests {
         let (mut agent, first) = agent_with_peer(&[]);
         let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
         insert_peer(&mut agent, second, &[]);
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
         let timeout = agent.config.send_timeout_ms;
 
-        agent.drive_sender(&first, 10);
-        agent.drive_sender(&second, 20);
+        agent.drive_sender(&higher, 10);
+        agent.drive_sender(&lower, 20);
         assert_indexes_consistent(&agent);
-        assert_eq!(timeout_deadline(&agent), Some(10 + timeout));
         assert_eq!(
             agent.next_deadline(Now::from_millis(0)),
             Some(Deadline::from_millis(10 + timeout))
         );
 
-        let SendState::Opening { token, .. } = agent.peers[&first].sender else {
-            panic!("first is opening");
+        let SendState::Opening { token, .. } = agent.peers[&higher].sender else {
+            panic!("higher is opening");
         };
         let stream = StreamId::new(4);
-        agent.stream_open_result(&first, token, Ok(stream), 11);
+        agent.stream_open_result(&higher, token, Ok(stream), 11);
         assert_indexes_consistent(&agent);
-        assert_eq!(timeout_deadline(&agent), Some(10 + timeout));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(10 + timeout))
+        );
 
-        assert!(agent.on_stream_ready(&first, stream, MESHSUB_PROTOCOL_ID_V11, true, 12));
+        assert!(agent.on_stream_ready(&higher, stream, MESHSUB_PROTOCOL_ID_V11, true, 12));
         assert_indexes_consistent(&agent);
-        assert_eq!(timeout_deadline(&agent), Some(20 + timeout));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(20 + timeout))
+        );
 
-        agent.handle_tick(20 + timeout);
-        assert_indexes_consistent(&agent);
-        assert!(matches!(agent.peers[&second].sender, SendState::Idle));
-        assert_eq!(timeout_deadline(&agent), None);
-
-        agent.drive_sender(&second, 30);
-        let SendState::Opening { token, .. } = agent.peers[&second].sender else {
-            panic!("second is opening");
+        let third = Ed25519Keypair::from_secret_key_bytes([4; 32]).peer_id();
+        insert_peer(&mut agent, third, &[]);
+        let (first_due, second_due) = if lower < third {
+            (lower, third)
+        } else {
+            (third, lower)
         };
-        agent.stream_open_result(&second, token, Err(String::from("refused")), 31);
+        let earlier = if second_due == lower { 25 } else { 15 };
+        agent.drive_sender(&third, earlier);
+        while agent.poll_event().is_some() {}
+        agent.handle_tick(25 + timeout);
+        assert_indexes_consistent(&agent);
+        assert!(matches!(agent.peers[&lower].sender, SendState::Idle));
+        assert!(matches!(agent.peers[&third].sender, SendState::Idle));
+        assert!(agent.establishing.is_empty());
+        let mut timed_out_peers = Vec::new();
+        while let Some(event) = agent.poll_event() {
+            if let GossipsubEvent::OutboundFailure { peer, .. } = event {
+                timed_out_peers.push(peer);
+            }
+        }
+        assert_eq!(timed_out_peers, alloc::vec![first_due, second_due]);
+
+        agent.drive_sender(&lower, 30);
+        let SendState::Opening { token, .. } = agent.peers[&lower].sender else {
+            panic!("lower is opening");
+        };
+        agent.stream_open_result(&lower, token, Err(String::from("refused")), 31);
         assert_indexes_consistent(&agent);
 
-        agent.drive_sender(&second, 40);
-        let SendState::Opening { token, .. } = agent.peers[&second].sender else {
-            panic!("second is opening");
+        agent.drive_sender(&lower, 40);
+        let SendState::Opening { token, .. } = agent.peers[&lower].sender else {
+            panic!("lower is opening");
         };
         let stream = StreamId::new(8);
-        agent.stream_open_result(&second, token, Ok(stream), 41);
-        assert!(agent.on_stream_closed(&second, stream));
+        agent.stream_open_result(&lower, token, Ok(stream), 41);
+        assert!(agent.on_stream_closed(&lower, stream));
         assert_indexes_consistent(&agent);
 
-        agent.drive_sender(&second, 50);
-        agent.on_connection_replaced(&second);
+        agent.drive_sender(&lower, 50);
+        agent.on_connection_replaced(&lower);
         assert_indexes_consistent(&agent);
-        agent.drive_sender(&first, 60);
-        agent.remove_peer(&first, "connection closed");
+        agent.drive_sender(&third, 60);
+        agent.remove_peer(&third, "connection closed");
         assert_indexes_consistent(&agent);
         assert!(agent.establishing.is_empty());
     }
