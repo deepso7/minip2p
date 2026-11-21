@@ -1,0 +1,33 @@
+name: Setup Android SDK and NDK
+description: Install Java (optional), Android SDK platform-tools, NDK r28c, and optionally SDK 36.
+inputs:
+  java:
+    description: Install Temurin JDK 17
+    required: false
+    default: "false"
+  sdk-platform:
+    description: Install Android SDK 36 and build-tools 36.0.0
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - if: inputs.java == 'true'
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with:
+        distribution: temurin
+        java-version: "17"
+    - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+      with:
+        packages: platform-tools
+    - name: Install Android NDK r28c
+      shell: bash
+      env:
+        INSTALL_SDK_PLATFORM: ${{ inputs.sdk-platform }}
+      run: |
+        packages=("ndk;28.2.13676358")
+        if [[ "$INSTALL_SDK_PLATFORM" == "true" ]]; then
+          packages=("platforms;android-36" "build-tools;36.0.0" "${packages[@]}")
+        fi
+        sdkmanager "${packages[@]}"
+        echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"

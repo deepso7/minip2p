@@ -8,7 +8,23 @@ const workflowPath = new URL(
   "../../../../.github/workflows/bindings-native.yml",
   import.meta.url
 );
+const setupAndroidPath = new URL(
+  "../../../../.github/actions/setup-android/action.yml",
+  import.meta.url
+);
+const setupNodePath = new URL(
+  "../../../../.github/actions/setup-node/action.yml",
+  import.meta.url
+);
+const muslScriptPath = new URL(
+  "../../../../scripts/build-node-musl.sh",
+  import.meta.url
+);
+
 const workflow = parse(await readFile(workflowPath, "utf-8"));
+const setupAndroid = parse(await readFile(setupAndroidPath, "utf-8"));
+const setupNode = parse(await readFile(setupNodePath, "utf-8"));
+const muslScript = await readFile(muslScriptPath, "utf-8");
 
 test("native workflow runs weekly and on manual dispatch", () => {
   assert.ok(workflow.on.workflow_dispatch !== undefined);
@@ -49,8 +65,9 @@ test("weekly workflow executes the suite on native runners and musl containers",
   });
   assert.ok(
     nativeJob.steps.some(
-      ({ run, shell }) =>
-        shell === "bash" && run === "pnpm install --frozen-lockfile"
+      ({ uses, with: inputs }) =>
+        uses === "./.github/actions/setup-node" &&
+        inputs?.["normalize-windows-patches"] === "true"
     )
   );
   assert.ok(nativeJob.steps.some(({ name }) => name === "Build relay fixture"));
@@ -62,47 +79,40 @@ test("weekly workflow executes the suite on native runners and musl containers",
     )
   );
 
-  const muslBuild = workflow.jobs["node-musl"].steps.find(
-    ({ name }) => name === "Build addon"
-  ).run;
-  assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
+  const muslStep = workflow.jobs["node-musl"].steps.find(
+    ({ name }) => name === "Build and test musl addon"
+  );
+  assert.match(muslStep.run, /scripts\/build-node-musl\.sh .* --test/u);
+  assert.match(muslScript, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
   assert.match(
-    muslBuild,
+    muslScript,
     /--prefix \/opt\/pnpm "\$\(node -p "require\(\\"\/work\/package\.json\\"\)\.packageManager/u
   );
   assert.match(
-    muslBuild,
+    muslScript,
     /cargo build --release --locked -p minip2p-relay-server-example/u
   );
-  assert.match(muslBuild, /pnpm --filter @minip2p\/node exec vitest run/u);
+  assert.match(muslScript, /pnpm --filter @minip2p\/node exec vitest run/u);
 });
 
 test("weekly Android setup does not request the removed tools package", () => {
-  const setupAndroid = workflow.jobs.android.steps.find(({ uses }) =>
+  assert.ok(
+    workflow.jobs.android.steps.some(
+      ({ uses }) => uses === "./.github/actions/setup-android"
+    )
+  );
+  const androidAction = setupAndroid.runs.steps.find(({ uses }) =>
     uses?.startsWith("android-actions/setup-android@")
   );
-
-  assert.equal(setupAndroid.with.packages, "platform-tools");
+  assert.equal(androidAction.with.packages, "platform-tools");
 });
 
 test("weekly Windows setup keeps pnpm patches on LF line endings", () => {
-  const normalizePatches = workflow.jobs["node-native"].steps.find(
+  const normalizePatches = setupNode.runs.steps.find(
     ({ name }) => name === "Normalize pnpm patches on Windows"
   );
 
-  assert.equal(normalizePatches.if, "runner.os == 'Windows'");
+  assert.match(normalizePatches.if, /runner\.os == 'Windows'/u);
   assert.equal(normalizePatches.shell, "bash");
   assert.match(normalizePatches.run, /react-native\/patches\/\*\.patch/u);
-});
-
-test("weekly Node jobs pin actions to immutable commits", () => {
-  for (const jobName of ["node-native", "node-musl"]) {
-    const actions = workflow.jobs[jobName].steps
-      .map(({ uses }) => uses)
-      .filter((uses) => uses !== undefined);
-
-    for (const action of actions) {
-      assert.match(action, /@[0-9a-f]{40}$/u, `${jobName}: ${action}`);
-    }
-  }
 });

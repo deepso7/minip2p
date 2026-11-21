@@ -1,0 +1,58 @@
+name: Setup Node and pnpm
+description: Install pinned Node.js and pnpm, optionally cache store on main, and install workspace dependencies.
+inputs:
+  install:
+    description: Run pnpm install --frozen-lockfile
+    required: false
+    default: "true"
+  working-directory:
+    description: Directory to run pnpm install in
+    required: false
+    default: .
+  registry-url:
+    description: Optional npm registry URL for publishing
+    required: false
+    default: ""
+  normalize-windows-patches:
+    description: Convert CRLF to LF in React Native pnpm patches on Windows
+    required: false
+    default: "false"
+  save-cache:
+    description: "Cache save policy: main, always, or never"
+    required: false
+    default: main
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "24.20.0"
+        registry-url: ${{ inputs.registry-url }}
+        package-manager-cache: false
+    - if: inputs.install == 'true' || inputs.registry-url == ''
+      uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+    - if: inputs.install == 'true'
+      id: pnpm-store
+      shell: bash
+      run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+    - if: inputs.install == 'true'
+      id: pnpm-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pnpm-store.outputs.dir }}
+        key: pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
+        restore-keys: |
+          pnpm-${{ runner.os }}-${{ runner.arch }}-
+    - if: inputs.normalize-windows-patches == 'true' && runner.os == 'Windows'
+      name: Normalize pnpm patches on Windows
+      shell: bash
+      run: sed -i 's/\r$//' bindings/ts/react-native/patches/*.patch
+    - if: inputs.install == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: pnpm install --frozen-lockfile
+    - if: inputs.install == 'true' && steps.pnpm-cache.outputs.cache-hit != 'true' && (inputs.save-cache == 'always' || (inputs.save-cache == 'main' && github.ref == 'refs/heads/main'))
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pnpm-store.outputs.dir }}
+        key: ${{ steps.pnpm-cache.outputs.cache-primary-key }}

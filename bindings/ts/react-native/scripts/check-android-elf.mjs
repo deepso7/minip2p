@@ -5,23 +5,23 @@ import path from "node:path";
 import process from "node:process";
 
 const ndk = process.env.ANDROID_NDK_HOME;
-if (ndk === undefined) {
-  throw new Error("ANDROID_NDK_HOME is required");
-}
 
 const packageRoot =
   process.argv[2] === undefined
     ? path.resolve(import.meta.dirname, "..")
     : path.resolve(process.argv[2]);
-const readelf = path.join(
-  ndk,
-  "toolchains",
-  "llvm",
-  "prebuilt",
-  process.platform === "darwin" ? "darwin-x86_64" : "linux-x86_64",
-  "bin",
-  "llvm-readelf"
-);
+const readelf =
+  ndk === undefined
+    ? "readelf"
+    : path.join(
+        ndk,
+        "toolchains",
+        "llvm",
+        "prebuilt",
+        process.platform === "darwin" ? "darwin-x86_64" : "linux-x86_64",
+        "bin",
+        "llvm-readelf"
+      );
 const libraries = [
   { abi: "arm64-v8a", machine: /Machine:\s+AArch64\b/u },
   {

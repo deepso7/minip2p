@@ -8,89 +8,74 @@ on:
 permissions:
   contents: read
 
-# A superseded PR run proves nothing: the commit it was checking is already
-# gone. main is never cancelled, so every merged commit keeps a full result.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  # Backtraces keep file and line, but builds skip full debuginfo: a cold
-  # workspace test build is about a third faster and its target dir about half
-  # the size, which keeps the shared Actions cache under its quota.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  # Pinned so a nextest release can't change test selection under us. Bump
-  # deliberately, like the other pinned tools below.
-  NEXTEST_VERSION: 0.9.143
 
 jobs:
-  docs-site:
+  plan:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      full: ${{ steps.affected.outputs.full }}
+      rust_fmt: ${{ steps.affected.outputs.rust_fmt }}
+      fuzz_fmt: ${{ steps.affected.outputs.fuzz_fmt }}
+      rust_packages: ${{ steps.affected.outputs.rust_packages }}
+      rust_has_packages: ${{ steps.affected.outputs.rust_has_packages }}
+      matrix_clippy_rows: ${{ steps.affected.outputs.matrix_clippy_rows }}
+      matrix_test_rows: ${{ steps.affected.outputs.matrix_test_rows }}
+      check_lib_rows: ${{ steps.affected.outputs.check_lib_rows }}
+      fuzz_clippy: ${{ steps.affected.outputs.fuzz_clippy }}
+      fuzz_smoke: ${{ steps.affected.outputs.fuzz_smoke }}
+      check_nostd: ${{ steps.affected.outputs.check_nostd }}
+      check_wasm: ${{ steps.affected.outputs.check_wasm }}
+      check_docs: ${{ steps.affected.outputs.check_docs }}
+      package_check: ${{ steps.affected.outputs.package_check }}
+      doctest_workspace: ${{ steps.affected.outputs.doctest_workspace }}
+      doctest_tcp_smoltcp: ${{ steps.affected.outputs.doctest_tcp_smoltcp }}
+      msrv: ${{ steps.affected.outputs.msrv }}
+      bench_targets: ${{ steps.affected.outputs.bench_targets }}
+      bench_build: ${{ steps.affected.outputs.bench_build }}
+      relay_container: ${{ steps.affected.outputs.relay_container }}
+      relay_installer: ${{ steps.affected.outputs.relay_installer }}
+      docs_site: ${{ steps.affected.outputs.docs_site }}
+      docs_snippets_quickstart: ${{ steps.affected.outputs.docs_snippets_quickstart }}
+      docs_snippets_custom_stream: ${{ steps.affected.outputs.docs_snippets_custom_stream }}
+      ts_lint: ${{ steps.affected.outputs.ts_lint }}
+      workflow_tests: ${{ steps.affected.outputs.workflow_tests }}
+      script_tests: ${{ steps.affected.outputs.script_tests }}
+      bindings_ts: ${{ steps.affected.outputs.bindings_ts }}
+      bindings_ts_packages: ${{ steps.affected.outputs.bindings_ts_packages }}
+      bindings_node_native: ${{ steps.affected.outputs.bindings_node_native }}
+      bindings_rn_gen: ${{ steps.affected.outputs.bindings_rn_gen }}
+      bindings_rn_built: ${{ steps.affected.outputs.bindings_rn_built }}
+      bindings_web: ${{ steps.affected.outputs.bindings_web }}
+      bindings_web_e2e: ${{ steps.affected.outputs.bindings_web_e2e }}
+      summary: ${{ steps.affected.outputs.summary }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Blume's lastModified metadata reads page history.
-          fetch-depth: 0
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24.20.0"
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: "1.91"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # The snippets are their own workspaces; without this they rebuilt
-          # from scratch on every run.
-          workspaces: |
-            docs/snippets/quickstart
-            docs/snippets/custom-stream
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm docs:check
-      - run: scripts/test-relay-installer.sh
-      - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
-      - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
+          fetch-depth: 2
+      - id: affected
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            python3 scripts/affected.py --base HEAD^1 --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/affected.py --all --github-output "$GITHUB_OUTPUT"
+          fi
 
-  # Both release architectures, each on a native runner: builds the release
-  # binary the way publish.yml does and runs it in the real relay image.
-  relay-container:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: scripts/test-relay-container.sh
-
-  # Split from `test` so the two run on parallel runners. The feature matrix
-  # grows with every portable backend, and a single serial job grew ~4x in a
-  # month; keeping lint and test apart keeps that growth off the critical path.
-  lint:
+  checks:
+    needs: plan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: stable
-          components: clippy,rustfmt
-          # Real no_std target: a host check can't catch dependencies that
-          # unconditionally link std. wasm32 is the browser build's target.
-          targets: thumbv7em-none-eabi,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # PR runs restore main's cache but never save their own: per-branch
-          # saves pushed the repo to the 10 GB ceiling, and the resulting
-          # evictions cost more than the occasional cold PR build.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all -- --check
-      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Comment ratchet
         env:
           EVENT: ${{ github.event_name }}
@@ -100,102 +85,170 @@ jobs:
           else
             python3 scripts/check-comments.py
           fi
-      # Library-only checks, as a consumer builds the crate: the clippy rows
-      # below use `--all-targets`, which unifies dev-dependency features in.
-      - run: |
-          for row in relay-server relay-relay-server relay-relay-server-tcp bare-tcp-relay-server; do
-            scripts/run-feature-matrix.sh check "$row"
-          done
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Every row, not just `ci`: release-tier feature combinations are only
-      # linted here (publish.yml tests them but does not run clippy).
-      - run: scripts/run-feature-matrix.sh clippy full
-      # --locked: fuzz/ has its own lockfile, which a PR cut before a version
-      # bump can leave stale; fail here rather than let it land on main.
-      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
-      # The same lists `just check-nostd`, `check-wasm`, `docs` and
-      # `package-check` run.
-      - run: scripts/check-targets.sh nostd
-      - run: scripts/check-targets.sh wasm
-      - run: scripts/check-targets.sh docs
-      - run: scripts/check-targets.sh package-check
+      - name: Python script tests
+        if: needs.plan.outputs.script_tests == 'true'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s bench -p 'test_*.py'
+      - if: needs.plan.outputs.ts_lint == 'true' || needs.plan.outputs.workflow_tests == 'true'
+        uses: ./.github/actions/setup-node
+      - name: Lint and format check
+        if: needs.plan.outputs.ts_lint == 'true'
+        run: pnpm lint
+      - name: Workflow contract tests
+        if: needs.plan.outputs.workflow_tests == 'true'
+        run: pnpm test:workflows
 
-  # Builds exactly the benchmarks the bench image builds (bench/targets) and
-  # checks the IR bench ids against scripts/bench_results.py, so a renamed
-  # feature or an unregistered bench fails here rather than on the bench
-  # instance after its image build.
-  bench-build:
+  lint:
+    needs: plan
+    if: >-
+      needs.plan.outputs.rust_fmt == 'true' || needs.plan.outputs.fuzz_fmt == 'true' || needs.plan.outputs.rust_has_packages == 'true' || needs.plan.outputs.matrix_clippy_rows != '' || needs.plan.outputs.fuzz_clippy == 'true' || needs.plan.outputs.check_nostd == 'true' || needs.plan.outputs.check_wasm == 'true' || needs.plan.outputs.check_docs == 'true' || needs.plan.outputs.package_check == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: python3 scripts/check-bench-ids.py
-      - run: scripts/build-benches.sh
+          components: clippy,rustfmt
+          targets: thumbv7em-none-eabi,wasm32-unknown-unknown
+          shared-key: lint
+      - if: needs.plan.outputs.rust_fmt == 'true'
+        run: cargo fmt --all -- --check
+      - if: needs.plan.outputs.fuzz_fmt == 'true'
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: Library-only feature checks
+        if: needs.plan.outputs.check_lib_rows != ''
+        env:
+          ROWS: ${{ needs.plan.outputs.check_lib_rows }}
+        run: scripts/run-feature-matrix.sh check --rows "$ROWS"
+      - name: Workspace clippy
+        if: needs.plan.outputs.rust_has_packages == 'true'
+        env:
+          RUST_PACKAGES: ${{ needs.plan.outputs.rust_packages }}
+        run: cargo clippy $RUST_PACKAGES --all-targets -- -D warnings
+      - name: Feature-matrix clippy
+        if: needs.plan.outputs.matrix_clippy_rows != ''
+        env:
+          ROWS: ${{ needs.plan.outputs.matrix_clippy_rows }}
+        run: |
+          if [ "$ROWS" = full ]; then
+            scripts/run-feature-matrix.sh clippy full
+          else
+            scripts/run-feature-matrix.sh clippy --rows "$ROWS"
+          fi
+      - name: Fuzz clippy
+        if: needs.plan.outputs.fuzz_clippy == 'true'
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+      - if: needs.plan.outputs.check_nostd == 'true'
+        run: scripts/check-targets.sh nostd
+      - if: needs.plan.outputs.check_wasm == 'true'
+        run: scripts/check-targets.sh wasm
+      - if: needs.plan.outputs.check_docs == 'true'
+        run: scripts/check-targets.sh docs
+      - if: needs.plan.outputs.package_check == 'true'
+        run: scripts/check-targets.sh package-check
 
-  test:
+  test-workspace:
+    needs: plan
+    if: needs.plan.outputs.rust_has_packages == 'true' || needs.plan.outputs.doctest_tcp_smoltcp == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          shared-key: test
+          nextest: "true"
+      - name: Workspace tests
+        if: needs.plan.outputs.rust_has_packages == 'true'
+        env:
+          FULL: ${{ needs.plan.outputs.full }}
+          RUST_PACKAGES: ${{ needs.plan.outputs.rust_packages }}
+        run: |
+          if [ "$FULL" = true ]; then
+            cargo nextest run $RUST_PACKAGES
+          else
+            cargo nextest run --no-tests=pass $RUST_PACKAGES
+          fi
+      - name: Workspace doctests
+        if: needs.plan.outputs.doctest_workspace == 'true'
+        env:
+          RUST_PACKAGES: ${{ needs.plan.outputs.rust_packages }}
+        run: cargo test $RUST_PACKAGES --doc
+      - name: Smoltcp doctests
+        if: needs.plan.outputs.doctest_tcp_smoltcp == 'true'
+        run: cargo test -p minip2p-tcp --features smoltcp --doc
+
+  test-matrix:
+    needs: plan
+    if: needs.plan.outputs.matrix_test_rows != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # nextest runs every test as its own process across all binaries at once.
-      # `cargo test` runs binaries one at a time, so the ffi relay test held the
-      # runner alone for 40s waiting on relay-loss detection — a wait that costs
-      # under a second on a dev box, so it only ever showed up here.
-      - name: Install cargo-nextest
-        run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
-      - run: cargo nextest run --workspace
-      # Only the matrix's `ci` rows; publish.yml's test-rust runs every row.
-      - run: scripts/run-feature-matrix.sh test ci
-      # nextest does not run doctests, and `--workspace --doc` only builds
-      # default features, so a doctest behind a feature gate needs its own line
-      # here. Today that is just SmoltcpTcpProvider; add a line when there are
-      # more.
-      - run: cargo test --workspace --doc
-      - run: cargo test -p minip2p-tcp --features smoltcp --doc
+          toolchain: stable
+          shared-key: test-matrix
+          nextest: "true"
+      - name: Feature-matrix tests
+        env:
+          ROWS: ${{ needs.plan.outputs.matrix_test_rows }}
+        run: |
+          if [ "$ROWS" = ci ]; then
+            scripts/run-feature-matrix.sh test ci
+          else
+            scripts/run-feature-matrix.sh test --rows "$ROWS"
+          fi
 
   msrv:
+    needs: plan
+    if: needs.plan.outputs.msrv == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable; 1.91 (workspace rust-version) via the toolchain input
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: "1.91"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          shared-key: msrv
+      - env:
+          RUST_PACKAGES: ${{ needs.plan.outputs.rust_packages }}
+        run: cargo check $RUST_PACKAGES --all-targets
+
+  bench-build:
+    needs: plan
+    if: needs.plan.outputs.bench_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-targets
+          toolchain: stable
+          shared-key: bench-build
+      - run: python3 scripts/check-bench-ids.py
+      - name: Build reachable benchmarks
+        env:
+          TARGETS: ${{ needs.plan.outputs.bench_targets }}
+        run: |
+          if [ "$TARGETS" = all ]; then
+            scripts/build-benches.sh
+          else
+            scripts/build-benches.sh build --only "$TARGETS"
+          fi
 
   fuzz-smoke:
+    needs: plan
+    if: needs.plan.outputs.fuzz_smoke == 'true'
     runs-on: ubuntu-latest
     env:
-      # Pinned so a broken upstream nightly can't fail every PR and the
-      # rust-cache key stays stable. Bump deliberately.
       NIGHTLY_TOOLCHAIN: nightly-2026-09-04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable; installs the nightly toolchain below via the toolchain input
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
           workspaces: fuzz
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Swatinem/rust-cache does not cache ~/.cargo/bin, so cargo-fuzz is
-      # rebuilt whenever the runner image ships without it. Pinned --version +
-      # --locked keeps the tool and its dependency tree fully reproducible (same
-      # intent as the pinned nightly above); a bare --locked would still float
-      # to whatever cargo-fuzz release is newest. Bump deliberately.
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+          shared-key: fuzz-smoke
+          cargo-fuzz: "true"
       - run: cargo +$NIGHTLY_TOOLCHAIN fuzz run wire_inputs -- -max_total_time=30
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
@@ -203,3 +256,171 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  relay-container:
+    needs: plan
+    if: needs.plan.outputs.relay_container == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: scripts/test-relay-container.sh
+
+  docs-site:
+    needs: plan
+    if: >-
+      needs.plan.outputs.docs_site == 'true' || needs.plan.outputs.relay_installer == 'true' || needs.plan.outputs.docs_snippets_quickstart == 'true' || needs.plan.outputs.docs_snippets_custom_stream == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ needs.plan.outputs.docs_site == 'true' && '0' || '1' }}
+      - if: needs.plan.outputs.docs_site == 'true'
+        uses: ./.github/actions/setup-node
+      - if: needs.plan.outputs.docs_snippets_quickstart == 'true' || needs.plan.outputs.docs_snippets_custom_stream == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.91"
+          shared-key: docs-site
+          workspaces: |
+            docs/snippets/quickstart
+            docs/snippets/custom-stream
+      - if: needs.plan.outputs.docs_site == 'true'
+        run: pnpm docs:check
+      - if: needs.plan.outputs.relay_installer == 'true'
+        run: scripts/test-relay-installer.sh
+      - if: needs.plan.outputs.docs_snippets_quickstart == 'true'
+        run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
+      - if: needs.plan.outputs.docs_snippets_custom_stream == 'true'
+        run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
+
+  ts-bindings:
+    needs: plan
+    if: needs.plan.outputs.bindings_ts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-node
+      - id: rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          targets: ${{ needs.plan.outputs.bindings_web_e2e == 'true' && 'wasm32-unknown-unknown' || '' }}
+          shared-key: generated-and-typescript
+          wasm-bindgen: ${{ needs.plan.outputs.bindings_web_e2e }}
+      - run: pnpm typecheck
+      - if: needs.plan.outputs.bindings_node_native == 'true'
+        run: pnpm --filter @minip2p/node native:build
+      - name: Run TypeScript tests
+        env:
+          TS_PACKAGES: ${{ needs.plan.outputs.bindings_ts_packages }}
+        run: |
+          if [ "$TS_PACKAGES" = all ]; then
+            pnpm test
+          else
+            filters=()
+            for pkg in $TS_PACKAGES; do
+              filters+=(--filter "$pkg")
+            done
+            pnpm "${filters[@]}" test
+          fi
+      - name: Build bindings
+        env:
+          TS_PACKAGES: ${{ needs.plan.outputs.bindings_ts_packages }}
+        run: |
+          if [ "$TS_PACKAGES" = all ]; then
+            pnpm build:bindings
+          else
+            filters=()
+            for pkg in $TS_PACKAGES; do
+              filters+=(--filter "${pkg}...")
+            done
+            pnpm "${filters[@]}" build
+          fi
+      - if: needs.plan.outputs.bindings_rn_built == 'true'
+        run: pnpm --filter @minip2p/react-native test:built
+      - if: needs.plan.outputs.bindings_rn_gen == 'true'
+        uses: ./.github/actions/run-ubrn
+        with:
+          rust-cachekey: ${{ steps.rust.outputs.cachekey }}
+          command: pnpm rn:generate
+      - name: Prepare browser e2e fixtures
+        if: needs.plan.outputs.bindings_web_e2e == 'true'
+        env:
+          BINDINGS_WEB: ${{ needs.plan.outputs.bindings_web }}
+        run: |
+          if [ "$BINDINGS_WEB" != true ]; then
+            pnpm --filter @minip2p/web wasm:build
+          fi
+          cargo build --locked -p minip2p-relay-server-example
+      - name: Generated files are current
+        if: needs.plan.outputs.bindings_rn_gen == 'true' || needs.plan.outputs.bindings_web_e2e == 'true'
+        run: test -z "$(git status --porcelain)"
+      - name: Restore Playwright browsers
+        if: needs.plan.outputs.bindings_web_e2e == 'true'
+        id: playwright
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bindings/ts/web/package.json') }}
+      - name: Install Playwright browsers
+        if: needs.plan.outputs.bindings_web_e2e == 'true'
+        env:
+          CACHE_HIT: ${{ steps.playwright.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" = true ]; then
+            pnpm --filter @minip2p/web exec playwright install-deps chromium firefox
+          else
+            pnpm --filter @minip2p/web exec playwright install --with-deps chromium firefox
+          fi
+      - name: Save Playwright browsers
+        if: needs.plan.outputs.bindings_web_e2e == 'true' && github.ref == 'refs/heads/main' && steps.playwright.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.playwright.outputs.cache-primary-key }}
+      - name: Browser e2e
+        if: needs.plan.outputs.bindings_web_e2e == 'true'
+        run: pnpm --filter @minip2p/web test:e2e
+
+  ci:
+    if: always()
+    needs:
+      - plan
+      - checks
+      - lint
+      - test-workspace
+      - test-matrix
+      - msrv
+      - bench-build
+      - fuzz-smoke
+      - relay-container
+      - docs-site
+      - ts-bindings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all reachable checks passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+        run: |
+          echo "Plan summary: $SUMMARY"
+          jq -e 'all(.[]; . == "success" or . == "skipped")' <<<"$RESULTS" >/dev/null
+
+  prune-caches:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ci]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/prune-caches.sh
