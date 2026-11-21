@@ -711,7 +711,7 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                let fed = self.feed_yamux(&mut noise, &mut yamux, &plaintext);
+                let fed = self.feed_yamux(&mut noise, &mut yamux, plaintext);
                 self.keep_ready(fed, noise, yamux, peer)
             }
             _ => Err(SessionError::protocol(
@@ -735,7 +735,7 @@ impl SecureMuxSession {
             return Err(SessionError::protocol("Noise authenticated twice"));
         }
         for plaintext in decrypted {
-            self.feed_yamux(noise, yamux, &plaintext)?;
+            self.feed_yamux(noise, yamux, plaintext)?;
         }
         Ok(())
     }
@@ -745,7 +745,7 @@ impl SecureMuxSession {
         &mut self,
         noise: &mut NoiseSession,
         yamux: &mut YamuxSession,
-        plaintext: &[u8],
+        plaintext: Vec<u8>,
     ) -> Result<(), SessionError> {
         let result = yamux.handle_data(plaintext);
         self.drain_yamux(noise, yamux, result.is_err())?;
@@ -830,7 +830,7 @@ impl SecureMuxSession {
 
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
-            let handled = yamux.handle_data(&remaining);
+            let handled = yamux.handle_data(remaining);
             let drained = self.drain_yamux(&mut noise, &mut yamux, handled.is_err());
             let outcome = drained.and_then(|()| {
                 handled.map_err(|error| {
@@ -1038,7 +1038,7 @@ fn push_yamux_events(
             }
             YamuxOutput::Data { stream: id, data } => SessionOutput::StreamData {
                 stream: stream(id),
-                data: Bytes::from(data),
+                data,
             },
             YamuxOutput::RemoteWriteClosed { stream: id } => {
                 SessionOutput::StreamRemoteWriteClosed { stream: stream(id) }
@@ -1433,7 +1433,7 @@ mod tests {
         .unwrap();
         for stream in [2, 4] {
             let syn = Frame::window_update(stream, FLAG_SYN, 0).unwrap();
-            yamux.handle_data(&syn.encode()).unwrap();
+            yamux.handle_data(syn.encode()).unwrap();
         }
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
@@ -1468,7 +1468,7 @@ mod tests {
         let (noise, _) = noise_pair(initiator_key, responder_key);
         let mut yamux = YamuxSession::new(YamuxRole::Client);
         let syn = Frame::window_update(2, FLAG_SYN, 0).unwrap();
-        yamux.handle_data(&syn.encode()).unwrap();
+        yamux.handle_data(syn.encode()).unwrap();
         let stream = StreamId::new(2);
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
@@ -1503,7 +1503,7 @@ mod tests {
         let (noise, _) = noise_pair(initiator_key, responder_key);
         let mut yamux = YamuxSession::new(YamuxRole::Client);
         let syn = Frame::window_update(2, FLAG_SYN, 0).unwrap();
-        yamux.handle_data(&syn.encode()).unwrap();
+        yamux.handle_data(syn.encode()).unwrap();
         let stream = StreamId::new(2);
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,

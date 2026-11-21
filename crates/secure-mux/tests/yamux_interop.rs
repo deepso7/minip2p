@@ -1,3 +1,4 @@
+use minip2p_core::Bytes;
 use minip2p_secure_mux::yamux::{
     FLAG_FIN, FLAG_SYN, FrameDecoder, FrameType, YamuxError, YamuxOutput, YamuxRole, YamuxSession,
 };
@@ -9,7 +10,7 @@ fn decodes_and_reencodes_pinned_upstream_transcript() {
     assert_eq!(value("producer"), "yamux-0.13.8");
     let transcript = hex(value("client_transcript"));
     let mut decoder = FrameDecoder::new(1024);
-    decoder.push(&transcript);
+    decoder.push(transcript.clone());
 
     let opening = decoder.next_frame().unwrap().expect("opening frame");
     assert_eq!(opening.frame_type(), FrameType::Data);
@@ -36,7 +37,7 @@ fn decodes_and_reencodes_pinned_upstream_transcript() {
 fn session_consumes_pinned_upstream_transcript() {
     let mut session = YamuxSession::new(YamuxRole::Server);
     session
-        .handle_data(&hex(value("client_transcript")))
+        .handle_data(hex(value("client_transcript")))
         .unwrap();
 
     assert_eq!(
@@ -47,7 +48,7 @@ fn session_consumes_pinned_upstream_transcript() {
         session.poll_output(),
         Some(YamuxOutput::Data {
             stream: 1,
-            data: b"fixture-data".to_vec(),
+            data: Bytes::from_static(b"fixture-data"),
         })
     );
     assert_eq!(
@@ -90,7 +91,7 @@ fn hex(input: &str) -> Vec<u8> {
 #[test]
 fn fixture_decoder_limit_is_enforced() {
     let mut decoder = FrameDecoder::new(4);
-    decoder.push(&hex(value("client_transcript")));
+    decoder.push(hex(value("client_transcript")));
     assert!(matches!(
         decoder.next_frame(),
         Err(YamuxError::FrameTooLarge { .. })

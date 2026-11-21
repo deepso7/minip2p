@@ -643,7 +643,10 @@ impl YamuxSession {
     /// A protocol error fails the session closed: queued frames are replaced
     /// by a protocol GoAway and queued events are dropped. No per-stream
     /// terminal events follow; every stream ends with the session.
-    pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
+    ///
+    /// When nothing is buffered from earlier input, `bytes` is adopted rather
+    /// than copied, and a data frame ending it is delivered as a view into it.
+    pub fn handle_data(&mut self, bytes: Vec<u8>) -> Result<(), YamuxError> {
         self.ensure_active()?;
         self.decoder.push(bytes);
         loop {

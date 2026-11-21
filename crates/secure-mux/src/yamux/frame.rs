@@ -1,5 +1,8 @@
 use alloc::vec::Vec;
 
+use bytes::Buf;
+use minip2p_core::Bytes;
+
 use crate::yamux::YamuxError;
 
 /// Size of every Yamux frame header.
@@ -79,12 +82,13 @@ pub struct Frame {
     flags: u16,
     stream_id: u32,
     value: u32,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 impl Frame {
     /// Constructs a data frame.
-    pub fn data(stream_id: u32, flags: u16, payload: Vec<u8>) -> Result<Self, YamuxError> {
+    pub fn data(stream_id: u32, flags: u16, payload: impl Into<Bytes>) -> Result<Self, YamuxError> {
+        let payload = payload.into();
         let value = match u32::try_from(payload.len()) {
             Ok(value) => value,
             Err(_) => return Err(YamuxError::FrameLengthOverflow),
@@ -107,7 +111,7 @@ impl Frame {
             flags,
             stream_id,
             value: credit,
-            payload: Vec::new(),
+            payload: Bytes::new(),
         };
         frame.validate()?;
         Ok(frame)
@@ -120,7 +124,7 @@ impl Frame {
             flags,
             stream_id: 0,
             value: nonce,
-            payload: Vec::new(),
+            payload: Bytes::new(),
         };
         frame.validate()?;
         Ok(frame)
@@ -133,7 +137,7 @@ impl Frame {
             flags: 0,
             stream_id: 0,
             value: code,
-            payload: Vec::new(),
+            payload: Bytes::new(),
         }
     }
 
@@ -163,7 +167,7 @@ impl Frame {
     }
 
     /// Returns the data-frame payload, consuming the frame.
-    pub(crate) fn into_payload(self) -> Vec<u8> {
+    pub(crate) fn into_payload(self) -> Bytes {
         self.payload
     }
 
@@ -191,7 +195,7 @@ impl Frame {
         payload: &[u8],
         room: FrameRoom,
     ) -> Result<Vec<u8>, YamuxError> {
-        let header = Self::data(stream_id, flags, Vec::new())?;
+        let header = Self::data(stream_id, flags, Bytes::new())?;
         let Ok(value) = u32::try_from(payload.len()) else {
             return Err(YamuxError::FrameLengthOverflow);
         };
@@ -256,14 +260,26 @@ impl FrameDecoder {
     }
 
     /// Appends ordered connection bytes.
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
+    ///
+    /// When nothing is buffered, `bytes` is adopted as the buffer instead of
+    /// being copied into it.
+    pub fn push(&mut self, bytes: Vec<u8>) {
+        if self.buffer.is_empty() {
+            self.buffer = bytes;
+            self.offset = 0;
+        } else {
+            self.buffer.extend_from_slice(&bytes);
+        }
     }
 
     /// Returns the next complete frame, if available.
     ///
     /// Oversized data frames are rejected as soon as their 12-byte header is
     /// present; the decoder never reserves their declared payload length.
+    ///
+    /// The last frame in the buffer keeps its payload in the buffer's
+    /// allocation, unless that payload is under half the allocation's
+    /// capacity (ADR 0012); every other payload is copied out.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, YamuxError> {
         let available = self
             .buffer
@@ -327,31 +343,45 @@ impl FrameDecoder {
         let payload_end = payload_start
             .checked_add(payload_len)
             .ok_or(YamuxError::FrameLengthOverflow)?;
-        let payload = self
-            .buffer
-            .get(payload_start..payload_end)
-            .ok_or(YamuxError::FrameLengthOverflow)?
-            .to_vec();
-        let frame = Frame {
+        let header = Frame {
             frame_type,
             flags,
             stream_id,
             value,
-            payload,
+            payload: Bytes::new(),
         };
-        frame.validate()?;
-        self.offset = self
-            .offset
-            .checked_add(frame_len)
-            .ok_or(YamuxError::FrameLengthOverflow)?;
-        self.compact_if_needed();
-        Ok(Some(frame))
+        header.validate()?;
+        let payload = self.take_payload(payload_start, payload_end)?;
+        Ok(Some(Frame { payload, ..header }))
     }
 
     /// Returns unread buffered bytes, including a partial header or payload.
     #[cfg(test)]
     pub fn buffered_len(&self) -> usize {
         self.buffer.len() - self.offset
+    }
+
+    /// Consumes the frame ending at `end` and returns its payload at
+    /// `start..end`, viewing the buffer itself when the frame ends the buffer
+    /// and the payload fills at least half its capacity.
+    fn take_payload(&mut self, start: usize, end: usize) -> Result<Bytes, YamuxError> {
+        let len = end
+            .checked_sub(start)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
+        if end == self.buffer.len() && len.saturating_mul(2) >= self.buffer.capacity() {
+            let mut payload = Bytes::from(core::mem::take(&mut self.buffer));
+            payload.advance(start);
+            self.offset = 0;
+            return Ok(payload);
+        }
+        let payload = self
+            .buffer
+            .get(start..end)
+            .map(Bytes::copy_from_slice)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
+        self.offset = end;
+        self.compact_if_needed();
+        Ok(payload)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -392,10 +422,10 @@ mod tests {
         bytes.extend_from_slice(&second);
         let mut decoder = FrameDecoder::new(1024);
         for byte in &bytes[..HEADER_LEN - 1] {
-            decoder.push(core::slice::from_ref(byte));
+            decoder.push(alloc::vec![*byte]);
             assert_eq!(decoder.next_frame().unwrap(), None);
         }
-        decoder.push(&bytes[HEADER_LEN - 1..]);
+        decoder.push(bytes[HEADER_LEN - 1..].to_vec());
         assert_eq!(decoder.next_frame().unwrap().unwrap().encode(), first);
         assert_eq!(decoder.next_frame().unwrap().unwrap().encode(), second);
         assert_eq!(decoder.next_frame().unwrap(), None);
@@ -406,7 +436,7 @@ mod tests {
     fn rejects_oversized_data_from_header_alone() {
         let header = [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 4, 1];
         let mut decoder = FrameDecoder::new(1024);
-        decoder.push(&header);
+        decoder.push(header.to_vec());
         assert_eq!(
             decoder.next_frame(),
             Err(YamuxError::FrameTooLarge {
@@ -416,5 +446,68 @@ mod tests {
         );
         assert_eq!(decoder.buffered_len(), HEADER_LEN);
         assert!(decoder.buffer.capacity() < 1025);
+    }
+
+    fn data_frame(stream_id: u32, len: usize) -> Vec<u8> {
+        Frame::data(stream_id, 0, alloc::vec![0x5a; len])
+            .unwrap()
+            .encode()
+    }
+
+    #[test]
+    fn a_lone_frame_payload_views_the_pushed_buffer() {
+        let bytes = data_frame(1, 1024);
+        let payload_at = bytes.as_ptr().wrapping_add(HEADER_LEN);
+        let mut decoder = FrameDecoder::new(1024);
+        decoder.push(bytes);
+        let frame = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(frame.payload(), [0x5a; 1024]);
+        assert_eq!(frame.payload().as_ptr(), payload_at);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn coalesced_frames_copy_all_but_the_last_payload() {
+        let first = data_frame(1, 16);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&data_frame(3, 1024));
+        let buffer = bytes.as_ptr_range();
+        let mut decoder = FrameDecoder::new(1024);
+        decoder.push(bytes);
+
+        let copied = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(copied.encode(), first);
+        assert!(!buffer.contains(&copied.payload().as_ptr()));
+        let viewed = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(
+            (viewed.stream_id(), viewed.payload()),
+            (3, &[0x5a; 1024][..])
+        );
+        assert!(buffer.contains(&viewed.payload().as_ptr()));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn a_frame_split_across_pushes_is_reassembled() {
+        let bytes = data_frame(1, 1024);
+        let mut decoder = FrameDecoder::new(1024);
+        decoder.push(bytes[..600].to_vec());
+        assert_eq!(decoder.next_frame().unwrap(), None);
+        decoder.push(bytes[600..].to_vec());
+        assert_eq!(decoder.next_frame().unwrap().unwrap().encode(), bytes);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn a_small_payload_never_pins_a_large_buffer() {
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(&data_frame(1, 16));
+        let buffer = bytes.as_ptr_range();
+        let mut decoder = FrameDecoder::new(1024);
+        decoder.push(bytes);
+        let frame = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(frame.payload(), [0x5a; 16]);
+        assert!(!buffer.contains(&frame.payload().as_ptr()));
+        assert_eq!(decoder.buffered_len(), 0);
     }
 }
