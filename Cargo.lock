@@ -1213,6 +1213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-mdns-demo"
+version = "0.13.0"
+dependencies = [
+ "minip2p-rs",
+]
+
+[[package]]
 name = "minip2p-multistream-select"
 version = "0.13.0"
 dependencies = [
