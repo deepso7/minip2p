@@ -734,11 +734,15 @@ function normalizeBigInts(
   return value;
 }
 
-/** The resolved config with its limit literals as UniFFI enums. */
+/** The resolved config with its map and limit literals in UniFFI form. */
 function nativeEndpointConfig(
   config: BackendEndpointConfig
 ): NativeEndpointConfig {
-  return { ...config, limits: config.limits && nativeLimits(config.limits) };
+  return {
+    ...config,
+    inboundStreamLimits: new Map(Object.entries(config.inboundStreamLimits)),
+    limits: config.limits && nativeLimits(config.limits),
+  };
 }
 
 function nativeLimits({

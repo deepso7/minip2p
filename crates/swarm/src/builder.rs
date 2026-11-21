@@ -4,11 +4,13 @@
 //! configuration) so the common case takes a keypair and returns a ready-to-use
 //! swarm.
 
+use alloc::collections::BTreeMap;
 use alloc::{
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+use core::num::NonZeroUsize;
 use minip2p_core::PeerId;
 use minip2p_identify::{IDENTIFY_PROTOCOL_ID, IdentifyConfig};
 use minip2p_identity::Ed25519Keypair;
@@ -52,6 +54,7 @@ pub struct SwarmBuilder {
     agent_version: String,
     protocols: Vec<String>,
     user_protocols: Vec<String>,
+    inbound_limits: BTreeMap<String, NonZeroUsize>,
     public_key: Vec<u8>,
     /// Derived once from the keypair and cached so the swarm's
     /// `local_peer_id` accessor is infallible.
@@ -75,6 +78,7 @@ impl SwarmBuilder {
                 PING_PROTOCOL_ID.to_string(),
             ],
             user_protocols: Vec::new(),
+            inbound_limits: BTreeMap::new(),
             public_key: keypair.public_key().encode_protobuf(),
             local_peer_id: keypair.peer_id(),
             timeouts: SwarmTimeouts::default(),
@@ -113,6 +117,24 @@ impl SwarmBuilder {
             self.user_protocols.push(id);
         }
         self
+    }
+
+    /// Registers an application protocol with an endpoint-wide inbound concurrency cap.
+    ///
+    /// Excess negotiated inbound streams wait in FIFO order until an earlier
+    /// stream fully ends. Outbound streams do not count. Repeating this setter
+    /// replaces the limit; `protocol` alone leaves an existing limit unchanged.
+    /// With QUIC, use an unlimited connection receive window: queued streams
+    /// could otherwise exhaust shared credit and prevent admitted streams from
+    /// finishing. TCP/Yamux has no connection-level receive window.
+    pub fn protocol_with_inbound_limit(
+        mut self,
+        protocol_id: impl Into<String>,
+        limit: NonZeroUsize,
+    ) -> Self {
+        let id = protocol_id.into();
+        self.inbound_limits.insert(id.clone(), limit);
+        self.protocol(id)
     }
 
     /// Overrides the protocol deadlines: negotiation, first Identify and
@@ -162,6 +184,7 @@ impl SwarmBuilder {
             entropy,
         )?;
         core.state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
+        core.state.inbound_limits = self.inbound_limits;
         for protocol in user_protocols {
             core.add_protocol(protocol)?;
         }
@@ -190,6 +213,7 @@ impl SwarmBuilder {
         };
         let mut swarm = Swarm::new(transport, identify, self.timeouts, self.local_peer_id)?;
         swarm.core_mut().state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
+        swarm.core_mut().state.inbound_limits = self.inbound_limits;
         for protocol in user_protocols {
             swarm.core_mut().add_protocol(protocol)?;
         }

@@ -81,6 +81,7 @@ impl<T: Transport> Host<T> {
         config: EndpointConfig,
         transport: impl FnOnce(&Ed25519Keypair) -> T,
     ) -> Result<Self, FfiError> {
+        let inbound_stream_limits = config.resolve_inbound_stream_limits()?;
         let keypair = keypair_from_bytes(secret_key)?;
         validate_browser_config(&config)?;
         let relays = config
@@ -117,6 +118,11 @@ impl<T: Transport> Host<T> {
         }
         for protocol in config.protocols {
             builder = builder.manual_ack_protocol(protocol);
+        }
+        for (protocol, limit) in inbound_stream_limits {
+            builder = builder
+                .protocol_with_inbound_limit(&protocol, limit)
+                .manual_ack_protocol(protocol);
         }
         let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
         let endpoint = builder

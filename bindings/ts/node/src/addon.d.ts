@@ -133,6 +133,8 @@ export interface NodeEndpointConfig {
   allowUnsigned: boolean
   /** Application protocol identifiers. */
   protocols: Array<string>
+  /** Positive inbound concurrency caps; each entry also registers its protocol. */
+  inboundStreamLimits?: Record<string, number>
   /** Signed discovery configuration. */
   discovery?: NodeDiscoveryOptions
   /** mDNS configuration. */

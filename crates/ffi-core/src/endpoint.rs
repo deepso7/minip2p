@@ -195,6 +195,7 @@ impl P2pEndpoint {
     /// The endpoint begins in the created state and owns its bound sockets,
     /// but does not run a background driver until explicitly started.
     pub fn new(secret_key: Vec<u8>, config: EndpointConfig) -> Result<Arc<Self>, FfiError> {
+        let inbound_stream_limits = config.resolve_inbound_stream_limits()?;
         let keypair = keypair_from_bytes(secret_key)?;
         let relays = config
             .relays
@@ -230,6 +231,11 @@ impl P2pEndpoint {
             .write_budget(crate::BINDING_WRITE_BUDGET);
         for protocol in config.protocols {
             builder = builder.manual_ack_protocol(protocol);
+        }
+        for (protocol, limit) in inbound_stream_limits {
+            builder = builder
+                .protocol_with_inbound_limit(&protocol, limit)
+                .manual_ack_protocol(protocol);
         }
 
         let custom_circuits = limits.max_circuits != NatConfig::default().max_circuits;
