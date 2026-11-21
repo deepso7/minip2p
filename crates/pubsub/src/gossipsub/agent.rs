@@ -17,7 +17,7 @@ use crate::events::{GossipsubAction, GossipsubEvent, GossipsubToken, PublishErro
 use crate::message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc,
-    SubOpts, decode_frame, encode_frame,
+    SubOpts, decode_frame, encode_frame, encode_publish_frame,
 };
 use crate::seen::{MessageId, SeenCache, message_id, seen_message_id, seen_message_id_from_wire};
 
@@ -605,15 +605,9 @@ impl GossipsubAgent {
 
         let seqno = self.next_seqno;
         let message = RawMessage::build_signed(&self.keypair, topic, data, seqno);
-        let body = Rpc {
-            subscriptions: Vec::new(),
-            publish: alloc::vec![message.clone()],
-            control: None,
-        }
-        .encode();
-        if body.len() > MAX_RPC_SIZE {
-            return Err(PublishError::TooLarge);
-        }
+        let frame: Bytes = encode_publish_frame(&message)
+            .ok_or(PublishError::TooLarge)?
+            .into();
         self.next_seqno = self.next_seqno.wrapping_add(1);
         let id = message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes());
         self.seen.insert(
@@ -625,7 +619,6 @@ impl GossipsubAgent {
         self.mcache
             .put(id, message, alloc::vec![String::from(topic)]);
 
-        let frame: Bytes = encode_frame(&body).into();
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending_messages.push_back(frame.clone());
@@ -1439,18 +1432,10 @@ impl GossipsubAgent {
                 if served >= self.config.max_iwant_serves_per_heartbeat {
                     break;
                 }
-                let Some(message) = self.mcache.get(&id).cloned() else {
+                let Some(frame) = self.mcache.get(&id).and_then(encode_publish_frame) else {
                     continue;
                 };
-                let body = Rpc {
-                    subscriptions: Vec::new(),
-                    publish: alloc::vec![message],
-                    control: None,
-                }
-                .encode();
-                if body.len() <= MAX_RPC_SIZE
-                    && self.queue_message(peer, encode_frame(&body).into())
-                {
+                if self.queue_message(peer, frame.into()) {
                     *self.iwant_served.entry(*peer).or_default() += 1;
                 }
             }
@@ -1517,18 +1502,12 @@ impl GossipsubAgent {
             .filter(|peer| **peer != *arrival && **peer != from)
             .cloned()
             .collect();
-        let frame: Bytes = encode_frame(
-            &Rpc {
-                subscriptions: Vec::new(),
-                publish: alloc::vec![message.clone()],
-                control: None,
-            }
-            .encode(),
-        )
-        .into();
-        for peer in recipients {
-            if self.queue_message(&peer, frame.clone()) {
-                self.drive_sender(&peer, now_ms);
+        if let Some(frame) = encode_publish_frame(&message) {
+            let frame = Bytes::from(frame);
+            for peer in recipients {
+                if self.queue_message(&peer, frame.clone()) {
+                    self.drive_sender(&peer, now_ms);
+                }
             }
         }
         self.mcache.put(id, message, interested_topics);
