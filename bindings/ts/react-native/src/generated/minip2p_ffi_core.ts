@@ -663,7 +663,9 @@ export type QuicLimitsOptions = {
      */
     maxConnections?: bigint,
     /**
-     * Locally initiated bidirectional streams per connection.
+     * Bound locally initiated bidirectional streams per connection.
+     * Excess opens wait FIFO with an immediate ID. The pending queue is
+     * unbounded and local-caller-only, so peers cannot use it for DoS.
      */
     maxStreamsPerConnection?: bigint,
     /**
@@ -965,7 +967,9 @@ export type YamuxOptions = {
      */
     maxFrameLen?: number,
     /**
-     * Streams tracked at once, counting unsettled closed ones.
+     * Active and unsettled streams at once, for TCP or circuits.
+     * Excess local opens wait FIFO with writes and FIN buffered within the
+     * send caps. The queue is unbounded and local-caller-only, not remote.
      */
     maxStreams?: bigint,
     /**
