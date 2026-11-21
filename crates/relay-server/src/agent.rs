@@ -501,8 +501,9 @@ fn target_leg(direction: CircuitDirection) -> CircuitLeg {
 #[derive(Default)]
 struct Forward {
     queue: VecDeque<Bytes>,
-    /// Small reads copied together behind `queue`, so a peer sending tiny
-    /// frames costs memory in proportion to its bytes, not its reads.
+    /// Small reads copied together behind `queue` while it waits, so a peer
+    /// sending tiny frames costs memory in proportion to its bytes, not its
+    /// reads.
     small: Vec<u8>,
     /// Length of the payload the head was cut from, while the head is the
     /// unsent tail of a Full; zero while the head is a whole payload.
@@ -524,8 +525,9 @@ enum FinState {
     Accepted,
 }
 
-/// Reads shorter than this are coalesced into one queue entry, flushed once
-/// it reaches this size or sooner when forwarding or ordering needs it.
+/// Reads shorter than this arriving behind queued or blocked bytes are
+/// coalesced into one queue entry, flushed once it reaches this size or
+/// sooner when forwarding or ordering needs it.
 const COALESCE_BELOW: usize = 4096;
 
 impl Forward {
@@ -535,8 +537,13 @@ impl Forward {
     }
 
     /// Appends a read behind everything already queued.
+    ///
+    /// A read into an idle, unblocked direction is queued as received, so the
+    /// common path neither copies nor allocates; the transports deliver
+    /// payloads within twice their length (ADR 0012), as for large reads.
     fn push(&mut self, data: Bytes) {
-        if data.len() < COALESCE_BELOW {
+        let idle = !self.blocked && self.queue.is_empty() && self.small.is_empty();
+        if data.len() < COALESCE_BELOW && !idle {
             self.small.extend_from_slice(&data);
             if self.small.len() >= COALESCE_BELOW {
                 self.flush_small();
@@ -3088,6 +3095,52 @@ mod tests {
     use core::str::FromStr;
 
     use super::*;
+
+    #[test]
+    fn an_idle_forward_queues_a_small_read_without_copying() {
+        let mut forward = Forward::default();
+        let data = Bytes::from(alloc::vec![7; 1300]);
+        let ptr = data.as_ptr();
+        forward.push(data);
+        assert_eq!(forward.unacked(), 1300);
+        assert!(forward.small.is_empty());
+        let head = forward.head().unwrap();
+        assert_eq!(head.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn small_reads_behind_a_queued_head_are_coalesced() {
+        let mut forward = Forward::default();
+        forward.push(Bytes::from_static(b"ab"));
+        forward.push(Bytes::from_static(b"cd"));
+        forward.push(Bytes::from_static(b"ef"));
+        assert_eq!(forward.queue.len(), 1);
+        assert_eq!(forward.small, b"cdef");
+        assert_eq!(forward.unacked(), 6);
+        forward.accept(None);
+        assert_eq!(forward.head().unwrap(), Bytes::from_static(b"cdef"));
+    }
+
+    #[test]
+    fn small_reads_to_a_blocked_forward_are_coalesced_in_order() {
+        let mut forward = Forward::default();
+        forward.push(Bytes::from_static(b"abcdef"));
+        forward.accept(Some(Bytes::from_static(b"def")));
+        assert!(forward.blocked);
+        assert_eq!(forward.unacked(), 3);
+        forward.push(Bytes::from_static(b"gh"));
+        forward.push(Bytes::from_static(b"ij"));
+        assert_eq!(forward.small, b"ghij");
+        assert_eq!(forward.unacked(), 7);
+
+        forward.blocked = false;
+        assert_eq!(forward.head().unwrap(), Bytes::from_static(b"def"));
+        forward.accept(None);
+        assert_eq!(forward.head().unwrap(), Bytes::from_static(b"ghij"));
+        forward.accept(None);
+        assert_eq!(forward.unacked(), 0);
+        assert!(forward.head().is_none());
+    }
 
     #[test]
     fn admission_keys_fold_ipv4_mapped_ipv6_and_each_ipv6_slash_64() {
