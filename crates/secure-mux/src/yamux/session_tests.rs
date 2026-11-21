@@ -704,12 +704,16 @@ fn window_credit_returns_only_for_acknowledged_bytes() {
         Err(YamuxError::ReceiveWindowExceeded { stream: 1 })
     );
 
-    server.ack(1, window / 2 - 1).unwrap();
-    assert_eq!(server.poll_frame(), None, "credit returns in half windows");
+    server.ack(1, window / 4 - 1).unwrap();
+    assert_eq!(
+        server.poll_frame(),
+        None,
+        "credit returns in quarter windows"
+    );
     server.ack(1, 1).unwrap();
     let update = decode(&outbound(&mut server));
     assert_eq!(update.frame_type(), FrameType::WindowUpdate);
-    assert_eq!(update.value() as usize, window / 2);
+    assert_eq!(update.value() as usize, window / 4);
     server.handle_data(&more).unwrap();
 }
 

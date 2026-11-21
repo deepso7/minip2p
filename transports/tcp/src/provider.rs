@@ -285,8 +285,10 @@ pub trait TcpProvider {
     /// `data` is never empty.
     ///
     /// Once the stream is connected, accept nothing only while the send
-    /// buffer is full (or after the write side is shut, when the transport
-    /// writes no more), so room comes back as the peer acknowledges data:
+    /// buffer is full — including while waiting for writable readiness to
+    /// return after a full buffer, e.g. under `TCP_NOTSENT_LOWAT` — (or after
+    /// the write side is shut, when the transport writes no more), so room
+    /// comes back only as the peer acknowledges data:
     /// the transport takes the first write accepted after a refusal as proof
     /// the peer is alive, and skips the Yamux keepalive ping for it. A
     /// provider that refused for any other reason (a per-poll write budget,

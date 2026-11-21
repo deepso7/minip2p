@@ -669,12 +669,16 @@ impl TcpProvider for StdTcpProvider {
     }
 
     fn send(&mut self, socket: SocketHandle, data: &[u8]) -> Result<usize, TcpError> {
+        let attached = self.registration.is_some();
         let result = {
             let entry = self
                 .sockets
                 .get_mut(&socket)
                 .ok_or(TcpError::UnknownSocket { socket })?;
             if matches!(entry.phase, Phase::Connecting) {
+                return Ok(0);
+            }
+            if attached && entry.watching_writable && !entry.writable {
                 return Ok(0);
             }
             loop {
@@ -1095,5 +1099,57 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         };
         assert_configured(&server.sockets[&accepted].stream);
+    }
+
+    #[test]
+    fn attached_send_waits_for_writable_readiness_once_backpressured() {
+        let (_server, bound) = loopback_listener();
+        let mut client = StdTcpProvider::new();
+        let mut poll = SharedPoll::new().expect("poll");
+        poll.attach(&mut client).expect("attach");
+
+        let handle = client.connect(&bound).expect("connect");
+        let started = Instant::now();
+        let mut connected = false;
+        while !connected {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "never connected"
+            );
+            poll.harvest(&mut client, Duration::from_millis(20))
+                .expect("harvest");
+            connected = client
+                .poll(Now::from_millis(0))
+                .expect("poll")
+                .into_iter()
+                .any(
+                    |event| matches!(event, TcpEvent::Connected { socket, .. } if socket == handle),
+                );
+        }
+
+        client.sockets.get_mut(&handle).expect("socket").writable = false;
+        client.watch_writable(handle, true);
+        assert_eq!(
+            client.send(handle, b"wait").expect("backpressured send"),
+            0,
+            "attached socket waiting for WRITABLE must not write past TCP_NOTSENT_LOWAT"
+        );
+
+        let mut woke = false;
+        while !woke {
+            assert!(started.elapsed() < Duration::from_secs(5), "never writable");
+            poll.harvest(&mut client, Duration::from_millis(20))
+                .expect("harvest");
+            woke = client
+                .poll(Now::from_millis(0))
+                .expect("poll")
+                .into_iter()
+                .any(|event| matches!(event, TcpEvent::Writable { socket } if socket == handle));
+        }
+        assert_eq!(
+            client.send(handle, b"wait").expect("resumed send"),
+            4,
+            "send resumes once WRITABLE readiness arrives"
+        );
     }
 }

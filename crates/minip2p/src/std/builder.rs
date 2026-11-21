@@ -164,7 +164,7 @@ impl EndpointBuilder<StdBuilderState> {
     /// ([`EndpointOptionsError::InvalidLimit`]).
     ///
     /// Without this the endpoint binds with [`TcpConfig::std_default`], whose
-    /// 2,432 KiB Yamux receive window keeps a 100 Mbit/s, 100 ms path busy
+    /// 1,664 KiB Yamux receive window keeps a 100 Mbit/s, 100 ms path busy
     /// (ADR 0120). Start overrides from it: [`TcpConfig::default`] is the
     /// portable profile, with the specification's 256 KiB window.
     ///

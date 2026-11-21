@@ -573,8 +573,8 @@ impl YamuxSession {
 
     /// Acknowledges `bytes` of the stream's delivered data as consumed.
     ///
-    /// Acknowledged bytes return to the peer as credit once at least half
-    /// the window has been acknowledged since the last update; the window
+    /// Acknowledged bytes return to the peer as credit once at least a quarter
+    /// of the window has been acknowledged since the last update; the window
     /// update is then pulled by [`poll_frame`](Self::poll_frame). On a closed,
     /// unsettled stream the bytes are released, and its slot with the last
     /// of them. Acknowledging a settled or unknown stream does nothing.
@@ -605,7 +605,7 @@ impl YamuxSession {
         };
         state.unacked -= acked;
         state.acked_since_update += acked;
-        if state.acked_since_update >= self.config.receive_window / 2 {
+        if state.acked_since_update >= self.config.receive_window / 4 {
             state.pending_credit += u64::from(state.acked_since_update);
             state.acked_since_update = 0;
             self.index_work(stream);
