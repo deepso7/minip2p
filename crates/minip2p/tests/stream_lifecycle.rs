@@ -85,6 +85,22 @@ fn inbound_limit_delivers_twenty_streams_with_at_most_four_open() {
 
 #[test]
 fn inbound_limit_requires_an_unlimited_quic_connection_window() {
+    let no_listen = Endpoint::builder()
+        .protocol_with_inbound_limit(CHAT, std::num::NonZeroUsize::new(1).unwrap())
+        .quic_limits(minip2p::QuicLimits {
+            connection_receive_window: 1024,
+            ..minip2p::QuicLimits::default()
+        })
+        .bind();
+    assert!(
+        matches!(
+            no_listen,
+            Err(minip2p::BindError::Options(
+                minip2p::EndpointOptionsError::InboundLimitWithFiniteQuicWindow
+            ))
+        ),
+        "unsafe QUIC credit must be rejected even without listen addresses"
+    );
     let builder = || {
         Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")

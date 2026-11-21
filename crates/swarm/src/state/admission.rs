@@ -22,7 +22,10 @@ impl SwarmState {
         let key = (conn_id, stream_id);
         if self.inbound_limits.contains_key(protocol) {
             if !self.inbound_has_room(protocol) {
-                self.inbound_order.push_back(key);
+                self.inbound_order
+                    .entry(protocol.into())
+                    .or_default()
+                    .push_back(key);
                 self.queued_inbound.insert(
                     key,
                     QueuedInbound {
@@ -89,11 +92,11 @@ impl SwarmState {
     }
 
     fn release_inbound_stream(&mut self, key: (ConnectionId, StreamId)) {
-        if self.admitted_inbound.remove(&key).is_some() {
-            self.inbound_promotion_needed = true;
+        if let Some(protocol) = self.admitted_inbound.remove(&key) {
+            self.inbound_promotion_needed.insert(protocol);
         }
         if let Some(queued) = self.queued_inbound.remove(&key) {
-            self.inbound_promotion_needed = true;
+            self.inbound_promotion_needed.insert(queued.protocol);
             let bytes = queued
                 .events
                 .iter()
@@ -113,24 +116,22 @@ impl SwarmState {
     }
 
     pub(super) fn promote_inbound(&mut self) {
-        if !core::mem::take(&mut self.inbound_promotion_needed) {
-            return;
-        }
-        let mut waiting = VecDeque::new();
-        while let Some(key) = self.inbound_order.pop_front() {
-            let Some(queued) = self.queued_inbound.get(&key) else {
-                continue;
-            };
-            if self.inbound_has_room(&queued.protocol) {
+        for protocol in core::mem::take(&mut self.inbound_promotion_needed) {
+            while self.inbound_has_room(&protocol) {
+                let Some(key) = self
+                    .inbound_order
+                    .get_mut(&protocol)
+                    .and_then(VecDeque::pop_front)
+                else {
+                    self.inbound_order.remove(&protocol);
+                    break;
+                };
                 if let Some(queued) = self.queued_inbound.remove(&key) {
                     self.admitted_inbound.insert(key, queued.protocol);
                     self.events.extend(queued.events);
                 }
-            } else {
-                waiting.push_back(key);
             }
         }
-        self.inbound_order = waiting;
     }
 
     pub(super) fn inbound_is_queued(&self, conn: ConnectionId, stream: StreamId) -> bool {

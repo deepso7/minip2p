@@ -3,6 +3,29 @@ use super::*;
 const PROTOCOL: &str = "/myapp/1.0.0";
 
 #[test]
+fn dial_only_quic_rejects_finite_credit_with_inbound_caps() {
+    let mut transport = minip2p_transport::TransportSet::new();
+    let quic =
+        minip2p_quic::QuicTransport::dual_stack(minip2p_quic::QuicNodeConfig::generate()).unwrap();
+    transport
+        .insert(TransportKind::Quic, quic.namespaces(), Box::new(quic))
+        .unwrap();
+    let result = Endpoint::builder()
+        .protocol_with_inbound_limit(PROTOCOL, std::num::NonZeroUsize::new(1).unwrap())
+        .quic_limits(QuicLimits {
+            connection_receive_window: 1024,
+            ..QuicLimits::default()
+        })
+        .bind_over(transport);
+    assert!(matches!(
+        result,
+        Err(BindError::Options(
+            EndpointOptionsError::InboundLimitWithFiniteQuicWindow
+        ))
+    ));
+}
+
+#[test]
 fn builder_protocol_registers_for_stream_routing() {
     let mut endpoint = Endpoint::builder()
         .protocol(PROTOCOL)

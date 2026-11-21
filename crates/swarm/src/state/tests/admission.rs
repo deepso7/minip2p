@@ -293,3 +293,27 @@ fn limits_are_independent_between_protocols() {
     state.handle_stream_closed(conn, a);
     assert_eq!(ready(&drain_events(&mut state)), [b]);
 }
+
+#[test]
+fn promotion_only_visits_the_protocol_that_released_a_slot() {
+    let (mut state, conn, _) = setup();
+    state
+        .inbound_limits
+        .insert(FREE.into(), NonZeroUsize::new(1).unwrap());
+    let [a, b, c, d, stale] = [1, 2, 3, 4, 5].map(StreamId::new);
+    incoming(&mut state, conn, a, LIMITED, &[]);
+    incoming(&mut state, conn, b, LIMITED, &[]);
+    incoming(&mut state, conn, c, FREE, &[]);
+    incoming(&mut state, conn, d, FREE, &[]);
+    state
+        .inbound_order
+        .get_mut(FREE)
+        .unwrap()
+        .push_front((conn, stale));
+    drain_events(&mut state);
+    state.handle_stream_closed(conn, a);
+    assert_eq!(ready(&drain_events(&mut state)), [b]);
+    assert_eq!(state.inbound_order[FREE].front(), Some(&(conn, stale)));
+    state.handle_stream_closed(conn, c);
+    assert_eq!(ready(&drain_events(&mut state)), [d]);
+}
