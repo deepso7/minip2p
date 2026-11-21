@@ -61,6 +61,10 @@ default-filter = '''
 # configured one. That mitigates rather than bounds it: a pause from outside
 # the suite can still stretch PTO.
 #
+# `quiet_connection_sends_keepalives_…` measures the gap between keepalives
+# on a thread that drives both ends, so a stall of that thread widens the gap
+# it asserts on. It runs alone for the same reason.
+#
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
 # events it returns are best effort. The assertions are not: they are what keeps
@@ -85,6 +89,7 @@ filter = '''
   )
   or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
   or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+  or test(=tests::quiet_connection_sends_keepalives_past_the_idle_timeout)
   or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
   or test(=std::nat_tests::relay_close_reports_the_reservations_it_ends)
 '''
