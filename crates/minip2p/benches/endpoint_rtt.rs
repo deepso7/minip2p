@@ -852,6 +852,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             / 1e6
             / seconds;
         quiesce(&mut client, profile);
+        assert_forwarding(&up, &down);
         let (client_counts, target_counts) = (
             datagram_counters(&client_peer).since(&before.0),
             datagram_counters(&target_peer).since(&before.1),
@@ -975,6 +976,7 @@ fn handshake(profile: Profile, limits: QuicLimits) -> (Duration, Duration) {
         .expect("connect");
     let mut connected = None;
     loop {
+        assert_forwarding(&proxy.up, &proxy.down);
         assert!(start.elapsed() < SETUP_TIMEOUT, "handshake timed out");
         match next_event(&mut client, Duration::from_millis(1)) {
             Some(EndpointEvent::ConnectSettled { outcome, .. }) => {
@@ -1031,7 +1033,16 @@ fn concurrent_handshakes(
     }
     let mut times = Vec::new();
     for _ in 0..count {
-        let (elapsed, outcome) = rx.recv_timeout(SETUP_TIMEOUT).expect("handshake settles");
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let (elapsed, outcome) = loop {
+            for (proxy, _) in &drivers {
+                assert_forwarding(&proxy.up, &proxy.down);
+            }
+            assert!(Instant::now() < deadline, "concurrent handshake timed out");
+            if let Ok(settled) = rx.recv_timeout(Duration::from_millis(10)) {
+                break settled;
+            }
+        };
         assert!(
             matches!(outcome, ConnectOutcome::Connected { .. }),
             "concurrent handshake failed: {outcome:?}"

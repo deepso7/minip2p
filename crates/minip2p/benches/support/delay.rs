@@ -284,6 +284,10 @@ fn grow_receive_buffer(socket: impl Into<socket2::Socket>) -> socket2::Socket {
 
 /// Forwards UDP datagrams between the first client that sends to
 /// [`addr`](Self::addr) and a fixed target, shaping each direction.
+///
+/// A failed `send_to` counts as a dropped datagram rather than a fault: UDP
+/// may drop, and loopback sends can fail transiently (`ENOBUFS`, or
+/// `ECONNREFUSED` once the target closes during teardown).
 pub struct UdpProxy {
     /// Where the client sends; the target sees the proxy's other socket.
     pub addr: SocketAddr,
@@ -319,7 +323,6 @@ impl UdpProxy {
             let (reader_stop, seen, read_stats) =
                 (Arc::clone(&stop), Arc::clone(&client), Arc::clone(&stats));
             handles.push(thread::spawn(move || {
-                let faulted = Arc::clone(&read_stats);
                 let mut shaper = Shaper::new(profile, read_stats);
                 let mut buf = vec![0; MAX_DATAGRAM];
                 while !reader_stop.load(Ordering::Relaxed) {
@@ -335,7 +338,7 @@ impl UdpProxy {
                         }
                         Err(error) => {
                             eprintln!("proxy receive failed: {error}");
-                            faulted.fail("proxy receive failed", &error);
+                            shaper.stats.fail("proxy receive failed", &error);
                             return;
                         }
                     };
@@ -410,12 +413,19 @@ impl TcpProxy {
                     }
                     Err(error) => {
                         eprintln!("proxy accept failed: {error}");
+                        accept_up.fail("proxy accept failed", &error);
                         return;
                     }
                 }
             };
             client.set_nonblocking(false).expect("blocking client leg");
-            let server = TcpStream::connect(target).expect("proxy connects to target");
+            let server = match TcpStream::connect(target) {
+                Ok(server) => server,
+                Err(error) => {
+                    accept_up.fail("proxy connect failed", &error);
+                    return;
+                }
+            };
             let mut pipes = Vec::new();
             for (from, to, stats) in [
                 (&client, &server, accept_up),
@@ -458,7 +468,6 @@ fn tcp_pipe(
     let (tx, rx) = mpsc::channel();
     let read_stats = Arc::clone(&stats);
     let reader = thread::spawn(move || {
-        let faulted = Arc::clone(&read_stats);
         let mut shaper = Shaper::new(profile, read_stats);
         let mut buf = vec![0; TCP_READ];
         while !stop.load(Ordering::Relaxed) {
@@ -476,7 +485,7 @@ fn tcp_pipe(
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(error) => {
-                    faulted.fail("proxy read failed", &error);
+                    shaper.stats.fail("proxy read failed", &error);
                     return;
                 }
             }
