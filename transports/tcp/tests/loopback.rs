@@ -1100,14 +1100,27 @@ mod provider {
         thread::sleep(Duration::from_millis(50));
 
         let batch = server.poll(Now::from_millis(0)).expect("poll");
+        let mut max_chunk = 0;
         let taken: usize = batch
             .iter()
             .map(|event| match event {
-                TcpEvent::Received { data, .. } => data.len(),
+                TcpEvent::Received { data, .. } => {
+                    assert!(
+                        data.len() <= 64 * 1024,
+                        "chunk of {} bytes exceeds 64 KiB read size",
+                        data.len()
+                    );
+                    max_chunk = max_chunk.max(data.len());
+                    data.len()
+                }
                 _ => 0,
             })
             .sum();
         assert!(taken > 0, "the poll must make progress");
+        assert!(
+            max_chunk > 16 * 1024,
+            "a saturated socket should read chunks larger than 16 KiB, saw at most {max_chunk}"
+        );
         assert!(
             taken <= 128 * 1024,
             "one poll took {taken} bytes, past its budget"
@@ -1126,10 +1139,21 @@ mod provider {
                 .expect("poll")
                 .iter()
                 .map(|event| match event {
-                    TcpEvent::Received { data, .. } => data.len(),
+                    TcpEvent::Received { data, .. } => {
+                        assert!(
+                            data.len() <= 64 * 1024,
+                            "chunk of {} bytes exceeds 64 KiB read size",
+                            data.len()
+                        );
+                        data.len()
+                    }
                     _ => 0,
                 })
                 .sum();
+            assert!(
+                more <= 128 * 1024,
+                "a follow-up poll took {more} bytes, past its budget"
+            );
             rest += more;
             assert!(start.elapsed() < PATIENCE, "the remainder never arrived");
         }

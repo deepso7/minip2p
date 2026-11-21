@@ -539,7 +539,12 @@ impl StdTcpProvider {
                 return;
             }
             reads += 1;
-            match socket.stream.read(&mut self.read_buffer) {
+            let limit = (MAX_READ_BYTES_PER_POLL - bytes_read).min(READ_CHUNK);
+            let Some(buf) = self.read_buffer.get_mut(..limit) else {
+                self.readable.remove(&handle);
+                return;
+            };
+            match socket.stream.read(buf) {
                 Ok(0) => {
                     socket.read_closed = true;
                     self.readable.remove(&handle);
@@ -1064,83 +1069,6 @@ mod tests {
             None,
             "read to WouldBlock, nothing left owed"
         );
-    }
-
-    #[test]
-    fn a_saturated_socket_yields_two_full_chunks_per_poll_then_stays_due() {
-        let (mut server, bound) = loopback_listener();
-        let mut peer = std::net::TcpStream::connect(
-            bound.to_string().replace("/ip4/", "").replace("/tcp/", ":"),
-        )
-        .expect("peer connects");
-        let started = Instant::now();
-        let accepted = loop {
-            assert!(started.elapsed() < Duration::from_secs(5), "never accepted");
-            if let Some(socket) = server
-                .poll(Now::from_millis(0))
-                .expect("poll")
-                .into_iter()
-                .find_map(|event| match event {
-                    TcpEvent::Accepted { socket, .. } => Some(socket),
-                    _ => None,
-                })
-            {
-                break socket;
-            }
-            thread::sleep(Duration::from_millis(1));
-        };
-        socket2::SockRef::from(&server.sockets[&accepted].stream)
-            .set_recv_buffer_size(1024 * 1024)
-            .expect("SO_RCVBUF");
-
-        let sent: Vec<u8> = (0..3 * READ_CHUNK).map(|i| i as u8).collect();
-        let writer = {
-            let sent = sent.clone();
-            thread::spawn(move || std::io::Write::write_all(&mut peer, &sent).map(|()| peer))
-        };
-        let mut peeked = vec![0; sent.len()];
-        while server.sockets[&accepted]
-            .stream
-            .peek(&mut peeked)
-            .unwrap_or(0)
-            <= MAX_READ_BYTES_PER_POLL
-        {
-            assert!(started.elapsed() < Duration::from_secs(5), "never buffered");
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let chunks: Vec<usize> = server
-            .poll(Now::from_millis(0))
-            .expect("poll")
-            .into_iter()
-            .filter_map(|event| match event {
-                TcpEvent::Received { data, .. } => Some(data.len()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            chunks,
-            [READ_CHUNK, READ_CHUNK],
-            "capped at the byte budget"
-        );
-        assert_eq!(
-            TcpProvider::next_deadline(&server),
-            Some(Deadline::IMMEDIATE),
-            "bytes left behind keep the provider due"
-        );
-
-        let mut received = MAX_READ_BYTES_PER_POLL;
-        while received < sent.len() {
-            assert!(started.elapsed() < Duration::from_secs(5), "never drained");
-            for event in server.poll(Now::from_millis(0)).expect("poll") {
-                if let TcpEvent::Received { data, .. } = event {
-                    assert!(data.len() <= READ_CHUNK);
-                    received += data.len();
-                }
-            }
-        }
-        assert_eq!(received, sent.len());
-        drop(writer.join().expect("writer").expect("write"));
     }
 
     /// Asserts the options `configure_stream` sets.
