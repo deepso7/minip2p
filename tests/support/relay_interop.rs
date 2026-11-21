@@ -59,58 +59,75 @@ pub struct Observed {
     pub reserved: bool,
     /// `via` of every `CircuitOpened`, across all relays.
     pub opened: Vec<Option<PeerId>>,
+    /// `CircuitClosed` events, across all relays.
+    closed: usize,
     pub bidirectional: bool,
 }
 
-/// Runs the foreign client, driving every relay until it exits, then a
-/// little longer for circuit closure and accounting.
-#[expect(
-    clippy::panic,
-    reason = "a relay error fails the gate with the error itself"
-)]
-pub fn run_client(relays: &mut [Endpoint], mut client: Command) -> Observed {
-    let mut child = ChildGuard(client.spawn().expect("spawn the foreign relay client"));
-    let mut observed = Observed::default();
-    let mut observe = |event| match event {
-        RelayServerEvent::ReservationAccepted { .. } => observed.reserved = true,
-        RelayServerEvent::CircuitOpened { via, .. } => observed.opened.push(via.map(|via| *via)),
-        RelayServerEvent::CircuitClosed { bytes, .. } => {
-            observed.bidirectional |=
-                bytes.source_to_destination > 0 && bytes.destination_to_source > 0;
+impl Observed {
+    #[expect(
+        clippy::panic,
+        reason = "a relay error fails the gate with the error itself"
+    )]
+    fn record(&mut self, event: RelayServerEvent) {
+        match event {
+            RelayServerEvent::ReservationAccepted { .. } => self.reserved = true,
+            RelayServerEvent::CircuitOpened { via, .. } => self.opened.push(via.map(|via| *via)),
+            RelayServerEvent::CircuitClosed { bytes, .. } => {
+                self.closed += 1;
+                self.bidirectional |=
+                    bytes.source_to_destination > 0 && bytes.destination_to_source > 0;
+            }
+            RelayServerEvent::Error(error)
+                if matches!(
+                    error.kind,
+                    minip2p::RelayServerRuntimeErrorKind::ResetStream
+                ) =>
+            {
+                eprintln!("expected foreign-exit reset race: {error:?}");
+            }
+            RelayServerEvent::Error(error) => panic!("relay server error: {error:?}"),
+            _ => {}
         }
-        RelayServerEvent::Error(error)
-            if matches!(
-                error.kind,
-                minip2p::RelayServerRuntimeErrorKind::ResetStream
-            ) =>
-        {
-            eprintln!("expected foreign-exit reset race: {error:?}");
-        }
-        RelayServerEvent::Error(error) => panic!("relay server error: {error:?}"),
-        _ => {}
-    };
-    let mut drive = |relays: &mut [Endpoint]| {
+    }
+
+    fn drive(&mut self, relays: &mut [Endpoint]) {
         for relay in relays.iter_mut() {
             if let Some(EndpointEvent::RelayServer(event)) = relay
                 .next_event(Duration::from_millis(20))
                 .expect("drive the relay")
             {
-                observe(event);
+                self.record(event);
             }
         }
-    };
+    }
+}
+
+/// Runs the foreign client, driving every relay until it exits, then until
+/// every opened circuit has closed.
+pub fn run_client(relays: &mut [Endpoint], mut client: Command) -> Observed {
+    let mut child = ChildGuard(client.spawn().expect("spawn the foreign relay client"));
+    let mut observed = Observed::default();
 
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        drive(relays);
+        observed.drive(relays);
         if let Some(status) = child.0.try_wait().expect("poll the client") {
             assert!(status.success(), "foreign relay client failed: {status}");
             break;
         }
         assert!(Instant::now() < deadline, "foreign relay client timed out");
     }
-    for _ in 0..50 {
-        drive(relays);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while observed.closed < observed.opened.len() {
+        assert!(
+            Instant::now() < deadline,
+            "{} of {} relay circuits still open 15 s after the foreign client exited",
+            observed.opened.len() - observed.closed,
+            observed.opened.len(),
+        );
+        observed.drive(relays);
     }
     observed
 }
