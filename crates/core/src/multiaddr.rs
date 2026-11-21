@@ -249,6 +249,15 @@ impl fmt::Display for Multiaddr {
 impl FromStr for Multiaddr {
     type Err = MultiaddrError;
 
+    /// Parses the text form, which round-trips [`Display`](fmt::Display) for
+    /// every multiaddr including the empty one: `""` is the text form of a
+    /// multiaddr with no components, so it parses back to that rather than
+    /// being rejected.
+    ///
+    /// An address a caller must not leave empty is checked where that
+    /// requirement lives, not here — [`PeerAddr`](crate::PeerAddr) answers
+    /// `MissingPeerId` for it, and an endpoint's listen validation answers
+    /// with the transport shape it wanted.
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         parse_multiaddr(input)
     }
@@ -320,7 +329,7 @@ pub enum TransportKind {
 /// Parses a `/`-delimited multiaddr string into protocol components.
 fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
     if input.is_empty() {
-        return Err(MultiaddrError::EmptyInput);
+        return Ok(Multiaddr::default());
     }
     if !input.starts_with('/') {
         return Err(MultiaddrError::MissingLeadingSlash);
@@ -823,6 +832,30 @@ mod tests {
         let addr = Multiaddr::new();
         assert_eq!(addr.to_bytes(), Vec::<u8>::new());
         assert_eq!(Multiaddr::from_bytes(&[]).unwrap(), addr);
+    }
+
+    #[test]
+    fn text_codec_round_trips_empty_multiaddr() {
+        let addr = Multiaddr::new();
+        assert_eq!(addr.to_string(), "");
+        assert_eq!("".parse::<Multiaddr>().unwrap(), addr);
+        assert_eq!(
+            Multiaddr::from_bytes(&[])
+                .unwrap()
+                .to_string()
+                .parse::<Multiaddr>()
+                .unwrap(),
+            addr
+        );
+    }
+
+    #[test]
+    fn an_address_required_to_name_a_peer_still_rejects_the_empty_one() {
+        let err = crate::PeerAddr::from_str("").unwrap_err();
+        assert!(
+            matches!(err, crate::PeerAddrError::MissingPeerId),
+            "{err:?}"
+        );
     }
 
     #[test]
