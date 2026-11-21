@@ -19,13 +19,20 @@ use crate::provider::{
     SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider, host_and_port,
 };
 
-/// Read size per syscall. Large enough that a busy stream is not dominated by
-/// syscall overhead, small enough not to hold a big buffer per provider.
-const READ_CHUNK: usize = 16 * 1024;
+/// Read size per syscall. Matches the secure session's 64 KiB input batch, so
+/// a saturated read carries several whole Noise frames instead of splitting
+/// every 16 KiB Yamux frame across two reads, and the provider holds one
+/// buffer of this size.
+const READ_CHUNK: usize = 64 * 1024;
 
-/// Reads one socket may take from a single poll before the rest wait their
-/// turn -- 128 KiB at [`READ_CHUNK`] apiece. Without a bound, one fast peer
-/// starves every other socket and the host's timers along with it.
+/// Bytes one socket may take from a single poll before the rest wait their
+/// turn: two full [`READ_CHUNK`]s. Without a bound, one fast peer starves every
+/// other socket and the host's timers along with it.
+const MAX_READ_BYTES_PER_POLL: usize = 128 * 1024;
+
+/// Read calls one socket may make in a single poll, however little each
+/// returns. Bounds a trickling peer's syscalls while leaving room for a burst
+/// of short reads under [`MAX_READ_BYTES_PER_POLL`].
 const MAX_READS_PER_POLL: usize = 8;
 
 /// Connections accepted in a single poll, for the same reason.
@@ -507,9 +514,11 @@ impl StdTcpProvider {
         });
     }
 
-    /// Reads until the socket has nothing more to give, or the budget runs out.
+    /// Reads until the socket has nothing more to give, or the budget runs out:
+    /// [`MAX_READ_BYTES_PER_POLL`] bytes or [`MAX_READS_PER_POLL`] read calls.
     fn read_all(&mut self, handle: SocketHandle) {
-        let mut budget = MAX_READS_PER_POLL;
+        let mut reads = 0;
+        let mut bytes_read = 0;
         loop {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
@@ -525,12 +534,17 @@ impl StdTcpProvider {
                 self.readable.remove(&handle);
                 return;
             }
-            if budget == 0 {
+            if reads == MAX_READS_PER_POLL || bytes_read >= MAX_READ_BYTES_PER_POLL {
                 self.deferred_work = true;
                 return;
             }
-            budget -= 1;
-            match socket.stream.read(&mut self.read_buffer) {
+            reads += 1;
+            let limit = (MAX_READ_BYTES_PER_POLL - bytes_read).min(READ_CHUNK);
+            let Some(buf) = self.read_buffer.get_mut(..limit) else {
+                self.readable.remove(&handle);
+                return;
+            };
+            match socket.stream.read(buf) {
                 Ok(0) => {
                     socket.read_closed = true;
                     self.readable.remove(&handle);
@@ -540,6 +554,7 @@ impl StdTcpProvider {
                     return;
                 }
                 Ok(read) => {
+                    bytes_read += read;
                     let Some(data) = self.read_buffer.get(..read).map(ToOwned::to_owned) else {
                         self.readable.remove(&handle);
                         return;
