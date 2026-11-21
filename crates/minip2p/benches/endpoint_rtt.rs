@@ -74,7 +74,7 @@ use std::time::{Duration, Instant};
 use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, PeerAddr, PeerId, QuicLimits, TcpConfig};
 use minip2p_quic::datagram_counters;
 use support::bulk::{self, CHUNK, Load};
-use support::delay::{LinkStats, Profile, TcpProxy, UdpProxy};
+use support::delay::{LinkStats, Profile, TcpProxy, UdpProxy, assert_forwarding};
 use support::{Driven, SETUP_TIMEOUT, bind_on, next_event};
 
 const PROTOCOL: &str = "/minip2p/bench/sink/1";
@@ -677,12 +677,22 @@ struct Linked {
 
 /// Pings the idle connection a few times and returns the median round trip
 /// in ms, timed around `ping()` and its `PingRttMeasured`.
-fn idle_rtt_ms(client: &mut Endpoint, target: &mut Endpoint, target_peer: &PeerId) -> f64 {
+///
+/// `healthy` runs on every turn of the wait, so a link that stops forwarding
+/// mid-ping fails here with the socket error rather than as an idle ping that
+/// never came back.
+fn idle_rtt_ms(
+    client: &mut Endpoint,
+    target: &mut Endpoint,
+    target_peer: &PeerId,
+    healthy: impl Fn(),
+) -> f64 {
     let mut rtts = Vec::new();
     for _ in 0..3 {
         let start = Instant::now();
         client.ping(target_peer).expect("ping");
         loop {
+            healthy();
             assert!(start.elapsed() < SETUP_TIMEOUT, "idle ping timed out");
             next_event(target, Duration::from_millis(1));
             if let Some(EndpointEvent::PingRttMeasured { .. }) =
@@ -729,6 +739,7 @@ fn link(profile: Profile, point: &Point) -> Linked {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let mut ready = false;
     while !ready {
+        assert_forwarding(&up, &down);
         assert!(
             Instant::now() < deadline,
             "connect through the proxy timed out"
@@ -739,7 +750,9 @@ fn link(profile: Profile, point: &Point) -> Linked {
             Some(EndpointEvent::PeerReady { peer_id, .. }) if peer_id == target_peer
         );
     }
-    let unloaded_rtt_ms = idle_rtt_ms(&mut client, &mut target, &target_peer);
+    let unloaded_rtt_ms = idle_rtt_ms(&mut client, &mut target, &target_peer, || {
+        assert_forwarding(&up, &down)
+    });
     Linked {
         target,
         client,
@@ -816,6 +829,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
         &sink,
         warm_up,
         Instant::now,
+        || assert_forwarding(&up, &down),
     );
 
     let mut samples = Vec::new();
@@ -838,6 +852,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             &sink,
             load,
             Instant::now,
+            || assert_forwarding(&up, &down),
         );
         let seconds = (end - start).as_secs_f64();
         pinging.store(false, Ordering::Relaxed);
@@ -852,6 +867,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             / 1e6
             / seconds;
         quiesce(&mut client, profile);
+        assert_forwarding(&up, &down);
         let (client_counts, target_counts) = (
             datagram_counters(&client_peer).since(&before.0),
             datagram_counters(&target_peer).since(&before.1),
@@ -975,6 +991,7 @@ fn handshake(profile: Profile, limits: QuicLimits) -> (Duration, Duration) {
         .expect("connect");
     let mut connected = None;
     loop {
+        assert_forwarding(&proxy.up, &proxy.down);
         assert!(start.elapsed() < SETUP_TIMEOUT, "handshake timed out");
         match next_event(&mut client, Duration::from_millis(1)) {
             Some(EndpointEvent::ConnectSettled { outcome, .. }) => {
@@ -1031,7 +1048,16 @@ fn concurrent_handshakes(
     }
     let mut times = Vec::new();
     for _ in 0..count {
-        let (elapsed, outcome) = rx.recv_timeout(SETUP_TIMEOUT).expect("handshake settles");
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let (elapsed, outcome) = loop {
+            for (proxy, _) in &drivers {
+                assert_forwarding(&proxy.up, &proxy.down);
+            }
+            assert!(Instant::now() < deadline, "concurrent handshake timed out");
+            if let Ok(settled) = rx.recv_timeout(Duration::from_millis(10)) {
+                break settled;
+            }
+        };
         assert!(
             matches!(outcome, ConnectOutcome::Connected { .. }),
             "concurrent handshake failed: {outcome:?}"

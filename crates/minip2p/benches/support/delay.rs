@@ -132,9 +132,26 @@ pub struct LinkStats {
     /// in microseconds; not reset, so a caller takes differences.
     pub reader_cpu_us: AtomicU64,
     pub writer_cpu_us: AtomicU64,
+    fault: Mutex<Option<String>>,
 }
 
 impl LinkStats {
+    /// Records why this direction stopped forwarding. The first failure wins;
+    /// anything after it is a consequence.
+    fn fail(&self, what: &str, error: &std::io::Error) {
+        let mut fault = self.fault.lock().expect("fault lock");
+        if fault.is_none() {
+            *fault = Some(format!("{what}: {error}"));
+        }
+    }
+
+    /// Why this direction stopped forwarding, if it did. A direction that
+    /// has faulted stays faulted: the thread that carried it has exited, so
+    /// [`reset`](Self::reset) deliberately leaves this alone.
+    pub fn fault(&self) -> Option<String> {
+        self.fault.lock().expect("fault lock").clone()
+    }
+
     /// Resets the traffic counters, for example between a warm-up and a timed
     /// pass.
     pub fn reset(&self) {
@@ -148,6 +165,24 @@ impl LinkStats {
         }
         self.held_high_water
             .store(self.held.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// Fails the run with the first failure either direction of a link recorded.
+///
+/// A forwarding thread that dies stalls the link, and every wait downstream
+/// of it then expires on its own deadline naming the wrong thing — a
+/// transfer or a handshake rather than the socket error underneath. Benches
+/// driving a proxy call this wherever they already bound a wait, so the
+/// socket error is what fails the run.
+pub fn assert_forwarding(up: &LinkStats, down: &LinkStats) {
+    for (direction, stats) in [("up", up), ("down", down)] {
+        let fault = stats.fault();
+        assert!(
+            fault.is_none(),
+            "link {direction} stopped forwarding: {}",
+            fault.unwrap_or_default()
+        );
     }
 }
 
@@ -200,7 +235,8 @@ fn deliver_loop(
             thread::sleep(due - now);
         }
         stats.held.fetch_sub(unit.len() as u64, Ordering::Relaxed);
-        if deliver(&unit).is_err() {
+        if let Err(error) = deliver(&unit) {
+            stats.fail("proxy send failed", &error);
             return;
         }
         stats.units.fetch_add(1, Ordering::Relaxed);
@@ -248,6 +284,10 @@ fn grow_receive_buffer(socket: impl Into<socket2::Socket>) -> socket2::Socket {
 
 /// Forwards UDP datagrams between the first client that sends to
 /// [`addr`](Self::addr) and a fixed target, shaping each direction.
+///
+/// A failed `send_to` counts as a dropped datagram rather than a fault: UDP
+/// may drop, and loopback sends can fail transiently (`ENOBUFS`, or
+/// `ECONNREFUSED` once the target closes during teardown).
 pub struct UdpProxy {
     /// Where the client sends; the target sees the proxy's other socket.
     pub addr: SocketAddr,
@@ -298,6 +338,7 @@ impl UdpProxy {
                         }
                         Err(error) => {
                             eprintln!("proxy receive failed: {error}");
+                            shaper.stats.fail("proxy receive failed", &error);
                             return;
                         }
                     };
@@ -372,12 +413,19 @@ impl TcpProxy {
                     }
                     Err(error) => {
                         eprintln!("proxy accept failed: {error}");
+                        accept_up.fail("proxy accept failed", &error);
                         return;
                     }
                 }
             };
             client.set_nonblocking(false).expect("blocking client leg");
-            let server = TcpStream::connect(target).expect("proxy connects to target");
+            let server = match TcpStream::connect(target) {
+                Ok(server) => server,
+                Err(error) => {
+                    accept_up.fail("proxy connect failed", &error);
+                    return;
+                }
+            };
             let mut pipes = Vec::new();
             for (from, to, stats) in [
                 (&client, &server, accept_up),
@@ -436,7 +484,10 @@ fn tcp_pipe(
                 }
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(_) => return,
+                Err(error) => {
+                    shaper.stats.fail("proxy read failed", &error);
+                    return;
+                }
             }
         }
     });
