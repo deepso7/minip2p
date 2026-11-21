@@ -27,7 +27,11 @@
 //! - `quic-check`: the windows in `MINIP2P_RTT_{STREAM,CONNECTION,SEND}`
 //!   (QUIC defaults when unset) against large ones,
 //!   at one and four streams.
-//! - `yamux`: one TCP stream; the Yamux receive window varies.
+//! - `yamux`: one TCP stream; the Yamux receive window varies. Candidates
+//!   below the specification's 256 KiB minimum are raised to it.
+//! - `yamux-check`: one TCP stream at fixed windows, so short-RTT profiles
+//!   show what the native default costs: 256 KiB (the portable default),
+//!   1,216 KiB, `chosen` (`TcpConfig::std_default()`), and the reference.
 //! - `retry`: handshakes with Retry on and off (see [`retry`]).
 //!
 //! Every window sweep also measures a large reference window, interleaved
@@ -42,8 +46,8 @@
 //! RTT the target sees during the transfer, datagrams lost each way (QUIC),
 //! the up direction's peak held bytes and queueing delay, and the busiest
 //! proxy thread's CPU share. A sweep reports no pick when its reference
-//! reaches under 85% of the link, anything was lost, the idle RTT is 20%
-//! off the profile's, or a proxy thread used over 80% of a core. `MINIP2P_RTT_PROFILE` picks the profile
+//! reaches under 85% of the link, anything was lost, the idle RTT is more
+//! than 20% plus 5 ms off the profile's, or a proxy thread used over 80% of a core. `MINIP2P_RTT_PROFILE` picks the profile
 //! (`100m_100ms` by default), `MINIP2P_RTT_RUNS` the runs per
 //! point (default 5), and `MINIP2P_RTT_TOTAL_MB` the bytes per timed
 //! transfer (default: 2.5 s or 25 round trips at the link rate, whichever is
@@ -127,6 +131,9 @@ struct Sample {
 /// near a full core.
 const MIN_REFERENCE_UTILIZATION: f64 = 0.85;
 const MAX_RTT_ERROR: f64 = 0.2;
+/// Idle-RTT error allowed on top of [`MAX_RTT_ERROR`], so scheduling jitter
+/// does not invalidate short-RTT profiles.
+const RTT_SLACK_MS: f64 = 5.0;
 const MAX_PROXY_CPU: f64 = 0.8;
 
 fn main() {
@@ -325,7 +332,8 @@ fn run_sweep(sweep: &str) {
 
 /// The points of a window sweep: candidates from the BDP, plus a large
 /// reference. `quic-check` instead pairs the configured windows with the
-/// reference at one and four streams.
+/// reference at one and four streams, and `yamux-check` measures fixed
+/// Yamux windows against the reference.
 fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
     let bdp = profile.bdp_bytes();
     let large = window(16 * MB, 100).max(window(bdp, 800));
@@ -355,6 +363,13 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
             TcpConfig::default(),
         )
     };
+    let tcp = |window: usize| {
+        let mut config = TcpConfig::default();
+        config.yamux.receive_window = u32::try_from(window).expect("window fits u32");
+        config
+    };
+    let min_yamux = TcpConfig::default().yamux.receive_window as usize;
+    let tcp_point = |label, tcp| point(label, Transport::Tcp, 1, QuicLimits::default(), tcp);
     let candidates = |percents: &[u64]| -> Vec<usize> {
         percents
             .iter()
@@ -400,23 +415,23 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
                 ]
             })
             .collect(),
-        "yamux" => {
-            let tcp = |window: usize| {
-                let mut config = TcpConfig::default();
-                config.yamux.receive_window = u32::try_from(window).expect("window fits u32");
-                config
-            };
-            candidates(&[100, 150, 200, 250, 300, 400])
-                .into_iter()
-                .map(|value| (label(value), value))
-                .chain([("reference".to_owned(), large)])
-                .map(|(label, value)| {
-                    point(label, Transport::Tcp, 1, QuicLimits::default(), tcp(value))
-                })
-                .collect()
-        }
+        "yamux" => candidates(&[100, 150, 200, 250, 300, 400])
+            .into_iter()
+            .map(|value| value.max(min_yamux))
+            .map(|value| (label(value), value))
+            .chain([("reference".to_owned(), large)])
+            .map(|(label, value)| tcp_point(label, tcp(value)))
+            .collect(),
+        "yamux-check" => [256 * 1024, 1_216 * 1024]
+            .into_iter()
+            .map(|value| tcp_point(label(value), tcp(value)))
+            .chain([
+                tcp_point("chosen".into(), TcpConfig::std_default()),
+                tcp_point("reference".into(), tcp(large)),
+            ])
+            .collect(),
         other => invalid(&format!(
-            "unknown MINIP2P_RTT_SWEEP {other}: quic-stream, quic-connection, quic-send, quic-check, yamux or retry"
+            "unknown MINIP2P_RTT_SWEEP {other}: quic-stream, quic-connection, quic-send, quic-check, yamux, yamux-check or retry"
         )),
     };
     points.dedup_by(|a, b| a.label == b.label);
@@ -459,7 +474,7 @@ fn calibration_problems(profile: Profile, results: &[(Point, Vec<Sample>)]) -> V
     let expected = profile.rtt.as_secs_f64() * 1000.0;
     for (point, samples) in results {
         for sample in samples {
-            if (sample.unloaded_rtt_ms - expected).abs() > MAX_RTT_ERROR * expected {
+            if (sample.unloaded_rtt_ms - expected).abs() > MAX_RTT_ERROR * expected + RTT_SLACK_MS {
                 problems.push(format!(
                     "{}: idle RTT {:.0} ms, not {expected:.0} ms",
                     point.label, sample.unloaded_rtt_ms
