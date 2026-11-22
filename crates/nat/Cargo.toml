@@ -24,10 +24,10 @@ std = [
 ]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.14.0", default-features = false }
-minip2p-relay = { path = "../relay", version = "0.14.0", default-features = false }
-minip2p-swarm = { path = "../swarm", version = "0.14.0", default-features = false }
-minip2p-transport = { path = "../transport", version = "0.14.0", default-features = false }
+minip2p-core = { path = "../core", version = "0.14.1", default-features = false }
+minip2p-relay = { path = "../relay", version = "0.14.1", default-features = false }
+minip2p-swarm = { path = "../swarm", version = "0.14.1", default-features = false }
+minip2p-transport = { path = "../transport", version = "0.14.1", default-features = false }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -1,6 +1,6 @@
 # Plan: Codebase simplification for humans and agents
 
-> **Status:** Done. PRs 1–6 landed (#577, #581, #578, #584, #579, #580), plus both deferred cleanups (#582, #583); released in v0.14.0. See [Outcome](#outcome) for where the shipped work differs from this plan.
+> **Status:** Done. PRs 1–6 landed (#577, #581, #578, #584, #579, #580), plus both deferred cleanups (#582, #583); released in v0.14.1. See [Outcome](#outcome) for where the shipped work differs from this plan.
 
 ## Goal
 
