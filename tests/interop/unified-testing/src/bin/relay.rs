@@ -13,8 +13,13 @@
 //!   11-byte `hello-relay`, and checks it comes back. It prints `status: pass`
 //!   and exits 0, or prints `error: …` and `status: fail` and exits 1.
 //!
-//! DCUtR is off. On a flat network it would upgrade the circuit to a direct
-//! connection, and then the echo would no longer prove the relay works.
+//! Every role prints `error: …` and `status: fail` on failure, so a failing
+//! relay or listener reads as clearly in the logs as a failing dialer.
+//!
+//! DCUtR is off in every role so the echo can only travel over the circuit.
+//! minip2p's DCUtR punches only QUIC targets on public addresses by default,
+//! so it would not fire here anyway; turning it off keeps the test honest if
+//! that changes.
 
 use std::collections::HashSet;
 use std::env;
@@ -69,8 +74,6 @@ fn main() {
         other => Err(format!("unknown ROLE={other}").into()),
     });
     if let Err(e) = result {
-        // Only the dialer's stdout is parsed, but every role reports the same
-        // way so a failing relay or listener reads clearly in the logs.
         println!("error: {e}");
         println!("status: fail");
         std::process::exit(1);
@@ -100,6 +103,13 @@ fn relay(config: &Config) -> Result<()> {
     serve(config, &mut node, |_, _| {})
 }
 
+/// Reserves a slot on the relay, publishes the peer id once the reservation
+/// is held (the dialer reads it as "reachable through the relay"), and echoes
+/// each chunk as it arrives: the go dialer reads its 11 bytes back without
+/// first closing its write side.
+///
+/// The reservation policy is `Always` to make the reservation explicit rather
+/// than depend on the default's reachability verdict.
 fn listener(config: &Config) -> Result<()> {
     let mut redis = Redis::connect(&config.redis_addr)?;
     let relay: PeerAddr = redis
@@ -109,8 +119,6 @@ fn listener(config: &Config) -> Result<()> {
         .listen_on(config.bind_addr()?)?
         .protocol(ECHO_PROTOCOL)
         .relay(relay)
-        // Always: nothing here runs AutoNAT, so the default (reserve only
-        // once known private) might never reserve.
         .nat_config(NatConfig {
             reservation_policy: ReservationPolicy::Always,
             dcutr: false,
@@ -123,8 +131,6 @@ fn listener(config: &Config) -> Result<()> {
     let mut published = false;
     let mut echoes = HashSet::new();
     serve(config, &mut node, |node, event| match event {
-        // The dialer reads the peer id as "reachable through the relay", so
-        // publish it only once the reservation is held.
         EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
             published = redis.command(&["SET", &peer_key, &peer_id]).is_ok();
         }
@@ -136,8 +142,6 @@ fn listener(config: &Config) -> Result<()> {
         } if protocol_id == ECHO_PROTOCOL => {
             echoes.insert(*stream);
         }
-        // Echo as bytes arrive: the go dialer reads its 11 bytes back
-        // without first closing its write side.
         EndpointEvent::StreamData { stream, data, .. } if echoes.contains(stream) => {
             if node.send_stream(*stream, data.clone()).is_err() {
                 echoes.remove(stream);
@@ -168,6 +172,11 @@ fn serve(
     }
 }
 
+/// Reaches the listener only through the relay (no direct candidates, no
+/// punch, no reservation of its own) and checks the echo. A failed circuit
+/// dial is retried, as the go reference does, because the reservation can
+/// lag the published peer id. A rejected or reset echo stream, or a dropped
+/// circuit, fails at once rather than waiting out [`DIAL_TIMEOUT`].
 fn dialer(config: &Config) -> Result<()> {
     let mut redis = Redis::connect(&config.redis_addr)?;
     let relay: PeerAddr = redis
@@ -180,7 +189,6 @@ fn dialer(config: &Config) -> Result<()> {
         .listen_on(config.bind_addr()?)?
         .protocol(ECHO_PROTOCOL)
         .relay(relay)
-        // Relay only: no direct candidates, no punch, no reservation of ours.
         .nat_config(NatConfig {
             reservation_policy: ReservationPolicy::Never,
             force_relay: true,
@@ -191,6 +199,7 @@ fn dialer(config: &Config) -> Result<()> {
 
     let deadline = Instant::now() + DIAL_TIMEOUT;
     let mut connect_id = node.connect(peer)?;
+    let mut echo_stream = None;
     let mut echoed = Vec::new();
     loop {
         if Instant::now() >= deadline {
@@ -207,10 +216,8 @@ fn dialer(config: &Config) -> Result<()> {
                 ..
             } if id == connect_id => match outcome {
                 ConnectOutcome::Connected { .. } => {
-                    node.open_stream(&peer, ECHO_PROTOCOL)?;
+                    echo_stream = Some(node.open_stream(&peer, ECHO_PROTOCOL)?);
                 }
-                // The reservation can lag the published peer id; retry like
-                // the go reference does.
                 other => {
                     config.log(format_args!("circuit dial failed, retrying: {other:?}"));
                     std::thread::sleep(Duration::from_secs(2));
@@ -222,7 +229,7 @@ fn dialer(config: &Config) -> Result<()> {
                 initiated_locally: true,
                 ..
             } => node.send_stream(stream, ECHO_MSG)?,
-            EndpointEvent::StreamData { data, .. } => {
+            EndpointEvent::StreamData { stream, data, .. } if Some(stream) == echo_stream => {
                 echoed.extend_from_slice(&data);
                 if echoed.len() >= ECHO_MSG.len() {
                     if echoed != ECHO_MSG {
@@ -231,6 +238,17 @@ fn dialer(config: &Config) -> Result<()> {
                     println!("status: pass");
                     return Ok(());
                 }
+            }
+            EndpointEvent::StreamClosed { stream, .. } if Some(stream) == echo_stream => {
+                return Err(format!("echo stream closed after {} bytes", echoed.len()).into());
+            }
+            EndpointEvent::ConnectionClosed {
+                peer_id, reason, ..
+            } if peer_id == peer && echo_stream.is_some() => {
+                return Err(format!("circuit closed before the echo: {reason:?}").into());
+            }
+            EndpointEvent::Error(e) if e.peer_id == Some(peer) && echo_stream.is_some() => {
+                return Err(format!("echo stream failed: {}", e.detail).into());
             }
             _ => {}
         }

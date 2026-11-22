@@ -74,7 +74,7 @@ Set `DEBUG=true` for every endpoint event on stderr. The logging is synchronous,
 
 One image plays all three roles, picked by `ROLE`: `relay` (a minip2p relay server), `listener` (reserves a slot and echoes `/relay-echo/1.0.0`), and `dialer` (reaches the listener through the relay, sends `hello-relay`, and checks the echo). It uses TCP with Noise and Yamux on one flat network. The suite has no written spec, so the contract is the go reference app's, [`relay/images/go/main.go`](https://github.com/libp2p/unified-testing/blob/master/relay/images/go/main.go): string keys `<TEST_KEY>_relay_multiaddr` and `<TEST_KEY>_listener_peer_id`, and `status: pass` / `status: fail` on stdout.
 
-DCUtR is off in every role: on a flat network it would move the connection off the relay, and the echo would no longer test it. The listener reserves with `ReservationPolicy::Always`, because nothing here runs AutoNAT and the default policy reserves only once the node is known to be private.
+DCUtR is off in every role so the echo can only travel over the circuit. minip2p's DCUtR punches only QUIC targets on public addresses by default, so it would not fire here anyway; the setting keeps the test honest if that changes. The listener reserves with `ReservationPolicy::Always` so the reservation does not depend on the default policy's reachability verdict.
 
 ```sh
 docker run -d --rm -p 127.0.0.1:6379:6379 redis:7-alpine
