@@ -754,6 +754,10 @@ fn js_value<T: serde::Serialize>(
 /// Converts a drained event to its serde JS shape (see `js_shape` in
 /// `minip2p-ffi-core`). `StreamData` is built by hand so its owned bytes
 /// become the `Buffer`'s backing store instead of being copied.
+///
+/// Calls `shrink_to_fit` before handing the `Vec` to napi so coalesced
+/// chunks do not pin spare capacity until GC (shrinking may reallocate and
+/// copy when spare capacity is present).
 fn event_value(env: &Env, event: P2pEvent) -> Result<Unknown<'static>> {
     let P2pEvent::StreamData {
         peer_id,
