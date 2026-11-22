@@ -239,7 +239,10 @@ fn dialer(config: &Config) -> Result<()> {
                     return Ok(());
                 }
             }
-            EndpointEvent::StreamClosed { stream, .. } if Some(stream) == echo_stream => {
+            EndpointEvent::StreamClosed { stream, .. }
+            | EndpointEvent::StreamRemoteWriteClosed { stream, .. }
+                if Some(stream) == echo_stream =>
+            {
                 return Err(format!("echo stream closed after {} bytes", echoed.len()).into());
             }
             EndpointEvent::ConnectionClosed {
@@ -247,7 +250,11 @@ fn dialer(config: &Config) -> Result<()> {
             } if peer_id == peer && echo_stream.is_some() => {
                 return Err(format!("circuit closed before the echo: {reason:?}").into());
             }
-            EndpointEvent::Error(e) if e.peer_id == Some(peer) && echo_stream.is_some() => {
+            EndpointEvent::Error(e)
+                if echo_stream.is_some_and(|s| {
+                    e.conn_id == Some(s.conn_id()) && e.stream_id == Some(s.stream_id())
+                }) =>
+            {
                 return Err(format!("echo stream failed: {}", e.detail).into());
             }
             _ => {}

@@ -3,6 +3,7 @@ name = "minip2p-unified-testing"
 version = "0.0.0"
 edition = "2024"
 publish = false
+default-run = "minip2p-unified-testing"
 
 # Interop test apps for libp2p/unified-testing and libp2p/test-plans, one
 # binary per suite. Standalone (its own workspace) like the other
