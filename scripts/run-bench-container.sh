@@ -129,7 +129,12 @@ start_pass() {
     docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK -e BENCH_IR_JOBS "$name-$side" \
       bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
     echo "$status $SECONDS" > "$work/$side.exit"
-  } | head -c "$log_max_bytes" > "$work/$side.pass.log" &
+  } | {
+    head -c "$log_max_bytes" > "$work/$side.pass.log"
+    if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
+      timeout 20 docker kill "${containers[@]}" >/dev/null 2>&1 || true
+    fi
+  } &
   pids+=($!)
   running[$!]=$side
 }
@@ -206,7 +211,8 @@ if [[ -n "$BENCH_SWEEP" ]]; then
   exit 0
 fi
 
-BENCH_IR_JOBS=$((cores / ${#sides[@]} > 0 ? cores / ${#sides[@]} : 1)) run_pass ir "${sides[@]}"
+ir_budget=$((cores < 4 ? cores : 4))
+BENCH_IR_JOBS=$((ir_budget / ${#sides[@]} > 0 ? ir_budget / ${#sides[@]} : 1)) run_pass ir "${sides[@]}"
 for side in "${reversed[@]}"; do run_pass wall "$side"; done
 for side in "${sides[@]}"; do run_pass node "$side"; done
 for side in "${sides[@]}"; do

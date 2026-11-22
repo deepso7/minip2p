@@ -81,7 +81,8 @@ RUN CARGO_BUILD_JOBS=1 cargo chef cook --release --package minip2p-nodejs --targ
 COPY . .
 
 ARG BUILD_JOBS=2
-RUN CARGO_BUILD_JOBS=$BUILD_JOBS pnpm --filter @minip2p/node native:build
+RUN addon_jobs=$((BUILD_JOBS / 2 > 0 ? BUILD_JOBS / 2 : 1)) \
+    && CARGO_BUILD_JOBS=$addon_jobs pnpm --filter @minip2p/node native:build
 
 FROM deps AS builder
 
