@@ -89,27 +89,37 @@ if ((build_jobs > 4)); then
 fi
 
 declare -A building
+build_done=$work/build.done
+mkfifo "$build_done"
+exec 3<>"$build_done"
 started=$SECONDS
 for side in "${sides[@]}"; do
-  docker build -f infra/bench/Dockerfile --build-arg "BUILD_JOBS=$build_jobs" \
-    --provenance=false --output "type=docker,name=$name-$side,compression=uncompressed" \
-    "${context[$side]}" > "$work/$side.build.log" 2>&1 &
+  {
+    status=0
+    docker build -f infra/bench/Dockerfile --build-arg "BUILD_JOBS=$build_jobs" \
+      --provenance=false --output "type=docker,name=$name-$side,compression=uncompressed" \
+      "${context[$side]}" > "$work/$side.build.log" 2>&1 3>&- &
+    child=$!
+    trap 'kill "$child" 2>/dev/null || true; exit 143' INT TERM
+    wait "$child" || status=$?
+    printf '%s %s %s\n' "$side" "$status" "$SECONDS" >&3
+  } &
   pids+=($!)
-  building[$!]=$side
+  building[$side]=$!
 done
-while ((${#pids[@]})); do
-  status=0
-  wait -n -p done_pid "${pids[@]}" || status=$?
-  side=${building[$done_pid]}
-  unset "building[$done_pid]"
-  pids=("${!building[@]}")
-  printf '==> %s: build (%ss)\n' "$side" "$((SECONDS - started))"
+while ((${#building[@]})); do
+  IFS=' ' read -r side status ended <&3
+  wait "${building[$side]}" 2>/dev/null || true
+  unset "building[$side]"
+  pids=("${building[@]}")
+  printf '==> %s: build (%ss)\n' "$side" "$((ended - started))"
   cat "$work/$side.build.log"
   if ((status != 0)); then
     echo "$side image build exited with code $status" >&2
     exit 1
   fi
 done
+exec 3<&- 3>&-
 
 for side in "${sides[@]}"; do
   docker run -d --name "$name-$side" --network none --memory 6g \
@@ -125,18 +135,21 @@ start_pass() {
   local side=$1 pass=$2
   rm -f "$work/$side.exit"
   {
-    status=0
-    docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK -e BENCH_IR_JOBS "$name-$side" \
-      bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
-    echo "$status $SECONDS" > "$work/$side.exit"
-  } | {
-    head -c "$log_max_bytes" > "$work/$side.pass.log"
-    if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
-      timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
-    fi
+    {
+      status=0
+      docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK -e BENCH_IR_JOBS "$name-$side" \
+        bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
+      echo "$status $SECONDS" > "$work/$side.exit"
+    } 4>&- | {
+      head -c "$log_max_bytes" > "$work/$side.pass.log"
+      if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
+        timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
+      fi
+    } 4>&- || true
+    printf '%s\n' "$side" >&4
   } &
   pids+=($!)
-  running[$!]=$side
+  running[$side]=$!
 }
 
 finish_pass() {
@@ -164,18 +177,22 @@ finish_pass() {
 }
 
 run_pass() {
-  local pass=$1 started=$SECONDS side done_pid
+  local pass=$1 started=$SECONDS side done_fifo=$work/$1.done
   shift
+  rm -f "$done_fifo"
+  mkfifo "$done_fifo"
+  exec 4<>"$done_fifo"
   running=()
   pids=()
   for side; do start_pass "$side" "$pass"; done
-  while ((${#pids[@]})); do
-    wait -n -p done_pid "${pids[@]}" || true
-    side=${running[$done_pid]}
-    unset "running[$done_pid]"
-    pids=("${!running[@]}")
+  while ((${#running[@]})); do
+    IFS= read -r side <&4
+    wait "${running[$side]}" 2>/dev/null || true
+    unset "running[$side]"
+    pids=("${running[@]}")
     finish_pass "$side" "$pass" "$started"
   done
+  exec 4<&- 4>&-
 }
 
 take_marker() {
