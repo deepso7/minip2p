@@ -17,14 +17,11 @@
 //! whichever dialer flag the runner set, so neither harness needs configuring.
 
 use std::env;
-use std::error::Error;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
-
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+use minip2p_unified_testing::redis::Redis;
+use minip2p_unified_testing::{Result, local_ip_towards};
 
 /// Both harnesses bound a test at three minutes unless told otherwise.
 const DEFAULT_TEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -198,9 +195,7 @@ fn listener(config: &Config) -> Result<()> {
     let mut node = Endpoint::builder().listen_on(config.bind_addr())?.bind()?;
     let addr = node.listen()?.to_string();
     let addr = if config.listen_ip == "0.0.0.0" {
-        let ip = UdpSocket::bind("0.0.0.0:0")
-            .and_then(|s| s.connect(&config.redis_addr).and(s.local_addr()))?
-            .ip();
+        let ip = local_ip_towards(&config.redis_addr)?;
         addr.replacen("0.0.0.0", &ip.to_string(), 1)
     } else {
         addr
@@ -226,7 +221,7 @@ fn dialer(config: &Config) -> Result<()> {
         .ok_or("timed out waiting for the listener address")?;
     config.log(format_args!("dialing {addr}"));
     let target: PeerAddr = addr.parse()?;
-    let peer = target.peer_id().clone();
+    let peer = *target.peer_id();
 
     let mut node = Endpoint::builder().listen_on(config.bind_addr())?.bind()?;
 
@@ -277,82 +272,6 @@ fn dialer(config: &Config) -> Result<()> {
 
 fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
-}
-
-/// Just enough RESP for RPUSH and BLPOP.
-struct Redis {
-    reader: BufReader<TcpStream>,
-}
-
-impl Redis {
-    fn connect(addr: &str) -> Result<Self> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match TcpStream::connect(addr) {
-                Ok(stream) => {
-                    return Ok(Self {
-                        reader: BufReader::new(stream),
-                    });
-                }
-                Err(e) if Instant::now() >= deadline => {
-                    return Err(format!("redis {addr}: {e}").into());
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
-            }
-        }
-    }
-
-    /// Sends one command; returns the reply's bulk strings (empty for an
-    /// integer, simple-string or null reply).
-    fn command(&mut self, args: &[&str]) -> Result<Vec<String>> {
-        let mut request = format!("*{}\r\n", args.len());
-        for arg in args {
-            request.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
-        }
-        self.reader.get_mut().write_all(request.as_bytes())?;
-        self.read_reply()
-    }
-
-    fn read_reply(&mut self) -> Result<Vec<String>> {
-        let line = self.read_line()?;
-        let (kind, rest) = line.split_at(1);
-        match kind {
-            "+" | ":" => Ok(Vec::new()),
-            "-" => Err(format!("redis: {rest}").into()),
-            "$" => Ok(self.read_bulk(rest.parse()?)?.into_iter().collect()),
-            "*" => {
-                let n: i64 = rest.parse()?;
-                let mut items = Vec::new();
-                for _ in 0..n.max(0) {
-                    let header = self.read_line()?;
-                    let len = header
-                        .strip_prefix('$')
-                        .ok_or("redis: expected bulk string")?;
-                    items.extend(self.read_bulk(len.parse()?)?);
-                }
-                Ok(items)
-            }
-            _ => Err(format!("redis: unexpected reply {line:?}").into()),
-        }
-    }
-
-    fn read_bulk(&mut self, len: i64) -> Result<Option<String>> {
-        if len < 0 {
-            return Ok(None);
-        }
-        let mut buf = vec![0; usize::try_from(len)? + 2];
-        std::io::Read::read_exact(&mut self.reader, &mut buf)?;
-        buf.truncate(buf.len() - 2);
-        Ok(Some(String::from_utf8(buf)?))
-    }
-
-    fn read_line(&mut self) -> Result<String> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            return Err("redis closed the connection".into());
-        }
-        Ok(line.trim_end_matches("\r\n").to_owned())
-    }
 }
 
 #[cfg(test)]
