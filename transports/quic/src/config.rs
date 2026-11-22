@@ -112,7 +112,20 @@ pub struct QuicLimits {
     /// delivered bytes it holds unacknowledged (ADR 0012). Must be non-zero.
     ///
     /// Fixed, so the engine buffers at most one more window behind a reader
-    /// that is not acknowledging. Defaults to quinn's 1,250,000 bytes.
+    /// that is not acknowledging. Defaults to quinn's 1,250,000 bytes
+    /// (ADR 0022).
+    ///
+    /// On constrained links, this limits how much payload each bulk stream can
+    /// contribute to the bottleneck queue before flow control caps it. In
+    /// `endpoint_rtt` (`quic-check`) with a single bulk stream at 1 Mbit/s,
+    /// 200 ms, lowering it from 1.25 MB to 256 KB cut peak queueing delay from
+    /// 9.2 s to 1.9 s (loaded ping p50 3.4 s to 2.0 s) at unchanged goodput
+    /// (0.12 MiB/s); with four concurrent streams at 256 KB, peak queue delay
+    /// was still 8.0 s and median ping was unchanged. At 50 Mbit/s, 100 ms,
+    /// the two smaller windows tested cost single-stream goodput: 5.77 MiB/s
+    /// at 1.25 MB (109 ms queue), 4.34 MiB/s at 512 KB, and 2.22 MiB/s at
+    /// 256 KB. 1.25 MB stays the default; hosts on slow links that care about
+    /// loaded latency can lower this field.
     pub stream_receive_window: usize,
     /// Per-connection receive window, fixed like
     /// [`stream_receive_window`](Self::stream_receive_window). Must be
