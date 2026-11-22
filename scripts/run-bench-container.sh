@@ -82,10 +82,16 @@ reject() {
   exit 1
 }
 
+cores=$(nproc)
+build_jobs=$((cores / ${#sides[@]} > 0 ? cores / ${#sides[@]} : 1))
+if ((build_jobs > 4)); then
+  build_jobs=4
+fi
+
 declare -A building
 started=$SECONDS
 for side in "${sides[@]}"; do
-  docker build -f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 \
+  docker build -f infra/bench/Dockerfile --build-arg "BUILD_JOBS=$build_jobs" \
     --provenance=false --output "type=docker,name=$name-$side,compression=uncompressed" \
     "${context[$side]}" > "$work/$side.build.log" 2>&1 &
   pids+=($!)
@@ -113,6 +119,8 @@ for side in "${sides[@]}"; do
     --entrypoint sleep "$name-$side" infinity >/dev/null
 done
 
+declare -A running
+
 start_pass() {
   local side=$1 pass=$2
   rm -f "$work/$side.exit"
@@ -123,15 +131,24 @@ start_pass() {
     echo "$status $SECONDS" > "$work/$side.exit"
   } | head -c "$log_max_bytes" > "$work/$side.pass.log" &
   pids+=($!)
+  running[$!]=$side
 }
 
 finish_pass() {
   local side=$1 pass=$2 started=$3 exit_code ended
-  read -r exit_code ended < "$work/$side.exit" || exit_code=unknown ended=$SECONDS
+  if [[ -f "$work/$side.exit" ]]; then
+    read -r exit_code ended < "$work/$side.exit" || {
+      exit_code=unknown
+      ended=$SECONDS
+    }
+  else
+    exit_code=unknown
+    ended=$SECONDS
+  fi
   printf '==> %s: %s (%ss)\n' "$side" "$pass" "$((ended - started))" | tee -a "$work/bench.log"
   cat "$work/$side.pass.log" >> "$work/bench.log"
   if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
-    timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
+    timeout 20 docker kill "${containers[@]}" >/dev/null 2>&1 || true
     reject "$side $pass output reached $((log_max_bytes / 1024 / 1024)) MB"
   fi
   if [[ "$exit_code" != 0 ]]; then
@@ -142,14 +159,18 @@ finish_pass() {
 }
 
 run_pass() {
-  local pass=$1 started=$SECONDS side
+  local pass=$1 started=$SECONDS side done_pid
   shift
+  running=()
+  pids=()
   for side; do start_pass "$side" "$pass"; done
   while ((${#pids[@]})); do
-    wait "${pids[0]}" || true
-    pids=("${pids[@]:1}")
+    wait -n -p done_pid "${pids[@]}" || true
+    side=${running[$done_pid]}
+    unset "running[$done_pid]"
+    pids=("${!running[@]}")
+    finish_pass "$side" "$pass" "$started"
   done
-  for side; do finish_pass "$side" "$pass" "$started"; done
 }
 
 take_marker() {
@@ -185,7 +206,6 @@ if [[ -n "$BENCH_SWEEP" ]]; then
   exit 0
 fi
 
-cores=$(nproc)
 BENCH_IR_JOBS=$((cores / ${#sides[@]} > 0 ? cores / ${#sides[@]} : 1)) run_pass ir "${sides[@]}"
 for side in "${reversed[@]}"; do run_pass wall "$side"; done
 for side in "${sides[@]}"; do run_pass node "$side"; done

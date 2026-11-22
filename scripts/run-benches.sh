@@ -19,18 +19,16 @@ run_pass() {
 }
 
 run_ir() {
-  local jobs logs=target/bench-results/ir-logs status=0 bench
+  local jobs
   jobs=$(getconf _NPROCESSORS_ONLN)
   jobs=${BENCH_IR_JOBS:-$((jobs < 4 ? jobs : 4))}
-  rm -rf "$logs"
-  mkdir -p "$logs"
+  if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_IR_JOBS must be a positive integer, got '$jobs'" >&2
+    exit 2
+  fi
   export -f bench_one
   awk '$1 == "ir" { print $2, $3, $4 }' bench/targets \
-    | xargs -P "$jobs" -n 3 bash -c 'bench_one "$@" > "$0/$3.log" 2>&1' "$logs" || status=$?
-  for bench in $(awk '$1 == "ir" { print $4 }' bench/targets); do
-    cat "$logs/$bench.log" || true
-  done
-  return "$status"
+    | xargs -P "$jobs" -n 3 bash -c 'bench_one "$@"' _
 }
 
 case "${1:-}" in

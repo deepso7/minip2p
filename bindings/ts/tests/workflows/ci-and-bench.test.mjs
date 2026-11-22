@@ -132,7 +132,12 @@ case "$2" in
 esac
 `;
 
-const runCommentStep = async ({ benchResult, existingBody, headSha }) => {
+const runCommentStep = async ({
+  benchResult,
+  comments,
+  existingBody,
+  headSha,
+}) => {
   const bench = parse(
     await readFile(path.join(repoRoot, ".github/workflows/bench.yml"), "utf-8")
   );
@@ -143,11 +148,20 @@ const runCommentStep = async ({ benchResult, existingBody, headSha }) => {
   try {
     await writeFile(path.join(dir, "gh"), FAKE_GH);
     await chmod(path.join(dir, "gh"), 0o755);
+    const existingComments =
+      comments ??
+      (existingBody === undefined
+        ? []
+        : [
+            {
+              body: existingBody,
+              id: 7,
+              user: { login: "github-actions[bot]" },
+            },
+          ]);
     await writeFile(
       path.join(dir, "comments.json"),
-      JSON.stringify(
-        existingBody === undefined ? [] : [{ body: existingBody, id: 7 }]
-      )
+      JSON.stringify(existingComments)
     );
     await writeFile(path.join(dir, "comparison.md"), comparisonFor(OLD_HEAD));
     execFileSync("bash", ["-c", step.run], {
@@ -224,4 +238,20 @@ test("Bench comment never replaces a comparison of the current head", async () =
     headSha: NEW_HEAD,
   });
   assert.equal(posted, undefined);
+});
+
+test("Bench comment ignores non-bot comments containing the marker", async () => {
+  const posted = await runCommentStep({
+    benchResult: "failure",
+    comments: [
+      {
+        body: comparisonFor(NEW_HEAD),
+        id: 99,
+        user: { login: "someone-else" },
+      },
+    ],
+    headSha: NEW_HEAD,
+  });
+  assert.equal(posted?.method, "POST");
+  assert.match(posted.body, /moved to `bbbbbbbbbbbb`/u);
 });

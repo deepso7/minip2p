@@ -2,11 +2,8 @@
 
 FROM node:24-bookworm@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2 AS toolchain
 
-ARG BUILD_JOBS=2
-
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
-    CARGO_BUILD_JOBS=$BUILD_JOBS \
     PATH=/usr/local/cargo/bin:$PATH \
     CARGO_TERM_COLOR=always
 
@@ -39,7 +36,7 @@ RUN apt-get update \
     && tar -xjf "valgrind-${VALGRIND_VERSION}.tar.bz2" \
     && cd "valgrind-${VALGRIND_VERSION}" \
     && ./configure --prefix=/usr/local \
-    && make -j"$BUILD_JOBS" \
+    && make -j"$(nproc)" \
     && make install \
     && cd / \
     && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" /tmp/bench-pins.json
@@ -72,17 +69,19 @@ RUN PNPM_VERSION=$(jq -er '.packageManager | select(startswith("pnpm@")) | ltrim
 COPY --from=planner /minip2p/recipe.json recipe.json
 
 # The Node addon builds in its own stage, which BuildKit runs alongside the
-# bench build, and only the `.node` file reaches the image: `napi build`
+# bench dependency cook, and only the `.node` file reaches the image: `napi build`
 # always passes `--target <host triple>`, so its artifacts land in
-# target/<triple>/, which nothing at run time reads. Cook the binding's
-# dependencies for that target explicitly or the napi step rebuilds them.
+# target/<triple>/, which nothing at run time reads. Cook steps stay at
+# CARGO_BUILD_JOBS=1 so concurrent addon + builder cooks across two A/B builds
+# stay within 4 job slots and share layers regardless of BUILD_JOBS.
 FROM deps AS addon
 
-RUN cargo chef cook --release --package minip2p-nodejs --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json
+RUN CARGO_BUILD_JOBS=1 cargo chef cook --release --package minip2p-nodejs --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json
 
 COPY . .
 
-RUN pnpm --filter @minip2p/node native:build
+ARG BUILD_JOBS=2
+RUN CARGO_BUILD_JOBS=$BUILD_JOBS pnpm --filter @minip2p/node native:build
 
 FROM deps AS builder
 
@@ -90,12 +89,13 @@ COPY bench/targets bench/
 COPY scripts/build-benches.sh scripts/
 # Fetch every locked crate, for all targets, so the offline container can run
 # `cargo metadata`, which Criterion calls to find target/criterion.
-RUN scripts/build-benches.sh cook \
+RUN CARGO_BUILD_JOBS=1 scripts/build-benches.sh cook \
     && cargo fetch --locked
 
 COPY . .
 COPY --from=addon /minip2p/bindings/ts/node/*.node bindings/ts/node/
 
-RUN scripts/build-benches.sh
+ARG BUILD_JOBS=2
+RUN CARGO_BUILD_JOBS=$BUILD_JOBS scripts/build-benches.sh
 
 # No ENTRYPOINT: scripts/run-bench-container.sh supplies the entrypoint.

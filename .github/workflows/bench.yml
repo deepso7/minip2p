@@ -230,7 +230,7 @@ jobs:
         run: |
           set -euo pipefail
           existing_json=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
-            | jq --slurp '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0] // {}')
+            | jq --slurp '[.[][] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- bench-comment -->")))][0] // {}')
           comment_id=$(jq -r '.id // empty' <<<"$existing_json")
           existing_body=$(jq -r '.body // empty' <<<"$existing_json")
           previous_body=$(printf '%s\n' "$existing_body" | sed \
