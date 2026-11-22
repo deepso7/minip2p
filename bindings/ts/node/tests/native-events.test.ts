@@ -28,7 +28,7 @@ describe("native event payloads", () => {
     ]);
 
     const stream = a.openStream(b.peerId(), protocol);
-    await Promise.all([
+    const [, ready] = await Promise.all([
       waitForEvent(a, "StreamReady"),
       waitForEvent(b, "StreamReady"),
     ]);
@@ -39,8 +39,22 @@ describe("native event payloads", () => {
     );
 
     const event = await waitForEvent(b, "StreamData");
+    expect(Object.keys(event)).toEqual(["tag", "inner"]);
+    expect(Object.keys(event.inner)).toEqual([
+      "peerId",
+      "connId",
+      "streamId",
+      "data",
+    ]);
+    for (const key of ["peerId", "connId", "streamId"]) {
+      expect(Reflect.get(event.inner, key)).toStrictEqual(
+        Reflect.get(ready.inner, key)
+      );
+    }
     const data = Reflect.get(event.inner, "data");
-    expect(data).toBeInstanceOf(Uint8Array);
+    expect(Buffer.isBuffer(data)).toBe(true);
+    expect(data.byteOffset).toBe(0);
+    expect(data.byteLength).toBe(data.buffer.byteLength);
     expect([...data]).toEqual([0, 127, 255]);
   }, 15_000);
 
