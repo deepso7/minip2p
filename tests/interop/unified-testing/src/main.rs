@@ -226,7 +226,7 @@ fn dialer(config: &Config) -> Result<()> {
         .ok_or("timed out waiting for the listener address")?;
     config.log(format_args!("dialing {addr}"));
     let target: PeerAddr = addr.parse()?;
-    let peer = target.peer_id().clone();
+    let peer = *target.peer_id();
 
     let mut node = Endpoint::builder().listen_on(config.bind_addr())?.bind()?;
 
