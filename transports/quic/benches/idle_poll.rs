@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use minip2p_core::platform::{Clock, StdClock};
+use minip2p_core::platform::{Clock, Deadline, StdClock};
 use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{SharedPoll, Transport, TransportEvent};
 
@@ -39,8 +39,10 @@ fn loopback(limits: QuicLimits) -> QuicTransport {
         .expect("bind loopback")
 }
 
-/// Counts `Connected` events, failing setup on any connection error or close.
-fn count_connected(events: Vec<TransportEvent>, connected: &mut usize) {
+/// Counts `Connected` events, failing setup on any connection error or close,
+/// and returns whether there were any events at all.
+fn count_connected(events: Vec<TransportEvent>, connected: &mut usize) -> bool {
+    let progressed = !events.is_empty();
     for event in events {
         assert!(
             !matches!(
@@ -51,9 +53,19 @@ fn count_connected(events: Vec<TransportEvent>, connected: &mut usize) {
         );
         *connected += usize::from(matches!(event, TransportEvent::Connected { .. }));
     }
+    progressed
+}
+
+/// Whether `transport` has work it can do without waiting on a socket or timer.
+fn busy(transport: &QuicTransport) -> bool {
+    transport.next_deadline() == Some(Deadline::IMMEDIATE)
 }
 
 /// `count` established connections from a client to a server.
+///
+/// The server skips address validation: a Retry round trip is no part of
+/// idle polling, and with hundreds of Retry handshakes in flight from one
+/// client socket under CPU load, one occasionally never completes.
 fn establish(count: usize) -> (QuicTransport, QuicTransport) {
     let setup_timeout = std::env::var("MINIP2P_BENCH_SETUP_TIMEOUT_SECS")
         .ok()
@@ -61,6 +73,7 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
         .map_or(DEFAULT_SETUP_TIMEOUT, Duration::from_secs);
     let limits = QuicLimits {
         idle_timeout_ms: 3_600_000,
+        require_address_validation: false,
         ..QuicLimits::default()
     };
     let mut server = loopback(limits.clone());
@@ -79,11 +92,11 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
             started_connections += 1;
         }
         while server_connected != batch_target || client_connected != batch_target {
-            count_connected(
+            let server_progressed = count_connected(
                 server.poll(clock.now()).expect("server setup poll"),
                 &mut server_connected,
             );
-            count_connected(
+            let client_progressed = count_connected(
                 client.poll(clock.now()).expect("client setup poll"),
                 &mut client_connected,
             );
@@ -93,7 +106,9 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
                  {client_connected}/{count} client connections after starting \
                  {started_connections}/{count}",
             );
-            std::thread::sleep(Duration::from_millis(1));
+            if !(server_progressed || client_progressed || busy(&server) || busy(&client)) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
     (server, client)

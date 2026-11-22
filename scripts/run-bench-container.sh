@@ -17,7 +17,7 @@ output=target/bench-artifacts
 max_bytes=$((50 * 1024 * 1024))
 log_max_bytes=$((256 * 1024 * 1024))
 script=$(< scripts/run-container-benches.sh)
-build_pid=
+pids=()
 
 declare -A context sha
 if [[ -n "${BENCH_BASE_CONTEXT:-}" ]]; then
@@ -42,19 +42,23 @@ mkdir -p "$quarantine" "$output"
 
 keep_log() {
   local log
-  for log in bench.log pass.log; do
-    if [[ -f "$work/$log" ]]; then
-      cp "$work/$log" "$output/$log" || true
+  for log in "$work"/bench.log "$work"/*.pass.log "$work"/*.build.log; do
+    if [[ -f "$log" ]]; then
+      cp "$log" "$output/" || true
     fi
   done
+}
+
+stop_jobs() {
+  if ((${#pids[@]})); then
+    kill "${pids[@]}" 2>/dev/null || true
+  fi
 }
 
 on_signal() {
   trap - EXIT
   trap '' INT TERM
-  if [[ -n "$build_pid" ]]; then
-    kill "$build_pid" 2>/dev/null || true
-  fi
+  stop_jobs
   keep_log
   timeout 5 docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
   exit "$1"
@@ -63,6 +67,7 @@ on_signal() {
 cleanup() {
   local status=$?
   trap - EXIT
+  stop_jobs
   keep_log
   timeout 20 docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
   timeout 60 docker rmi "${containers[@]}" >/dev/null 2>&1 || true
@@ -77,14 +82,44 @@ reject() {
   exit 1
 }
 
+cores=$(nproc)
+build_jobs=$((cores / ${#sides[@]} > 0 ? cores / ${#sides[@]} : 1))
+if ((build_jobs > 4)); then
+  build_jobs=4
+fi
+
+declare -A building
+build_done=$work/build.done
+mkfifo "$build_done"
+exec 3<>"$build_done"
+started=$SECONDS
 for side in "${sides[@]}"; do
-  docker build -f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 \
-    --provenance=false --output "type=docker,name=$name-$side,compression=uncompressed" \
-    "${context[$side]}" &
-  build_pid=$!
-  wait "$build_pid"
-  build_pid=
+  {
+    status=0
+    docker build -f infra/bench/Dockerfile --build-arg "BUILD_JOBS=$build_jobs" \
+      --provenance=false --output "type=docker,name=$name-$side,compression=uncompressed" \
+      "${context[$side]}" > "$work/$side.build.log" 2>&1 3>&- &
+    child=$!
+    trap 'kill "$child" 2>/dev/null || true; exit 143' INT TERM
+    wait "$child" || status=$?
+    printf '%s %s %s\n' "$side" "$status" "$SECONDS" >&3
+  } &
+  pids+=($!)
+  building[$side]=$!
 done
+while ((${#building[@]})); do
+  IFS=' ' read -r side status ended <&3
+  wait "${building[$side]}" 2>/dev/null || true
+  unset "building[$side]"
+  pids=("${building[@]}")
+  printf '==> %s: build (%ss)\n' "$side" "$((ended - started))"
+  cat "$work/$side.build.log"
+  if ((status != 0)); then
+    echo "$side image build exited with code $status" >&2
+    exit 1
+  fi
+done
+exec 3<&- 3>&-
 
 for side in "${sides[@]}"; do
   docker run -d --name "$name-$side" --network none --memory 6g \
@@ -94,36 +129,77 @@ for side in "${sides[@]}"; do
     --entrypoint sleep "$name-$side" infinity >/dev/null
 done
 
-run_pass() {
+declare -A running
+
+start_pass() {
   local side=$1 pass=$2
-  printf '==> %s: %s\n' "$side" "$pass" >> "$work/bench.log"
-  rm -f "$work/exit-code"
+  rm -f "$work/$side.exit"
   {
-    status=0
-    docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK "$name-$side" \
-      bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
-    echo "$status" > "$work/exit-code"
-  } | head -c "$log_max_bytes" > "$work/pass.log" &
-  wait $!
-  cat "$work/pass.log" >> "$work/bench.log"
-  if (($(stat -c %s "$work/pass.log") >= log_max_bytes)); then
+    {
+      status=0
+      docker exec -e BENCH_GIT_SHA="${sha[$side]}" -e BENCH_SWEEP -e MINIP2P_BENCH_QUICK -e BENCH_IR_JOBS "$name-$side" \
+        bash -c "$script" run-container-benches "$pass" 2>&1 || status=$?
+      echo "$status $SECONDS" > "$work/$side.exit"
+    } 4>&- | {
+      head -c "$log_max_bytes" > "$work/$side.pass.log"
+      if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
+        timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
+      fi
+    } 4>&- || true
+    printf '%s\n' "$side" >&4
+  } &
+  pids+=($!)
+  running[$side]=$!
+}
+
+finish_pass() {
+  local side=$1 pass=$2 started=$3 exit_code ended
+  if [[ -f "$work/$side.exit" ]]; then
+    read -r exit_code ended < "$work/$side.exit" || {
+      exit_code=unknown
+      ended=$SECONDS
+    }
+  else
+    exit_code=unknown
+    ended=$SECONDS
+  fi
+  printf '==> %s: %s (%ss)\n' "$side" "$pass" "$((ended - started))" | tee -a "$work/bench.log"
+  cat "$work/$side.pass.log" >> "$work/bench.log"
+  if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
     timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
     reject "$side $pass output reached $((log_max_bytes / 1024 / 1024)) MB"
   fi
-  local exit_code
-  exit_code=$(cat "$work/exit-code" 2>/dev/null || echo unknown)
   if [[ "$exit_code" != 0 ]]; then
-    cat "$work/pass.log" >&2
+    cat "$work/$side.pass.log" >&2
     echo "$side $pass pass exited with code $exit_code" >&2
     exit 1
   fi
+}
+
+run_pass() {
+  local pass=$1 started=$SECONDS side done_fifo=$work/$1.done
+  shift
+  rm -f "$done_fifo"
+  mkfifo "$done_fifo"
+  exec 4<>"$done_fifo"
+  running=()
+  pids=()
+  for side; do start_pass "$side" "$pass"; done
+  while ((${#running[@]})); do
+    IFS= read -r side <&4
+    wait "${running[$side]}" 2>/dev/null || true
+    unset "running[$side]"
+    pids=("${running[@]}")
+    finish_pass "$side" "$pass" "$started"
+  done
+  exec 4<&- 4>&-
 }
 
 take_marker() {
   local side=$1 marker=MINIP2P_BENCH_RESULTS
   [[ -n "$BENCH_SWEEP" ]] && marker=MINIP2P_SWEEP_RESULTS
   local encoded_max=$((max_bytes / 3 * 4 + 1024))
-  sed -n "/^$marker=/{s///p;q}" "$work/pass.log" | head -c "$encoded_max" > "$work/encoded"
+  sed -n "/^$marker=/{s///p;q}" "$work/$side.pass.log" | head -c "$encoded_max" > "$work/encoded"
   [[ -s "$work/encoded" ]] || reject "$marker marker missing from the $side output"
   (($(stat -c %s "$work/encoded") < encoded_max)) || reject "$marker marker is larger than 50 MB"
   if [[ -n "$BENCH_SWEEP" ]]; then
@@ -147,15 +223,16 @@ take_marker() {
 }
 
 if [[ -n "$BENCH_SWEEP" ]]; then
-  run_pass current sweep
+  run_pass sweep current
   take_marker current
   exit 0
 fi
 
-for side in "${sides[@]}"; do run_pass "$side" ir; done
-for side in "${reversed[@]}"; do run_pass "$side" wall; done
-for side in "${sides[@]}"; do run_pass "$side" node; done
+ir_budget=$((cores < 4 ? cores : 4))
+BENCH_IR_JOBS=$((ir_budget / ${#sides[@]} > 0 ? ir_budget / ${#sides[@]} : 1)) run_pass ir "${sides[@]}"
+for side in "${reversed[@]}"; do run_pass wall "$side"; done
+for side in "${sides[@]}"; do run_pass node "$side"; done
 for side in "${sides[@]}"; do
-  run_pass "$side" results
+  run_pass results "$side"
   take_marker "$side"
 done
