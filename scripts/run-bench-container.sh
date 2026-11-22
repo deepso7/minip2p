@@ -132,7 +132,7 @@ start_pass() {
   } | {
     head -c "$log_max_bytes" > "$work/$side.pass.log"
     if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
-      timeout 20 docker kill "${containers[@]}" >/dev/null 2>&1 || true
+      timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
     fi
   } &
   pids+=($!)
@@ -153,7 +153,7 @@ finish_pass() {
   printf '==> %s: %s (%ss)\n' "$side" "$pass" "$((ended - started))" | tee -a "$work/bench.log"
   cat "$work/$side.pass.log" >> "$work/bench.log"
   if (($(stat -c %s "$work/$side.pass.log") >= log_max_bytes)); then
-    timeout 20 docker kill "${containers[@]}" >/dev/null 2>&1 || true
+    timeout 20 docker kill "$name-$side" >/dev/null 2>&1 || true
     reject "$side $pass output reached $((log_max_bytes / 1024 / 1024)) MB"
   fi
   if [[ "$exit_code" != 0 ]]; then
