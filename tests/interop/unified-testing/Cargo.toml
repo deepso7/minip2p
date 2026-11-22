@@ -4,16 +4,23 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Transport test app for libp2p/unified-testing. Standalone (its own
-# workspace) like the other foreign-harness crates in tests/interop. See README.md.
+# Interop test apps for libp2p/unified-testing and libp2p/test-plans, one
+# binary per suite. Standalone (its own workspace) like the other
+# foreign-harness crates in tests/interop. See README.md.
 [workspace]
 
 [[bin]]
 name = "minip2p-unified-testing"
 path = "src/main.rs"
 
+[[bin]]
+name = "minip2p-relay-interop"
+path = "src/bin/relay.rs"
+
 [dependencies]
 minip2p = { package = "minip2p-rs", path = "../../../crates/minip2p", features = [
   "quic",
+  "relay",
+  "relay-server",
   "tcp",
 ] }
