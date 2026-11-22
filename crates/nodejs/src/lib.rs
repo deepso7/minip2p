@@ -6,10 +6,12 @@ use std::sync::Arc;
 
 use minip2p_ffi_core::{
     ConfigCapability, CongestionController, ConnectTarget, DiscoveryOptions, EndpointConfig,
-    EventDoorbell, FfiError, LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions,
+    EventDoorbell, FfiError, LimitsOptions, MdnsOptions, P2pEndpoint, P2pEvent, QuicLimitsOptions,
     TcpLimitsOptions, TimeoutLimit, TimeoutsOptions, WindowLimit, YamuxOptions,
 };
-use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
+use napi::bindgen_prelude::{
+    BigInt, BufferSlice, Either, JsObjectValue, JsValue, Object, Uint8Array,
+};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
@@ -461,8 +463,8 @@ impl NodeEndpoint {
     pub fn drain_events(&self, env: Env, limit: u32) -> Result<Vec<Unknown<'static>>> {
         self.0
             .drain_events(limit)
-            .iter()
-            .map(|event| env.to_js_value(event))
+            .into_iter()
+            .map(|event| event_value(&env, event))
             .collect()
     }
 
@@ -749,6 +751,41 @@ fn js_value<T: serde::Serialize>(
         .and_then(|value| env.to_js_value(&value))
 }
 
+/// Converts a drained event to its serde JS shape (see `js_shape` in
+/// `minip2p-ffi-core`). `StreamData` is built by hand so its owned bytes
+/// become the `Buffer`'s backing store instead of being copied.
+///
+/// Calls `shrink_to_fit` before handing the `Vec` to napi so coalesced
+/// chunks do not pin spare capacity until GC (shrinking may reallocate and
+/// copy when spare capacity is present).
+fn event_value(env: &Env, event: P2pEvent) -> Result<Unknown<'static>> {
+    let P2pEvent::StreamData {
+        peer_id,
+        conn_id,
+        stream_id,
+        mut data,
+    } = event
+    else {
+        return env.to_js_value(&event);
+    };
+    data.shrink_to_fit();
+    let mut inner = Object::new(env)?;
+    inner.set_named_property("peerId", peer_id.as_str())?;
+    inner.set_named_property("connId", js_u64(conn_id))?;
+    inner.set_named_property("streamId", js_u64(stream_id))?;
+    inner.set_named_property("data", &BufferSlice::from_data(env, data)?)?;
+    let mut outer = Object::new(env)?;
+    outer.set_named_property("tag", "StreamData")?;
+    outer.set_named_property("inner", inner)?;
+    Ok(outer.to_unknown())
+}
+
+/// Mirrors napi-rs's serde `u64`: a `number` up to `u32::MAX`, a `bigint`
+/// above it.
+fn js_u64(value: u64) -> Either<u32, u64> {
+    u32::try_from(value).map_or(Either::B(value), Either::A)
+}
+
 fn bigint_u64(value: BigInt, name: &str) -> Result<u64> {
     let (_, value, lossless) = value.get_u64();
     if lossless {
@@ -757,5 +794,25 @@ fn bigint_u64(value: BigInt, name: &str) -> Result<u64> {
         Err(Error::from_reason(format!(
             "{name} must be an unsigned 64-bit integer"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use napi::bindgen_prelude::Either;
+
+    use super::js_u64;
+
+    #[test]
+    fn u64_fields_switch_to_bigint_above_u32_max() {
+        let max = u64::from(u32::MAX);
+        assert!(matches!(js_u64(0), Either::A(0)));
+        assert!(matches!(js_u64(max), Either::A(u32::MAX)));
+        assert!(matches!(js_u64(max + 1), Either::B(value) if value == max + 1));
+        assert!(matches!(
+            js_u64((1 << 53) - 1),
+            Either::B(value) if value == (1 << 53) - 1
+        ));
+        assert!(matches!(js_u64(u64::MAX), Either::B(u64::MAX)));
     }
 }

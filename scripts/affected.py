@@ -226,6 +226,7 @@ def load_workspace_metadata(root: Path = ROOT) -> dict[str, Any]:
             "dir": manifest_dir,
             "features": pkg["features"],
             "dependencies": pkg["dependencies"],
+            "has_doctest": any(t.get("doctest", False) for t in pkg["targets"]),
         }
     return packages
 
@@ -744,7 +745,7 @@ def compute_plan(changed_files: list[str], force_full: bool = False, root: Path 
     check_wasm = bool(wasm_crates & changed_crates)
 
     check_docs = rust_has_packages
-    doctest_workspace = rust_has_packages
+    doctest_workspace = any(packages[name]["has_doctest"] for name in affected_crates)
     tcp_smoltcp_crates = resolve_feature_closure(
         packages, "minip2p-tcp", use_default=True, extra_features=("smoltcp",), include_dev=True
     )

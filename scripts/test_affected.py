@@ -68,6 +68,14 @@ class AffectedPlanTest(unittest.TestCase):
         self.assertFalse(plan["bindings_ts"])
         self.assertFalse(plan["check_nostd"])
         self.assertFalse(plan["check_wasm"])
+        self.assertFalse(plan["doctest_workspace"])
+
+    def test_cdylib_only_nodejs_crate_skips_workspace_doctests(self) -> None:
+        plan = affected.compute_plan(["crates/nodejs/src/lib.rs"])
+        self.assertEqual(plan["rust_packages"], "-p minip2p-nodejs")
+        self.assertTrue(plan["rust_has_packages"])
+        self.assertFalse(plan["doctest_workspace"])
+        self.assertTrue(plan["bindings_node_native"])
 
     def test_tcp_transport_skips_web_fuzz_and_quic_snippets(self) -> None:
         plan = affected.compute_plan(["transports/tcp/src/lib.rs"])
@@ -81,6 +89,7 @@ class AffectedPlanTest(unittest.TestCase):
         self.assertFalse(plan["bindings_web"])
         self.assertTrue(plan["bindings_node_native"])
         self.assertFalse(plan["docs_snippets_quickstart"])
+        self.assertTrue(plan["doctest_workspace"])
         self.assertTrue(plan["doctest_tcp_smoltcp"])
 
     def test_discovery_skips_relay_container_and_web(self) -> None:
