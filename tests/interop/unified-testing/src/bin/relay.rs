@@ -74,7 +74,7 @@ fn main() {
         other => Err(format!("unknown ROLE={other}").into()),
     });
     if let Err(e) = result {
-        println!("error: {e}");
+        println!("error: {:?}", e.to_string());
         println!("status: fail");
         std::process::exit(1);
     }
