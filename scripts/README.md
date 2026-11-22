@@ -25,7 +25,7 @@ Each script prints its usage when called without valid arguments; the environmen
 
 | Script | Used by | What it does |
 | --- | --- | --- |
-| `run-benches.sh` | `just bench`, `just bench-ir`, `run-container-benches.sh` | Runs one pass of `bench/targets` and collects its result documents. |
+| `run-benches.sh` | `just bench`, `just bench-ir`, `run-container-benches.sh` | Runs one pass of `bench/targets` and collects its result documents; the `ir` pass runs `BENCH_IR_JOBS` benches at a time (default: the core count, at most 4). |
 | `build-benches.sh` | `just bench-build`, CI, `infra/bench/Dockerfile` | Builds the benches listed in `bench/targets` without running them. |
 | `check-bench-ids.py` | `just bench-build`, CI | Checks the IR bench ids against `bench_results.py`. |
 | `bench_results.py` | `run-benches.sh`, `run-container-benches.sh`, the Node package's `bench` script, `bench.yml`, `check-bench-ids.py`, `bench/test_bench_results.py` | Normalizes results and compares a head run with its base. |

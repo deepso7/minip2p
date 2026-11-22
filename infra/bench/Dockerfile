@@ -50,7 +50,7 @@ WORKDIR /minip2p
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM toolchain AS builder
+FROM toolchain AS deps
 
 WORKDIR /minip2p
 
@@ -70,17 +70,32 @@ RUN PNPM_VERSION=$(jq -er '.packageManager | select(startswith("pnpm@")) | ltrim
     && pnpm install --frozen-lockfile
 
 COPY --from=planner /minip2p/recipe.json recipe.json
-COPY bench/targets bench/
-COPY scripts/build-benches.sh scripts/
-# `napi build` always passes `--target <host triple>`, which builds into
-# target/<triple>/ instead of target/release/, so cook the binding's
+
+# The Node addon builds in its own stage, which BuildKit runs alongside the
+# bench build, and only the `.node` file reaches the image: `napi build`
+# always passes `--target <host triple>`, so its artifacts land in
+# target/<triple>/, which nothing at run time reads. Cook the binding's
 # dependencies for that target explicitly or the napi step rebuilds them.
-RUN cargo chef cook --release --package minip2p-nodejs --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json \
-    && scripts/build-benches.sh cook
+FROM deps AS addon
+
+RUN cargo chef cook --release --package minip2p-nodejs --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json
 
 COPY . .
 
-RUN pnpm --filter @minip2p/node native:build \
-    && scripts/build-benches.sh
+RUN pnpm --filter @minip2p/node native:build
+
+FROM deps AS builder
+
+COPY bench/targets bench/
+COPY scripts/build-benches.sh scripts/
+# Fetch every locked crate, for all targets, so the offline container can run
+# `cargo metadata`, which Criterion calls to find target/criterion.
+RUN scripts/build-benches.sh cook \
+    && cargo fetch --locked
+
+COPY . .
+COPY --from=addon /minip2p/bindings/ts/node/*.node bindings/ts/node/
+
+RUN scripts/build-benches.sh
 
 # No ENTRYPOINT: scripts/run-bench-container.sh supplies the entrypoint.

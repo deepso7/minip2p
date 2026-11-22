@@ -229,28 +229,50 @@ jobs:
           TARGET: ${{ runner.temp }}/bench-comment.md
         run: |
           set -euo pipefail
-          actual_head_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
-          if [ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "PR head moved since benchmark started; skipping stale comment" >&2
-            exit 0
-          fi
-
           existing_json=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
             | jq --slurp '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0] // {}')
           comment_id=$(jq -r '.id // empty' <<<"$existing_json")
           existing_body=$(jq -r '.body // empty' <<<"$existing_json")
+          previous_body=$(printf '%s\n' "$existing_body" | sed \
+            -e '/^<!-- bench-comment -->$/d' \
+            -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d')
 
-          if [ "$START_RESULT" = success ] && [ "$BENCH_RESULT" = success ]; then
+          conclusion="$BENCH_RESULT"
+          if [ "$START_RESULT" != success ]; then
+            conclusion="$START_RESULT"
+          fi
+          comparison=''
+          if [ "$conclusion" = success ]; then
             test -s "$ARTIFACT_DIR/comparison.md"
+            comparison=$(sed '/^<!-- bench-comment -->$/d' "$ARTIFACT_DIR/comparison.md")
+          fi
+
+          actual_head_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+          if [ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            if grep -qF -- "- Head: \`${actual_head_sha:0:12}\`" <<<"$previous_body"; then
+              echo "the comment already compares the current head ${actual_head_sha:0:12}; keeping it" >&2
+              exit 0
+            fi
+            below=${comparison:-$previous_body}
+            {
+              printf '%s\n' '<!-- bench-comment -->'
+              printf '%s\n' '<!-- bench-status-start -->'
+              printf '> [!WARNING]\n'
+              printf '> The benchmark run for `%s` ([%s](%s)) finished after the PR moved to `%s`. Add the `bench` label again to measure the current head.' \
+                "${EXPECTED_HEAD_SHA:0:12}" "$conclusion" "$RUN_URL" "${actual_head_sha:0:12}"
+              if [ -n "$comparison" ]; then
+                printf ' The comparison below is from that run.'
+              elif [ -n "${below//[[:space:]]/}" ]; then
+                printf ' The comparison below is from the last successful run.'
+              fi
+              printf '\n%s\n\n' '<!-- bench-status-end -->'
+              if [ -n "${below//[[:space:]]/}" ]; then
+                printf '%s\n' "$below"
+              fi
+            } > "$TARGET"
+          elif [ -n "$comparison" ]; then
             cp "$ARTIFACT_DIR/comparison.md" "$TARGET"
           else
-            conclusion="$BENCH_RESULT"
-            if [ "$START_RESULT" != success ]; then
-              conclusion="$START_RESULT"
-            fi
-            previous_body=$(printf '%s\n' "$existing_body" | sed \
-              -e '/^<!-- bench-comment -->$/d' \
-              -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d')
             {
               printf '%s\n' '<!-- bench-comment -->'
               printf '%s\n' '<!-- bench-status-start -->'
