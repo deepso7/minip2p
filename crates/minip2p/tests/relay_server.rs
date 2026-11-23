@@ -514,6 +514,17 @@ mod relayed_close {
 
     use super::*;
 
+    fn take_drop_budget(counter: &AtomicUsize) -> bool {
+        let mut left = counter.load(Ordering::SeqCst);
+        while let Some(next) = left.checked_sub(1) {
+            match counter.compare_exchange_weak(left, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(observed) => left = observed,
+            }
+        }
+        false
+    }
+
     /// A UDP proxy in front of a relay that can drop what passes through it.
     struct LossyProxy {
         addr: SocketAddr,
@@ -552,12 +563,8 @@ mod relayed_close {
                             continue;
                         };
                         *client.lock().unwrap() = Some(from);
-                        let dropped = blackhole.load(Ordering::SeqCst)
-                            || drop_upstream
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                                    left.checked_sub(1)
-                                })
-                                .is_ok();
+                        let dropped =
+                            blackhole.load(Ordering::SeqCst) || take_drop_budget(&drop_upstream);
                         if !dropped && let Some(datagram) = buf.get(..len) {
                             drop(back.send_to(datagram, relay));
                         }
