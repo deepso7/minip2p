@@ -564,7 +564,7 @@ impl<T: Transport> NatDriver<T> {
                     }
                 }
             }
-            NatAction::CloseCircuit { conn_id } => match swarm.transport_mut().close(conn_id) {
+            NatAction::CloseConnection { conn_id } => match swarm.transport_mut().close(conn_id) {
                 Ok(()) | Err(minip2p_transport::TransportError::ConnectionNotFound { .. }) => {
                     #[cfg(feature = "relay")]
                     self.io.promoted.retain(|_, id| *id != conn_id);

@@ -1775,3 +1775,141 @@ fn resume_without_a_wanted_reservation_does_nothing() {
     assert!(drain_actions(&mut hk.agent).is_empty());
     assert!(drain_events(&mut hk.agent).is_empty());
 }
+
+/// Whether `actions` close `conn_id`.
+fn closes(actions: &[Out], conn_id: ConnectionId) -> bool {
+    actions
+        .iter()
+        .any(|action| matches!(action, Out::CloseConnection { conn_id: c } if *c == conn_id))
+}
+
+#[test]
+fn a_resumed_renewal_that_times_out_closes_its_connection_and_reacquires_on_a_fresh_one() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    let relay = hk.relay;
+    let stale = ConnectionId::new(1);
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(5_000));
+    drain_actions(&mut hk.agent);
+
+    let deadline = 5_000 + NatConfig::default().relay_timeout_ms;
+    hk.agent.handle_tick(at(deadline));
+    let actions = drain_actions(&mut hk.agent);
+    assert!(has_reset_for(&actions, stream));
+    assert!(closes(&actions, stale));
+    drain_events(&mut hk.agent);
+
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: stale,
+            peer_id: relay,
+            reason: ConnectionCloseReason::Local,
+        },
+        false,
+        at(deadline),
+    );
+    let retry_at = hk
+        .agent
+        .next_deadline(at(deadline))
+        .expect("a backoff")
+        .millis_until(at(0));
+    hk.agent.handle_tick(at(retry_at));
+    let fresh = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+    assert_ne!(fresh, stale);
+    assert!(retry_at < 5_000 + 30_000, "before QUIC's idle timeout");
+
+    ready_on(&mut hk, &relay, fresh, HOP_PROTOCOL_ID, at(retry_at));
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    hk.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: fresh,
+            peer_id: relay,
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        false,
+        at(retry_at),
+    );
+    drain_actions(&mut hk.agent);
+    hk.agent.handle_event(
+        &SwarmEvent::StreamData {
+            peer_id: relay,
+            conn_id: fresh,
+            stream_id: stream,
+            data: Bytes::from(hop_reserve_ok(None)),
+        },
+        false,
+        at(retry_at),
+    );
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::RelayReserved { relay: r, .. }] if *r == relay
+    ));
+}
+
+#[test]
+fn a_renewal_whose_stream_never_negotiates_closes_its_connection() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    drain_actions(&mut hk.agent);
+
+    hk.agent
+        .handle_tick(at(5_000 + NatConfig::default().relay_timeout_ms));
+    assert!(closes(&drain_actions(&mut hk.agent), ConnectionId::new(1)));
+}
+
+#[test]
+fn a_timed_out_renewal_closes_its_own_connection_not_a_newer_one() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    let relay = hk.relay;
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(5_000));
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(2),
+            peer_id: relay,
+        },
+        false,
+        at(5_100),
+    );
+    drain_actions(&mut hk.agent);
+
+    hk.agent
+        .handle_tick(at(5_000 + NatConfig::default().relay_timeout_ms));
+    let actions = drain_actions(&mut hk.agent);
+    assert!(closes(&actions, ConnectionId::new(1)));
+    assert!(!closes(&actions, ConnectionId::new(2)));
+}
+
+#[test]
+fn a_refused_renewal_keeps_the_relay_connection_open() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
+    drain_actions(&mut hk.agent);
+
+    hk.agent.resume(at(5_000));
+    let (events, _) = hk.finish_reserve(hop_status(Status::ReservationRefused), at(5_010));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReservationLost { relay: r }] if *r == hk.relay
+    ));
+    let actions = drain_actions(&mut hk.agent);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Out::CloseConnection { .. })),
+        "{actions:?}"
+    );
+}

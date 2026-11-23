@@ -653,7 +653,7 @@ fn cancelling_keeps_a_dialed_relay_session_another_attempt_already_uses() {
     assert!(
         !drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == dialed)),
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == dialed)),
         "an established relay session outlives the attempt that dialed it"
     );
 }
@@ -810,7 +810,7 @@ fn relay_timeout_fails_a_stalled_leg() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == dialed)),
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == dialed)),
         "the leg closes its own handshake when it gives up"
     );
     assert!(h.agent.is_idle());

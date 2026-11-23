@@ -276,7 +276,7 @@ fn cancelling_an_active_dcutr_resets_it_and_closes_the_circuit() {
     assert!(
         actions
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn))
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn))
     );
     assert!(!h.agent.owns_stream(conn, stream));
     assert!(drain_events(&mut h.agent).is_empty());
@@ -317,7 +317,7 @@ fn cancel_of_a_provisional_leg_closes_the_circuit() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn))
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn))
     );
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -358,7 +358,7 @@ fn cancel_closes_an_in_flight_relay_dial() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn))
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn))
     );
 
     h.agent.handle_event(
@@ -381,15 +381,13 @@ fn cancel_closes_an_in_flight_punch_dial() {
 
     h.agent.cancel(id, at(314));
     let after = drain_actions(&mut h.agent);
-    assert!(
-        after.iter().any(
-            |action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == punch_conn)
-        )
-    );
+    assert!(after.iter().any(
+        |action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == punch_conn)
+    ));
     assert!(
         after
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn))
+            .any(|action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn))
     );
 
     h.agent.handle_event(
@@ -423,15 +421,13 @@ fn fallback_closes_an_in_flight_punch_dial() {
 
     h.agent.handle_tick(at(1_152));
     let after = drain_actions(&mut h.agent);
-    assert!(
-        after.iter().any(
-            |action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == punch_conn)
-        )
-    );
+    assert!(after.iter().any(
+        |action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == punch_conn)
+    ));
     assert!(
         after
             .iter()
-            .all(|action| !matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+            .all(|action| !matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn)),
         "fallback must keep the provisional relay circuit"
     );
     assert!(matches!(
@@ -459,7 +455,7 @@ fn fallback_closes_an_in_flight_punch_dial() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .all(|action| !matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+            .all(|action| !matches!(action, Out::CloseConnection { conn_id } if *conn_id == conn)),
         "settled cancel after FellBackToRelay must stay a no-op"
     );
 }
@@ -564,7 +560,7 @@ fn the_holder_runs_three_rounds_and_each_failed_round_cancels_its_dials() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == first_dial))
+            .any(|out| matches!(out, Out::CloseConnection { conn_id } if *conn_id == first_dial))
     );
 
     let second = drive_round_at(&mut h, conn, StreamId::new(91), 3_400);
@@ -592,7 +588,7 @@ fn the_holder_runs_three_rounds_and_each_failed_round_cancels_its_dials() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn))
+            .all(|out| !matches!(out, Out::CloseConnection { conn_id } if *conn_id == conn))
     );
 
     let fourth = StreamId::new(93);
@@ -988,7 +984,7 @@ fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
     assert!(
         !drain_actions(&mut h.agent).iter().any(|action| matches!(
             action,
-            Out::CloseCircuit { conn_id } if *conn_id == other_circuit
+            Out::CloseConnection { conn_id } if *conn_id == other_circuit
         )),
         "cancelling the first attempt must not close the second attempt's circuit"
     );
@@ -996,7 +992,7 @@ fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
     h.agent.cancel(second, at(321));
     assert!(drain_actions(&mut h.agent).iter().any(|action| matches!(
         action,
-        Out::CloseCircuit { conn_id } if *conn_id == other_circuit
+        Out::CloseConnection { conn_id } if *conn_id == other_circuit
     )));
 }
 
@@ -1034,7 +1030,7 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
     assert!(
         !drain_actions(&mut h.agent).iter().any(|action| matches!(
             action,
-            Out::CloseCircuit { conn_id } if *conn_id == inbound_circuit
+            Out::CloseConnection { conn_id } if *conn_id == inbound_circuit
         )),
         "cancelling the attempt must not close the inbound circuit"
     );
@@ -1059,7 +1055,7 @@ fn a_remote_that_never_starts_dcutr_settles_relayed_after_the_start_timeout() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+            .all(|out| !matches!(out, Out::CloseConnection { conn_id } if *conn_id == conn)),
         "the Relayed path stays"
     );
     assert!(h.agent.is_idle());
@@ -1089,7 +1085,7 @@ fn a_remote_without_dcutr_settles_relayed_once_identified() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+            .all(|out| !matches!(out, Out::CloseConnection { conn_id } if *conn_id == conn)),
         "the Relayed path stays"
     );
     assert!(h.agent.is_idle());
@@ -1287,13 +1283,13 @@ fn no_attempt_event_follows_the_engine_settling() {
     assert!(
         actions
             .iter()
-            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+            .all(|out| !matches!(out, Out::CloseConnection { conn_id } if *conn_id == conn)),
         "the kept connection stays open"
     );
     assert!(
         actions
             .iter()
-            .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == punch_conn)),
+            .any(|out| matches!(out, Out::CloseConnection { conn_id } if *conn_id == punch_conn)),
         "the attempt's punch dial is dropped"
     );
 

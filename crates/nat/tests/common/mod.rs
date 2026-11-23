@@ -629,7 +629,7 @@ pub enum Out {
         remote_write_closed: bool,
         result: Result<ConnectionId, PromoteError>,
     },
-    CloseCircuit {
+    CloseConnection {
         conn_id: ConnectionId,
     },
 }
@@ -644,7 +644,7 @@ impl From<NatAction> for Out {
                 target,
                 payload_len,
             },
-            NatAction::CloseCircuit { conn_id } => Out::CloseCircuit { conn_id },
+            NatAction::CloseConnection { conn_id } => Out::CloseConnection { conn_id },
         }
     }
 }

@@ -912,7 +912,7 @@ impl ConnectAttempt {
         };
         if self.handshaking() {
             if let Some(conn_id) = self.promoted.take() {
-                shared.push_action(NatAction::CloseCircuit { conn_id });
+                shared.push_action(NatAction::CloseConnection { conn_id });
             }
             self.fail_bridge(error, swarm, shared, now);
         } else {
@@ -1281,7 +1281,7 @@ impl ConnectAttempt {
         self.relay_deadline = None;
         self.punch_deadline = None;
         if let Some(conn_id) = self.promoted.take() {
-            shared.push_action(NatAction::CloseCircuit { conn_id });
+            shared.push_action(NatAction::CloseConnection { conn_id });
         }
     }
 

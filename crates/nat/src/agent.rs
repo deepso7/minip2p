@@ -211,7 +211,7 @@ impl Shared {
         let (tokens, close) = self.ledger.abort_attempt_dials(id, target, swarm);
         retired.extend(tokens);
         for conn_id in close {
-            self.push_action(NatAction::CloseCircuit { conn_id });
+            self.push_action(NatAction::CloseConnection { conn_id });
         }
         self.pending_session_dials
             .retain(|token, _| !retired.contains(token));
@@ -999,7 +999,9 @@ impl NatAgent {
     /// waiting retry runs at once, and a held reservation is renewed at
     /// once. The renewal doubles as a liveness check: if the relay does not
     /// answer within [`NatConfig::relay_timeout_ms`], the reservation is
-    /// reported lost and reacquired. Nothing happens unless the reservation
+    /// reported lost, the silent connection is closed through
+    /// [`NatAction::CloseConnection`], and the reservation is reacquired on
+    /// a fresh dial. Nothing happens unless the reservation
     /// policy wants a reservation.
     pub fn resume<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
         self.holding(swarm, |agent, swarm| {
@@ -1063,7 +1065,8 @@ impl NatAgent {
     fn dial_started(&mut self, token: NatToken, purpose: DialPurpose, conn_id: ConnectionId) {
         match purpose.connect_id() {
             Some(id) if !self.attempts.contains_key(&id) => {
-                self.shared.push_action(NatAction::CloseCircuit { conn_id });
+                self.shared
+                    .push_action(NatAction::CloseConnection { conn_id });
             }
             _ => self.shared.ledger.dial_started(conn_id, token, purpose),
         }

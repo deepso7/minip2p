@@ -80,7 +80,7 @@ loop {
     // 2. Execute what needs the transport under the swarm.
     while let Some(action) = agent.poll_action() {
         match action {
-            NatAction::SendRandomUdp { .. } | NatAction::CloseCircuit { .. } => { /* ... */ }
+            NatAction::SendRandomUdp { .. } | NatAction::CloseConnection { .. } => { /* ... */ }
         }
     }
     // 3. Surface events to the application.
