@@ -1747,28 +1747,6 @@ fn resume_renews_a_held_reservation_at_once() {
 }
 
 #[test]
-fn a_resumed_renewal_the_relay_never_answers_loses_the_reservation() {
-    let mut hk = build(ReservationPolicy::Always, 1, 0);
-    reserve_via_relay(&mut hk, hop_reserve_ok(None), at(10));
-    drain_actions(&mut hk.agent);
-
-    hk.agent.resume(at(5_000));
-    let relay = hk.relay;
-    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
-    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(5_000));
-    drain_actions(&mut hk.agent);
-
-    let deadline = 5_000 + NatConfig::default().relay_timeout_ms;
-    hk.agent.handle_tick(at(deadline - 1));
-    assert!(drain_events(&mut hk.agent).is_empty());
-    hk.agent.handle_tick(at(deadline));
-    assert!(matches!(
-        drain_events(&mut hk.agent).as_slice(),
-        [NatEvent::RelayReservationLost { relay: r }] if *r == relay
-    ));
-}
-
-#[test]
 fn resume_without_a_wanted_reservation_does_nothing() {
     let mut hk = build(ReservationPolicy::Never, 1, 0);
     hk.agent.resume(at(10));
@@ -1797,11 +1775,16 @@ fn a_resumed_renewal_that_times_out_closes_its_connection_and_reacquires_on_a_fr
     drain_actions(&mut hk.agent);
 
     let deadline = 5_000 + NatConfig::default().relay_timeout_ms;
+    hk.agent.handle_tick(at(deadline - 1));
+    assert!(drain_events(&mut hk.agent).is_empty());
     hk.agent.handle_tick(at(deadline));
     let actions = drain_actions(&mut hk.agent);
     assert!(has_reset_for(&actions, stream));
     assert!(closes(&actions, stale));
-    drain_events(&mut hk.agent);
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::RelayReservationLost { relay: r }] if *r == relay
+    ));
 
     hk.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
