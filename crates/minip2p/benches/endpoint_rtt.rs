@@ -14,9 +14,10 @@
 //!
 //! With `MINIP2P_RTT_SWEEP` set it instead runs one window sweep and appends
 //! a JSON line per measurement to
-//! `target/bench-results/rtt/<sweep>-<profile>.jsonl`, then prints a summary
-//! with the value #361's rule picks. `scripts/rtt-sweep.sh` runs the whole
-//! procedure. Sweeps, by `MINIP2P_RTT_SWEEP`:
+//! `target/bench-results/rtt/<sweep>-<profile>.jsonl` as each finishes,
+//! keeping earlier invocations' lines (each line records its windows), then
+//! prints a summary with the value #361's rule picks. `scripts/rtt-sweep.sh`
+//! runs the whole procedure. Sweeps, by `MINIP2P_RTT_SWEEP`:
 //!
 //! - `quic-stream`: one stream; the stream window varies, the connection and
 //!   send windows stay large.
@@ -47,7 +48,9 @@
 //! the up direction's peak held bytes and queueing delay, and the busiest
 //! proxy thread's CPU share. A sweep reports no pick when its reference
 //! reaches under 85% of the link, anything was lost, the idle RTT is more
-//! than 20% plus 5 ms off the profile's, or a proxy thread used over 80% of a core. `MINIP2P_RTT_PROFILE` picks the profile
+//! than 20% plus 5 ms off the profile's RTT plus the idle ping's serialization
+//! (see `Profile::idle_rtt`), or a proxy thread used over 80% of a core.
+//! `MINIP2P_RTT_PROFILE` picks the profile
 //! (`100m_100ms` by default), `MINIP2P_RTT_RUNS` the runs per
 //! point (default 5), and `MINIP2P_RTT_TOTAL_MB` the bytes per timed
 //! transfer (default: 2.5 s or 25 round trips at the link rate, whichever is
@@ -63,6 +66,7 @@
 
 mod support;
 
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     Arc, Mutex,
@@ -74,7 +78,10 @@ use std::time::{Duration, Instant};
 use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, PeerAddr, PeerId, QuicLimits, TcpConfig};
 use minip2p_quic::datagram_counters;
 use support::bulk::{self, CHUNK, Load};
-use support::delay::{LinkStats, Profile, TcpProxy, UdpProxy, assert_forwarding};
+use support::delay::{
+    LinkStats, Profile, QUIC_IDLE_WIRE_BYTES, TCP_IDLE_WIRE_BYTES, TcpProxy, UdpProxy,
+    assert_forwarding,
+};
 use support::{Driven, SETUP_TIMEOUT, bind_on, next_event};
 
 const PROTOCOL: &str = "/minip2p/bench/sink/1";
@@ -93,6 +100,16 @@ const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 enum Transport {
     Quic,
     Tcp,
+}
+
+impl Transport {
+    /// Wire bytes the idle ping waits on, for [`Profile::idle_rtt`].
+    fn idle_wire_bytes(self) -> usize {
+        match self {
+            Self::Quic => QUIC_IDLE_WIRE_BYTES,
+            Self::Tcp => TCP_IDLE_WIRE_BYTES,
+        }
+    }
 }
 
 /// One configuration a sweep measures.
@@ -127,13 +144,9 @@ struct Sample {
 }
 
 /// What makes a sweep's measurements untrustworthy: the reference falling
-/// short of the link, loss, an idle RTT off the profile's, or a proxy thread
-/// near a full core.
+/// short of the link, loss, an idle RTT off the profile's (see
+/// [`Profile::idle_rtt_calibrated`]), or a proxy thread near a full core.
 const MIN_REFERENCE_UTILIZATION: f64 = 0.85;
-const MAX_RTT_ERROR: f64 = 0.2;
-/// Idle-RTT error allowed on top of [`MAX_RTT_ERROR`], so scheduling jitter
-/// does not invalidate short-RTT profiles.
-const RTT_SLACK_MS: f64 = 5.0;
 const MAX_PROXY_CPU: f64 = 0.8;
 
 fn main() {
@@ -267,7 +280,11 @@ fn run_sweep(sweep: &str) {
     );
     std::fs::create_dir_all(dir).expect("create sweep results directory");
     let path = format!("{dir}/{sweep}-{}.jsonl", profile.name());
-    let mut lines = Vec::new();
+    let mut jsonl = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open sweep results");
     let mut results: Vec<(Point, Vec<Sample>)> = points
         .iter()
         .map(|point| (point.clone(), Vec::new()))
@@ -291,8 +308,9 @@ fn run_sweep(sweep: &str) {
             sample.max_queue_delay_ms,
             100.0 * sample.proxy_cpu,
         );
-        lines.push(json_line(sweep, profile, run, point, &sample));
-        std::fs::write(&path, lines.join("\n") + "\n").expect("write sweep results");
+        jsonl
+            .write_all(format!("{}\n", json_line(sweep, profile, run, point, &sample)).as_bytes())
+            .expect("append sweep results");
         samples.push(sample);
     };
     let count = results.len();
@@ -471,10 +489,12 @@ fn calibration_problems(profile: Profile, results: &[(Point, Vec<Sample>)]) -> V
     if lost > 0 {
         problems.push(format!("{lost} datagrams lost"));
     }
-    let expected = profile.rtt.as_secs_f64() * 1000.0;
     for (point, samples) in results {
+        let wire_bytes = point.transport.idle_wire_bytes();
+        let expected = profile.idle_rtt(wire_bytes).as_secs_f64() * 1000.0;
         for sample in samples {
-            if (sample.unloaded_rtt_ms - expected).abs() > MAX_RTT_ERROR * expected + RTT_SLACK_MS {
+            let measured = Duration::from_secs_f64(sample.unloaded_rtt_ms / 1000.0);
+            if !profile.idle_rtt_calibrated(wire_bytes, measured) {
                 problems.push(format!(
                     "{}: idle RTT {:.0} ms, not {expected:.0} ms",
                     point.label, sample.unloaded_rtt_ms
