@@ -733,7 +733,9 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::Error { id, .. }
             | TransportEvent::IncomingConnection { id, .. }
             | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
-            TransportEvent::Listening { .. } => None,
+            TransportEvent::Listening { .. }
+            | TransportEvent::ListenerError { .. }
+            | TransportEvent::ListenerRecovered { .. } => None,
         };
         if event_id.is_some_and(ConnectionId::is_circuit) {
             self.reject_inner_collision(event_id.expect("checked above"));

@@ -458,7 +458,7 @@ impl TcpProvider for VirtualProvider {
         net.ready
             .entry(self.node)
             .or_default()
-            .retain(|event| event_socket(event) != socket);
+            .retain(|event| event_socket(event) != Some(socket));
     }
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TcpEvent>, TcpError> {
@@ -520,13 +520,14 @@ impl TcpProvider for VirtualProvider {
     }
 }
 
-fn event_socket(event: &TcpEvent) -> SocketHandle {
+fn event_socket(event: &TcpEvent) -> Option<SocketHandle> {
     match event {
         TcpEvent::Accepted { socket, .. }
         | TcpEvent::Connected { socket, .. }
         | TcpEvent::Received { socket, .. }
         | TcpEvent::RemoteWriteClosed { socket }
         | TcpEvent::Writable { socket }
-        | TcpEvent::Closed { socket, .. } => *socket,
+        | TcpEvent::Closed { socket, .. } => Some(*socket),
+        TcpEvent::AcceptFailed { .. } | TcpEvent::AcceptRecovered { .. } => None,
     }
 }

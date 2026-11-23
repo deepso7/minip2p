@@ -3,9 +3,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
-use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
+use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId, TransportError};
 
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
@@ -198,12 +198,26 @@ pub enum SwarmEvent {
     /// for the application to republish. Listening through the swarm's
     /// `listen*` methods and external-address changes never fire it.
     ListenAddressesChanged { addrs: Vec<PeerAddr> },
+    /// The listener on `addr` could not take an inbound connection (out of
+    /// file descriptors, say), for `error`.
+    ///
+    /// A capability failure event: the listener stays open and the
+    /// transport keeps retrying. Reported once per change in failure state;
+    /// [`ListenerRecovered`](Self::ListenerRecovered) follows once a
+    /// connection is accepted again.
+    ListenerError {
+        addr: Multiaddr,
+        error: TransportError,
+    },
+    /// The listener on `addr` accepted a connection again after its last
+    /// [`ListenerError`](Self::ListenerError).
+    ListenerRecovered { addr: Multiaddr },
 }
 
 impl SwarmEvent {
     /// The peer this event names; `None` for [`DialFailed`](Self::DialFailed),
-    /// [`ListenAddressesChanged`](Self::ListenAddressesChanged),
-    /// and errors without a peer.
+    /// [`ListenAddressesChanged`](Self::ListenAddressesChanged), listener
+    /// failures and recoveries, and errors without a peer.
     pub fn peer_id(&self) -> Option<&PeerId> {
         match self {
             Self::ConnectionEstablished { peer_id, .. }
@@ -221,7 +235,10 @@ impl SwarmEvent {
             | Self::StreamWriteStopped { peer_id, .. }
             | Self::StreamClosed { peer_id, .. } => Some(peer_id),
             Self::Error(error) => error.peer_id.as_ref(),
-            Self::DialFailed { .. } | Self::ListenAddressesChanged { .. } => None,
+            Self::DialFailed { .. }
+            | Self::ListenAddressesChanged { .. }
+            | Self::ListenerError { .. }
+            | Self::ListenerRecovered { .. } => None,
         }
     }
 

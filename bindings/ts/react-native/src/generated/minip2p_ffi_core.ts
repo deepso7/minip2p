@@ -3455,7 +3455,9 @@ export enum P2pEvent_Tags {
     MdnsFailed = "MdnsFailed",
     MdnsRecovered = "MdnsRecovered",
     DiscoveryProtocolViolation = "DiscoveryProtocolViolation",
-    IdentifyFailed = "IdentifyFailed"
+    IdentifyFailed = "IdentifyFailed",
+    ListenerError = "ListenerError",
+    ListenerRecovered = "ListenerRecovered"
 }
 /**
  * Event delivered by the native endpoint driver.
@@ -4908,6 +4910,78 @@ inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFaile
 
     }
 
+    type ListenerError__interface = {
+        tag: P2pEvent_Tags.ListenerError;
+        inner:
+Readonly<{addr: string; detail: string}>
+    };
+    /**
+     * A listener could not take an inbound connection (out of file
+     * descriptors, say). The listener stays open and keeps retrying;
+     * reported once per change in failure state, and followed by
+     * `ListenerRecovered` once a connection is accepted again.
+     */
+    class ListenerError_ extends UniffiEnum implements ListenerError__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.ListenerError;
+        readonly inner:
+Readonly<{addr: string; detail: string}>;
+        constructor(
+inner: {addr: string; detail: string }) {
+            super("P2pEvent", "ListenerError");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {addr: string; detail: string }): ListenerError_ {
+            return new ListenerError_(inner);
+        }
+
+        static instanceOf(obj: any): obj is ListenerError_ {
+            return obj.tag === P2pEvent_Tags.ListenerError;
+        }
+
+    }
+
+    type ListenerRecovered__interface = {
+        tag: P2pEvent_Tags.ListenerRecovered;
+        inner:
+Readonly<{addr: string}>
+    };
+    /**
+     * A listener accepted a connection again after its last
+     * `ListenerError`.
+     */
+    class ListenerRecovered_ extends UniffiEnum implements ListenerRecovered__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.ListenerRecovered;
+        readonly inner:
+Readonly<{addr: string}>;
+        constructor(
+inner: {addr: string }) {
+            super("P2pEvent", "ListenerRecovered");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {addr: string }): ListenerRecovered_ {
+            return new ListenerRecovered_(inner);
+        }
+
+        static instanceOf(obj: any): obj is ListenerRecovered_ {
+            return obj.tag === P2pEvent_Tags.ListenerRecovered;
+        }
+
+    }
+
     function instanceOf(obj: any): obj is P2pEvent {
         return obj[uniffiTypeNameSymbol] === "P2pEvent";
     }
@@ -4955,7 +5029,9 @@ inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFaile
   MdnsFailed: MdnsFailed_,
   MdnsRecovered: MdnsRecovered_,
   DiscoveryProtocolViolation: DiscoveryProtocolViolation_,
-  IdentifyFailed: IdentifyFailed_
+  IdentifyFailed: IdentifyFailed_,
+  ListenerError: ListenerError_,
+  ListenerRecovered: ListenerRecovered_
     });
 
 })();
@@ -4963,7 +5039,7 @@ inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFaile
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed' | 'ListenerError' | 'ListenerRecovered']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -5014,6 +5090,8 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 40: return new P2pEvent.MdnsRecovered();
                 case 41: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
                 case 42: return new P2pEvent.IdentifyFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypeIdentifyFailure.readFromCursor(c) });
+                case 43: return new P2pEvent.ListenerError({addr: FfiConverterString.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 44: return new P2pEvent.ListenerRecovered({addr: FfiConverterString.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -5344,6 +5422,19 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
                     FfiConverterTypeIdentifyFailure.writeIntoCursor(inner.cause, c);
+                    return;
+                }
+                case P2pEvent_Tags.ListenerError: {
+                    c.writeI32(43);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.addr, c);
+                    FfiConverterString.writeIntoCursor(inner.detail, c);
+                    return;
+                }
+                case P2pEvent_Tags.ListenerRecovered: {
+                    c.writeI32(44);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.addr, c);
                     return;
                 }
                 default:
@@ -5677,6 +5768,19 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterUInt64.allocationSize(inner.connId);
                     size += FfiConverterTypeIdentifyFailure.allocationSize(inner.cause);
+                    return size;
+                }
+                case P2pEvent_Tags.ListenerError: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.addr);
+                    size += FfiConverterString.allocationSize(inner.detail);
+                    return size;
+                }
+                case P2pEvent_Tags.ListenerRecovered: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.addr);
                     return size;
                 }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();

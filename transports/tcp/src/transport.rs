@@ -587,6 +587,16 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 let message = reason.unwrap_or_else(|| "byte stream closed".to_string());
                 self.close_from_provider(socket, message);
             }
+            TcpEvent::AcceptFailed { listener, error } => {
+                self.pending.push_back(TransportEvent::ListenerError {
+                    addr: listener,
+                    error: Box::new(error.into()),
+                });
+            }
+            TcpEvent::AcceptRecovered { listener } => {
+                self.pending
+                    .push_back(TransportEvent::ListenerRecovered { addr: listener });
+            }
         }
     }
 

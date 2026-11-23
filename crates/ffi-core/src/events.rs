@@ -771,6 +771,22 @@ pub enum P2pEvent {
         /// Why it failed.
         cause: IdentifyFailure,
     },
+    /// A listener could not take an inbound connection (out of file
+    /// descriptors, say). The listener stays open and keeps retrying;
+    /// reported once per change in failure state, and followed by
+    /// `ListenerRecovered` once a connection is accepted again.
+    ListenerError {
+        /// The listener's bound address.
+        addr: String,
+        /// Human-readable failure detail.
+        detail: String,
+    },
+    /// A listener accepted a connection again after its last
+    /// `ListenerError`.
+    ListenerRecovered {
+        /// The listener's bound address.
+        addr: String,
+    },
 }
 
 /// Edge-triggered notification implemented by a binding shell.
@@ -907,6 +923,13 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: stream.conn_id().as_u64(),
             stream_id: stream.stream_id().as_u64(),
+        },
+        EndpointEvent::ListenerError { addr, error } => P2pEvent::ListenerError {
+            addr: addr.to_string(),
+            detail: error.to_string(),
+        },
+        EndpointEvent::ListenerRecovered { addr } => P2pEvent::ListenerRecovered {
+            addr: addr.to_string(),
         },
         _ => return None,
     })
@@ -1635,6 +1658,29 @@ mod tests {
                 to: PathKind::Punched,
                 old_conn_id: 4,
                 new_conn_id: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn listener_failures_and_recoveries_name_the_listener() {
+        let addr = Multiaddr::from_str("/ip4/0.0.0.0/tcp/4001").expect("address");
+        assert_eq!(
+            convert_endpoint_event(EndpointEvent::ListenerError {
+                addr: addr.clone(),
+                error: minip2p::TransportError::ResourceExhausted {
+                    resource: "readiness tokens",
+                },
+            }),
+            Some(P2pEvent::ListenerError {
+                addr: addr.to_string(),
+                detail: "resource exhausted: readiness tokens".into(),
+            })
+        );
+        assert_eq!(
+            convert_endpoint_event(EndpointEvent::ListenerRecovered { addr: addr.clone() }),
+            Some(P2pEvent::ListenerRecovered {
+                addr: addr.to_string(),
             })
         );
     }

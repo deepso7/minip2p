@@ -2437,6 +2437,8 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.EndpointError]: "endpointError",
   [P2pEvent_Tags.ReachabilityChanged]: "reachabilityChanged",
   [P2pEvent_Tags.ListenAddressesChanged]: "listenAddressesChanged",
+  [P2pEvent_Tags.ListenerError]: "listenerError",
+  [P2pEvent_Tags.ListenerRecovered]: "listenerRecovered",
   [P2pEvent_Tags.PublicAddressesChanged]: "publicAddressesChanged",
   [P2pEvent_Tags.RelayReserved]: "relayReserved",
   [P2pEvent_Tags.RelayReservationLost]: "relayReservationLost",

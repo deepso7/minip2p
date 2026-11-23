@@ -38,6 +38,14 @@ const MAX_READS_PER_POLL: usize = 8;
 /// Connections accepted in a single poll, for the same reason.
 const MAX_ACCEPTS_PER_POLL: usize = 32;
 
+/// How long, in milliseconds, a listener waits after a failed `accept` before
+/// trying again, matching mDNS's `MDNS_FAILURE_RETRY`.
+///
+/// Readiness is edge-triggered, so connections already queued when `accept`
+/// failed (out of descriptors, say) raise no further edge; without a timer
+/// they would wait for an unrelated wake.
+pub const ACCEPT_FAILURE_RETRY: u64 = 100;
+
 fn io_error(operation: TcpIoOperation, error: &std::io::Error) -> TcpError {
     TcpError::Io {
         operation,
@@ -150,6 +158,11 @@ struct Listener {
     /// Its registration token, once attached.
     token: Option<Token>,
     bound: Multiaddr,
+    /// The failure last reported as [`TcpEvent::AcceptFailed`], until a
+    /// stream is accepted again.
+    failure: Option<TcpError>,
+    /// When to retry a failed `accept`, while one is owed.
+    retry_at: Option<Deadline>,
 }
 
 /// What a registration token currently stands for.
@@ -411,7 +424,12 @@ impl StdTcpProvider {
     /// flood on the lowest-token listener spend the whole budget every time
     /// and starve every later bind indefinitely; rotating the start costs one
     /// index and guarantees each listener leads a poll in turn.
-    fn accept_all(&mut self) {
+    ///
+    /// A failed `accept` ends that listener's turn and schedules a retry
+    /// [`ACCEPT_FAILURE_RETRY`] after `now`; a stream whose setup fails is
+    /// dropped and the listener carries on. Either failure is reported
+    /// through [`record_failure`](Self::record_failure).
+    fn accept_all(&mut self, now: Now) {
         let tokens: Vec<usize> = self.listeners.keys().copied().collect();
         if tokens.is_empty() {
             return;
@@ -426,24 +444,69 @@ impl StdTcpProvider {
                     self.deferred_work = true;
                     return;
                 }
-                let Some(listener) = self.listeners.get(&token) else {
+                let Some(listener) = self.listeners.get_mut(&token) else {
                     break;
                 };
                 match listener.listener.accept() {
                     Ok((stream, peer)) => {
                         budget -= 1;
-                        if let Err(error) = self.adopt(stream, socket_addr_to_multiaddr(peer)) {
-                            let _ = error;
+                        listener.retry_at = None;
+                        match self.adopt(stream, socket_addr_to_multiaddr(peer)) {
+                            Ok(()) => self.record_recovery(token),
+                            Err(error) => self.record_failure(token, error),
                         }
                     }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        listener.retry_at = None;
+                        break;
+                    }
                     Err(error) if error.kind() == ErrorKind::Interrupted => {
                         budget -= 1;
                         continue;
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        listener.retry_at = Some(now.deadline_after(ACCEPT_FAILURE_RETRY));
+                        self.record_failure(token, io_error(TcpIoOperation::Accept, &error));
+                        break;
+                    }
                 }
             }
+        }
+    }
+
+    /// Reports `error` on listener `key` unless it repeats the failure
+    /// already reported.
+    ///
+    /// The whole error is compared, platform text included: distinct errnos
+    /// such as `EMFILE` and `ENOBUFS` share an [`IoErrorKind`](minip2p_core::platform::IoErrorKind),
+    /// and the text for one errno does not drift between attempts.
+    fn record_failure(&mut self, key: usize, error: TcpError) {
+        let Some(listener) = self.listeners.get_mut(&key) else {
+            return;
+        };
+        if listener
+            .failure
+            .as_ref()
+            .is_some_and(|reported| *reported == error)
+        {
+            return;
+        }
+        listener.failure = Some(error.clone());
+        self.ready.push_back(TcpEvent::AcceptFailed {
+            listener: listener.bound.clone(),
+            error,
+        });
+    }
+
+    /// Reports listener `key` recovered, if it was failing.
+    fn record_recovery(&mut self, key: usize) {
+        let Some(listener) = self.listeners.get_mut(&key) else {
+            return;
+        };
+        if listener.failure.take().is_some() {
+            self.ready.push_back(TcpEvent::AcceptRecovered {
+                listener: listener.bound.clone(),
+            });
         }
     }
 
@@ -615,18 +678,20 @@ impl StdTcpProvider {
     }
 
     fn discard_queued(&mut self, handle: SocketHandle) {
-        self.ready.retain(|event| event_socket(event) != handle);
+        self.ready
+            .retain(|event| event_socket(event) != Some(handle));
     }
 }
 
-fn event_socket(event: &TcpEvent) -> SocketHandle {
+fn event_socket(event: &TcpEvent) -> Option<SocketHandle> {
     match event {
         TcpEvent::Accepted { socket, .. }
         | TcpEvent::Connected { socket, .. }
         | TcpEvent::Received { socket, .. }
         | TcpEvent::RemoteWriteClosed { socket }
         | TcpEvent::Writable { socket }
-        | TcpEvent::Closed { socket, .. } => *socket,
+        | TcpEvent::Closed { socket, .. } => Some(*socket),
+        TcpEvent::AcceptFailed { .. } | TcpEvent::AcceptRecovered { .. } => None,
     }
 }
 
@@ -649,6 +714,8 @@ impl TcpProvider for StdTcpProvider {
                 listener,
                 token,
                 bound: bound.clone(),
+                failure: None,
+                retry_at: None,
             },
         );
         Ok(bound)
@@ -748,7 +815,7 @@ impl TcpProvider for StdTcpProvider {
         self.discard_queued(socket);
     }
 
-    fn poll(&mut self, _now: Now) -> Result<Vec<TcpEvent>, TcpError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TcpEvent>, TcpError> {
         self.deferred_work = false;
         self.dispatched = false;
         if self.registration.is_none() {
@@ -759,7 +826,7 @@ impl TcpProvider for StdTcpProvider {
                     .map(|(handle, _)| *handle),
             );
         }
-        self.accept_all();
+        self.accept_all(now);
 
         for handle in self.connecting.iter().copied().collect::<Vec<_>>() {
             self.settle_connect(handle);
@@ -773,13 +840,20 @@ impl TcpProvider for StdTcpProvider {
     /// Due now while anything learned from readiness is still unserviced:
     /// readiness dispatched since the last poll, events not yet handed over, a
     /// socket marked readable, or work a budget deferred. No edge will
-    /// announce those again.
+    /// announce those again. Otherwise due at the earliest retry of a failed
+    /// `accept`, since the connections it left queued raise no edge either.
     fn next_deadline(&self) -> Option<Deadline> {
-        (self.dispatched
+        if self.dispatched
             || !self.ready.is_empty()
             || self.deferred_work
-            || !self.readable.is_empty())
-        .then_some(Deadline::IMMEDIATE)
+            || !self.readable.is_empty()
+        {
+            return Some(Deadline::IMMEDIATE);
+        }
+        self.listeners
+            .values()
+            .filter_map(|listener| listener.retry_at)
+            .min()
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -1068,6 +1142,124 @@ mod tests {
             TcpProvider::next_deadline(&server),
             None,
             "read to WouldBlock, nothing left owed"
+        );
+    }
+
+    fn std_addr(addr: &Multiaddr) -> String {
+        addr.to_string().replace("/ip4/", "").replace("/tcp/", ":")
+    }
+
+    /// Polls until `wanted` holds for the events seen so far, returning them
+    /// all.
+    fn poll_until(
+        provider: &mut StdTcpProvider,
+        wanted: impl Fn(&[TcpEvent]) -> bool,
+    ) -> Vec<TcpEvent> {
+        let started = Instant::now();
+        let mut seen = Vec::new();
+        while !wanted(&seen) {
+            assert!(started.elapsed() < Duration::from_secs(5), "saw {seen:?}");
+            seen.extend(provider.poll(Now::from_millis(0)).expect("poll"));
+            thread::sleep(Duration::from_millis(1));
+        }
+        seen
+    }
+
+    fn failures(events: &[TcpEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, TcpEvent::AcceptFailed { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_changed_failure_is_reported_and_a_repeat_is_not() {
+        let (mut server, bound) = loopback_listener();
+        let failure = |detail: &str| TcpError::Io {
+            operation: TcpIoOperation::Accept,
+            kind: minip2p_core::platform::IoErrorKind::Other,
+            detail: detail.to_string(),
+        };
+        for detail in [
+            "Too many open files (os error 24)",
+            "Too many open files (os error 24)",
+            "No buffer space available (os error 105)",
+        ] {
+            server.record_failure(0, failure(detail));
+        }
+        let events = server.poll(Now::from_millis(0)).expect("poll");
+        assert_eq!(
+            events,
+            [
+                TcpEvent::AcceptFailed {
+                    listener: bound.clone(),
+                    error: failure("Too many open files (os error 24)"),
+                },
+                TcpEvent::AcceptFailed {
+                    listener: bound,
+                    error: failure("No buffer space available (os error 105)"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_adopt_is_reported_once_and_recovery_follows_a_later_accept() {
+        let (mut server, bound) = loopback_listener();
+        let poll = mio::Poll::new().expect("poll");
+        let waker = Arc::new(Waker::new(poll.registry(), Token(usize::MAX)).expect("waker"));
+        let two_tokens = TokenSpace::full()
+            .subspace(usize::BITS - 1, 0)
+            .expect("a one-bit space");
+        server
+            .attach(
+                poll.registry().try_clone().expect("registry"),
+                two_tokens,
+                waker,
+            )
+            .expect("attach");
+
+        let _first = std::net::TcpStream::connect(std_addr(&bound)).expect("first peer");
+        let events = poll_until(&mut server, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TcpEvent::Accepted { .. }))
+        });
+        let Some(&TcpEvent::Accepted { socket: first, .. }) = events.first() else {
+            panic!("the first stream takes the last token: {events:?}");
+        };
+
+        let _refused: Vec<_> = (0..3)
+            .map(|_| std::net::TcpStream::connect(std_addr(&bound)).expect("peer"))
+            .collect();
+        let mut events = poll_until(&mut server, |events| failures(events) == 1);
+        assert!(matches!(
+            events.as_slice(),
+            [TcpEvent::AcceptFailed {
+                listener,
+                error: TcpError::Exhausted { .. },
+            }] if *listener == bound
+        ));
+        thread::sleep(Duration::from_millis(20));
+        events.extend(server.poll(Now::from_millis(0)).expect("poll"));
+        assert_eq!(failures(&events), 1, "repeats are not reported: {events:?}");
+
+        server.abort(first);
+        let _last = std::net::TcpStream::connect(std_addr(&bound)).expect("last peer");
+        let events = poll_until(&mut server, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TcpEvent::AcceptRecovered { .. }))
+        });
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    TcpEvent::Accepted { .. },
+                    TcpEvent::AcceptRecovered { listener },
+                ] if *listener == bound
+            ),
+            "{events:?}"
         );
     }
 

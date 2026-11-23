@@ -4,9 +4,9 @@
 //! capability (NAT, Gossipsub, Discovery, mDNS, relay-server) transitions all
 //! leave through [`EndpointEvent`].
 
-use minip2p_core::{Bytes, Path, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyFailure, IdentifyMessage, PingFailure, SwarmEvent, SwarmRuntimeError};
-use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamKey};
+use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamKey, TransportError};
 
 use crate::ProtocolId;
 use crate::connect::{ConnectId, ConnectOutcome};
@@ -213,6 +213,21 @@ pub enum EndpointEvent {
     /// for the application to republish. External-address changes never
     /// fire it.
     ListenAddressesChanged { addrs: alloc::vec::Vec<PeerAddr> },
+    /// The listener on `addr` could not take an inbound connection (out of
+    /// file descriptors, say), for `error`.
+    ///
+    /// A capability failure event: the listener stays open and keeps
+    /// retrying (every `ACCEPT_FAILURE_RETRY`, 100 ms, for a failed TCP
+    /// `accept`), and the rest of the endpoint is unaffected. Reported once
+    /// per change in failure state; [`Self::ListenerRecovered`] follows once
+    /// a connection is accepted again.
+    ListenerError {
+        addr: Multiaddr,
+        error: TransportError,
+    },
+    /// The listener on `addr` accepted a connection again after its last
+    /// [`Self::ListenerError`].
+    ListenerRecovered { addr: Multiaddr },
     /// The one terminal event of a Connection attempt.
     ///
     /// On success, [`Self::ConnectionEstablished`] for the peer is delivered
@@ -436,6 +451,8 @@ impl EndpointEvent {
                 reason,
             },
             SwarmEvent::ListenAddressesChanged { addrs } => Self::ListenAddressesChanged { addrs },
+            SwarmEvent::ListenerError { addr, error } => Self::ListenerError { addr, error },
+            SwarmEvent::ListenerRecovered { addr } => Self::ListenerRecovered { addr },
         }
     }
 }

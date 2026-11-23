@@ -198,7 +198,9 @@ fn event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::Error { id, .. }
         | TransportEvent::IncomingConnection { id, .. }
         | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
-        TransportEvent::Listening { .. } => None,
+        TransportEvent::Listening { .. }
+        | TransportEvent::ListenerError { .. }
+        | TransportEvent::ListenerRecovered { .. } => None,
     }
 }
 

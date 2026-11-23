@@ -121,5 +121,5 @@ pub use provider::{SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider
 #[cfg(feature = "smoltcp")]
 pub use smoltcp_provider::{SmoltcpConfig, SmoltcpTcpProvider};
 #[cfg(feature = "std")]
-pub use std_provider::StdTcpProvider;
+pub use std_provider::{ACCEPT_FAILURE_RETRY, StdTcpProvider};
 pub use transport::TcpTransport;

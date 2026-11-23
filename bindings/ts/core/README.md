@@ -79,4 +79,6 @@ const endpoint = Minip2p.create({
 
 With mDNS enabled, `mdnsFailed` (`{ kind, detail }`, `kind` from `MdnsFailureKind`) reports a hard mDNS failure once per change in failure state. mDNS keeps running and retries, and `mdnsRecovered` follows once a retry succeeds; a goodbye that failed during shutdown is final.
 
+`listenerError` (`{ addr, detail }`) reports a listener that cannot take inbound connections (out of file descriptors, say), once per change in failure state. The listener stays open and retries, and `listenerRecovered` (`{ addr }`) follows once it accepts again.
+
 Raw native unions, the `Minip2pBackend` adapter contract, `resolveEndpointConfig` (shared config defaults and validation), and `typedFfiError` (native `FfiError` variant to typed SDK error) are available from `@minip2p/core/backend`.

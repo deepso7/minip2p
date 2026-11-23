@@ -408,7 +408,9 @@ fn transport_event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::Error { id, .. }
         | TransportEvent::IncomingConnection { id, .. }
         | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
-        TransportEvent::Listening { .. } => None,
+        TransportEvent::Listening { .. }
+        | TransportEvent::ListenerError { .. }
+        | TransportEvent::ListenerRecovered { .. } => None,
     }
 }
 
@@ -888,6 +890,16 @@ impl SwarmState {
                 self.handle_connection_closed(id, reason);
             }
             TransportEvent::Listening { .. } => {}
+            TransportEvent::ListenerError { addr, error } => {
+                self.events.push_back(SwarmEvent::ListenerError {
+                    addr,
+                    error: *error,
+                });
+            }
+            TransportEvent::ListenerRecovered { addr } => {
+                self.events
+                    .push_back(SwarmEvent::ListenerRecovered { addr });
+            }
             TransportEvent::Error { id, message } => {
                 if let Some(ConnPhase::Dialing(pending) | ConnPhase::Vetoed(pending)) =
                     self.conn_phases.get_mut(&id)
