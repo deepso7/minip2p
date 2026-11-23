@@ -92,6 +92,8 @@ pub enum TcpIoOperation {
     Write,
     /// Half-closing a stream's write side.
     HalfClose,
+    /// Accepting an inbound stream on a listener.
+    Accept,
 }
 
 impl TcpIoOperation {
@@ -105,6 +107,7 @@ impl TcpIoOperation {
             Self::Register => "registering a socket",
             Self::Write => "writing to a stream",
             Self::HalfClose => "half-closing a stream",
+            Self::Accept => "accepting a connection",
         }
     }
 }
@@ -188,6 +191,25 @@ pub enum TcpEvent {
         socket: SocketHandle,
         /// What happened, when it was a failure rather than an orderly end.
         reason: Option<String>,
+    },
+    /// A listener could not take an inbound stream: `accept` itself failed
+    /// (out of descriptors, say) or the accepted stream could not be set up.
+    ///
+    /// A capability failure event: the listener stays open and the provider
+    /// keeps retrying. Reported once per change in failure state, so a
+    /// failure that keeps recurring is reported once;
+    /// [`TcpEvent::AcceptRecovered`] follows once a stream is accepted again.
+    AcceptFailed {
+        /// The listener's bound address.
+        listener: Multiaddr,
+        /// Why the accept failed.
+        error: TcpError,
+    },
+    /// A listener accepted a stream again after its last
+    /// [`TcpEvent::AcceptFailed`].
+    AcceptRecovered {
+        /// The listener's bound address.
+        listener: Multiaddr,
     },
 }
 

@@ -3,7 +3,7 @@ use alloc::string::String;
 
 use minip2p_core::{Bytes, Multiaddr, PeerId};
 
-use crate::{ConnectionCloseReason, ConnectionEndpoint, ConnectionId, StreamId};
+use crate::{ConnectionCloseReason, ConnectionEndpoint, ConnectionId, StreamId, TransportError};
 
 /// Events emitted by a transport back to the host.
 ///
@@ -99,6 +99,20 @@ pub enum TransportEvent {
     },
     /// The transport is now listening on the given address.
     Listening { addr: Multiaddr },
+    /// The listener on `addr` could not take an inbound connection (out of
+    /// file descriptors, say), for `error`.
+    ///
+    /// A capability failure event: the listener stays open and the
+    /// transport keeps retrying. Reported once per change in failure state;
+    /// [`ListenerRecovered`](Self::ListenerRecovered) follows once a
+    /// connection is accepted again.
+    ListenerError {
+        addr: Multiaddr,
+        error: Box<TransportError>,
+    },
+    /// The listener on `addr` accepted a connection again after its last
+    /// [`ListenerError`](Self::ListenerError).
+    ListenerRecovered { addr: Multiaddr },
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]

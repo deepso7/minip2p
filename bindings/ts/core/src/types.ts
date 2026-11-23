@@ -471,6 +471,15 @@ export interface Minip2pNamedEventMap {
    * `listenAddrs()` now returns), for the app to republish.
    */
   listenAddressesChanged: { readonly addrs: readonly string[] };
+  /**
+   * The listener on `addr` could not take an inbound connection (out of file
+   * descriptors, say). The listener stays open and keeps retrying; reported
+   * once per change in failure state, and `listenerRecovered` follows once a
+   * connection is accepted again.
+   */
+  listenerError: { readonly addr: string; readonly detail: string };
+  /** The listener on `addr` accepted a connection again after its last `listenerError`. */
+  listenerRecovered: { readonly addr: string };
   publicAddressesChanged: { readonly addrs: readonly string[] };
   relayReserved: {
     readonly relayPeerId: string;
@@ -759,6 +768,8 @@ export const P2pEvent_Tags = {
   InboundDirectUpgrade: "InboundDirectUpgrade",
   InboundPathEstablished: "InboundPathEstablished",
   ListenAddressesChanged: "ListenAddressesChanged",
+  ListenerError: "ListenerError",
+  ListenerRecovered: "ListenerRecovered",
   MdnsFailed: "MdnsFailed",
   MdnsRecovered: "MdnsRecovered",
   Message: "Message",
@@ -871,6 +882,14 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.ListenAddressesChanged,
       Minip2pNamedEventMap["listenAddressesChanged"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.ListenerError,
+      Minip2pNamedEventMap["listenerError"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.ListenerRecovered,
+      Minip2pNamedEventMap["listenerRecovered"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.PublicAddressesChanged,
