@@ -658,18 +658,6 @@ pub enum P2pEvent {
         /// Direct connection now carrying the peer.
         new_conn_id: u64,
     },
-    /// The transport failed to send a hole-punch datagram during an inbound
-    /// DCUtR round; reported at most once per round. The round continues.
-    InboundHolePunchSendFailed {
-        /// Peer the circuit's hole punch targets.
-        peer_id: String,
-        /// One-based DCUtR round.
-        attempt: u32,
-        /// Punch target of the first datagram that failed.
-        target: String,
-        /// Human-readable failure detail.
-        reason: String,
-    },
     /// An accepted pubsub message arrived.
     ///
     /// When unsigned messages are enabled, `signed` can be `false`; hosts
@@ -798,6 +786,18 @@ pub enum P2pEvent {
     ListenerRecovered {
         /// The listener's bound address.
         addr: String,
+    },
+    /// The transport failed to send a hole-punch datagram during an inbound
+    /// DCUtR round; reported at most once per round. The round continues.
+    InboundHolePunchSendFailed {
+        /// Peer the circuit's hole punch targets.
+        peer_id: String,
+        /// One-based DCUtR round.
+        attempt: u32,
+        /// Punch target of the first datagram that failed.
+        target: String,
+        /// Human-readable failure detail.
+        reason: String,
     },
 }
 

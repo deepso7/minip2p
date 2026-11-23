@@ -3443,7 +3443,6 @@ export enum P2pEvent_Tags {
     ConnectFailed = "ConnectFailed",
     ConnectCancelled = "ConnectCancelled",
     InboundDirectUpgrade = "InboundDirectUpgrade",
-    InboundHolePunchSendFailed = "InboundHolePunchSendFailed",
     Message = "Message",
     PeerSubscribed = "PeerSubscribed",
     PeerUnsubscribed = "PeerUnsubscribed",
@@ -3458,7 +3457,8 @@ export enum P2pEvent_Tags {
     DiscoveryProtocolViolation = "DiscoveryProtocolViolation",
     IdentifyFailed = "IdentifyFailed",
     ListenerError = "ListenerError",
-    ListenerRecovered = "ListenerRecovered"
+    ListenerRecovered = "ListenerRecovered",
+    InboundHolePunchSendFailed = "InboundHolePunchSendFailed"
 }
 /**
  * Event delivered by the native endpoint driver.
@@ -4466,41 +4466,6 @@ inner: {peerId: string; oldConnId: bigint; newConnId: bigint }): InboundDirectUp
 
     }
 
-    type InboundHolePunchSendFailed__interface = {
-        tag: P2pEvent_Tags.InboundHolePunchSendFailed;
-        inner:
-Readonly<{peerId: string; attempt: number; target: string; reason: string}>
-    };
-    /**
-     * The transport failed to send a hole-punch datagram during an inbound
-     * DCUtR round; reported at most once per round. The round continues.
-     */
-    class InboundHolePunchSendFailed_ extends UniffiEnum implements InboundHolePunchSendFailed__interface {
-        /**
-         * @private
-         * This field is private and should not be used, use `tag` instead.
-         */
-        readonly [uniffiTypeNameSymbol] = "P2pEvent";
-        readonly tag = P2pEvent_Tags.InboundHolePunchSendFailed;
-        readonly inner:
-Readonly<{peerId: string; attempt: number; target: string; reason: string}>;
-        constructor(
-inner: {peerId: string; attempt: number; target: string; reason: string }) {
-            super("P2pEvent", "InboundHolePunchSendFailed");
-
-            this.inner = Object.freeze(inner);
-        }
-        static new(
-inner: {peerId: string; attempt: number; target: string; reason: string }): InboundHolePunchSendFailed_ {
-            return new InboundHolePunchSendFailed_(inner);
-        }
-
-        static instanceOf(obj: any): obj is InboundHolePunchSendFailed_ {
-            return obj.tag === P2pEvent_Tags.InboundHolePunchSendFailed;
-        }
-
-    }
-
     type Message__interface = {
         tag: P2pEvent_Tags.Message;
         inner:
@@ -5018,6 +4983,41 @@ inner: {addr: string }): ListenerRecovered_ {
 
     }
 
+    type InboundHolePunchSendFailed__interface = {
+        tag: P2pEvent_Tags.InboundHolePunchSendFailed;
+        inner:
+Readonly<{peerId: string; attempt: number; target: string; reason: string}>
+    };
+    /**
+     * The transport failed to send a hole-punch datagram during an inbound
+     * DCUtR round; reported at most once per round. The round continues.
+     */
+    class InboundHolePunchSendFailed_ extends UniffiEnum implements InboundHolePunchSendFailed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.InboundHolePunchSendFailed;
+        readonly inner:
+Readonly<{peerId: string; attempt: number; target: string; reason: string}>;
+        constructor(
+inner: {peerId: string; attempt: number; target: string; reason: string }) {
+            super("P2pEvent", "InboundHolePunchSendFailed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {peerId: string; attempt: number; target: string; reason: string }): InboundHolePunchSendFailed_ {
+            return new InboundHolePunchSendFailed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is InboundHolePunchSendFailed_ {
+            return obj.tag === P2pEvent_Tags.InboundHolePunchSendFailed;
+        }
+
+    }
+
     function instanceOf(obj: any): obj is P2pEvent {
         return obj[uniffiTypeNameSymbol] === "P2pEvent";
     }
@@ -5053,7 +5053,6 @@ inner: {addr: string }): ListenerRecovered_ {
   ConnectFailed: ConnectFailed_,
   ConnectCancelled: ConnectCancelled_,
   InboundDirectUpgrade: InboundDirectUpgrade_,
-  InboundHolePunchSendFailed: InboundHolePunchSendFailed_,
   Message: Message_,
   PeerSubscribed: PeerSubscribed_,
   PeerUnsubscribed: PeerUnsubscribed_,
@@ -5068,7 +5067,8 @@ inner: {addr: string }): ListenerRecovered_ {
   DiscoveryProtocolViolation: DiscoveryProtocolViolation_,
   IdentifyFailed: IdentifyFailed_,
   ListenerError: ListenerError_,
-  ListenerRecovered: ListenerRecovered_
+  ListenerRecovered: ListenerRecovered_,
+  InboundHolePunchSendFailed: InboundHolePunchSendFailed_
     });
 
 })();
@@ -5076,7 +5076,7 @@ inner: {addr: string }): ListenerRecovered_ {
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'InboundHolePunchSendFailed' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed' | 'ListenerError' | 'ListenerRecovered']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed' | 'ListenerError' | 'ListenerRecovered' | 'InboundHolePunchSendFailed']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -5114,22 +5114,22 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 27: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 28: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
                 case 29: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
-                case 30: return new P2pEvent.InboundHolePunchSendFailed({peerId: FfiConverterString.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), target: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 31: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
-                case 32: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 33: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 34: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 35: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 36: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 37: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 38: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
-                case 39: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 40: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 41: return new P2pEvent.MdnsRecovered();
-                case 42: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
-                case 43: return new P2pEvent.IdentifyFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypeIdentifyFailure.readFromCursor(c) });
-                case 44: return new P2pEvent.ListenerError({addr: FfiConverterString.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 45: return new P2pEvent.ListenerRecovered({addr: FfiConverterString.readFromCursor(c) });
+                case 30: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
+                case 31: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 32: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 33: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 34: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 35: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 36: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 37: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
+                case 38: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 39: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 40: return new P2pEvent.MdnsRecovered();
+                case 41: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
+                case 42: return new P2pEvent.IdentifyFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypeIdentifyFailure.readFromCursor(c) });
+                case 43: return new P2pEvent.ListenerError({addr: FfiConverterString.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 44: return new P2pEvent.ListenerRecovered({addr: FfiConverterString.readFromCursor(c) });
+                case 45: return new P2pEvent.InboundHolePunchSendFailed({peerId: FfiConverterString.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), target: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -5367,17 +5367,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterUInt64.writeIntoCursor(inner.newConnId, c);
                     return;
                 }
-                case P2pEvent_Tags.InboundHolePunchSendFailed: {
-                    c.writeI32(30);
-                    const inner = value.inner;
-                    FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterUInt32.writeIntoCursor(inner.attempt, c);
-                    FfiConverterString.writeIntoCursor(inner.target, c);
-                    FfiConverterString.writeIntoCursor(inner.reason, c);
-                    return;
-                }
                 case P2pEvent_Tags.Message: {
-                    c.writeI32(31);
+                    c.writeI32(30);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.fromPeerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.topics, c);
@@ -5387,35 +5378,35 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerSubscribed: {
-                    c.writeI32(32);
+                    c.writeI32(31);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
                 case P2pEvent_Tags.PeerUnsubscribed: {
-                    c.writeI32(33);
+                    c.writeI32(32);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
                 case P2pEvent_Tags.GossipsubOutboundFailure: {
-                    c.writeI32(34);
+                    c.writeI32(33);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.GossipsubProtocolViolation: {
-                    c.writeI32(35);
+                    c.writeI32(34);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.PeerDiscovered: {
-                    c.writeI32(36);
+                    c.writeI32(35);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
@@ -5423,7 +5414,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerUpdated: {
-                    c.writeI32(37);
+                    c.writeI32(36);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
@@ -5431,31 +5422,31 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerExpired: {
-                    c.writeI32(38);
+                    c.writeI32(37);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryDialFailed: {
-                    c.writeI32(39);
+                    c.writeI32(38);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.MdnsFailed: {
-                    c.writeI32(40);
+                    c.writeI32(39);
                     const inner = value.inner;
                     FfiConverterTypeMdnsFailureKind.writeIntoCursor(inner.kind, c);
                     FfiConverterString.writeIntoCursor(inner.detail, c);
                     return;
                 }
                 case P2pEvent_Tags.MdnsRecovered: {
-                    c.writeI32(41);
+                    c.writeI32(40);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryProtocolViolation: {
-                    c.writeI32(42);
+                    c.writeI32(41);
                     const inner = value.inner;
                     FfiConverterOptionalString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
@@ -5464,7 +5455,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.IdentifyFailed: {
-                    c.writeI32(43);
+                    c.writeI32(42);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -5472,16 +5463,25 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.ListenerError: {
-                    c.writeI32(44);
+                    c.writeI32(43);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.addr, c);
                     FfiConverterString.writeIntoCursor(inner.detail, c);
                     return;
                 }
                 case P2pEvent_Tags.ListenerRecovered: {
-                    c.writeI32(45);
+                    c.writeI32(44);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.addr, c);
+                    return;
+                }
+                case P2pEvent_Tags.InboundHolePunchSendFailed: {
+                    c.writeI32(45);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt32.writeIntoCursor(inner.attempt, c);
+                    FfiConverterString.writeIntoCursor(inner.target, c);
+                    FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 default:
@@ -5723,15 +5723,6 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterUInt64.allocationSize(inner.newConnId);
                     return size;
                 }
-                case P2pEvent_Tags.InboundHolePunchSendFailed: {
-                    const inner = value.inner;
-                    let size = 4;
-                    size += FfiConverterString.allocationSize(inner.peerId);
-                    size += FfiConverterUInt32.allocationSize(inner.attempt);
-                    size += FfiConverterString.allocationSize(inner.target);
-                    size += FfiConverterString.allocationSize(inner.reason);
-                    return size;
-                }
                 case P2pEvent_Tags.Message: {
                     const inner = value.inner;
                     let size = 4;
@@ -5837,6 +5828,15 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.addr);
+                    return size;
+                }
+                case P2pEvent_Tags.InboundHolePunchSendFailed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.peerId);
+                    size += FfiConverterUInt32.allocationSize(inner.attempt);
+                    size += FfiConverterString.allocationSize(inner.target);
+                    size += FfiConverterString.allocationSize(inner.reason);
                     return size;
                 }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();

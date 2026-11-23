@@ -743,6 +743,9 @@ fn open_round(
         return None;
     };
     shared.own_stream(source, conn, stream, StreamRole::DcutrInbound(id));
+    if budget.rounds() == 1 {
+        shared.punch_send_failures.remove(source);
+    }
     Some(Round::Exchange(Exchange {
         conn,
         stream,

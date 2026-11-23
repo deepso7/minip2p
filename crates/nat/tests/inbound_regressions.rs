@@ -5,8 +5,8 @@ mod common;
 use common::*;
 use minip2p_swarm::ConnectionCloseReason;
 
-use minip2p_core::PeerAddr;
 use minip2p_core::{Multiaddr, Protocol};
+use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
     DCUTR_PROTOCOL_ID, Deadline, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID,
 };
@@ -1054,10 +1054,12 @@ fn a_punch_during_a_later_round_still_turns_passive() {
     assert_eq!(upgrade_count(&drain_events(&mut h.agent)), 1);
 }
 
-/// Reports every blast in `actions` as failed to send, the way a driver
-/// whose transport rejects each datagram would, and returns the events.
-fn fail_every_blast(h: &mut Harness, actions: Vec<Out>) -> Vec<NatEvent> {
-    for out in actions {
+/// Drains the agent's actions and reports every blast among them as failed
+/// to send, as a driver whose transport rejects each datagram would, then
+/// returns the actions and the events that produced.
+fn fail_blasts(h: &mut Harness) -> (Vec<Out>, Vec<NatEvent>) {
+    let actions = drain_actions(&mut h.agent);
+    for out in &actions {
         if let Out::SendRandomUdp {
             peer,
             attempt,
@@ -1065,23 +1067,28 @@ fn fail_every_blast(h: &mut Harness, actions: Vec<Out>) -> Vec<NatEvent> {
             ..
         } = out
         {
-            h.agent
-                .punch_send_failed(peer, attempt, target, "network unreachable".into());
+            h.agent.punch_send_failed(
+                *peer,
+                *attempt,
+                target.clone(),
+                "network unreachable".into(),
+            );
         }
     }
-    drain_events(&mut h.agent)
+    let events = drain_events(&mut h.agent);
+    (actions, events)
 }
 
-#[test]
-fn punch_send_failures_are_reported_once_per_inbound_round() {
-    let mut h = inbound_harness(NatConfig {
-        punch_deadline_ms: 250,
-        blast_interval_ms: 100,
-        ..NatConfig::default()
-    });
-    let (conn, mut actions) = drive_to_relayed(&mut h);
-    let mut opened_at = 13;
-    for round in 1..=3u32 {
+/// Runs the inbound circuit opened by `actions` through every DCUtR round
+/// with each blast failing, and returns the punch-send failures reported.
+fn run_failing_rounds(
+    h: &mut Harness,
+    conn: ConnectionId,
+    mut actions: Vec<Out>,
+    mut t: u64,
+) -> Vec<NatEvent> {
+    let mut reported = Vec::new();
+    for _ in 1..=3u32 {
         let stream = opened_stream(&actions);
         h.agent.handle_event(
             &SwarmEvent::StreamReady {
@@ -1092,41 +1099,115 @@ fn punch_send_failures_are_reported_once_per_inbound_round() {
                 initiated_locally: true,
             },
             false,
-            at(opened_at),
+            at(t),
         );
         drain_actions(&mut h.agent);
         answer_dcutr_at(
-            &mut h,
+            h,
             conn,
             stream,
             &[
                 "/ip4/8.8.8.8/udp/4001/quic-v1",
                 "/ip4/8.8.4.4/udp/4001/quic-v1",
             ],
-            opened_at,
+            t,
         );
-        let mut blasts = drain_actions(&mut h.agent);
-        h.agent.handle_tick(at(opened_at + 100));
-        blasts.extend(drain_actions(&mut h.agent));
-        opened_at += 250;
-        h.agent.handle_tick(at(opened_at));
-        actions = drain_actions(&mut h.agent);
-        blasts.extend(actions.iter().cloned());
-        assert!(blast_count(&blasts) >= 4, "round {round}");
-
-        let events = fail_every_blast(&mut h, blasts);
-
-        assert!(
-            matches!(
-                events.as_slice(),
-                [NatEvent::InboundHolePunchSendFailed { peer, attempt, target, .. }]
-                    if *peer == h.target
-                        && *attempt == round
-                        && *target == maddr("/ip4/8.8.8.8/udp/4001/quic-v1")
-            ),
-            "round {round}: {events:?}"
-        );
-        assert_eq!(events[0].connect_id(), None);
+        let mut blasts = 0;
+        for tick in [None, Some(t + 100), Some(t + 250)] {
+            if let Some(tick) = tick {
+                h.agent.handle_tick(at(tick));
+            }
+            let (out, events) = fail_blasts(h);
+            blasts += blast_count(&out);
+            reported.extend(events);
+            actions = out;
+        }
+        assert!(blasts >= 6);
+        t += 250;
     }
+    reported
+}
+
+fn rounds_reported(events: &[NatEvent], source: PeerId) -> Vec<u32> {
+    events
+        .iter()
+        .map(|event| match event {
+            NatEvent::InboundHolePunchSendFailed {
+                peer,
+                attempt,
+                target,
+                ..
+            } => {
+                assert_eq!(*peer, source);
+                assert_eq!(*target, maddr("/ip4/8.8.8.8/udp/4001/quic-v1"));
+                assert_eq!(event.connect_id(), None);
+                *attempt
+            }
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn punch_send_failures_are_reported_once_per_inbound_round() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 100,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+
+    let events = run_failing_rounds(&mut h, conn, actions, 13);
+
+    assert_eq!(rounds_reported(&events, h.target), [1, 2, 3]);
     assert!(h.agent.is_idle());
+}
+
+/// A second inbound circuit from the same source, while the first is still
+/// punching, reports its own first round.
+#[test]
+fn a_concurrent_circuit_from_the_same_source_reports_its_own_rounds() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 100,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 13);
+    let (_, events) = fail_blasts(&mut h);
+    assert_eq!(rounds_reported(&events, h.target), [1]);
+
+    let stop = StreamId::new(STOP_STREAM + 1);
+    inbound_stop_stream(&mut h, stop, 20);
+    let target = h.target;
+    h.stream_data(stop, stop_connect(&target), at(20));
+    let promotion = drain_actions(&mut h.agent);
+    let second = complete_promotion(&mut h.agent, &target, &promotion, at(21));
+    drain_events(&mut h.agent);
+    let actions = drain_actions(&mut h.agent);
+    let stream = opened_stream(&actions);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: second,
+            peer_id: h.target,
+            stream_id: stream,
+            protocol_id: DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        at(22),
+    );
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(
+        &mut h,
+        second,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        22,
+    );
+    let (_, events) = fail_blasts(&mut h);
+
+    assert_eq!(rounds_reported(&events, h.target), [1]);
 }

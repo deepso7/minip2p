@@ -108,6 +108,11 @@ pub(crate) struct Shared {
     /// so a release never has to be remembered; a reservation made while
     /// handling the event adds to it.
     circuits_reserved: usize,
+    /// The last inbound punch round per peer whose send failure was
+    /// reported. A peer's circuit starting its first round clears it; the
+    /// next tick drops peers with no inbound circuit left, after the driver
+    /// has fed back every datagram queued before.
+    pub(crate) punch_send_failures: BTreeMap<PeerId, u32>,
 }
 
 impl Shared {
@@ -490,9 +495,6 @@ pub struct NatAgent {
     housekeeping: Housekeeping,
     inbound: BTreeMap<u64, InboundCircuit>,
     next_inbound_id: u64,
-    /// The last inbound punch round per peer whose send failure was
-    /// reported, kept while the peer has an inbound circuit.
-    punch_send_failures: BTreeMap<PeerId, u32>,
     /// Unsent tails of writes the swarm refused as Full, resent on the
     /// stream's Writable.
     held: HeldWrites,
@@ -526,12 +528,12 @@ impl NatAgent {
                 observations: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
                 circuits_reserved: 0,
+                punch_send_failures: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
             inbound: BTreeMap::new(),
             next_inbound_id: 0,
-            punch_send_failures: BTreeMap::new(),
             held: HeldWrites::new(),
         }
     }
@@ -981,6 +983,10 @@ impl NatAgent {
     /// Advances time-based state: stagger expiry, leg deadlines, punch
     /// windows (the attempts' and the ledger's), connect deadlines.
     pub fn handle_tick<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
+        let inbound = &self.inbound;
+        self.shared
+            .punch_send_failures
+            .retain(|peer, _| inbound.values().any(|c| c.source() == Some(peer)));
         self.holding(swarm, |agent, swarm| {
             for attempt in agent.attempts.values_mut() {
                 attempt.on_tick(swarm, &mut agent.shared, now);
@@ -1125,7 +1131,7 @@ impl NatAgent {
         target: Multiaddr,
         reason: String,
     ) {
-        if self.punch_send_failures.insert(peer, attempt) == Some(attempt) {
+        if self.shared.punch_send_failures.insert(peer, attempt) == Some(attempt) {
             return;
         }
         self.shared
@@ -1398,8 +1404,5 @@ impl NatAgent {
     fn reap_done(&mut self) {
         self.attempts.retain(|_, attempt| !attempt.is_done());
         self.inbound.retain(|_, circuit| !circuit.is_done());
-        let inbound = &self.inbound;
-        self.punch_send_failures
-            .retain(|peer, _| inbound.values().any(|c| c.source() == Some(peer)));
     }
 }
