@@ -29,8 +29,9 @@ use minip2p_transport::{
 };
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
-    ClientConfig, ConnectionHandle, DatagramEvent, EndpointConfig, IdleTimeout, Incoming,
-    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt, congestion,
+    ClientConfig, ConnectionHandle, ConnectionIdGenerator, DatagramEvent, EndpointConfig,
+    IdleTimeout, Incoming, InvalidCid, RandomConnectionIdGenerator, ServerConfig, TransportConfig,
+    ValidationTokenConfig, VarInt, congestion,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
@@ -346,6 +347,70 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     Ok(config)
 }
 
+/// Random bytes in each connection id the endpoint issues.
+const CID_NONCE_LEN: usize = 6;
+/// Keyed-hash bytes after the nonce, so the endpoint drops most short-header
+/// packets whose id it never issued (all but about 1 in 65,536) instead of
+/// answering them.
+const CID_SIGNATURE_LEN: usize = 2;
+
+/// The endpoint's connection ids: a random nonce and its keyed hash, eight
+/// bytes like quinn-proto's default.
+///
+/// That default randomizes only three bytes, and `Endpoint::retry` draws a
+/// Retry's source id without checking it against the ids live connections
+/// hold, which the endpoint routes by first. With hundreds of connections
+/// holding several ids each, a Retry id then matched a live one in about 4%
+/// of 512-dial runs; the client's validated Initials went to that unrelated
+/// connection, which dropped them, and the handshake stalled (#631). Six
+/// random bytes make a match negligible.
+struct CidGenerator {
+    nonces: RandomConnectionIdGenerator,
+    key: std::hash::RandomState,
+}
+
+impl CidGenerator {
+    fn signature(&self, nonce: &[u8]) -> [u8; CID_SIGNATURE_LEN] {
+        let hash = std::hash::BuildHasher::hash_one(&self.key, nonce).to_le_bytes();
+        let mut signature = [0; CID_SIGNATURE_LEN];
+        signature.copy_from_slice(&hash[..CID_SIGNATURE_LEN]);
+        signature
+    }
+}
+
+impl ConnectionIdGenerator for CidGenerator {
+    fn generate_cid(&mut self) -> quinn_proto::ConnectionId {
+        let nonce = self.nonces.generate_cid();
+        let mut id = [0; CID_NONCE_LEN + CID_SIGNATURE_LEN];
+        let (head, tail) = id.split_at_mut(CID_NONCE_LEN);
+        head.copy_from_slice(&nonce);
+        tail.copy_from_slice(&self.signature(&nonce));
+        quinn_proto::ConnectionId::new(&id)
+    }
+
+    fn validate(&self, cid: &quinn_proto::ConnectionId) -> Result<(), InvalidCid> {
+        match cid.split_at_checked(CID_NONCE_LEN) {
+            Some((nonce, signature)) if signature == self.signature(nonce) => Ok(()),
+            _ => Err(InvalidCid),
+        }
+    }
+
+    fn cid_len(&self) -> usize {
+        CID_NONCE_LEN + CID_SIGNATURE_LEN
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+fn cid_generator() -> Box<dyn ConnectionIdGenerator> {
+    Box::new(CidGenerator {
+        nonces: RandomConnectionIdGenerator::new(CID_NONCE_LEN),
+        key: std::hash::RandomState::new(),
+    })
+}
+
 /// Bytes of received QUIC datagrams a WebTransport-serving connection
 /// buffers. Datagrams are not served: each is drained and dropped.
 const DATAGRAM_RECEIVE_BUFFER: usize = 16 * 1024;
@@ -658,7 +723,8 @@ impl QuicTransport {
             None
         };
 
-        let endpoint_config = EndpointConfig::default();
+        let mut endpoint_config = EndpointConfig::default();
+        endpoint_config.cid_generator(cid_generator);
         let max_payload =
             usize::try_from(endpoint_config.get_max_udp_payload_size()).unwrap_or(RECV_BUFFER_SIZE);
         let recv_buf_len = sockets
@@ -1601,6 +1667,23 @@ mod tests {
             .sockets
             .for_addr(addr.parse().expect("addr"))
             .expect("a socket of that family")
+    }
+
+    #[test]
+    fn connection_ids_do_not_repeat_across_many_connections() {
+        let mut generator = cid_generator();
+        let ids: std::collections::HashSet<_> =
+            (0..100_000).map(|_| generator.generate_cid()).collect();
+        assert!(ids.len() >= 99_999, "{} repeated ids", 100_000 - ids.len());
+        assert!(ids.iter().all(|id| generator.validate(id).is_ok()));
+        let forged = (0..=u8::MAX)
+            .filter(|&byte| {
+                generator
+                    .validate(&quinn_proto::ConnectionId::new(&[byte; 8]))
+                    .is_ok()
+            })
+            .count();
+        assert!(forged < 4, "{forged} of 256 forged ids passed validation");
     }
 
     #[test]

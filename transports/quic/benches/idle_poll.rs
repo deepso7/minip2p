@@ -62,10 +62,6 @@ fn busy(transport: &QuicTransport) -> bool {
 }
 
 /// `count` established connections from a client to a server.
-///
-/// The server skips address validation: a Retry round trip is no part of
-/// idle polling, and with hundreds of Retry handshakes in flight from one
-/// client socket under CPU load, one occasionally never completes.
 fn establish(count: usize) -> (QuicTransport, QuicTransport) {
     let setup_timeout = std::env::var("MINIP2P_BENCH_SETUP_TIMEOUT_SECS")
         .ok()
@@ -73,7 +69,6 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
         .map_or(DEFAULT_SETUP_TIMEOUT, Duration::from_secs);
     let limits = QuicLimits {
         idle_timeout_ms: 3_600_000,
-        require_address_validation: false,
         ..QuicLimits::default()
     };
     let mut server = loopback(limits.clone());
