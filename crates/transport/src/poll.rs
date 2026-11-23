@@ -210,6 +210,14 @@ impl<T: Transport + PollSource + ?Sized> BlockingTransport for T {}
 /// Sets a flag, then wakes the poll, so the wait reports an interrupt rather
 /// than a plain wakeup. Interrupts that arrive before one is consumed coalesce
 /// into one; an interrupt with no wait in progress is kept for the next one.
+///
+/// Interrupting returns `()` because a wake fails only in exceptional
+/// conditions, such as kernel resource exhaustion, for which the handles offer
+/// no recovery path: the shared `Arc<mio::Waker>` keeps the OS resource the
+/// wake is issued on alive for as long as any handle exists, Linux's `eventfd`
+/// waker resets the counter and retries on `WouldBlock`, and the kqueue and
+/// IOCP wakers fail only on kernel resource exhaustion. A failed wake trips a
+/// `debug_assert!`; release builds ignore it, as ADR 0013 records.
 #[derive(Clone)]
 pub struct WaitHandle {
     flag: Arc<AtomicBool>,
@@ -218,9 +226,13 @@ pub struct WaitHandle {
 
 impl WaitHandle {
     /// Interrupts the current wait, or the next one if none is active.
+    ///
+    /// Fails only in exceptional conditions (see [`WaitHandle`]); a failed
+    /// wake panics in debug builds.
     pub fn interrupt(&self) {
         self.flag.store(true, Ordering::SeqCst);
-        drop(self.waker.wake());
+        let woken = self.waker.wake();
+        debug_assert!(woken.is_ok(), "SharedPoll interrupt failed: {woken:?}");
     }
 }
 
@@ -234,6 +246,10 @@ impl fmt::Debug for WaitHandle {
 ///
 /// For host work finished on another thread, such as a name lookup: the wait
 /// ends with a host wakeup, never with an interrupt.
+///
+/// Waking returns `()` for the reasons given on [`WaitHandle`], which shares
+/// the same `mio::Waker`. A failed wake trips a `debug_assert!`;
+/// release builds ignore it, as ADR 0013 records.
 #[derive(Clone)]
 pub struct WakeHandle {
     waker: Arc<Waker>,
@@ -241,8 +257,12 @@ pub struct WakeHandle {
 
 impl WakeHandle {
     /// Wakes the current wait, or the next one if none is active.
+    ///
+    /// Fails only in exceptional conditions (see [`WaitHandle`]); a failed
+    /// wake panics in debug builds.
     pub fn wake(&self) {
-        drop(self.waker.wake());
+        let woken = self.waker.wake();
+        debug_assert!(woken.is_ok(), "SharedPoll wake failed: {woken:?}");
     }
 }
 
