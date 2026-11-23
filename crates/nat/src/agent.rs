@@ -108,6 +108,11 @@ pub(crate) struct Shared {
     /// so a release never has to be remembered; a reservation made while
     /// handling the event adds to it.
     circuits_reserved: usize,
+    /// The last inbound punch round per peer whose send failure was
+    /// reported. A peer's circuit starting its first round clears it; the
+    /// next tick drops peers with no inbound circuit left, after the driver
+    /// has fed back every datagram queued before.
+    pub(crate) punch_send_failures: BTreeMap<PeerId, u32>,
 }
 
 impl Shared {
@@ -523,6 +528,7 @@ impl NatAgent {
                 observations: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
                 circuits_reserved: 0,
+                punch_send_failures: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -977,6 +983,10 @@ impl NatAgent {
     /// Advances time-based state: stagger expiry, leg deadlines, punch
     /// windows (the attempts' and the ledger's), connect deadlines.
     pub fn handle_tick<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
+        let inbound = &self.inbound;
+        self.shared
+            .punch_send_failures
+            .retain(|peer, _| inbound.values().any(|c| c.source() == Some(peer)));
         self.holding(swarm, |agent, swarm| {
             for attempt in agent.attempts.values_mut() {
                 attempt.on_tick(swarm, &mut agent.shared, now);
@@ -1105,6 +1115,34 @@ impl NatAgent {
                 }
             }
         }
+    }
+
+    /// Reports that the transport failed to send a
+    /// [`NatAction::SendRandomUdp`] datagram for `peer`'s inbound punch round
+    /// `attempt`, for `reason`.
+    ///
+    /// Queues one [`NatEvent::InboundHolePunchSendFailed`] per round: later
+    /// failures in the same round are dropped. Drivers do not report
+    /// transports that lack a raw-UDP send, and report every failure before
+    /// the agent's next input, as draining [`Self::poll_action`] after each
+    /// input does: a later input may forget the round.
+    pub fn punch_send_failed(
+        &mut self,
+        peer: PeerId,
+        attempt: u32,
+        target: Multiaddr,
+        reason: String,
+    ) {
+        if self.shared.punch_send_failures.insert(peer, attempt) == Some(attempt) {
+            return;
+        }
+        self.shared
+            .push_event(NatEvent::InboundHolePunchSendFailed {
+                peer,
+                attempt,
+                target,
+                reason,
+            });
     }
 
     /// Returns the next queued command for the driver.

@@ -156,6 +156,14 @@ impl InboundCircuit {
         };
     }
 
+    /// The peer that dialed through the circuit, once STOP named it.
+    pub(crate) fn source(&self) -> Option<&PeerId> {
+        match &self.phase {
+            Phase::Handshaking { source, .. } | Phase::Upgrading { source, .. } => Some(source),
+            Phase::AwaitStop { .. } | Phase::Done { .. } => None,
+        }
+    }
+
     pub(crate) fn promotes(&self, conn_id: ConnectionId) -> bool {
         self.promoted() == Some(conn_id)
     }
@@ -344,7 +352,12 @@ impl InboundCircuit {
                 shared.push_action(NatAction::CloseConnection { conn_id: *circuit });
                 self.phase = Phase::Done { promoted: None };
             }
-            Phase::Upgrading { budget, round, .. } => {
+            Phase::Upgrading {
+                source,
+                budget,
+                round,
+                ..
+            } => {
                 let upgrading = now.monotonic_ms < budget.deadline();
                 match budget.due(now.monotonic_ms) {
                     Some(UpgradeStop::ExchangeTimeout { .. }) if upgrading => {
@@ -368,6 +381,8 @@ impl InboundCircuit {
                     {
                         for addr in &schedule.addrs {
                             shared.push_action(NatAction::SendRandomUdp {
+                                peer: *source,
+                                attempt: budget.rounds(),
                                 target: addr.clone(),
                                 payload_len: shared.config.blast_payload_len,
                             });
@@ -637,6 +652,8 @@ impl InboundCircuit {
                         let next_at = if rtt_ms == 0 {
                             for addr in &remote_addrs {
                                 shared.push_action(NatAction::SendRandomUdp {
+                                    peer: *source,
+                                    attempt: budget.rounds(),
                                     target: addr.clone(),
                                     payload_len: shared.config.blast_payload_len,
                                 });
@@ -726,6 +743,9 @@ fn open_round(
         return None;
     };
     shared.own_stream(source, conn, stream, StreamRole::DcutrInbound(id));
+    if budget.rounds() == 1 {
+        shared.punch_send_failures.remove(source);
+    }
     Some(Round::Exchange(Exchange {
         conn,
         stream,

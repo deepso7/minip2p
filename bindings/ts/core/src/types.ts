@@ -530,6 +530,18 @@ export interface Minip2pNamedEventMap {
     /** Direct connection now carrying the peer. */
     readonly newConnId: number;
   };
+  /**
+   * The transport failed to send a hole-punch datagram during an inbound
+   * DCUtR round; reported at most once per round. The round continues.
+   */
+  inboundHolePunchSendFailed: {
+    readonly peerId: string;
+    /** One-based DCUtR round. */
+    readonly attempt: number;
+    /** Punch target of the first datagram that failed. */
+    readonly target: string;
+    readonly reason: string;
+  };
   message: {
     readonly fromPeerId: string;
     readonly topics: readonly string[];
@@ -766,6 +778,7 @@ export const P2pEvent_Tags = {
   IdentifyFailed: "IdentifyFailed",
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
+  InboundHolePunchSendFailed: "InboundHolePunchSendFailed",
   InboundPathEstablished: "InboundPathEstablished",
   ListenAddressesChanged: "ListenAddressesChanged",
   ListenerError: "ListenerError",
@@ -937,6 +950,10 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.InboundDirectUpgrade,
       Minip2pNamedEventMap["inboundDirectUpgrade"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.InboundHolePunchSendFailed,
+      Minip2pNamedEventMap["inboundHolePunchSendFailed"]
     >
   | RawEvent<typeof P2pEvent_Tags.Message, Minip2pNamedEventMap["message"]>
   | RawEvent<

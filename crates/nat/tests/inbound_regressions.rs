@@ -5,8 +5,8 @@ mod common;
 use common::*;
 use minip2p_swarm::ConnectionCloseReason;
 
-use minip2p_core::PeerAddr;
 use minip2p_core::{Multiaddr, Protocol};
+use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
     DCUTR_PROTOCOL_ID, Deadline, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID,
 };
@@ -1052,4 +1052,165 @@ fn a_punch_during_a_later_round_still_turns_passive() {
     replace(&mut h, a, b, false, 140);
     assert!(h.agent.is_punched(b));
     assert_eq!(upgrade_count(&drain_events(&mut h.agent)), 1);
+}
+
+/// Drains the agent's actions and reports every blast among them as failed
+/// to send, as a driver whose transport rejects each datagram would, then
+/// returns the actions and the events that produced.
+fn fail_blasts(h: &mut Harness) -> (Vec<Out>, Vec<NatEvent>) {
+    let actions = drain_actions(&mut h.agent);
+    for out in &actions {
+        if let Out::SendRandomUdp {
+            peer,
+            attempt,
+            target,
+            ..
+        } = out
+        {
+            h.agent.punch_send_failed(
+                *peer,
+                *attempt,
+                target.clone(),
+                "network unreachable".into(),
+            );
+        }
+    }
+    let events = drain_events(&mut h.agent);
+    (actions, events)
+}
+
+/// Runs the inbound circuit opened by `actions` through every DCUtR round
+/// with each blast failing, and returns the punch-send failures reported.
+fn run_failing_rounds(
+    h: &mut Harness,
+    conn: ConnectionId,
+    mut actions: Vec<Out>,
+    mut t: u64,
+) -> Vec<NatEvent> {
+    let mut reported = Vec::new();
+    for _ in 1..=3u32 {
+        let stream = opened_stream(&actions);
+        h.agent.handle_event(
+            &SwarmEvent::StreamReady {
+                conn_id: conn,
+                peer_id: h.target,
+                stream_id: stream,
+                protocol_id: DCUTR_PROTOCOL_ID.into(),
+                initiated_locally: true,
+            },
+            false,
+            at(t),
+        );
+        drain_actions(&mut h.agent);
+        answer_dcutr_at(
+            h,
+            conn,
+            stream,
+            &[
+                "/ip4/8.8.8.8/udp/4001/quic-v1",
+                "/ip4/8.8.4.4/udp/4001/quic-v1",
+            ],
+            t,
+        );
+        let mut blasts = 0;
+        for tick in [None, Some(t + 100), Some(t + 250)] {
+            if let Some(tick) = tick {
+                h.agent.handle_tick(at(tick));
+            }
+            let (out, events) = fail_blasts(h);
+            blasts += blast_count(&out);
+            reported.extend(events);
+            actions = out;
+        }
+        assert!(blasts >= 6);
+        t += 250;
+    }
+    reported
+}
+
+fn rounds_reported(events: &[NatEvent], source: PeerId) -> Vec<u32> {
+    let rounds: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event {
+            NatEvent::InboundHolePunchSendFailed {
+                peer,
+                attempt,
+                target,
+                ..
+            } if *peer == source
+                && *target == maddr("/ip4/8.8.8.8/udp/4001/quic-v1")
+                && event.connect_id().is_none() =>
+            {
+                Some(*attempt)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rounds.len(), events.len(), "{events:?}");
+    rounds
+}
+
+#[test]
+fn punch_send_failures_are_reported_once_per_inbound_round() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 100,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+
+    let events = run_failing_rounds(&mut h, conn, actions, 13);
+
+    assert_eq!(rounds_reported(&events, h.target), [1, 2, 3]);
+    assert!(h.agent.is_idle());
+}
+
+/// A circuit from the same source that replaces one still punching reports
+/// its own first round.
+#[test]
+fn a_replacement_circuit_from_the_same_source_reports_its_own_rounds() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 100,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 13);
+    let (_, events) = fail_blasts(&mut h);
+    assert_eq!(rounds_reported(&events, h.target), [1]);
+
+    let stop = StreamId::new(STOP_STREAM + 1);
+    inbound_stop_stream(&mut h, stop, 20);
+    let target = h.target;
+    h.stream_data(stop, stop_connect(&target), at(20));
+    let promotion = drain_actions(&mut h.agent);
+    let second = promoted_circuit(&promotion);
+    replace(&mut h, conn, second, true, 21);
+    drain_events(&mut h.agent);
+    let actions = drain_actions(&mut h.agent);
+    let stream = opened_stream(&actions);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: second,
+            peer_id: h.target,
+            stream_id: stream,
+            protocol_id: DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        at(22),
+    );
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(
+        &mut h,
+        second,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        22,
+    );
+    let (_, events) = fail_blasts(&mut h);
+
+    assert_eq!(rounds_reported(&events, h.target), [1]);
 }

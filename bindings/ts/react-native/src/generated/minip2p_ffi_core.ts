@@ -3457,7 +3457,8 @@ export enum P2pEvent_Tags {
     DiscoveryProtocolViolation = "DiscoveryProtocolViolation",
     IdentifyFailed = "IdentifyFailed",
     ListenerError = "ListenerError",
-    ListenerRecovered = "ListenerRecovered"
+    ListenerRecovered = "ListenerRecovered",
+    InboundHolePunchSendFailed = "InboundHolePunchSendFailed"
 }
 /**
  * Event delivered by the native endpoint driver.
@@ -4982,6 +4983,41 @@ inner: {addr: string }): ListenerRecovered_ {
 
     }
 
+    type InboundHolePunchSendFailed__interface = {
+        tag: P2pEvent_Tags.InboundHolePunchSendFailed;
+        inner:
+Readonly<{peerId: string; attempt: number; target: string; reason: string}>
+    };
+    /**
+     * The transport failed to send a hole-punch datagram during an inbound
+     * DCUtR round; reported at most once per round. The round continues.
+     */
+    class InboundHolePunchSendFailed_ extends UniffiEnum implements InboundHolePunchSendFailed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.InboundHolePunchSendFailed;
+        readonly inner:
+Readonly<{peerId: string; attempt: number; target: string; reason: string}>;
+        constructor(
+inner: {peerId: string; attempt: number; target: string; reason: string }) {
+            super("P2pEvent", "InboundHolePunchSendFailed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {peerId: string; attempt: number; target: string; reason: string }): InboundHolePunchSendFailed_ {
+            return new InboundHolePunchSendFailed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is InboundHolePunchSendFailed_ {
+            return obj.tag === P2pEvent_Tags.InboundHolePunchSendFailed;
+        }
+
+    }
+
     function instanceOf(obj: any): obj is P2pEvent {
         return obj[uniffiTypeNameSymbol] === "P2pEvent";
     }
@@ -5031,7 +5067,8 @@ inner: {addr: string }): ListenerRecovered_ {
   DiscoveryProtocolViolation: DiscoveryProtocolViolation_,
   IdentifyFailed: IdentifyFailed_,
   ListenerError: ListenerError_,
-  ListenerRecovered: ListenerRecovered_
+  ListenerRecovered: ListenerRecovered_,
+  InboundHolePunchSendFailed: InboundHolePunchSendFailed_
     });
 
 })();
@@ -5039,7 +5076,7 @@ inner: {addr: string }): ListenerRecovered_ {
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed' | 'ListenerError' | 'ListenerRecovered']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed' | 'ListenerError' | 'ListenerRecovered' | 'InboundHolePunchSendFailed']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -5092,6 +5129,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 42: return new P2pEvent.IdentifyFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypeIdentifyFailure.readFromCursor(c) });
                 case 43: return new P2pEvent.ListenerError({addr: FfiConverterString.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 44: return new P2pEvent.ListenerRecovered({addr: FfiConverterString.readFromCursor(c) });
+                case 45: return new P2pEvent.InboundHolePunchSendFailed({peerId: FfiConverterString.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), target: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -5435,6 +5473,15 @@ const FfiConverterTypeP2pEvent = (() => {
                     c.writeI32(44);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.addr, c);
+                    return;
+                }
+                case P2pEvent_Tags.InboundHolePunchSendFailed: {
+                    c.writeI32(45);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt32.writeIntoCursor(inner.attempt, c);
+                    FfiConverterString.writeIntoCursor(inner.target, c);
+                    FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 default:
@@ -5781,6 +5828,15 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.addr);
+                    return size;
+                }
+                case P2pEvent_Tags.InboundHolePunchSendFailed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.peerId);
+                    size += FfiConverterUInt32.allocationSize(inner.attempt);
+                    size += FfiConverterString.allocationSize(inner.target);
+                    size += FfiConverterString.allocationSize(inner.reason);
                     return size;
                 }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();

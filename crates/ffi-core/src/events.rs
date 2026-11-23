@@ -787,6 +787,18 @@ pub enum P2pEvent {
         /// The listener's bound address.
         addr: String,
     },
+    /// The transport failed to send a hole-punch datagram during an inbound
+    /// DCUtR round; reported at most once per round. The round continues.
+    InboundHolePunchSendFailed {
+        /// Peer the circuit's hole punch targets.
+        peer_id: String,
+        /// One-based DCUtR round.
+        attempt: u32,
+        /// Punch target of the first datagram that failed.
+        target: String,
+        /// Human-readable failure detail.
+        reason: String,
+    },
 }
 
 /// Edge-triggered notification implemented by a binding shell.
@@ -1101,6 +1113,17 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
             peer_id: peer.to_base58(),
             old_conn_id: old_conn_id.as_u64(),
             new_conn_id: new_conn_id.as_u64(),
+        },
+        NatEvent::InboundHolePunchSendFailed {
+            peer,
+            attempt,
+            target,
+            reason,
+        } => P2pEvent::InboundHolePunchSendFailed {
+            peer_id: peer.to_base58(),
+            attempt,
+            target: target.to_string(),
+            reason,
         },
         _ => return None,
     })
@@ -1620,6 +1643,27 @@ mod tests {
                     relay_peer_id: relay.to_base58(),
                 },
                 conn_id: 4,
+            })
+        );
+    }
+
+    #[cfg(feature = "driver")]
+    #[test]
+    fn inbound_hole_punch_send_failure_converts_its_round_and_target() {
+        let remote = peer(15);
+        let target: Multiaddr = "/ip4/203.0.113.7/udp/4001/quic-v1".parse().unwrap();
+        assert_eq!(
+            convert_nat(NatEvent::InboundHolePunchSendFailed {
+                peer: remote,
+                attempt: 2,
+                target: target.clone(),
+                reason: "network unreachable".into(),
+            }),
+            Some(P2pEvent::InboundHolePunchSendFailed {
+                peer_id: remote.to_base58(),
+                attempt: 2,
+                target: target.to_string(),
+                reason: "network unreachable".into(),
             })
         );
     }
