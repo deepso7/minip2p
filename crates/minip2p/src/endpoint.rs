@@ -181,7 +181,8 @@ pub enum CloseOutcome {
     /// portable close does not wait, so anything it leaves tracked ends
     /// here, as a std `close_within(Duration::ZERO)` does. A std close also
     /// ends here, with `unfinished` possibly empty, when a gracefully closed
-    /// TCP socket was still waiting for its peer to close.
+    /// TCP socket was still waiting for its peer to close, or a relayed
+    /// connection's bridge stream was still unacknowledged.
     DeadlineExpired,
     /// Driving the transports failed, which ended the teardown early; the
     /// failure is the last of [`CloseReport::errors`]. A failed disconnect
@@ -617,8 +618,9 @@ impl<P: Platform> Endpoint<P> {
     /// by the peer (which covers every byte before it). Bytes on a stream
     /// left open are best effort: handed to QUIC, which may still hold them
     /// for congestion control. Over a relayed connection the FIN is handed
-    /// to the relay, without waiting for its acknowledgement. To deliver
-    /// everything, close the write side before flushing. The std `flush`
+    /// to the relay, without waiting for its acknowledgement (a std
+    /// `close_within` waits for it, as it finishes the relay's bridge
+    /// stream). To deliver everything, close the write side before flushing. The std `flush`
     /// drives the endpoint until this is `false` or its deadline passes; a
     /// portable endpoint's `flush` drives one batch, so the host repeats it,
     /// polling between attempts, until it returns `true`. Bytes a peer's stop or reset, or a connection failure,

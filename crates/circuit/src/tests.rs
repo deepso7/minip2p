@@ -31,6 +31,7 @@ struct CloseObservingTransport<T> {
     closed: Vec<ConnectionId>,
     fail_close_write: bool,
     fail_send: bool,
+    full: bool,
     send_calls: usize,
     close_write_calls: usize,
     reset_calls: usize,
@@ -145,6 +146,7 @@ impl<T> CloseObservingTransport<T> {
             closed: Vec::new(),
             fail_close_write: false,
             fail_send: false,
+            full: false,
             send_calls: 0,
             close_write_calls: 0,
             reset_calls: 0,
@@ -189,6 +191,13 @@ impl<T: Transport> Transport for CloseObservingTransport<T> {
                 id,
                 stream_id,
                 reason: "injected bridge send failure".to_string(),
+            });
+        }
+        if self.full {
+            return Err(TransportError::Full {
+                id,
+                stream_id,
+                unsent: data,
             });
         }
         self.inner.send_stream(id, stream_id, data)
@@ -1384,6 +1393,77 @@ fn ready_close_sends_go_away_then_bridge_fin_without_reset() {
         b.poll(Now::from_millis(0))
             .expect("terminal peer state")
             .is_empty()
+    );
+}
+
+#[test]
+fn a_close_behind_a_full_bridge_flushes_then_fins_without_reset() {
+    let (mut a, mut b, circuit_id, bridge, a_peer, b_peer) = setup_close_observed_pair();
+    complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    let inner_conn = ConnectionId::new(1);
+    let stream = a.open_stream(circuit_id).expect("open stream before close");
+    let _ = a.poll(Now::from_millis(0)).expect("local stream open");
+    let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
+    let _ = a.poll(Now::from_millis(0)).expect("stream acknowledgement");
+    a.inner_mut().full = true;
+    a.send_stream(circuit_id, stream, Bytes::from_static(b"held-behind-full"))
+        .expect("the circuit holds what the bridge refused");
+
+    a.close(circuit_id).expect("graceful circuit close");
+    assert_eq!(a.inner().reset_calls, 0, "a Full bridge is not reset");
+    assert_eq!(a.inner().close_write_calls, 0, "no FIN ahead of held bytes");
+    assert!(
+        a.has_pending_writes(),
+        "the closing bridge still holds bytes"
+    );
+    assert!(
+        a.poll(Now::from_millis(0))
+            .expect("local close event")
+            .contains(&TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Local
+            })
+    );
+
+    a.inner_mut().full = false;
+    a.handle_inner_event(TransportEvent::StreamWritable {
+        id: inner_conn,
+        stream_id: bridge,
+    });
+    assert_eq!(a.inner().close_write_calls, 1);
+    assert_eq!(a.inner().reset_calls, 0);
+    assert!(!a.has_pending_writes());
+    assert!(
+        a.poll(Now::from_millis(0))
+            .expect("nothing more")
+            .is_empty()
+    );
+
+    let peer_wire = b
+        .inner_mut()
+        .poll(Now::from_millis(0))
+        .expect("peer bridge events");
+    assert!(
+        peer_wire
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { .. })),
+        "bridge FIN reaches the peer: {peer_wire:?}"
+    );
+    for event in peer_wire {
+        b.handle_inner_event(event);
+    }
+    let peer_events = b.poll(Now::from_millis(0)).expect("peer close events");
+    assert!(
+        peer_events.iter().any(|event| matches!(
+            event,
+            TransportEvent::StreamData { data, .. } if data[..] == b"held-behind-full"[..]
+        )),
+        "the held bytes reach the peer: {peer_events:?}"
+    );
+    assert!(
+        peer_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if *id == circuit_id))
     );
 }
 
