@@ -13,8 +13,8 @@ use minip2p::{
 };
 use minip2p_core::Multihash;
 use minip2p_ffi_core::{
-    CloseOutcome, ConfigCapability, ConnectTarget, EndpointConfig, FfiError, P2pEvent,
-    UnfinishedConnection,
+    CloseOutcome, ConfigCapability, ConnectTarget, DriverFailureKind, EndpointConfig, FfiError,
+    P2pEvent, UnfinishedConnection,
 };
 use minip2p_test_support::InMemoryTransport;
 use minip2p_transport::TransportEvent;
@@ -488,11 +488,21 @@ fn a_never_started_host_closes_without_an_event() {
     assert!(matches!(a.start(), Err(FfiError::Stopped)));
 }
 
+fn webtransport_address() -> String {
+    format!(
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g/p2p/{}",
+        peer(2)
+    )
+}
+
 /// Sessions the platform holds open: connected and not yet closed.
 type OpenSessions = Rc<RefCell<BTreeSet<u64>>>;
 
+/// A failure the platform's next `poll_event` returns.
+type PollFailure = Rc<RefCell<Option<IoError>>>;
+
 /// A platform whose sessions never come up, tracking which are still open.
-struct PendingIo(OpenSessions, u64);
+struct PendingIo(OpenSessions, u64, PollFailure);
 
 impl WebTransportIo for PendingIo {
     fn connect(&mut self, _: &str, _: &[Multihash]) -> Result<SessionHandle, IoError> {
@@ -513,8 +523,8 @@ impl WebTransportIo for PendingIo {
     fn close(&mut self, session: SessionHandle, _: u32, _: &str) {
         self.0.borrow_mut().remove(&session.0);
     }
-    fn poll_event(&mut self) -> Option<IoEvent> {
-        None
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError> {
+        self.2.borrow_mut().take().map_or(Ok(None), Err)
     }
 }
 
@@ -525,13 +535,10 @@ fn closing_or_freeing_a_host_closes_its_pending_webtransport_sessions() {
         host.as_mut().expect("host").close(Now::from_millis(1));
     };
     let free: End = |host| *host = None;
-    let address = format!(
-        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g/p2p/{}",
-        peer(2)
-    );
+    let address = webtransport_address();
     for (started, end) in [(true, close), (false, close), (true, free)] {
         let open = OpenSessions::default();
-        let io = PendingIo(open.clone(), 0);
+        let io = PendingIo(open.clone(), 0, PollFailure::default());
         let mut host = Some(
             Host::new(vec![1; 32], config(), |key| {
                 WebTransportClient::new(io, key.clone(), WebEntropy)
@@ -559,4 +566,54 @@ fn closing_or_freeing_a_host_closes_its_pending_webtransport_sessions() {
             "started {started}: the pending session outlived its host"
         );
     }
+}
+
+/// An event the platform cannot decode fails the host: `DriverFailed` with
+/// the decode detail, its sessions closed, `EndpointClosed`, then `Stopped`.
+#[test]
+fn an_undecodable_io_event_fails_the_host() {
+    let open = OpenSessions::default();
+    let failure = PollFailure::default();
+    let io = PendingIo(open.clone(), 0, failure.clone());
+    let mut host = Host::new(vec![1; 32], config(), |key| {
+        WebTransportClient::new(io, key.clone(), WebEntropy)
+    })
+    .expect("host");
+    host.start().expect("start");
+    let target = || ConnectTarget::Addresses {
+        addresses: vec![webtransport_address()],
+    };
+    host.connect(target(), Now::from_millis(0))
+        .expect("connect");
+    host.pump(Now::from_millis(0));
+    host.drain_events(LIMIT);
+    assert_eq!(open.borrow().len(), 1, "the dial is pending");
+
+    *failure.borrow_mut() = Some(IoError("missing field `bytes`".into()));
+    assert!(host.pump(Now::from_millis(1)).ring);
+    let events = host.drain_events(LIMIT);
+    assert!(
+        matches!(
+            events.first(),
+            Some(P2pEvent::DriverFailed { kind: DriverFailureKind::Transport, detail })
+                if detail.contains("missing field `bytes`")
+        ),
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(P2pEvent::EndpointClosed {
+                outcome: CloseOutcome::Failed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(open.borrow().is_empty(), "the session outlived the failure");
+    assert!(!host.is_running());
+    assert!(matches!(
+        host.connect(target(), Now::from_millis(2)),
+        Err(FfiError::Stopped)
+    ));
 }

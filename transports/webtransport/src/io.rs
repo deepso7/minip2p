@@ -131,6 +131,9 @@ pub trait WebTransportIo {
     /// as `WebTransport.close()` does, leaving the server to close QUIC.
     fn close(&mut self, session: SessionHandle, code: u32, reason: &str);
 
-    /// The next queued event, if any.
-    fn poll_event(&mut self) -> Option<IoEvent>;
+    /// The next queued event, if any. An `Err` means the platform reported
+    /// something the implementation cannot turn into an [`IoEvent`]; the
+    /// client fails rather than lose it, and its `poll` returns
+    /// [`TransportError::Io`](minip2p_transport::TransportError::Io).
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError>;
 }

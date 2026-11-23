@@ -908,11 +908,11 @@ impl WebTransportIo for QuinnIo {
         self.transmit(session.0, Instant::now());
     }
 
-    fn poll_event(&mut self) -> Option<IoEvent> {
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError> {
         if self.events.is_empty() {
             self.pump();
         }
-        self.events.pop_front()
+        Ok(self.events.pop_front())
     }
 }
 
