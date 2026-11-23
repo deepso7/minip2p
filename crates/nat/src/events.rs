@@ -16,10 +16,19 @@ use crate::types::{NatError, Path, ReachabilityState, UpgradeStop};
 #[derive(Clone, Debug)]
 pub enum NatAction {
     /// Send one datagram of `payload_len` random bytes to `target` to open
-    /// our NAT mapping (responder-side hole punch). The wiring fills the
-    /// random bytes and calls the transport's raw-UDP send; transports
-    /// without one may drop the action.
+    /// our NAT mapping (responder-side hole punch) during DCUtR round
+    /// `attempt` with `peer`.
+    ///
+    /// The wiring fills the bytes from its entropy source and calls the
+    /// transport's raw-UDP send. The bytes only open the mapping, so a
+    /// failing entropy source sends zeros instead. Transports without a
+    /// raw-UDP send drop the action silently; any other send failure goes
+    /// back through [`NatAgent::punch_send_failed`](crate::NatAgent::punch_send_failed).
     SendRandomUdp {
+        /// The circuit source this side is punching toward.
+        peer: PeerId,
+        /// 1-based DCUtR round of the inbound circuit.
+        attempt: u32,
         target: Multiaddr,
         payload_len: usize,
     },
@@ -132,6 +141,18 @@ pub enum NatEvent {
         /// The direct connection now carrying the peer.
         new_conn_id: ConnectionId,
     },
+    /// The transport failed to send a responder-side hole-punch datagram
+    /// to `peer` during inbound DCUtR round `attempt`. Reported at most once
+    /// per round, for its first failed datagram; the round goes on, since
+    /// the dialer's punch may still land.
+    InboundHolePunchSendFailed {
+        peer: PeerId,
+        /// 1-based DCUtR round of the inbound circuit.
+        attempt: u32,
+        /// The punch target of the first datagram that failed.
+        target: Multiaddr,
+        reason: String,
+    },
 }
 
 impl NatEvent {
@@ -154,7 +175,8 @@ impl NatEvent {
             | NatEvent::RelayReserved { .. }
             | NatEvent::RelayReservationLost { .. }
             | NatEvent::InboundPathEstablished { .. }
-            | NatEvent::InboundDirectUpgrade { .. } => None,
+            | NatEvent::InboundDirectUpgrade { .. }
+            | NatEvent::InboundHolePunchSendFailed { .. } => None,
         }
     }
 }

@@ -1053,3 +1053,80 @@ fn a_punch_during_a_later_round_still_turns_passive() {
     assert!(h.agent.is_punched(b));
     assert_eq!(upgrade_count(&drain_events(&mut h.agent)), 1);
 }
+
+/// Reports every blast in `actions` as failed to send, the way a driver
+/// whose transport rejects each datagram would, and returns the events.
+fn fail_every_blast(h: &mut Harness, actions: Vec<Out>) -> Vec<NatEvent> {
+    for out in actions {
+        if let Out::SendRandomUdp {
+            peer,
+            attempt,
+            target,
+            ..
+        } = out
+        {
+            h.agent
+                .punch_send_failed(peer, attempt, target, "network unreachable".into());
+        }
+    }
+    drain_events(&mut h.agent)
+}
+
+#[test]
+fn punch_send_failures_are_reported_once_per_inbound_round() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 100,
+        ..NatConfig::default()
+    });
+    let (conn, mut actions) = drive_to_relayed(&mut h);
+    let mut opened_at = 13;
+    for round in 1..=3u32 {
+        let stream = opened_stream(&actions);
+        h.agent.handle_event(
+            &SwarmEvent::StreamReady {
+                conn_id: conn,
+                peer_id: h.target,
+                stream_id: stream,
+                protocol_id: DCUTR_PROTOCOL_ID.into(),
+                initiated_locally: true,
+            },
+            false,
+            at(opened_at),
+        );
+        drain_actions(&mut h.agent);
+        answer_dcutr_at(
+            &mut h,
+            conn,
+            stream,
+            &[
+                "/ip4/8.8.8.8/udp/4001/quic-v1",
+                "/ip4/8.8.4.4/udp/4001/quic-v1",
+            ],
+            opened_at,
+        );
+        let mut blasts = drain_actions(&mut h.agent);
+        h.agent.handle_tick(at(opened_at + 100));
+        blasts.extend(drain_actions(&mut h.agent));
+        opened_at += 250;
+        h.agent.handle_tick(at(opened_at));
+        actions = drain_actions(&mut h.agent);
+        blasts.extend(actions.iter().cloned());
+        assert!(blast_count(&blasts) >= 4, "round {round}");
+
+        let events = fail_every_blast(&mut h, blasts);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [NatEvent::InboundHolePunchSendFailed { peer, attempt, target, .. }]
+                    if *peer == h.target
+                        && *attempt == round
+                        && *target == maddr("/ip4/8.8.8.8/udp/4001/quic-v1")
+            ),
+            "round {round}: {events:?}"
+        );
+        assert_eq!(events[0].connect_id(), None);
+    }
+    assert!(h.agent.is_idle());
+}

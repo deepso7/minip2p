@@ -22,7 +22,6 @@ use minip2p_nat::{
     ReachabilityState,
 };
 use minip2p_swarm::{SwarmCore, SwarmEvent};
-#[cfg(feature = "relay")]
 use minip2p_transport::TransportError;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
@@ -544,9 +543,14 @@ impl<T: Transport> NatDriver<T> {
     }
 
     /// Executes one agent action. These need the transport underneath the
-    /// swarm; the agent issues swarm commands itself. Best-effort actions
-    /// swallow errors; the agent's timeouts and the swarm's lifecycle events
-    /// surface failures.
+    /// swarm; the agent issues swarm commands itself.
+    ///
+    /// A hole-punch datagram is sent zero-filled when the entropy source
+    /// fails, since its bytes only open the NAT mapping. A transport without
+    /// raw UDP ([`TransportError::Unsupported`]) drops it silently; any other
+    /// send failure goes back to the agent, which surfaces it once per punch
+    /// round as [`NatEvent::InboundHolePunchSendFailed`]. Closing swallows
+    /// errors; the swarm's lifecycle events surface them.
     pub(crate) fn execute<R: EntropySource>(
         &mut self,
         action: NatAction,
@@ -554,13 +558,20 @@ impl<T: Transport> NatDriver<T> {
     ) {
         match action {
             NatAction::SendRandomUdp {
+                peer,
+                attempt,
                 target,
                 payload_len,
             } => {
                 let mut payload = vec![0u8; payload_len];
-                if let Ok(()) = swarm.entropy_mut().fill_bytes(&mut payload) {
-                    match swarm.transport_mut().send_datagram(&target, &payload) {
-                        Ok(()) | Err(_) => {}
+                if swarm.entropy_mut().fill_bytes(&mut payload).is_err() {
+                    payload.fill(0);
+                }
+                match swarm.transport_mut().send_datagram(&target, &payload) {
+                    Ok(()) | Err(TransportError::Unsupported { .. }) => {}
+                    Err(error) => {
+                        self.agent
+                            .punch_send_failed(peer, attempt, target, error.to_string());
                     }
                 }
             }
@@ -859,3 +870,7 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "nat_tests.rs"]
+mod tests;

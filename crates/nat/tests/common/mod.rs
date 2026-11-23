@@ -614,6 +614,8 @@ pub enum Out {
         peer: PeerId,
     },
     SendRandomUdp {
+        peer: PeerId,
+        attempt: u32,
         target: Multiaddr,
         payload_len: usize,
     },
@@ -638,9 +640,13 @@ impl From<NatAction> for Out {
     fn from(action: NatAction) -> Self {
         match action {
             NatAction::SendRandomUdp {
+                peer,
+                attempt,
                 target,
                 payload_len,
             } => Out::SendRandomUdp {
+                peer,
+                attempt,
                 target,
                 payload_len,
             },

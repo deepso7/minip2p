@@ -2449,6 +2449,7 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.ConnectFailed]: "connectFailed",
   [P2pEvent_Tags.ConnectCancelled]: "connectCancelled",
   [P2pEvent_Tags.InboundDirectUpgrade]: "inboundDirectUpgrade",
+  [P2pEvent_Tags.InboundHolePunchSendFailed]: "inboundHolePunchSendFailed",
   [P2pEvent_Tags.Message]: "message",
   [P2pEvent_Tags.PeerSubscribed]: "peerSubscribed",
   [P2pEvent_Tags.PeerUnsubscribed]: "peerUnsubscribed",

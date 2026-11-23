@@ -490,6 +490,9 @@ pub struct NatAgent {
     housekeeping: Housekeeping,
     inbound: BTreeMap<u64, InboundCircuit>,
     next_inbound_id: u64,
+    /// The last inbound punch round per peer whose send failure was
+    /// reported, kept while the peer has an inbound circuit.
+    punch_send_failures: BTreeMap<PeerId, u32>,
     /// Unsent tails of writes the swarm refused as Full, resent on the
     /// stream's Writable.
     held: HeldWrites,
@@ -528,6 +531,7 @@ impl NatAgent {
             housekeeping,
             inbound: BTreeMap::new(),
             next_inbound_id: 0,
+            punch_send_failures: BTreeMap::new(),
             held: HeldWrites::new(),
         }
     }
@@ -1107,6 +1111,32 @@ impl NatAgent {
         }
     }
 
+    /// Reports that the transport failed to send a
+    /// [`NatAction::SendRandomUdp`] datagram for `peer`'s inbound punch round
+    /// `attempt`, for `reason`.
+    ///
+    /// Queues one [`NatEvent::InboundHolePunchSendFailed`] per round: later
+    /// failures in the same round are dropped. Drivers do not report
+    /// transports that lack a raw-UDP send.
+    pub fn punch_send_failed(
+        &mut self,
+        peer: PeerId,
+        attempt: u32,
+        target: Multiaddr,
+        reason: String,
+    ) {
+        if self.punch_send_failures.insert(peer, attempt) == Some(attempt) {
+            return;
+        }
+        self.shared
+            .push_event(NatEvent::InboundHolePunchSendFailed {
+                peer,
+                attempt,
+                target,
+                reason,
+            });
+    }
+
     /// Returns the next queued command for the driver.
     pub fn poll_action(&mut self) -> Option<NatAction> {
         self.shared.actions.pop_front()
@@ -1368,5 +1398,8 @@ impl NatAgent {
     fn reap_done(&mut self) {
         self.attempts.retain(|_, attempt| !attempt.is_done());
         self.inbound.retain(|_, circuit| !circuit.is_done());
+        let inbound = &self.inbound;
+        self.punch_send_failures
+            .retain(|peer, _| inbound.values().any(|c| c.source() == Some(peer)));
     }
 }
