@@ -40,6 +40,21 @@ const TCP_READ: usize = 16 * 1024;
 /// thread has not read yet is not dropped by the kernel.
 const SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Share of [`Profile::idle_rtt`] a measured idle RTT may be off by.
+pub const MAX_RTT_ERROR: f64 = 0.2;
+/// Idle-RTT error allowed on top of [`MAX_RTT_ERROR`], so scheduling jitter
+/// does not invalidate short-RTT profiles.
+pub const RTT_SLACK: Duration = Duration::from_millis(5);
+/// Wire bytes a QUIC idle ping waits on, both directions together. The
+/// first pings on a fresh connection queue behind post-handshake traffic,
+/// so the median of a few still waits on about one full-size datagram on
+/// top of the ping itself: measured 1,470 to 1,500 bytes from 64 kbit/s to
+/// 2 Mbit/s.
+pub const QUIC_IDLE_WIRE_BYTES: usize = 1_500;
+/// Wire bytes a TCP idle ping waits on, both directions together: the ping
+/// and its Yamux framing, measured at about 128 bytes.
+pub const TCP_IDLE_WIRE_BYTES: usize = 128;
+
 /// A link's rate, in bits per second each way, and round-trip delay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
@@ -104,6 +119,22 @@ impl Profile {
     pub fn bdp_bytes(&self) -> u64 {
         u64::try_from(u128::from(self.rate_bits_per_s) * self.rtt.as_micros() / 8_000_000)
             .expect("BDP fits u64")
+    }
+
+    /// The round trip an idle exchange should take on this link: the RTT
+    /// plus the time `wire_bytes`, both directions together, take to
+    /// serialize. Below a few Mbit/s the serialization is no longer noise:
+    /// 1,500 bytes take 187.5 ms at 64 kbit/s.
+    pub fn idle_rtt(&self, wire_bytes: usize) -> Duration {
+        self.rtt + self.serialization(wire_bytes)
+    }
+
+    /// Whether `measured` is within [`MAX_RTT_ERROR`] of
+    /// [`idle_rtt`](Self::idle_rtt) plus [`RTT_SLACK`].
+    pub fn idle_rtt_calibrated(&self, wire_bytes: usize, measured: Duration) -> bool {
+        let expected = self.idle_rtt(wire_bytes).as_secs_f64();
+        (measured.as_secs_f64() - expected).abs()
+            <= MAX_RTT_ERROR * expected + RTT_SLACK.as_secs_f64()
     }
 
     fn one_way(&self) -> Duration {
@@ -496,4 +527,43 @@ fn tcp_pipe(
         drop(to.shutdown(Shutdown::Write));
     });
     [reader, writer]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn calibrated(profile: &str, wire_bytes: usize, measured_ms: u64) -> bool {
+        Profile::named(profile)
+            .expect("profile")
+            .idle_rtt_calibrated(wire_bytes, Duration::from_millis(measured_ms))
+    }
+
+    #[test]
+    fn low_rate_idle_rtts_include_serialization() {
+        assert!(calibrated("64k_400ms", QUIC_IDLE_WIRE_BYTES, 584));
+        assert!(calibrated("64k_400ms", TCP_IDLE_WIRE_BYTES, 416));
+        assert!(calibrated("500k_40ms", QUIC_IDLE_WIRE_BYTES, 65));
+        assert!(calibrated("500k_40ms", TCP_IDLE_WIRE_BYTES, 43));
+        assert!(calibrated("2m_40ms", QUIC_IDLE_WIRE_BYTES, 49));
+    }
+
+    #[test]
+    fn drifted_idle_rtts_are_rejected_at_any_rate() {
+        assert!(!calibrated("64k_400ms", QUIC_IDLE_WIRE_BYTES, 750));
+        assert!(!calibrated("64k_400ms", TCP_IDLE_WIRE_BYTES, 584));
+        assert!(!calibrated("500k_40ms", QUIC_IDLE_WIRE_BYTES, 90));
+        assert!(!calibrated("2m_40ms", QUIC_IDLE_WIRE_BYTES, 65));
+        assert!(!calibrated("100m_100ms", QUIC_IDLE_WIRE_BYTES, 130));
+        assert!(!calibrated("100m_100ms", QUIC_IDLE_WIRE_BYTES, 70));
+    }
+
+    #[test]
+    fn fast_profiles_keep_the_propagation_guard() {
+        assert!(calibrated("100m_100ms", QUIC_IDLE_WIRE_BYTES, 101));
+        assert!(calibrated("100m_100ms", QUIC_IDLE_WIRE_BYTES, 125));
+        assert!(!calibrated("100m_100ms", QUIC_IDLE_WIRE_BYTES, 126));
+        assert!(calibrated("1g_1ms", QUIC_IDLE_WIRE_BYTES, 6));
+        assert!(!calibrated("1g_1ms", QUIC_IDLE_WIRE_BYTES, 7));
+    }
 }
