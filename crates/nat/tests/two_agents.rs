@@ -406,7 +406,7 @@ impl World {
                     now,
                 );
             }
-            Out::CloseCircuit { .. }
+            Out::CloseConnection { .. }
             | Out::CloseStreamWrite { .. }
             | Out::ResetStream { .. }
             | Out::Ping { .. } => {}

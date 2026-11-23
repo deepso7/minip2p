@@ -341,7 +341,7 @@ impl InboundCircuit {
             Phase::Handshaking {
                 circuit, deadline, ..
             } if now.monotonic_ms >= *deadline => {
-                shared.push_action(NatAction::CloseCircuit { conn_id: *circuit });
+                shared.push_action(NatAction::CloseConnection { conn_id: *circuit });
                 self.phase = Phase::Done { promoted: None };
             }
             Phase::Upgrading { budget, round, .. } => {

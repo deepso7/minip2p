@@ -218,7 +218,7 @@ fn stalled_inbound_circuit_handshake_is_closed_at_its_deadline() {
     assert!(
         drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id: id } if *id == conn_id))
+            .any(|action| matches!(action, Out::CloseConnection { conn_id: id } if *id == conn_id))
     );
     assert!(h.agent.is_idle());
 }
@@ -243,7 +243,7 @@ fn established_inbound_circuit_disarms_its_handshake_deadline() {
     assert!(
         !drain_actions(&mut h.agent)
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id: id } if *id == conn_id)),
+            .any(|action| matches!(action, Out::CloseConnection { conn_id: id } if *id == conn_id)),
         "a ready inbound circuit must not be reclaimed by its old handshake deadline"
     );
     assert!(h.agent.is_idle());

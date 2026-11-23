@@ -26,7 +26,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 use crate::ReservationPolicy;
 use crate::acquire::{self, AcquireError, Acquired};
 use crate::agent::{Shared, StreamInput, StreamRole, close_write, reset, send};
-use crate::events::NatEvent;
+use crate::events::{NatAction, NatEvent};
 use crate::ledger::DialPurpose;
 use crate::swarm::NatSwarm;
 use crate::types::{ReachabilityState, ReservationInfo};
@@ -796,7 +796,7 @@ impl ReservationManager {
                 }
             }
             ResState::Acquiring { deadline, .. } if now.monotonic_ms >= *deadline => {
-                self.fail_acquire(swarm, shared, now);
+                self.time_out_acquire(swarm, shared, now);
             }
             _ => {}
         }
@@ -948,6 +948,26 @@ impl ReservationManager {
             emit_renewal_lost(&mut renewing, shared);
         }
         self.back_off(shared, now);
+    }
+
+    /// The acquisition passed its deadline. A renewal that timed out on an
+    /// existing connection also closes that exact connection: the relay
+    /// may have restarted behind it, and the backoff retry must dial afresh
+    /// instead of waiting out the transport's idle timeout. A refusal keeps
+    /// the connection, which answered.
+    fn time_out_acquire(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        let stale = match &self.state {
+            ResState::Acquiring {
+                stage,
+                renewing: Some(_),
+                ..
+            } => stage.stream().map(|(conn, _)| conn),
+            _ => None,
+        };
+        self.fail_acquire(swarm, shared, now);
+        if let Some(conn_id) = stale {
+            shared.push_action(NatAction::CloseConnection { conn_id });
+        }
     }
 
     /// Rotates to the next relay after an exponential, jittered backoff.

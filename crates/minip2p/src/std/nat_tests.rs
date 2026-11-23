@@ -602,12 +602,12 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
 
     execute(
         &mut driver,
-        NatAction::CloseCircuit { conn_id: promoted },
+        NatAction::CloseConnection { conn_id: promoted },
         &mut pair.local,
     );
     execute(
         &mut driver,
-        NatAction::CloseCircuit { conn_id: promoted },
+        NatAction::CloseConnection { conn_id: promoted },
         &mut pair.local,
     );
     assert!(driver.promoted().is_empty());

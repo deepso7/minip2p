@@ -553,9 +553,9 @@ fn an_adopted_circuit_whose_relay_times_out_closes_and_hands_over() {
     w.agent.handle_tick(at(12_000));
     let actions = drain_actions(&mut w.agent);
     assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == a_circuit))
+        actions.iter().any(
+            |action| matches!(action, Out::CloseConnection { conn_id } if *conn_id == a_circuit)
+        )
     );
     assert!(drain_all_events(&mut w.agent).iter().any(|event| matches!(
         event,

@@ -11,7 +11,7 @@ use crate::types::{NatError, Path, ReachabilityState, UpgradeStop};
 /// Swarm commands (dials, stream opens, writes, resets, pings) and bridge
 /// promotion are not actions: the agent issues them directly through the
 /// [`NatSwarm`](crate::NatSwarm) passed into each call. What remains needs the
-/// transport underneath the swarm (raw UDP, circuit closing) and is
+/// transport underneath the swarm (raw UDP, connection closing) and is
 /// fire-and-forget.
 #[derive(Clone, Debug)]
 pub enum NatAction {
@@ -23,10 +23,11 @@ pub enum NatAction {
         target: Multiaddr,
         payload_len: usize,
     },
-    /// Close a promoted circuit connection, or a NAT dial's handshake that
-    /// has not established, through the transport. Closing an already-gone
+    /// Close `conn_id` through the transport: a promoted circuit, a NAT
+    /// dial's handshake that has not established, or a relay connection
+    /// whose reservation renewal timed out. Closing an already-gone
     /// connection is successful cleanup.
-    CloseCircuit {
+    CloseConnection {
         conn_id: minip2p_transport::ConnectionId,
     },
 }
