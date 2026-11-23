@@ -1293,7 +1293,11 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        while let Some(event) = self.io.poll_event() {
+        while let Some(event) = self.io.poll_event().map_err(|error| TransportError::Io {
+            operation: "polling WebTransport events",
+            kind: IoErrorKind::Other,
+            detail: error.to_string(),
+        })? {
             self.on_io_event(event, now);
         }
         self.release_resets(now);

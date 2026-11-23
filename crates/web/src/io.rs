@@ -4,7 +4,8 @@
 //! Every call returns at once. `write` hands JS a view into wasm memory that
 //! `JsIo` copies before returning, so a queued browser write never points at
 //! memory that may move. Promise outcomes come back through `pollEvent` as
-//! plain `{ kind, ... }` objects, decoded here.
+//! plain `{ kind, ... }` objects, decoded here; one that does not decode
+//! fails the endpoint rather than being lost.
 
 use minip2p_core::{Bytes, Multihash};
 use minip2p_webtransport::{IoError, IoEvent, SessionHandle, StreamHandle, WebTransportIo};
@@ -203,17 +204,27 @@ impl WebTransportIo for JsIo {
         self.0.close(js_handle(session.0), code, reason);
     }
 
-    fn poll_event(&mut self) -> Option<IoEvent> {
-        loop {
-            let value = self.0.poll_event();
-            if value.is_undefined() || value.is_null() {
-                return None;
-            }
-            if let Ok(event) = serde_wasm_bindgen::from_value::<JsEvent>(value) {
-                return Some(event.into());
-            }
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError> {
+        let value = self.0.poll_event();
+        if value.is_undefined() || value.is_null() {
+            return Ok(None);
         }
+        let kind = js_sys::Reflect::get(&value, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|kind| kind.as_string());
+        serde_wasm_bindgen::from_value::<JsEvent>(value)
+            .map(|event| Some(event.into()))
+            .map_err(|error| undecodable(kind.as_deref(), &error.to_string()))
     }
+}
+
+/// The error for a `JsIo` event that does not match [`JsEvent`]: the
+/// TypeScript `IoEvent` and this decoder have drifted apart.
+fn undecodable(kind: Option<&str>, error: &str) -> IoError {
+    let kind = kind.map_or_else(|| "an".into(), |kind| format!("a `{kind}`"));
+    IoError(format!(
+        "JsIo returned {kind} event Rust cannot decode: {error}"
+    ))
 }
 
 /// Handles come from `JsIo` as `u32`s, so every one the client holds fits.

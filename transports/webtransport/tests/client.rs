@@ -185,8 +185,8 @@ impl WebTransportIo for FakeIo {
         self.closed_sessions.push(session.0);
     }
 
-    fn poll_event(&mut self) -> Option<IoEvent> {
-        self.events.pop_front()
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError> {
+        Ok(self.events.pop_front())
     }
 }
 
