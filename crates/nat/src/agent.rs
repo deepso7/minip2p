@@ -1123,7 +1123,9 @@ impl NatAgent {
     ///
     /// Queues one [`NatEvent::InboundHolePunchSendFailed`] per round: later
     /// failures in the same round are dropped. Drivers do not report
-    /// transports that lack a raw-UDP send.
+    /// transports that lack a raw-UDP send, and report every failure before
+    /// the agent's next input, as draining [`Self::poll_action`] after each
+    /// input does: a later input may forget the round.
     pub fn punch_send_failed(
         &mut self,
         peer: PeerId,

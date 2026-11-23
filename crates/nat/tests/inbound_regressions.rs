@@ -1165,10 +1165,10 @@ fn punch_send_failures_are_reported_once_per_inbound_round() {
     assert!(h.agent.is_idle());
 }
 
-/// A second inbound circuit from the same source, while the first is still
-/// punching, reports its own first round.
+/// A circuit from the same source that replaces one still punching reports
+/// its own first round.
 #[test]
-fn a_concurrent_circuit_from_the_same_source_reports_its_own_rounds() {
+fn a_replacement_circuit_from_the_same_source_reports_its_own_rounds() {
     let mut h = inbound_harness(NatConfig {
         punch_deadline_ms: 250,
         blast_interval_ms: 100,
@@ -1186,7 +1186,8 @@ fn a_concurrent_circuit_from_the_same_source_reports_its_own_rounds() {
     let target = h.target;
     h.stream_data(stop, stop_connect(&target), at(20));
     let promotion = drain_actions(&mut h.agent);
-    let second = complete_promotion(&mut h.agent, &target, &promotion, at(21));
+    let second = promoted_circuit(&promotion);
+    replace(&mut h, conn, second, true, 21);
     drain_events(&mut h.agent);
     let actions = drain_actions(&mut h.agent);
     let stream = opened_stream(&actions);
