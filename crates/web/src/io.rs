@@ -209,19 +209,19 @@ impl WebTransportIo for JsIo {
         if value.is_undefined() || value.is_null() {
             return Ok(None);
         }
-        let kind = js_sys::Reflect::get(&value, &JsValue::from_str("kind"))
-            .ok()
-            .and_then(|kind| kind.as_string());
-        serde_wasm_bindgen::from_value::<JsEvent>(value)
+        serde_wasm_bindgen::from_value::<JsEvent>(value.clone())
             .map(|event| Some(event.into()))
-            .map_err(|error| undecodable(kind.as_deref(), &error.to_string()))
+            .map_err(|error| undecodable(&value, &error.to_string()))
     }
 }
 
 /// The error for a `JsIo` event that does not match [`JsEvent`]: the
 /// TypeScript `IoEvent` and this decoder have drifted apart.
-fn undecodable(kind: Option<&str>, error: &str) -> IoError {
-    let kind = kind.map_or_else(|| "an".into(), |kind| format!("a `{kind}`"));
+fn undecodable(value: &JsValue, error: &str) -> IoError {
+    let kind = js_sys::Reflect::get(value, &JsValue::from_str("kind"))
+        .ok()
+        .and_then(|kind| kind.as_string())
+        .map_or_else(|| "an".into(), |kind| format!("a `{kind}`"));
     IoError(format!(
         "JsIo returned {kind} event Rust cannot decode: {error}"
     ))
