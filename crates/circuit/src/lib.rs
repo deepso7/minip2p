@@ -189,6 +189,9 @@ pub struct CircuitTransport<T, E> {
     unsettled: UnsettledConnections,
     bridge_index: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     retired_bridges: BTreeSet<(ConnectionId, StreamId)>,
+    /// Closed circuits whose bridge refused their last ciphertext as Full,
+    /// by bridge: each finishes its bridge once it has written the rest.
+    closing_bridges: BTreeMap<(ConnectionId, StreamId), Circuit>,
     retired_bridge_order: VecDeque<(ConnectionId, StreamId)>,
     active_inner: BTreeSet<ConnectionId>,
     direct_by_peer: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
@@ -228,6 +231,7 @@ impl<T, E> CircuitTransport<T, E> {
             unsettled: UnsettledConnections::new(),
             bridge_index: BTreeMap::new(),
             retired_bridges: BTreeSet::new(),
+            closing_bridges: BTreeMap::new(),
             retired_bridge_order: VecDeque::new(),
             active_inner: BTreeSet::new(),
             direct_by_peer: BTreeMap::new(),
@@ -435,6 +439,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     /// Reports that a bridge stream fully closed or reset.
     pub fn inject_bridge_closed(&mut self, inner_conn: ConnectionId, bridge_stream: StreamId) {
         let key = (inner_conn, bridge_stream);
+        self.closing_bridges.remove(&key);
         self.release_retired_bridge(key);
         if let Some(id) = self.bridge_index.get(&key).copied() {
             self.fail_circuit(
@@ -453,7 +458,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         inner_conn: ConnectionId,
         bridge_stream: StreamId,
     ) {
-        if let Some(id) = self.bridge_index.get(&(inner_conn, bridge_stream)).copied() {
+        let key = (inner_conn, bridge_stream);
+        if let Some(circuit) = self.closing_bridges.remove(&key) {
+            self.reset_bridge(&circuit);
+        }
+        if let Some(id) = self.bridge_index.get(&key).copied() {
             self.fail_circuit(
                 id,
                 ConnectionCloseReason::Error("relay bridge write side stopped".to_string()),
@@ -495,6 +504,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     }
 
     fn release_retired_bridges_for_connection(&mut self, id: ConnectionId) {
+        self.closing_bridges.retain(|(conn, _), _| *conn != id);
         self.retired_bridges.retain(|(conn, _)| *conn != id);
         self.retired_bridge_order.retain(|(conn, _)| *conn != id);
     }
@@ -593,6 +603,42 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let result = self.with_circuit(id, |this, circuit| this.pump(circuit));
         if let Err(teardown) = result {
             self.fail_circuit(id, teardown.0);
+        }
+    }
+
+    /// Half-closes a closed circuit's bridge once the bridge has taken all
+    /// its ciphertext, or holds the circuit until a `StreamWritable` lets
+    /// [`write_bridge`](Self::write_bridge) send the rest.
+    fn finish_bridge(&mut self, circuit: Circuit) {
+        if circuit.bridge_tail.is_some() || circuit.session.has_pending_write() {
+            self.closing_bridges.insert(circuit.bridge_key(), circuit);
+        } else if self
+            .inner
+            .close_stream_write(circuit.inner_conn, circuit.bridge_stream)
+            .is_err()
+        {
+            self.reset_bridge(&circuit);
+        }
+    }
+
+    /// Resumes a closed circuit's bridge that refused bytes as Full.
+    fn closing_bridge_writable(&mut self, key: (ConnectionId, StreamId)) {
+        let Some(mut circuit) = self.closing_bridges.remove(&key) else {
+            return;
+        };
+        if self.write_bridge(&mut circuit).is_ok() {
+            self.finish_bridge(circuit);
+        } else {
+            self.reset_bridge(&circuit);
+        }
+    }
+
+    fn reset_bridge(&mut self, circuit: &Circuit) {
+        let reset_result = self
+            .inner
+            .reset_stream(circuit.inner_conn, circuit.bridge_stream);
+        match reset_result {
+            Ok(()) | Err(_) => {}
         }
     }
 
@@ -745,6 +791,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 let key = (id, stream_id);
                 if let Some(circuit) = self.bridge_index.get(&key).copied() {
                     self.bridge_writable(circuit);
+                } else if self.closing_bridges.contains_key(&key) {
+                    self.closing_bridge_writable(key);
                 } else if !self.retired_bridges.contains(&key) {
                     self.pending
                         .push_back(TransportEvent::StreamWritable { id, stream_id });
@@ -765,7 +813,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 error_code,
             } => {
                 let key = (id, stream_id);
-                if self.bridge_index.contains_key(&key) {
+                if self.bridge_index.contains_key(&key) || self.closing_bridges.contains_key(&key) {
                     self.inject_bridge_write_stopped(id, stream_id);
                 } else if !self.retired_bridges.contains(&key) {
                     self.pending.push_back(TransportEvent::StreamWriteStopped {
@@ -777,7 +825,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             }
             TransportEvent::StreamClosed { id, stream_id } => {
                 let key = (id, stream_id);
-                if self.bridge_index.contains_key(&key) || self.retired_bridges.contains(&key) {
+                if self.bridge_index.contains_key(&key)
+                    || self.retired_bridges.contains(&key)
+                    || self.closing_bridges.contains_key(&key)
+                {
                     self.inject_bridge_closed(id, stream_id);
                 } else {
                     self.pending
@@ -1015,23 +1066,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
         self.retire_bridge(key);
-        let announced = circuit.session.go_away(0).is_ok();
-        let flushed = self.pump(&mut circuit).is_ok()
-            && circuit.bridge_tail.is_none()
-            && !circuit.session.has_pending_write();
-        let graceful = announced
-            && flushed
-            && self
-                .inner
-                .close_stream_write(circuit.inner_conn, circuit.bridge_stream)
-                .is_ok();
-        if !graceful {
-            let reset_result = self
-                .inner
-                .reset_stream(circuit.inner_conn, circuit.bridge_stream);
-            match reset_result {
-                Ok(()) | Err(_) => {}
-            }
+        if circuit.session.go_away(0).is_ok() && self.pump(&mut circuit).is_ok() {
+            self.finish_bridge(circuit);
+        } else {
+            self.reset_bridge(&circuit);
         }
         self.pending
             .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
@@ -1076,10 +1114,12 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     }
 
     /// A circuit's ciphertext the bridge refused, or its session still
-    /// holding output, or the inner transport's own pending writes (which
-    /// carry the circuits' bridges too).
+    /// holding output, a closed circuit's bridge not yet finished, or the
+    /// inner transport's own pending writes (which carry the circuits'
+    /// bridges and their FINs too).
     fn has_pending_writes(&self) -> bool {
         self.inner.has_pending_writes()
+            || !self.closing_bridges.is_empty()
             || self
                 .circuits
                 .values()

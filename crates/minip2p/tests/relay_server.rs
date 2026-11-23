@@ -52,8 +52,19 @@ impl RelayedPair {
 /// Reserves on `relay` for a responder, then connects an initiator to it
 /// over a relayed circuit and waits for Identify on both ends.
 fn relayed_pair(
+    relay: Endpoint,
+    relay_addr: PeerAddr,
+    bind_client: impl Fn(EndpointBuilder) -> Endpoint,
+) -> RelayedPair {
+    relayed_pair_via(relay, relay_addr.clone(), relay_addr, bind_client)
+}
+
+/// [`relayed_pair`], with the initiator reaching the relay at
+/// `initiator_relay_addr` (a proxy in front of it, say).
+fn relayed_pair_via(
     mut relay: Endpoint,
     relay_addr: PeerAddr,
+    initiator_relay_addr: PeerAddr,
     bind_client: impl Fn(EndpointBuilder) -> Endpoint,
 ) -> RelayedPair {
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -97,7 +108,7 @@ fn relayed_pair(
     let mut initiator = bind_client(
         Endpoint::builder()
             .protocol(ECHO_PROTOCOL)
-            .relay(relay_addr.clone())
+            .relay(initiator_relay_addr)
             .nat_config(NatConfig {
                 force_relay: true,
                 reservation_policy: ReservationPolicy::Never,
@@ -487,5 +498,229 @@ mod bulk {
             "the relay tore the circuit down: {failure:?}"
         );
         pair.finish();
+    }
+}
+
+/// Closing an endpoint over a relayed circuit drains the circuit's bridge
+/// stream before it closes the relay connection, so a lost final packet is
+/// retransmitted instead of dying with the connection (#565).
+#[cfg(feature = "quic")]
+mod relayed_close {
+    use std::net::{SocketAddr, UdpSocket};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use minip2p::{CloseOutcome, Multiaddr, Protocol};
+
+    use super::*;
+
+    fn take_drop_budget(counter: &AtomicUsize) -> bool {
+        let mut left = counter.load(Ordering::SeqCst);
+        while let Some(next) = left.checked_sub(1) {
+            match counter.compare_exchange_weak(left, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(observed) => left = observed,
+            }
+        }
+        false
+    }
+
+    /// A UDP proxy in front of a relay that can drop what passes through it.
+    struct LossyProxy {
+        addr: SocketAddr,
+        /// Client-to-relay datagrams still to drop.
+        drop_upstream: Arc<AtomicUsize>,
+        /// Drops every datagram, both ways.
+        blackhole: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        threads: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl LossyProxy {
+        fn start(relay: SocketAddr) -> Self {
+            let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let tick = Some(Duration::from_millis(5));
+            front.set_read_timeout(tick).unwrap();
+            back.set_read_timeout(tick).unwrap();
+            let addr = front.local_addr().unwrap();
+            let drop_upstream = Arc::new(AtomicUsize::new(0));
+            let blackhole = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let client = Arc::new(std::sync::Mutex::new(None));
+            let upstream = {
+                let (front, back) = (front.try_clone().unwrap(), back.try_clone().unwrap());
+                let (drop_upstream, blackhole, stop, client) = (
+                    Arc::clone(&drop_upstream),
+                    Arc::clone(&blackhole),
+                    Arc::clone(&stop),
+                    Arc::clone(&client),
+                );
+                thread::spawn(move || {
+                    let mut buf = [0u8; 65_536];
+                    while !stop.load(Ordering::SeqCst) {
+                        let Ok((len, from)) = front.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        *client.lock().unwrap() = Some(from);
+                        let dropped =
+                            blackhole.load(Ordering::SeqCst) || take_drop_budget(&drop_upstream);
+                        if !dropped && let Some(datagram) = buf.get(..len) {
+                            drop(back.send_to(datagram, relay));
+                        }
+                    }
+                })
+            };
+            let downstream = {
+                let (blackhole, stop) = (Arc::clone(&blackhole), Arc::clone(&stop));
+                thread::spawn(move || {
+                    let mut buf = [0u8; 65_536];
+                    while !stop.load(Ordering::SeqCst) {
+                        let Ok((len, _)) = back.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        let to = *client.lock().unwrap();
+                        if let Some(to) = to
+                            && !blackhole.load(Ordering::SeqCst)
+                            && let Some(datagram) = buf.get(..len)
+                        {
+                            drop(front.send_to(datagram, to));
+                        }
+                    }
+                })
+            };
+            Self {
+                addr,
+                drop_upstream,
+                blackhole,
+                stop,
+                threads: vec![upstream, downstream],
+            }
+        }
+
+        fn multiaddr(&self) -> Multiaddr {
+            format!("/ip4/127.0.0.1/udp/{}/quic-v1", self.addr.port())
+                .parse()
+                .unwrap()
+        }
+    }
+
+    impl Drop for LossyProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            for thread in self.threads.drain(..) {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    /// A QUIC relay, an initiator reaching it only through a [`LossyProxy`],
+    /// and a responder reaching it directly, connected over a circuit.
+    fn proxied_pair() -> (RelayedPair, LossyProxy) {
+        let relay = Endpoint::builder()
+            .relay_server()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind relay");
+        let bound = relay.bound_addresses().pop().expect("bound address");
+        let port = bound
+            .iter()
+            .find_map(|protocol| match protocol {
+                Protocol::Udp(port) => Some(*port),
+                _ => None,
+            })
+            .expect("bound UDP port");
+        let proxy = LossyProxy::start(SocketAddr::from(([127, 0, 0, 1], port)));
+        let relay_addr = PeerAddr::new(bound, *relay.peer_id()).unwrap();
+        let via_proxy = PeerAddr::new(proxy.multiaddr(), *relay.peer_id()).unwrap();
+        let pair = relayed_pair_via(relay, relay_addr, via_proxy, |builder| {
+            builder
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                .expect("quic listen address")
+                .bind()
+                .expect("bind client")
+        });
+        (pair, proxy)
+    }
+
+    fn stop_relay(stop_tx: mpsc::Sender<()>, relay_thread: thread::JoinHandle<()>) {
+        stop_tx.send(()).unwrap();
+        relay_thread.join().expect("relay driver thread");
+    }
+
+    /// Every client datagram from the payload on, through the circuit's
+    /// close, until the retransmissions after it.
+    const DROPPED: usize = 8;
+
+    #[test]
+    fn a_lost_final_bridge_packet_is_retransmitted_before_close_returns() {
+        let (pair, proxy) = proxied_pair();
+        let RelayedPair {
+            mut initiator,
+            mut responder,
+            responder_peer,
+            stop_tx,
+            relay_thread,
+            ..
+        } = pair;
+        let stream = initiator
+            .open_stream(&responder_peer, ECHO_PROTOCOL)
+            .expect("open stream");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "stream never became ready");
+            if let Some(EndpointEvent::StreamReady { stream: ready, .. }) =
+                initiator.next_event(Duration::from_millis(20)).unwrap()
+                && ready == stream
+            {
+                break;
+            }
+            let _ = responder.next_event(Duration::ZERO).unwrap();
+        }
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        proxy.drop_upstream.store(DROPPED, Ordering::SeqCst);
+        initiator.send_stream(stream, payload.clone()).unwrap();
+        initiator.close_stream_write(stream).unwrap();
+        let closer = thread::spawn(move || initiator.close_within(Duration::from_secs(5)));
+
+        let mut received = Vec::new();
+        let mut finished = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished && Instant::now() < deadline {
+            match responder.next_event(Duration::from_millis(20)).unwrap() {
+                Some(EndpointEvent::StreamData { data, .. }) => received.extend_from_slice(&data),
+                Some(EndpointEvent::StreamRemoteWriteClosed { .. }) => finished = true,
+                _ => {}
+            }
+        }
+        let report = closer.join().expect("close thread");
+        assert_eq!(received, payload, "the responder gets every byte");
+        assert!(finished, "the responder gets the stream FIN");
+        assert_eq!(proxy.drop_upstream.load(Ordering::SeqCst), 0);
+        assert_eq!(report.outcome, CloseOutcome::Drained, "{report:?}");
+        drop(responder);
+        stop_relay(stop_tx, relay_thread);
+    }
+
+    #[test]
+    fn an_unreachable_relay_bounds_the_close_by_its_deadline() {
+        let (pair, proxy) = proxied_pair();
+        let RelayedPair {
+            initiator,
+            responder,
+            stop_tx,
+            relay_thread,
+            ..
+        } = pair;
+        proxy.blackhole.store(true, Ordering::SeqCst);
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let report = initiator.close_within(timeout);
+        let elapsed = started.elapsed();
+        assert!(elapsed < timeout + Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(report.outcome, CloseOutcome::DeadlineExpired, "{report:?}");
+        drop(responder);
+        stop_relay(stop_tx, relay_thread);
     }
 }

@@ -403,9 +403,11 @@ impl Endpoint {
     /// be driving its endpoint for the flush to finish). Bytes on a stream
     /// left open are best effort: handed to QUIC, which may still hold them
     /// for congestion control. Over a relayed connection the FIN is handed
-    /// to the relay, without waiting for its acknowledgement. To deliver
-    /// everything, close the write side before flushing: `send_stream`,
-    /// `close_stream_write`, `flush`, then `close`.
+    /// to the relay, without waiting for its acknowledgement; only
+    /// [`close_within`](Self::close_within) waits for that, as it finishes
+    /// the relay's bridge stream. To deliver everything, close the write
+    /// side before flushing: `send_stream`, `close_stream_write`, `flush`,
+    /// then `close`.
     ///
     /// Drained is not delivered: bytes a peer's stop or reset, or
     /// a connection failure, discarded no longer count as pending, so a flush
@@ -556,7 +558,12 @@ impl Endpoint {
     /// First it [`flush`](Self::flush)es, within the same `timeout`, so
     /// bytes and FINs the endpoint accepted go out before the connections
     /// close; what is still pending when the deadline passes is lost (QUIC
-    /// discards it and TCP may abort). A TCP connection closed gracefully
+    /// discards it and TCP may abort). Relayed connections close next, and
+    /// the relay connections they ride stay open, within the same
+    /// `timeout`, until each circuit's last bytes and its bridge stream's
+    /// FIN are acknowledged, so a lost final packet is retransmitted rather
+    /// than discarded; a bridge still unacknowledged at the deadline makes
+    /// the close [`CloseOutcome::DeadlineExpired`]. A TCP connection closed gracefully
     /// then waits, within the same `timeout`, for the peer to close its side:
     /// dropping the socket sooner can reset it and lose what the peer had not
     /// read yet. With [`Duration::ZERO`] this is an immediate best-effort
@@ -587,13 +594,29 @@ impl Endpoint {
         #[cfg(feature = "mdns")]
         drop(self.shutdown_mdns());
         let drain_by = std::time::Instant::now() + timeout;
+        let mut bridges_unfinished = false;
         if let Err(error) = self.flush(drain_by) {
             report.errors.push(error);
             report.outcome = CloseOutcome::Failed;
         }
+        let relayed: Vec<crate::ConnectionId> = self
+            .engine
+            .core
+            .established_connections()
+            .filter_map(|(conn_id, _)| conn_id.is_circuit().then_some(conn_id))
+            .collect();
+        let mut relayed_first = !relayed.is_empty();
         loop {
+            if relayed_first && std::time::Instant::now() >= drain_by {
+                relayed_first = false;
+                bridges_unfinished = self.relayed_close_busy(&relayed);
+            }
             let now = self.now();
-            report.errors.extend(self.disconnect_established(now));
+            report.errors.extend(if relayed_first {
+                self.disconnect_relayed(now)
+            } else {
+                self.disconnect_established(now)
+            });
             #[cfg(all(feature = "relay-server", feature = "quic"))]
             {
                 let now = self.now();
@@ -633,6 +656,10 @@ impl Endpoint {
             }
             self.engine.settle(now);
             report.events.extend(self.engine.events.drain(..));
+            if relayed_first && !last && !self.relayed_close_busy(&relayed) {
+                relayed_first = false;
+                continue;
+            }
             if last
                 || (quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by))
             {
@@ -652,10 +679,38 @@ impl Endpoint {
         report.unfinished.extend(self.engine.backbone_connections());
         let lingering =
             minip2p_transport::Transport::has_pending_writes(self.engine.core.transport());
-        if report.outcome == CloseOutcome::Drained && (!report.unfinished.is_empty() || lingering) {
+        if report.outcome == CloseOutcome::Drained
+            && (!report.unfinished.is_empty() || lingering || bridges_unfinished)
+        {
             report.outcome = CloseOutcome::DeadlineExpired;
         }
         report
+    }
+
+    /// Disconnects every peer whose established connection is relayed,
+    /// returning each failure.
+    fn disconnect_relayed(&mut self, now: Now) -> Vec<Error> {
+        let relayed: Vec<crate::PeerId> = self
+            .engine
+            .core
+            .established_connections()
+            .filter_map(|(conn_id, peer)| conn_id.is_circuit().then_some(*peer))
+            .collect();
+        relayed
+            .iter()
+            .filter_map(|peer| self.engine.core.disconnect(peer, now.monotonic_ms).err())
+            .collect()
+    }
+
+    /// Whether a closing relayed connection is still tracked, or the
+    /// transport still holds writes, such as a bridge's FIN the relay has
+    /// not acknowledged: the relay connections stay open until it is not.
+    fn relayed_close_busy(&self, relayed: &[crate::ConnectionId]) -> bool {
+        self.engine
+            .core
+            .tracked_connections()
+            .any(|(conn_id, _)| relayed.contains(&conn_id))
+            || minip2p_transport::Transport::has_pending_writes(self.engine.core.transport())
     }
 
     fn close_drain_busy(&self) -> bool {
