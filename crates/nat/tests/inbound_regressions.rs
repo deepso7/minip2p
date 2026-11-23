@@ -1129,23 +1129,25 @@ fn run_failing_rounds(
 }
 
 fn rounds_reported(events: &[NatEvent], source: PeerId) -> Vec<u32> {
-    events
+    let rounds: Vec<u32> = events
         .iter()
-        .map(|event| match event {
+        .filter_map(|event| match event {
             NatEvent::InboundHolePunchSendFailed {
                 peer,
                 attempt,
                 target,
                 ..
-            } => {
-                assert_eq!(*peer, source);
-                assert_eq!(*target, maddr("/ip4/8.8.8.8/udp/4001/quic-v1"));
-                assert_eq!(event.connect_id(), None);
-                *attempt
+            } if *peer == source
+                && *target == maddr("/ip4/8.8.8.8/udp/4001/quic-v1")
+                && event.connect_id().is_none() =>
+            {
+                Some(*attempt)
             }
-            other => panic!("unexpected {other:?}"),
+            _ => None,
         })
-        .collect()
+        .collect();
+    assert_eq!(rounds.len(), events.len(), "{events:?}");
+    rounds
 }
 
 #[test]
