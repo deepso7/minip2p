@@ -73,7 +73,9 @@ impl InMemoryLink {
     /// since a push is new input.
     fn queue_mut(&mut self, side: LinkSide) -> &mut VecDeque<TransportEvent> {
         if let Some(waker) = side_value(&self.wakers, side) {
-            drop(waker.wake());
+            waker
+                .wake()
+                .expect("waking the in-memory link's host failed");
         }
         side_value_mut(&mut self.queues, side)
     }
