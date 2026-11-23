@@ -1,0 +1,846 @@
+{
+  "schema_version": 1,
+  "git_sha": "55417043c031412480b3c85ff3caac31ed2f4c96",
+  "rows": [
+    {
+      "tier": "rust-micro",
+      "name": "multiaddr/decode_binary",
+      "metric": "Ir",
+      "value": 1214
+    },
+    {
+      "tier": "rust-micro",
+      "name": "multiaddr/encode_binary",
+      "metric": "Ir",
+      "value": 1358
+    },
+    {
+      "tier": "rust-micro",
+      "name": "multiaddr/parse_text",
+      "metric": "Ir",
+      "value": 2360
+    },
+    {
+      "tier": "rust-micro",
+      "name": "peer_book_128_peers_16_addrs/next_deadline",
+      "metric": "Ir",
+      "value": 113
+    },
+    {
+      "tier": "rust-micro",
+      "name": "peer_book_128_peers_16_addrs/tick_active",
+      "metric": "Ir",
+      "value": 128
+    },
+    {
+      "tier": "rust-micro",
+      "name": "peer_book_128_peers_16_addrs/tick_expire",
+      "metric": "Ir",
+      "value": 5202522
+    },
+    {
+      "tier": "rust-micro",
+      "name": "peer_book_128_peers_16_addrs/tick_expire_sparse_4",
+      "metric": "Ir",
+      "value": 435078
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/128",
+      "metric": "Ir",
+      "value": 982277
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/128",
+      "metric": "allocs_per_msg",
+      "value": 194
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/128",
+      "metric": "bytes_allocated_per_msg",
+      "value": 94478
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/32",
+      "metric": "Ir",
+      "value": 623186
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/32",
+      "metric": "allocs_per_msg",
+      "value": 83
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/32",
+      "metric": "bytes_allocated_per_msg",
+      "value": 31070
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/8",
+      "metric": "Ir",
+      "value": 539528
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/8",
+      "metric": "allocs_per_msg",
+      "value": 50
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_forward_1KiB/8",
+      "metric": "bytes_allocated_per_msg",
+      "value": 16766
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
+      "metric": "Ir",
+      "value": 67344190
+    },
+    {
+      "tier": "rust-micro",
+      "name": "pubsub/gossipsub_publish_32x60KiB",
+      "metric": "Ir",
+      "value": 5293353
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_handle_event_same_now_128_pending_hops",
+      "metric": "Ir",
+      "value": 37182
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/close_connection_100_circuits",
+      "metric": "Ir",
+      "value": 493209
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/close_destination_connection",
+      "metric": "Ir",
+      "value": 13000
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/connect_new_peer",
+      "metric": "Ir",
+      "value": 10395
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/hop_admission",
+      "metric": "Ir",
+      "value": 19169
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/next_deadline",
+      "metric": "Ir",
+      "value": 592
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/reserve_new_peer",
+      "metric": "Ir",
+      "value": 20419
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/reset_holding_full_tails",
+      "metric": "Ir",
+      "value": 5036
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/tick_expire_100",
+      "metric": "Ir",
+      "value": 174838
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_100/tick_idle",
+      "metric": "Ir",
+      "value": 605
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/close_connection_100_circuits",
+      "metric": "Ir",
+      "value": 625570
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/close_destination_connection",
+      "metric": "Ir",
+      "value": 20946
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/connect_new_peer",
+      "metric": "Ir",
+      "value": 14445
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/hop_admission",
+      "metric": "Ir",
+      "value": 24333
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/next_deadline",
+      "metric": "Ir",
+      "value": 608
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/reserve_new_peer",
+      "metric": "Ir",
+      "value": 24650
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/reset_holding_full_tails",
+      "metric": "Ir",
+      "value": 6240
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/tick_expire_100",
+      "metric": "Ir",
+      "value": 220278
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_10k/tick_idle",
+      "metric": "Ir",
+      "value": 621
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/close_connection_100_circuits",
+      "metric": "Ir",
+      "value": 570307
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/close_destination_connection",
+      "metric": "Ir",
+      "value": 16015
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/connect_new_peer",
+      "metric": "Ir",
+      "value": 12328
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/hop_admission",
+      "metric": "Ir",
+      "value": 21744
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/next_deadline",
+      "metric": "Ir",
+      "value": 600
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/reserve_new_peer",
+      "metric": "Ir",
+      "value": 22000
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/reset_holding_full_tails",
+      "metric": "Ir",
+      "value": 5512
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/tick_expire_100",
+      "metric": "Ir",
+      "value": 207137
+    },
+    {
+      "tier": "rust-micro",
+      "name": "relay_server_1k/tick_idle",
+      "metric": "Ir",
+      "value": 613
+    },
+    {
+      "tier": "rust-micro",
+      "name": "yamux/1024_streams/sparse_send_8_streams",
+      "metric": "Ir",
+      "value": 173783
+    },
+    {
+      "tier": "rust-micro",
+      "name": "yamux/256KiB/queued_send_16KiB_window_updates",
+      "metric": "Ir",
+      "value": 342486
+    },
+    {
+      "tier": "rust-micro",
+      "name": "yamux/64KiB/session_receive_and_drain",
+      "metric": "Ir",
+      "value": 2650
+    },
+    {
+      "tier": "rust-micro",
+      "name": "yamux/64KiB/session_send_and_drain",
+      "metric": "Ir",
+      "value": 69351
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/quic/echo_64b",
+      "metric": "median_ns",
+      "value": 30642.10079989379
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/quic/echo_64b_crossed_4x4",
+      "metric": "median_ns",
+      "value": 298226.84449404763
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/quic/ping",
+      "metric": "median_ns",
+      "value": 11826.201339285715
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/quic/setup",
+      "metric": "median_ns",
+      "value": 923784.3529411764
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/quic/transfer_1mib",
+      "metric": "median_ns",
+      "value": 1952658.8833333333
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/tcp/echo_64b",
+      "metric": "median_ns",
+      "value": 50583.44975935829
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/tcp/echo_64b_crossed_4x4",
+      "metric": "median_ns",
+      "value": 422036.49551971327
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/tcp/ping",
+      "metric": "median_ns",
+      "value": 17441.701077586207
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/tcp/setup",
+      "metric": "median_ns",
+      "value": 613727.0321320017
+    },
+    {
+      "tier": "rust-wall",
+      "name": "e2e/tcp/transfer_1mib",
+      "metric": "median_ns",
+      "value": 3280825.4375
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/full",
+      "metric": "cpu_ms_per_s",
+      "value": 0.03899547710951097
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/full",
+      "metric": "wakeups_per_s",
+      "value": 0.9997532914801134
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/full_no_mdns",
+      "metric": "cpu_ms_per_s",
+      "value": 0.008273650095808084
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/full_no_mdns",
+      "metric": "wakeups_per_s",
+      "value": 0.09989918009910752
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/quic_dual_stack",
+      "metric": "cpu_ms_per_s",
+      "value": 0.005678284281061987
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/quic_dual_stack",
+      "metric": "wakeups_per_s",
+      "value": 0.09989944196097796
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/quic_only",
+      "metric": "cpu_ms_per_s",
+      "value": 0.005546417674817156
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_idle/quic_only",
+      "metric": "wakeups_per_s",
+      "value": 0.09989945379713897
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/idle/quic",
+      "metric": "rtt_us_p50",
+      "value": 41.92
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/idle/quic",
+      "metric": "rtt_us_p99",
+      "value": 62.279999999999994
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/idle/tcp",
+      "metric": "rtt_us_p50",
+      "value": 30.451
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/idle/tcp",
+      "metric": "rtt_us_p99",
+      "value": 38.650999999999996
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/pubsub/quic",
+      "metric": "rtt_us_p50",
+      "value": 36.97
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/pubsub/quic",
+      "metric": "rtt_us_p99",
+      "value": 65.491
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/pubsub/tcp",
+      "metric": "rtt_us_p50",
+      "value": 66.14999999999999
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/pubsub/tcp",
+      "metric": "rtt_us_p99",
+      "value": 90.671
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/relay/quic",
+      "metric": "rtt_us_p50",
+      "value": 51.291000000000004
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/relay/quic",
+      "metric": "rtt_us_p99",
+      "value": 61.04
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/relay/tcp",
+      "metric": "rtt_us_p50",
+      "value": 114.271
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_ping_load/relay/tcp",
+      "metric": "rtt_us_p99",
+      "value": 152.191
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_rtt/quic/100m_100ms",
+      "metric": "mb_per_s",
+      "value": 10.263612315412464
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_rtt/tcp/100m_100ms",
+      "metric": "mb_per_s",
+      "value": 11.681027365513682
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic",
+      "metric": "allocs_per_mb",
+      "value": 1721.37109375
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic",
+      "metric": "bytes_allocated_per_mb",
+      "value": 3395181.09375
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic",
+      "metric": "mb_per_s",
+      "value": 1631.801475236498
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/client/received",
+      "metric": "avg_datagram_bytes",
+      "value": 43.66111771700357
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/client/received",
+      "metric": "datagrams_per_mb",
+      "value": 6.5703125
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/client/received",
+      "metric": "datagrams_per_receive_call",
+      "value": 1
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/client/sent",
+      "metric": "avg_datagram_bytes",
+      "value": 1432.63983439703
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/client/sent",
+      "metric": "datagrams_per_mb",
+      "value": 749.15625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/target/received",
+      "metric": "avg_datagram_bytes",
+      "value": 1432.63983439703
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/target/received",
+      "metric": "datagrams_per_mb",
+      "value": 749.15625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/target/received",
+      "metric": "datagrams_per_receive_call",
+      "value": 9.35851266286049
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/target/sent",
+      "metric": "avg_datagram_bytes",
+      "value": 43.66349583828775
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/quic/target/sent",
+      "metric": "datagrams_per_mb",
+      "value": 6.5703125
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed",
+      "metric": "allocs_per_mb",
+      "value": 4776.28515625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed",
+      "metric": "bytes_allocated_per_mb",
+      "value": 9222779.21484375
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed",
+      "metric": "mb_per_s",
+      "value": 588.6681992505265
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/client/received",
+      "metric": "avg_datagram_bytes",
+      "value": 43.52802813805232
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/client/received",
+      "metric": "datagrams_per_mb",
+      "value": 71.078125
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/client/received",
+      "metric": "datagrams_per_receive_call",
+      "value": 1
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/client/sent",
+      "metric": "avg_datagram_bytes",
+      "value": 1387.7861376856156
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/client/sent",
+      "metric": "datagrams_per_mb",
+      "value": 774.9765625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/relay/received",
+      "metric": "avg_datagram_bytes",
+      "value": 1309.2765948359727
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/relay/received",
+      "metric": "datagrams_per_mb",
+      "value": 823.15234375
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/relay/received",
+      "metric": "datagrams_per_receive_call",
+      "value": 4.493783720384705
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/relay/sent",
+      "metric": "avg_datagram_bytes",
+      "value": 1283.7695251291445
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/relay/sent",
+      "metric": "datagrams_per_mb",
+      "value": 840.11328125
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/target/received",
+      "metric": "avg_datagram_bytes",
+      "value": 1398.3989272271972
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/target/received",
+      "metric": "datagrams_per_mb",
+      "value": 769.03515625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/target/received",
+      "metric": "datagrams_per_receive_call",
+      "value": 6.394887286428896
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/target/sent",
+      "metric": "avg_datagram_bytes",
+      "value": 46.339305983460356
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/relayed/target/sent",
+      "metric": "datagrams_per_mb",
+      "value": 48.1796875
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/tcp",
+      "metric": "allocs_per_mb",
+      "value": 476.98828125
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/tcp",
+      "metric": "bytes_allocated_per_mb",
+      "value": 3437842.66796875
+    },
+    {
+      "tier": "rust-wall",
+      "name": "endpoint_throughput/tcp",
+      "metric": "mb_per_s",
+      "value": 998.4642839262992
+    },
+    {
+      "tier": "rust-wall",
+      "name": "quic/idle_poll/1",
+      "metric": "median_ns",
+      "value": 456.73177157583416
+    },
+    {
+      "tier": "rust-wall",
+      "name": "quic/idle_poll/256",
+      "metric": "median_ns",
+      "value": 480.4030510480054
+    },
+    {
+      "tier": "rust-wall",
+      "name": "quic/idle_poll/512",
+      "metric": "median_ns",
+      "value": 480.995007518967
+    },
+    {
+      "tier": "rust-wall",
+      "name": "quic/idle_poll/64",
+      "metric": "median_ns",
+      "value": 475.94025236557695
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll/1",
+      "metric": "median_ns",
+      "value": 2771.6626888802793
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll/256",
+      "metric": "median_ns",
+      "value": 728377.2581349206
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll/512",
+      "metric": "median_ns",
+      "value": 1456830.8863636362
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll/64",
+      "metric": "median_ns",
+      "value": 173590.39703551045
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll_sparse/1",
+      "metric": "median_ns",
+      "value": 2887.5598601838738
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll_sparse/256",
+      "metric": "median_ns",
+      "value": 3014.809301958307
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll_sparse/512",
+      "metric": "median_ns",
+      "value": 2994.1505805153747
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/readiness_poll_sparse/64",
+      "metric": "median_ns",
+      "value": 2911.3125475237775
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_idle/1",
+      "metric": "median_ns",
+      "value": 149.9901614710942
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_idle/256",
+      "metric": "median_ns",
+      "value": 144.69663574893275
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_idle/512",
+      "metric": "median_ns",
+      "value": 150.854741493956
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_idle/64",
+      "metric": "median_ns",
+      "value": 146.40766554877413
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_sparse/1",
+      "metric": "median_ns",
+      "value": 7068.672658585625
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_sparse/256",
+      "metric": "median_ns",
+      "value": 9294.953562176164
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_sparse/512",
+      "metric": "median_ns",
+      "value": 9362.033010074567
+    },
+    {
+      "tier": "rust-wall",
+      "name": "tcp/transport_poll_sparse/64",
+      "metric": "median_ns",
+      "value": 8882.527837680565
+    },
+    {
+      "tier": "node-ffi",
+      "name": "connected_peers_sync",
+      "metric": "median_ns",
+      "value": 417997.50000018324
+    },
+    {
+      "tier": "node-ffi",
+      "name": "raw_drain_events",
+      "metric": "median_ns",
+      "value": 1483553.9999999127
+    },
+    {
+      "tier": "node-ffi",
+      "name": "sdk_drain_flood",
+      "metric": "median_ns",
+      "value": 1791839.9999999793
+    },
+    {
+      "tier": "node-ffi",
+      "name": "sdk_stream_transfer",
+      "metric": "median_ns",
+      "value": 1361087.999999995
+    }
+  ]
+}
