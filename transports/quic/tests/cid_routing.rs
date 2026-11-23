@@ -165,3 +165,51 @@ fn unknown_cid_datagrams_from_a_shared_address_leave_both_connections_intact() {
     );
     assert!(!client.closed(0) && !client.closed(1));
 }
+
+/// Hundreds of Retry-validated dials from one client socket, in batches as
+/// `idle_poll` sets them up, all complete: no Retry's connection id may
+/// match one a live connection holds (#631).
+#[test]
+fn many_retry_validated_dials_from_one_socket_all_connect() {
+    const DIALS: usize = 128;
+    const BATCH: usize = 32;
+    let mut server = loopback(QuicNodeConfig::generate().with_limits(QuicLimits {
+        require_address_validation: true,
+        ..QuicLimits::default()
+    }));
+    let mut client = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("listen");
+    let target = server.local_peer_addrs().expect("server address").remove(0);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let (mut dialed, mut server_connected, mut client_connected) = (0, 0, 0);
+    while dialed != DIALS {
+        let batch = (dialed + BATCH).min(DIALS);
+        while dialed != batch {
+            client.dial(&target).expect("dial");
+            dialed += 1;
+        }
+        while server_connected != batch || client_connected != batch {
+            for (transport, connected) in [
+                (&mut server, &mut server_connected),
+                (&mut client, &mut client_connected),
+            ] {
+                for event in transport.poll(now()).expect("poll") {
+                    assert!(
+                        !matches!(
+                            event,
+                            TransportEvent::Closed { .. } | TransportEvent::Error { .. }
+                        ),
+                        "a dial failed: {event:?}"
+                    );
+                    *connected += usize::from(matches!(event, TransportEvent::Connected { .. }));
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{server_connected} server and {client_connected} client connections of {dialed}"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+}
