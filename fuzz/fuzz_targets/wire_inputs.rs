@@ -968,8 +968,8 @@ impl WebTransportIo for FuzzWtIo {
 
     fn close(&mut self, _session: SessionHandle, _code: u32, _reason: &str) {}
 
-    fn poll_event(&mut self) -> Option<IoEvent> {
-        self.events.pop_front()
+    fn poll_event(&mut self) -> Result<Option<IoEvent>, IoError> {
+        Ok(self.events.pop_front())
     }
 }
 
