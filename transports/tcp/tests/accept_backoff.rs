@@ -7,7 +7,7 @@
 
 use minip2p_core::platform::{Deadline, Now, StdEntropy};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_tcp::{ACCEPT_FAILURE_RETRY, StdTcpProvider, TcpTransport};
+use minip2p_tcp::{StdTcpProvider, TcpTransport};
 use minip2p_transport::{Transport, TransportError, TransportEvent};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
@@ -66,7 +66,7 @@ fn an_exhausted_listener_retries_on_a_timer_and_drains_its_backlog() {
     );
     assert_eq!(
         transport.next_deadline(),
-        Some(Deadline::from_millis(ACCEPT_FAILURE_RETRY)),
+        Some(Deadline::from_millis(100)),
         "the backlog raises no further edge, so a retry is scheduled"
     );
 

@@ -165,29 +165,6 @@ struct Listener {
     retry_at: Option<Deadline>,
 }
 
-/// Whether two accept failures are the same one, for reporting purposes.
-///
-/// I/O failures match on operation and kind: the platform's text can drift
-/// between attempts at the same broken thing, and reporting each drift would
-/// be noise.
-fn same_failure(a: &TcpError, b: &TcpError) -> bool {
-    match (a, b) {
-        (
-            TcpError::Io {
-                operation: a_operation,
-                kind: a_kind,
-                ..
-            },
-            TcpError::Io {
-                operation: b_operation,
-                kind: b_kind,
-                ..
-            },
-        ) => a_operation == b_operation && a_kind == b_kind,
-        _ => a == b,
-    }
-}
-
 /// What a registration token currently stands for.
 #[derive(Clone, Copy)]
 enum Slot {
@@ -499,6 +476,10 @@ impl StdTcpProvider {
 
     /// Reports `error` on listener `key` unless it repeats the failure
     /// already reported.
+    ///
+    /// The whole error is compared, platform text included: distinct errnos
+    /// such as `EMFILE` and `ENOBUFS` share an [`IoErrorKind`](minip2p_core::platform::IoErrorKind),
+    /// and the text for one errno does not drift between attempts.
     fn record_failure(&mut self, key: usize, error: TcpError) {
         let Some(listener) = self.listeners.get_mut(&key) else {
             return;
@@ -506,7 +487,7 @@ impl StdTcpProvider {
         if listener
             .failure
             .as_ref()
-            .is_some_and(|reported| same_failure(reported, &error))
+            .is_some_and(|reported| *reported == error)
         {
             return;
         }
@@ -1189,6 +1170,37 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, TcpEvent::AcceptFailed { .. }))
             .count()
+    }
+
+    #[test]
+    fn a_changed_failure_is_reported_and_a_repeat_is_not() {
+        let (mut server, bound) = loopback_listener();
+        let failure = |detail: &str| TcpError::Io {
+            operation: TcpIoOperation::Accept,
+            kind: minip2p_core::platform::IoErrorKind::Other,
+            detail: detail.to_string(),
+        };
+        for detail in [
+            "Too many open files (os error 24)",
+            "Too many open files (os error 24)",
+            "No buffer space available (os error 105)",
+        ] {
+            server.record_failure(0, failure(detail));
+        }
+        let events = server.poll(Now::from_millis(0)).expect("poll");
+        assert_eq!(
+            events,
+            [
+                TcpEvent::AcceptFailed {
+                    listener: bound.clone(),
+                    error: failure("Too many open files (os error 24)"),
+                },
+                TcpEvent::AcceptFailed {
+                    listener: bound,
+                    error: failure("No buffer space available (os error 105)"),
+                },
+            ]
+        );
     }
 
     #[test]
