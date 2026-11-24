@@ -151,7 +151,8 @@ fn listener(config: &Config) -> Result<()> {
             config.log(format_args!("{event:?}"));
             match event {
                 EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
-                    published = redis.command(&["SET", &peer_key, &peer_id]).is_ok();
+                    redis.command(&["SET", &peer_key, &peer_id])?;
+                    published = true;
                 }
                 EndpointEvent::Nat(NatEvent::InboundDirectUpgrade { new_conn_id, .. }) => {
                     config.log(format_args!("punched, now direct on {new_conn_id:?}"));
@@ -167,9 +168,11 @@ fn listener(config: &Config) -> Result<()> {
 /// reference's does, and `handshake_plus_one_rtt` is that span plus the one
 /// ping that proves the punched path carries traffic.
 ///
-/// A punch that cannot happen is reported instead of waited out:
-/// `FellBackToRelay` means the upgrade budget or all three rounds are gone,
-/// and the relayed path alone is not a pass for this suite.
+/// Every outcome that makes success impossible is reported instead of waited
+/// out: `FellBackToRelay` (the upgrade budget or all three rounds are gone,
+/// and a relayed path alone is not a pass for this suite), and a ping that
+/// fails or a punched connection that closes before the ping answers — only
+/// one ping is sent, so nothing would arrive after either.
 ///
 /// The upgrade is accepted as either `Punched` or `Direct`. A punch whose
 /// winning connection is the *peer's* dial arriving inbound carries no local
@@ -240,6 +243,18 @@ fn dialer(config: &Config) -> Result<()> {
             }
             EndpointEvent::Nat(NatEvent::FellBackToRelay { reason, .. }) => {
                 return Err(format!("no direct upgrade, settled on the relay: {reason:?}").into());
+            }
+            EndpointEvent::PingFailed { conn_id, cause, .. }
+                if punched.is_some_and(|(punched_conn, _)| conn_id == punched_conn) =>
+            {
+                return Err(format!("ping over the punched path failed: {cause:?}").into());
+            }
+            EndpointEvent::ConnectionClosed {
+                conn_id, reason, ..
+            } if punched.is_some_and(|(punched_conn, _)| conn_id == punched_conn) => {
+                return Err(
+                    format!("punched connection closed before the ping: {reason:?}").into(),
+                );
             }
             EndpointEvent::ConnectSettled {
                 connect_id: id,
