@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 
 use crate::dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_core::platform::Now;
-use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -643,6 +643,7 @@ impl InboundCircuit {
                 }) => {
                     let remote_addrs = select_punch_candidates(
                         &remote_addrs,
+                        source,
                         shared.config.allow_private_punch_targets,
                     );
                     let blast_start = now.monotonic_ms.saturating_add(rtt_ms.div_ceil(2));
@@ -815,13 +816,42 @@ pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>)
 /// unicast IP when [`NatConfig::allow_private_punch_targets`] is set), then
 /// bound them with [`bound_punch_candidates`].
 ///
+/// A terminal `/p2p/<peer-id>` is kept when it names `peer` and the address is
+/// dialed without it; rust-libp2p advertises its DCUtR candidates that way.
+/// An address naming anyone else is dropped rather than dialed: the peer we
+/// are punching with is the only one that consented to this traffic.
+///
 /// [`NatConfig::allow_private_punch_targets`]: crate::NatConfig::allow_private_punch_targets
-pub(crate) fn select_punch_candidates(addrs: &[Multiaddr], allow_private: bool) -> Vec<Multiaddr> {
+pub(crate) fn select_punch_candidates(
+    addrs: &[Multiaddr],
+    peer: &PeerId,
+    allow_private: bool,
+) -> Vec<Multiaddr> {
+    let transports: Vec<Multiaddr> = addrs
+        .iter()
+        .filter_map(|addr| transport_for(addr, peer))
+        .collect();
     bound_punch_candidates(
-        select_direct_addrs(addrs, None, None)
+        select_direct_addrs(&transports, None, None)
             .into_iter()
             .filter(|addr| is_punchable_quic(addr, allow_private)),
     )
+}
+
+/// Strips a terminal `/p2p/<peer-id>` that names `peer`, drops an address that
+/// names another peer, and leaves an address without one untouched.
+///
+/// This runs before [`select_direct_addrs`], which recognises only bare
+/// transport shapes: a suffixed address has no [`TransportKind`] and would be
+/// dropped there before it could be stripped.
+///
+/// [`TransportKind`]: minip2p_core::TransportKind
+fn transport_for(addr: &Multiaddr, peer: &PeerId) -> Option<Multiaddr> {
+    match PeerAddr::from_multiaddr(addr) {
+        Ok(peer_addr) if peer_addr.peer_id() == peer => Some(peer_addr.into_parts().0),
+        Ok(_) => None,
+        Err(_) => Some(addr.clone()),
+    }
 }
 
 fn is_punchable_quic(addr: &Multiaddr, allow_private: bool) -> bool {

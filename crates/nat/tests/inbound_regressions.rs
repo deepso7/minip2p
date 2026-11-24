@@ -427,6 +427,27 @@ fn allowed_private_punch_targets_are_still_unicast_quic_ips() {
 }
 
 #[test]
+fn punch_targets_keep_a_terminal_peer_id_and_drop_a_foreign_one() {
+    let mut h = inbound_harness(NatConfig {
+        allow_private_punch_targets: true,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    let mine = format!("/ip4/10.0.0.1/udp/4001/quic-v1/p2p/{}", h.target);
+    let theirs = format!(
+        "/ip4/10.0.0.2/udp/4001/quic-v1/p2p/{}",
+        peer(b"somebody-else")
+    );
+    answer_dcutr_at(&mut h, conn, stream, &[&mine, &theirs], 20);
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(24));
+    let targets = blast_targets(drain_actions(&mut h.agent));
+    assert_eq!(targets, vec![maddr("/ip4/10.0.0.1/udp/4001/quic-v1")]);
+}
+
+#[test]
 fn dcutr_connect_advertises_trusted_observation_but_not_tcp_listener() {
     let mut h = inbound_harness(NatConfig::default());
     h.agent
