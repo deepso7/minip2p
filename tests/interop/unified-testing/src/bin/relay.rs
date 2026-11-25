@@ -100,7 +100,7 @@ fn relay(config: &Config) -> Result<()> {
     let addr = node.listen()?.to_string();
     config.log(format_args!("relay at {addr}"));
     Redis::connect(&config.redis_addr)?.command(&["SET", &config.key("relay_multiaddr"), &addr])?;
-    serve(config, &mut node, |_, _| {})
+    serve(config, &mut node, |_, _| Ok(()))
 }
 
 /// Reserves a slot on the relay, publishes the peer id once the reservation
@@ -130,44 +130,48 @@ fn listener(config: &Config) -> Result<()> {
     let peer_id = node.peer_id().to_string();
     let mut published = false;
     let mut echoes = HashSet::new();
-    serve(config, &mut node, |node, event| match event {
-        EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
-            published = redis.command(&["SET", &peer_key, &peer_id]).is_ok();
-        }
-        EndpointEvent::StreamReady {
-            stream,
-            protocol_id,
-            initiated_locally: false,
-            ..
-        } if protocol_id == ECHO_PROTOCOL => {
-            echoes.insert(*stream);
-        }
-        EndpointEvent::StreamData { stream, data, .. } if echoes.contains(stream) => {
-            if node.send_stream(*stream, data.clone()).is_err() {
+    serve(config, &mut node, |node, event| {
+        match event {
+            EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
+                redis.command(&["SET", &peer_key, &peer_id])?;
+                published = true;
+            }
+            EndpointEvent::StreamReady {
+                stream,
+                protocol_id,
+                initiated_locally: false,
+                ..
+            } if protocol_id == ECHO_PROTOCOL => {
+                echoes.insert(*stream);
+            }
+            EndpointEvent::StreamData { stream, data, .. } if echoes.contains(stream) => {
+                if node.send_stream(*stream, data.clone()).is_err() {
+                    echoes.remove(stream);
+                }
+            }
+            EndpointEvent::StreamRemoteWriteClosed { stream, .. } if echoes.remove(stream) => {
+                let _ = node.close_stream_write(*stream);
+            }
+            EndpointEvent::StreamClosed { stream, .. } => {
                 echoes.remove(stream);
             }
+            _ => {}
         }
-        EndpointEvent::StreamRemoteWriteClosed { stream, .. } if echoes.remove(stream) => {
-            let _ = node.close_stream_write(*stream);
-        }
-        EndpointEvent::StreamClosed { stream, .. } => {
-            echoes.remove(stream);
-        }
-        _ => {}
+        Ok(())
     })
 }
 
 /// Drives `node` until Docker stops the container, handing each event to
-/// `on_event`.
+/// `on_event`, and stops at the first error `on_event` reports.
 fn serve(
     config: &Config,
     node: &mut Endpoint,
-    mut on_event: impl FnMut(&mut Endpoint, &EndpointEvent),
+    mut on_event: impl FnMut(&mut Endpoint, &EndpointEvent) -> Result<()>,
 ) -> Result<()> {
     loop {
         if let EndpointWaitOutcome::Event(event) = node.wait(Duration::from_secs(1))? {
             config.log(format_args!("{event:?}"));
-            on_event(node, &event);
+            on_event(node, &event)?;
         }
     }
 }
