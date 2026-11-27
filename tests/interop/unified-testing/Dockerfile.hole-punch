@@ -1,0 +1,23 @@
+# Hole-punch (DCUtR) peer image for libp2p/unified-testing.
+# Build context: the repository root.
+#   docker build -f tests/interop/unified-testing/Dockerfile.hole-punch -t minip2p-hole-punch .
+FROM rust:1.91-slim-bookworm AS build
+WORKDIR /src
+# The root manifest supplies the `workspace = true` fields the crates inherit.
+COPY Cargo.toml ./
+COPY crates crates
+COPY transports transports
+COPY tests/interop/unified-testing tests/interop/unified-testing
+RUN cargo build --release --locked \
+      --manifest-path tests/interop/unified-testing/Cargo.toml \
+      --bin minip2p-hole-punch-interop
+
+FROM debian:bookworm-slim
+# iproute2 for run-peer.sh: the harness gives the peer containers no route to
+# the relay's subnet, so each peer adds its own before the node starts.
+RUN apt-get update \
+      && apt-get install -y --no-install-recommends iproute2 \
+      && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/tests/interop/unified-testing/target/release/minip2p-hole-punch-interop /usr/local/bin/
+COPY --chmod=0755 tests/interop/unified-testing/run-peer.sh /usr/local/bin/run-peer.sh
+ENTRYPOINT ["run-peer.sh"]

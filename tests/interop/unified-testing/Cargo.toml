@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "minip2p-relay-interop"
 path = "src/bin/relay.rs"
 
+[[bin]]
+name = "minip2p-hole-punch-interop"
+path = "src/bin/hole_punch.rs"
+
 [dependencies]
 minip2p = { package = "minip2p-rs", path = "../../../crates/minip2p", features = [
   "quic",

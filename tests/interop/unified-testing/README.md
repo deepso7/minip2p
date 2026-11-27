@@ -6,8 +6,9 @@ minip2p's entries in libp2p's interop matrices, one binary per suite:
 | --- | --- | --- |
 | `minip2p-unified-testing` | transport, in both [test-plans](https://github.com/libp2p/test-plans) and [unified-testing](https://github.com/libp2p/unified-testing) | `src/main.rs` |
 | `minip2p-relay-interop` | unified-testing [`relay`](https://github.com/libp2p/unified-testing/tree/master/relay) (Circuit Relay v2) | `src/bin/relay.rs` |
+| `minip2p-hole-punch-interop` | unified-testing [`hole-punch`](https://github.com/libp2p/unified-testing/tree/master/hole-punch) (DCUtR through two NATs) | `src/bin/hole_punch.rs` |
 
-`src/redis.rs` is the shared Redis client. The suites disagree on the key type: transport uses a list (`RPUSH` / `BLPOP`), relay a string (`SET` / `GET`).
+`src/redis.rs` is the shared Redis client. The suites disagree on the key type: transport uses a list (`RPUSH` / `BLPOP`), relay and hole-punch a string (`SET` / `GET`).
 
 ## transport
 
@@ -84,4 +85,28 @@ env $env ROLE=relay    ./target/release/minip2p-relay-interop &
 env $env ROLE=listener ./target/release/minip2p-relay-interop &
 env $env ROLE=dialer   ./target/release/minip2p-relay-interop
 # status: pass
+```
+
+## hole-punch
+
+Two peers, each behind its own NAT router, meet through a relay the harness runs and upgrade the circuit to a direct connection with DCUtR. The dialer times the upgrade and prints `latency: {handshake_plus_one_rtt, ping_rtt, unit}`; the listener runs until the harness stops it. The contract is the rust reference peer's, [`hole-punch/images/rust/v0.56/src/bin/peer.rs`](https://github.com/libp2p/unified-testing/blob/master/hole-punch/images/rust/v0.56/src/bin/peer.rs): `IS_DIALER`, `REDIS_ADDR`, `TEST_KEY`, `TRANSPORT`, `DIALER_IP` / `LISTENER_IP`, `DEBUG`, and the string keys `<TEST_KEY>_relay_multiaddr` (set by the relay) and `<TEST_KEY>_listener_peer_id`.
+
+Three things are minip2p's rather than the harness's:
+
+- **QUIC only.** `punch_candidates` keeps only `/quic-v1` addresses, so `TRANSPORT=tcp` is refused instead of being measured over the relay. The suite entry declares `transports: [quic-v1]`.
+- **`allow_private_punch_targets = true`.** Every testbed address is a private `10.x`, which the punch path drops by default; both roles set it, because the initiator dials those targets and the responder blasts UDP at them.
+- **The LAN address is bound explicitly, never `0.0.0.0`.** Both peers also sit on the harness's flat Redis network, and a wildcard bind would advertise that address too — a "punch" over it would never have crossed a NAT.
+
+The reservation holder drives DCUtR (ADR 0017), so the **listener** runs the rounds while the dialer answers and is the one timed. Settling on a relayed path (`ConnectSettled` with `Path::Relayed`) therefore fails the dialer: a relayed path is not a pass for this suite.
+
+`run-peer.sh` adds the route to `WAN_SUBNET` via `WAN_ROUTER_IP` on `lan0` before the binary starts, because the harness gives the peer containers no route to the relay's subnet. That is why this image installs `iproute2` and the suite grants it `NET_ADMIN`.
+
+```sh
+docker build -f tests/interop/unified-testing/Dockerfile.hole-punch -t minip2p-hole-punch .
+```
+
+The app needs two NATs and a relay, so run it through the suite rather than by hand. Until a `minip2p` entry is merged upstream in `libp2p/unified-testing`, add a local `minip2p` entry in `hole-punch/images.yaml` with `transports: [quic-v1]`, `source.type: local`, `source.path` set to the minip2p checkout root (the Docker build context), and `source.dockerfile: tests/interop/unified-testing/Dockerfile.hole-punch`, then run:
+
+```sh
+cd hole-punch && ./run.sh --test-select "minip2p"
 ```
