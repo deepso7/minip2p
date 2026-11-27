@@ -72,4 +72,4 @@ napi-derive = "=3.6.13"
 serde = { workspace = true, features = ["std"] }
 
 [build-dependencies]
-napi-build = "=2.6.0"
+napi-build = "=2.7.0"
