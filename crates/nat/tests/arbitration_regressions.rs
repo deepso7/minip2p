@@ -100,6 +100,13 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
     let stream = StreamId::new(90);
     open_inbound_dcutr(&mut h, conn, stream);
     let global = maddr("/ip4/9.9.9.9/udp/4002/quic-v1");
+    let suffixed_target = maddr(&format!("/ip4/8.8.8.8/udp/4002/quic-v1/p2p/{}", h.target));
+    let suffixed_duplicate = maddr(&format!("/ip4/9.9.9.9/udp/4002/quic-v1/p2p/{}", h.target));
+    let suffixed_foreign = maddr(&format!(
+        "/ip4/1.1.1.1/udp/4002/quic-v1/p2p/{}",
+        peer(b"somebody-else")
+    ));
+    let non_terminal_p2p = maddr(&format!("/ip4/4.2.2.2/udp/4002/p2p/{}/quic-v1", h.target));
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
@@ -110,6 +117,10 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
                 maddr("/dns4/attacker.invalid/udp/4002/quic-v1"),
                 maddr("/ip4/192.0.2.7/udp/4002/quic-v1"),
                 global.clone(),
+                suffixed_duplicate,
+                suffixed_target,
+                suffixed_foreign,
+                non_terminal_p2p,
             ])),
         },
         false,
@@ -134,7 +145,7 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
             _ => None,
         })
         .collect();
-    assert_eq!(dials, vec![global]);
+    assert_eq!(dials, vec![global, maddr("/ip4/8.8.8.8/udp/4002/quic-v1")]);
 }
 
 /// A CONNECT naming hundreds of global addresses produces at most the cap's
