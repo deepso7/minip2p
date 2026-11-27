@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 
 use crate::dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_core::platform::Now;
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_core::{Multiaddr, PeerAddr, PeerAddrError, PeerId, Protocol, select_direct_addrs};
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -807,8 +807,8 @@ pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>)
 /// because those are useful when configured by the local application, and any
 /// transport, because a host dials what it bound. DCUtR addresses are neither:
 /// they come from an untrusted remote peer, and the DCUtR role decides what
-/// happens to them -- the initiator dials them, the responder blasts UDP at
-/// them to open its own mapping. Resolving or sending traffic to
+/// happens to them -- the initiator blasts UDP at them to open its own
+/// mapping, and the responder dials them. Resolving or sending traffic to
 /// private/special-use targets would turn the NAT agent into an SSRF
 /// primitive, and a hole punch aimed at a `/tcp` address would put UDP on a
 /// port whose owner never consented to receive it. Keep only strict QUIC-v1
@@ -850,7 +850,8 @@ fn transport_for(addr: &Multiaddr, peer: &PeerId) -> Option<Multiaddr> {
     match PeerAddr::from_multiaddr(addr) {
         Ok(peer_addr) if peer_addr.peer_id() == peer => Some(peer_addr.into_parts().0),
         Ok(_) => None,
-        Err(_) => Some(addr.clone()),
+        Err(PeerAddrError::MissingPeerId) => Some(addr.clone()),
+        Err(_) => None,
     }
 }
 

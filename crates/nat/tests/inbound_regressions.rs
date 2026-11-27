@@ -435,12 +435,12 @@ fn punch_targets_keep_a_terminal_peer_id_and_drop_a_foreign_one() {
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
-    let mine = format!("/ip4/10.0.0.1/udp/4001/quic-v1/p2p/{}", h.target);
-    let theirs = format!(
+    let remote = format!("/ip4/10.0.0.1/udp/4001/quic-v1/p2p/{}", h.target);
+    let foreign = format!(
         "/ip4/10.0.0.2/udp/4001/quic-v1/p2p/{}",
         peer(b"somebody-else")
     );
-    answer_dcutr_at(&mut h, conn, stream, &[&mine, &theirs], 20);
+    answer_dcutr_at(&mut h, conn, stream, &[&remote, &foreign], 20);
     drain_actions(&mut h.agent);
     h.agent.handle_tick(at(24));
     let targets = blast_targets(drain_actions(&mut h.agent));
