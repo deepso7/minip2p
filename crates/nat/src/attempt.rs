@@ -295,6 +295,7 @@ impl ConnectAttempt {
                 }) => {
                     self.punch_addrs = select_punch_candidates(
                         &remote_addrs,
+                        &self.peer,
                         shared.config.allow_private_punch_targets,
                     );
                 }
