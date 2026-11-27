@@ -128,13 +128,14 @@ fn listener(config: &Config) -> Result<()> {
 
     let peer_key = config.key("listener_peer_id");
     let peer_id = node.peer_id().to_string();
-    let mut published = false;
+    let mut redis = Some(redis);
     let mut echoes = HashSet::new();
     serve(config, &mut node, |node, event| {
         match event {
-            EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
-                redis.command(&["SET", &peer_key, &peer_id])?;
-                published = true;
+            EndpointEvent::Nat(NatEvent::RelayReserved { .. }) => {
+                if let Some(mut redis) = redis.take() {
+                    redis.command(&["SET", &peer_key, &peer_id])?;
+                }
             }
             EndpointEvent::StreamReady {
                 stream,
