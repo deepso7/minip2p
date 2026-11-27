@@ -97,7 +97,7 @@ Three things are minip2p's rather than the harness's:
 - **`allow_private_punch_targets = true`.** Every testbed address is a private `10.x`, which the punch path drops by default; both roles set it, because the initiator dials those targets and the responder blasts UDP at them.
 - **The LAN address is bound explicitly, never `0.0.0.0`.** Both peers also sit on the harness's flat Redis network, and a wildcard bind would advertise that address too — a "punch" over it would never have crossed a NAT.
 
-The reservation holder drives DCUtR (ADR 0017), so the **listener** runs the rounds while the dialer answers and is the one timed. `FellBackToRelay` therefore fails the dialer: a relayed path is not a pass for this suite.
+The reservation holder drives DCUtR (ADR 0017), so the **listener** runs the rounds while the dialer answers and is the one timed. Settling on a relayed path (`ConnectSettled` with `Path::Relayed`) therefore fails the dialer: a relayed path is not a pass for this suite.
 
 `run-peer.sh` adds the route to `WAN_SUBNET` via `WAN_ROUTER_IP` on `lan0` before the binary starts, because the harness gives the peer containers no route to the relay's subnet. That is why this image installs `iproute2` and the suite grants it `NET_ADMIN`.
 
@@ -105,7 +105,7 @@ The reservation holder drives DCUtR (ADR 0017), so the **listener** runs the rou
 docker build -f tests/interop/unified-testing/Dockerfile.hole-punch -t minip2p-hole-punch .
 ```
 
-The app needs two NATs and a relay, so run it through the suite rather than by hand:
+The app needs two NATs and a relay, so run it through the suite rather than by hand. Until a `minip2p` entry is merged upstream in `libp2p/unified-testing`, add a local `minip2p` entry in `hole-punch/images.yaml` with `transports: [quic-v1]`, `source.type: local`, `source.path` set to the minip2p checkout root (the Docker build context), and `source.dockerfile: tests/interop/unified-testing/Dockerfile.hole-punch`, then run:
 
 ```sh
 cd hole-punch && ./run.sh --test-select "minip2p"

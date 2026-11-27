@@ -118,7 +118,7 @@ fn main() {
         }
     });
     if let Err(e) = result {
-        println!("error: {e}");
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -145,14 +145,15 @@ fn listener(config: &Config) -> Result<()> {
 
     let peer_key = config.key("listener_peer_id");
     let peer_id = node.peer_id().to_string();
-    let mut published = false;
+    let mut redis = Some(redis);
     loop {
         if let EndpointWaitOutcome::Event(event) = node.wait(Duration::from_secs(1))? {
             config.log(format_args!("{event:?}"));
             match event {
-                EndpointEvent::Nat(NatEvent::RelayReserved { .. }) if !published => {
-                    redis.command(&["SET", &peer_key, &peer_id])?;
-                    published = true;
+                EndpointEvent::Nat(NatEvent::RelayReserved { .. }) => {
+                    if let Some(mut redis) = redis.take() {
+                        redis.command(&["SET", &peer_key, &peer_id])?;
+                    }
                 }
                 EndpointEvent::Nat(NatEvent::InboundDirectUpgrade { new_conn_id, .. }) => {
                     config.log(format_args!("punched, now direct on {new_conn_id:?}"));
@@ -164,15 +165,18 @@ fn listener(config: &Config) -> Result<()> {
 }
 
 /// Dials the listener through the relay and waits for the circuit to be
-/// upgraded by a punch. The clock starts before the circuit dial, as the rust
-/// reference's does, and `handshake_plus_one_rtt` is that span plus the one
-/// ping that proves the punched path carries traffic.
+/// upgraded by a punch. The clock starts before `node.connect(peer)` (which
+/// dials the relay lazily) and `handshake_plus_one_rtt` is that span plus one
+/// ping on the punched path; `ping_rtt` is timed with `Instant` rather than
+/// `PingRttMeasured.rtt_ms` because `rtt_ms` is whole milliseconds and reads
+/// 0 between containers (matching `src/main.rs`).
 ///
 /// Every outcome that makes success impossible is reported instead of waited
-/// out: `FellBackToRelay` (the upgrade budget or all three rounds are gone,
-/// and a relayed path alone is not a pass for this suite), and a ping that
-/// fails or a punched connection that closes before the ping answers — only
-/// one ping is sent, so nothing would arrive after either.
+/// out: `ConnectSettled` finishing on a `Relayed` path (the upgrade budget or
+/// all three rounds are gone, and a relayed path alone is not a pass for this
+/// suite), and a ping that fails or a punched connection that closes before
+/// the ping answers — only one ping is sent, so nothing would arrive after
+/// either.
 ///
 /// The upgrade is accepted as either `Punched` or `Direct`. A punch whose
 /// winning connection is the *peer's* dial arriving inbound carries no local
@@ -211,13 +215,46 @@ fn dialer(config: &Config) -> Result<()> {
         let now = Instant::now();
         config.log(format_args!("{event:?}"));
         match event {
+            EndpointEvent::ConnectionReplaced {
+                peer_id,
+                old,
+                new,
+                new_path,
+                ..
+            } if peer_id == peer
+                && punched.is_some_and(|(punched_conn, _)| punched_conn == old) =>
+            {
+                match new_path {
+                    Path::Punched | Path::Direct => {
+                        if let Some((punched_conn, _)) = &mut punched {
+                            *punched_conn = new;
+                        }
+                    }
+                    Path::Relayed { relay } => {
+                        return Err(format!(
+                            "punched connection replaced by a relay path via {relay:?}"
+                        )
+                        .into());
+                    }
+                    _ => {}
+                }
+            }
             EndpointEvent::Nat(NatEvent::PathUpgraded {
                 connect_id: id,
+                from: Path::Relayed { .. },
                 to: Path::Punched | Path::Direct,
-                new_conn_id,
                 ..
             }) if id == connect_id => {
-                punched = Some((new_conn_id, now - punch_start));
+                let conn_id = match (node.connection_id(&peer), node.path(&peer)) {
+                    (Some(conn_id), Some(Path::Punched | Path::Direct)) => conn_id,
+                    (conn_id, path) => {
+                        return Err(format!(
+                            "punched connection is no longer active (conn={conn_id:?}, path={path:?})"
+                        )
+                        .into());
+                    }
+                };
+                punched = Some((conn_id, now - punch_start));
                 ping_start = Instant::now();
                 node.ping(&peer)?;
             }
@@ -241,9 +278,6 @@ fn dialer(config: &Config) -> Result<()> {
                 println!("  unit: ms");
                 return Ok(());
             }
-            EndpointEvent::Nat(NatEvent::FellBackToRelay { reason, .. }) => {
-                return Err(format!("no direct upgrade, settled on the relay: {reason:?}").into());
-            }
             EndpointEvent::PingFailed { conn_id, cause, .. }
                 if punched.is_some_and(|(punched_conn, _)| conn_id == punched_conn) =>
             {
@@ -260,12 +294,18 @@ fn dialer(config: &Config) -> Result<()> {
                 connect_id: id,
                 outcome,
                 ..
-            } if id == connect_id => {
-                if let ConnectOutcome::Connected { .. } = outcome {
-                    continue;
+            } if id == connect_id => match outcome {
+                ConnectOutcome::Connected {
+                    path: Path::Relayed { relay },
+                    ..
+                } => {
+                    return Err(
+                        format!("no direct upgrade, settled on the relay via {relay:?}").into(),
+                    );
                 }
-                return Err(format!("circuit dial failed: {outcome:?}").into());
-            }
+                ConnectOutcome::Connected { .. } => continue,
+                other => return Err(format!("circuit dial failed: {other:?}").into()),
+            },
             _ => {}
         }
     }

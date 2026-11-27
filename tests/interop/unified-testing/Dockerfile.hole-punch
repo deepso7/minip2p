@@ -19,5 +19,5 @@ RUN apt-get update \
       && apt-get install -y --no-install-recommends iproute2 \
       && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/tests/interop/unified-testing/target/release/minip2p-hole-punch-interop /usr/local/bin/
-COPY tests/interop/unified-testing/run-peer.sh /usr/local/bin/run-peer.sh
+COPY --chmod=0755 tests/interop/unified-testing/run-peer.sh /usr/local/bin/run-peer.sh
 ENTRYPOINT ["run-peer.sh"]
